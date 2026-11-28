@@ -37,6 +37,15 @@ SGPR_RMW = (
 # Image instructions whose fourth operand a[3] is a 4-dword sampler descriptor (S#).
 SAMPLER_IMAGE_OPS = ("image_sample", "image_gather4", "image_get_lod")
 
+# Buffer/BDA/global/flat store and atomic ops that mutate GPU buffer memory (not image_store/image_atomic/ds_write).
+BUFFER_WRITE_PREFIXES = (
+    "buffer_store", "tbuffer_store", "buffer_atomic",
+    "global_store", "global_atomic",
+    "flat_store", "flat_atomic",
+    "s_store_", "s_buffer_store_",
+    "s_atomic", "s_buffer_atomic",
+)
+
 # Scalar shift-add instructions: s_lshlK_add_u32 sD, sIdx, sBase -> sD = (sIdx << K) + sBase.
 LSHL_ADD_SHIFT = {
     "s_lshl1_add_u32": 1,
@@ -226,6 +235,54 @@ def _valid_stride(n):
     return isinstance(n, int) and 4 <= n <= 4096 and n % 4 == 0
 
 
+def _trace_vsharp_write_slot(sym, a_op):
+    """Return integer root/table descriptor slot offset if V# operand `a_op` is statically traceable, else None."""
+    slots = _sgpr_slots(a_op, 4)
+    if slots is None:
+        return None
+    tags = [_slot_tag(sym, s) for s in slots]
+    if all(t is not None and t[0] == "user" for t in tags):
+        u0 = tags[0][1]
+        if all(tags[i][1] == u0 + i for i in range(4)):
+            return u0
+    if all(t is not None and t[0] == "table_desc" for t in tags):
+        base_u, off0 = tags[0][1], tags[0][2]
+        if all(tags[i][1] == base_u and tags[i][2] == off0 + 4 * i for i in range(4)):
+            return off0
+    return None
+
+
+def _trace_ptr_write_slot(sym, a_op):
+    """Return integer root SGPR offset if a 64-bit BDA pointer operand is a direct user SGPR pair, else None."""
+    slots = _sgpr_slots(a_op, 2)
+    if slots is None:
+        return None
+    t0, t1 = _slot_tag(sym, slots[0]), _slot_tag(sym, slots[1])
+    if t0 is not None and t0[0] == "user" and ((t1 is not None and t1[0] == "user") or t1 == ("const", 0)):
+        return t0[1]
+    return None
+
+
+def _sload_const_offset(sym, ins):
+    """Constant byte offset of an s_load_dword* instruction, or None if dynamic."""
+    a = ins["args"]
+    off = 0
+    for m in ins.get("mods", ()):
+        if m.startswith("offset:"):
+            try:
+                off += int(m.split(":", 1)[1], 0)
+            except ValueError:
+                return None
+    if len(a) >= 3:
+        c = _const_of(sym, a[2])
+        if c is None or c >= 0x100000:
+            return None
+        off += c
+    if off < 0 or off >= 0x100000:
+        return None
+    return off & ~3
+
+
 def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
     """Advance symbolic SGPR origin/constants and descriptor-stride state by one instruction."""
     op = base_op(ins["op"])
@@ -233,8 +290,27 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
     if not a:
         return
 
-    # Record pointer, descriptor, stride and literal-sampler observations BEFORE writes clobber operands.
+    # Record pointer, descriptor, stride, buffer-write and literal-sampler observations BEFORE writes clobber operands.
     if events is not None:
+        if op.startswith(BUFFER_WRITE_PREFIXES):
+            events["writes_buffer"] = True
+            slot = None
+            if op.startswith(("buffer_store", "tbuffer_store", "buffer_atomic")) and len(a) >= 3:
+                slot = _trace_vsharp_write_slot(sym, a[2])
+            elif op.startswith(("s_buffer_store_", "s_buffer_atomic")) and len(a) >= 2:
+                slot = _trace_vsharp_write_slot(sym, a[1])
+            elif op.startswith(("s_store_", "s_atomic")) and len(a) >= 2:
+                slot = _trace_ptr_write_slot(sym, a[1])
+            elif op.startswith("global_store") and len(a) >= 3:
+                slot = _trace_ptr_write_slot(sym, a[2])
+            elif op.startswith("global_atomic_"):
+                saddr_idx = 3 if "glc" in ins.get("mods", ()) else 2
+                if len(a) > saddr_idx:
+                    slot = _trace_ptr_write_slot(sym, a[saddr_idx])
+            if slot is not None:
+                events["buffer_write_slots"].add(slot)
+            else:
+                events["buffer_write_dynamic"] = True
         if op.startswith(("s_load_dword", "s_store_dword")) and len(a) >= 2:
             slots = _sgpr_slots(a[1], 2)
             if slots is not None:
@@ -284,7 +360,9 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                 if s_slots is not None:
                     tags = [_slot_tag(sym, s) for s in s_slots]
                     if all(t is not None and t[0] == "const" for t in tags):
-                        events["literal_samplers"].add(tuple(t[1] for t in tags))
+                        words = tuple(t[1] for t in tags)
+                        events["literal_samplers"].add(words)
+                        events["literal_sampler_sites"][id(ins)] = words
                     elif all(t is not None and t[0] == "user" for t in tags):
                         for t in tags:
                             events["ssharp"].add(t[1])
@@ -326,7 +404,17 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
     new_scale = {}
     new_pstride = {}
 
-    if op == "s_mov_b32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+    if op.startswith("s_load_dword") and len(a) >= 2:
+        ptr_slots = _sgpr_slots(a[1], 2)
+        if ptr_slots is not None:
+            t0, t1 = _slot_tag(sym, ptr_slots[0]), _slot_tag(sym, ptr_slots[1])
+            if t0 is not None and t0[0] == "user" and ((t1 is not None and t1[0] == "user") or t1 == ("const", 0)):
+                off = _sload_const_offset(sym, ins)
+                if off is not None:
+                    dst_slots = _sgpr_regs(a[0])
+                    for i, dr in enumerate(dst_slots):
+                        new_sym[dr] = ("table_desc", t0[1], off + 4 * i)
+    elif op == "s_mov_b32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
         d = a[0]["r"]
         c = _const_of(sym, a[1])
         if c is not None:
@@ -477,7 +565,7 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
             ptr_stride.pop(r, None)
 
 
-def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
+def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=(), extra=None):
     """Analyse reachable RDNA2 basic blocks for user-SGPR reads/kinds, descriptor strides and literal samplers.
 
     Returns a dict with:
@@ -490,7 +578,8 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
     nblk = len(blocks)
     if nblk == 0:
         return {"user_sgpr_reads": [], "descriptor_strides": [], "literal_samplers": [],
-                "table_loads": False, "truncates_high": False}
+                "table_loads": False, "truncates_high": False,
+                "writes_buffer": False, "buffer_write_slots": []}
     sys_set = frozenset(system_sgprs)
     user_range = {r for r in range(user_sgpr_limit) if r not in sys_set}
 
@@ -564,8 +653,12 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
         "ssharp": set(),
         "strides": set(),
         "literal_samplers": set(),
+        "literal_sampler_sites": {},
         "table_loads": False,
         "truncates_high": False,
+        "writes_buffer": False,
+        "buffer_write_slots": set(),
+        "buffer_write_dynamic": False,
     }
     for b in range(nblk):
         if entry_written[b] is None:
@@ -614,12 +707,25 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
             row["pair"] = pairs[r]
         user_reads.append(row)
 
+    if extra is not None:
+        extra["literal_sampler_sites"] = events["literal_sampler_sites"]
+
+    writes_buffer = bool(events["writes_buffer"])
+    if not writes_buffer:
+        write_slots = []
+    elif events["buffer_write_dynamic"]:
+        write_slots = "dynamic"
+    else:
+        write_slots = sorted(events["buffer_write_slots"])
+
     return {
         "user_sgpr_reads": user_reads,
         "descriptor_strides": sorted(events["strides"]),
         "literal_samplers": [list(s) for s in sorted(events["literal_samplers"])],
         "table_loads": events["table_loads"],
         "truncates_high": events["truncates_high"],
+        "writes_buffer": writes_buffer,
+        "buffer_write_slots": write_slots,
     }
 
 
@@ -714,7 +820,7 @@ def fspx_state_sha256_file(disasm_path, name):
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def collect(disasm_path, name, blocks, succ, user_sgpr_limit=32, system_sgprs=()):
+def collect(disasm_path, name, blocks, succ, user_sgpr_limit=32, system_sgprs=(), extra=None):
     """Collect all build-time runtime metadata for one translated shader."""
     meta = {}
     digest = fssm_sha256_file(disasm_path, name)
@@ -737,13 +843,15 @@ def collect(disasm_path, name, blocks, succ, user_sgpr_limit=32, system_sgprs=()
     if "input_signature" in dxbc_info:
         meta["input_signature"] = dxbc_info["input_signature"]
 
-    ins_info = analyse_instructions(blocks, succ, user_sgpr_limit=user_sgpr_limit, system_sgprs=system_sgprs)
+    ins_info = analyse_instructions(blocks, succ, user_sgpr_limit=user_sgpr_limit, system_sgprs=system_sgprs, extra=extra)
     if ins_info["user_sgpr_reads"]:
         meta["user_sgpr_reads"] = ins_info["user_sgpr_reads"]
     if ins_info["descriptor_strides"]:
         meta["descriptor_strides"] = ins_info["descriptor_strides"]
     if ins_info["literal_samplers"]:
         meta["literal_samplers"] = ins_info["literal_samplers"]
+    meta["writes_buffer"] = ins_info["writes_buffer"]
+    meta["buffer_write_slots"] = ins_info["buffer_write_slots"]
 
     has_sfi0 = "sfi0_resource_heap_directly_indexed" in dxbc_info
     if has_sfi0 or ins_info["table_loads"] or ins_info["truncates_high"]:

@@ -392,20 +392,20 @@ class _Types:
         return k[1]
 
 
-def run_fragment(text, inputs=None, push_constants=None, memory=None):
+def run_fragment(text, inputs=None, push_constants=None, memory=None, spec_constants=None, resources=None):
     """Execute the entry point of `text` once and return the words written to every Output variable.
 
     `inputs` maps an Input variable name (for example "%in_attr1") to its value (a tuple for vectors).
     `push_constants` is a list of 32-bit words at byte offsets 0, 4, 8, ... of the PushConstant block
     (missing words read as zero). `memory` is a mutable {byte_address: word} mapping used for
-    PhysicalStorageBuffer loads and stores.
+    PhysicalStorageBuffer loads and stores. `spec_constants` maps SpecId integers to override values.
 
     Returns {output_variable_name: tuple_of_32bit_words}. Float outputs are returned as their bit patterns, a
     bool as 0 or 1, and an aggregate (a mesh shader's arrayed outputs) as its scalars in order. A mesh shader's
     result also has "OpSetMeshOutputsEXT": (vertex count, primitive count) once that instruction has run.
     A module with a subgroup operation is rejected here; see run_workgroup.
     """
-    gen = _invocation(text, inputs, push_constants, memory)
+    gen = _invocation(text, inputs, push_constants, memory, resources=resources, spec_constants=spec_constants)
     try:
         req = next(gen)
     except StopIteration as done:
@@ -555,7 +555,7 @@ def _parsed_lines(text):
     return parsed
 
 
-def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None, resources=None):
+def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None, resources=None, spec_constants=None):
     """One invocation as a generator. It yields (opcode, instruction index, value, id) at each subgroup operation
     and at each OpControlBarrier, and expects that operation's result back; with `step` it also yields _TICK before
     each instruction. `workgroup` (run_workgroup's) maps a Workgroup variable id to the box all invocations
@@ -567,6 +567,8 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
     left out stays declared but cannot be accessed (OpAccessChain into it raises)."""
     inputs = inputs or {}
     resources = resources or {}
+    spec_constants = spec_constants or {}
+    spec_ids = {}
     push_constants = list(push_constants or [])
     memory = {} if memory is None else memory
     types = _Types()
@@ -615,6 +617,9 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             in_body = True
             first_fn = res
             continue
+        if op == "OpDecorate" and len(a) >= 3 and a[1] == "SpecId":
+            spec_ids[a[0]] = int(a[2])
+            continue
         if op in _IGNORED:
             continue
         if op == "OpTypeInt":
@@ -641,15 +646,17 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             ptr_types[res] = (a[0], a[1])
         elif op in ("OpTypeImage", "OpTypeSampler", "OpTypeSampledImage"):
             types.t[res] = ("image",)                  # opaque: only OpImageFetch on a bound resource reads it
-        elif op == "OpConstant":
+        elif op in ("OpConstant", "OpSpecConstant"):
             k = types.t[a[0]]
             if k[0] == "float":
                 constants[res] = values[res] = f32_literal(a[1]) if k[1] == 32 else float(a[1])
             elif k[0] == "int":
-                constants[res] = values[res] = int(a[1]) & ((1 << k[1]) - 1)
+                sid = spec_ids.get(res) if op == "OpSpecConstant" else None
+                raw_v = spec_constants[sid] if (sid is not None and sid in spec_constants) else int(a[1])
+                constants[res] = values[res] = raw_v & ((1 << k[1]) - 1)
                 id_type[res] = a[0]
             else:
-                raise UnsupportedConstruct(f"OpConstant of type {k[0]}")
+                raise UnsupportedConstruct(f"{op} of type {k[0]}")
         elif op == "OpConstantTrue":
             constants[res] = values[res] = True
         elif op == "OpConstantFalse":
