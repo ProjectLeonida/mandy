@@ -201,6 +201,11 @@ OF[0x6E] = ("movd", "V Ed")
 OF[0x7E] = ("movd", "Ed V")
 
 _VEX_IMM8_MAP1 = {0x70, 0x71, 0x72, 0x73, 0xC2, 0xC4, 0xC5, 0xC6}
+# VEX.128/256.0F.WIG 77 (vzeroupper / vzeroall) is the one map-1 VEX opcode with no ModRM byte
+# at all: the ModRM byte the other map-1 forms read is really the next instruction.
+# tools/gdk_runtime_calls.py makes the same exception for it (see its decoder), and
+# tests/test_gdk_runtime_calls.py pins the length of C5 F8 77 at 3.
+_VEX_NO_MODRM_MAP1 = {0x77}
 
 
 class Insn:
@@ -530,6 +535,9 @@ def decode_one(buf, pos, end, addr):
     if pos >= end:
         raise DecodeError("truncated prefixes")
 
+    # VEX and EVEX are prefixes, so the opcode they introduce is required: a buffer that ends inside
+    # one is a truncated instruction, like a lone REX byte below, and must raise DecodeError instead
+    # of reading the opcode past `end`.
     vex = None
     b0 = buf[pos]
     if b0 == 0x62 and pos + 3 < end:
@@ -539,6 +547,8 @@ def decode_one(buf, pos, end, addr):
                    "r": (~p0 >> 7) & 1, "x": (~p0 >> 6) & 1, "b": (~p0 >> 5) & 1,
                    "w": (p1 >> 7) & 1, "vvvv": (~p1 >> 3) & 0xF, "pp": p1 & 3}
             pos += 4
+            if pos >= end:
+                raise DecodeError("truncated after evex prefix")
             b0 = buf[pos]
     elif b0 in (0xC4, 0xC5) and pos + 1 < end:
         if b0 == 0xC5:
@@ -547,11 +557,17 @@ def decode_one(buf, pos, end, addr):
                    "w": 0, "vvvv": (~b1 >> 3) & 0xF, "pp": b1 & 3}
             pos += 2
         else:
+            # The three-byte VEX form reads two payload bytes, so the two-byte check above is not
+            # enough for it.
+            if pos + 2 >= end:
+                raise DecodeError("truncated after vex prefix")
             b1, b2 = buf[pos + 1], buf[pos + 2]
             vex = {"evex": False, "map": b1 & 0x1F, "r": (~b1 >> 7) & 1,
                    "x": (~b1 >> 6) & 1, "b": (~b1 >> 5) & 1,
                    "w": (b2 >> 7) & 1, "vvvv": (~b2 >> 3) & 0xF, "pp": b2 & 3}
             pos += 3
+        if pos >= end:
+            raise DecodeError("truncated after vex prefix")
         b0 = buf[pos]
 
     rex = 0
@@ -579,7 +595,10 @@ def decode_one(buf, pos, end, addr):
     if vex is not None:
         omap = vex["map"]
         if omap == 1:
-            spec = ("simd", "V W Ib") if op in _VEX_IMM8_MAP1 else ("simd", "V W")
+            if op in _VEX_NO_MODRM_MAP1:
+                spec = ("simd", "")
+            else:
+                spec = ("simd", "V W Ib") if op in _VEX_IMM8_MAP1 else ("simd", "V W")
         elif omap == 2:
             spec = ("simd", "V W")
         elif omap == 3:
