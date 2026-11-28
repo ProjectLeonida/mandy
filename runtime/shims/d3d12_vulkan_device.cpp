@@ -5045,6 +5045,66 @@ struct DeviceState {
         check_arena("a release");
     }
 
+    // The arena copies of the programs shaders read their code base from (s_getpc_b64 and the constant tables in the
+    // program's own bytes; PipelineState::create_compute and create_graphics). A copy belongs to a program, not to a
+    // PSO: every PSO made from a program used to get a copy of the same bytes, so N PSOs of one program held N copies
+    // of the fixed-size arena. The first PSO of a program makes the copy and the others take a reference to it; the
+    // last one returns it to the arena when that PSO is deleted, which is when a PSO's own copy was returned. The key
+    // is the SHA-256 the PSO found the program's translation by, which is that of the bytes copied.
+    // LEONIDA_SHARE_CODE_BASE=0, or an empty key, gives the PSO a copy of its own, as before.
+    struct CodeCopy {
+        VkDeviceSize offset = 0;
+        VkDeviceSize bytes = 0;
+        std::uint64_t users = 0;
+    };
+    std::mutex code_copy_mutex;  // taken before arena.mutex
+    std::unordered_map<std::string, CodeCopy> code_copies;  // by the program's SHA-256, guarded by code_copy_mutex
+
+    static bool share_code_copies() {
+        static const bool share = [] {
+            wchar_t v[2]{};
+            return !(GetEnvironmentVariableW(L"LEONIDA_SHARE_CODE_BASE", v, 2) == 1 && v[0] == L'0');
+        }();
+        return share;
+    }
+
+    // Gives `offset` the console VA of a copy of `code`; false when the arena has no room for one. `key` is cleared
+    // when the copy is the PSO's own; code_copy_release takes the key as this left it.
+    bool code_copy_acquire(std::string& key, std::span<const std::uint8_t> code, VkDeviceSize& offset) {
+        if (!share_code_copies()) key.clear();
+        if (key.empty()) {
+            if (!arena_allocate(code.size(), 256, offset, arena_shader)) return false;
+            std::memcpy(arena.mapped + offset, code.data(), code.size());
+            return true;
+        }
+        std::lock_guard lock(code_copy_mutex);
+        const auto [it, made] = code_copies.try_emplace(key);
+        CodeCopy& copy = it->second;
+        if (made) {
+            if (!arena_allocate(code.size(), 256, copy.offset, arena_shader)) {
+                code_copies.erase(it);
+                return false;
+            }
+            std::memcpy(arena.mapped + copy.offset, code.data(), code.size());
+            copy.bytes = code.size();
+        }
+        ++copy.users;
+        offset = copy.offset;
+        return true;
+    }
+
+    void code_copy_release(const std::string& key, VkDeviceSize offset, VkDeviceSize bytes) {
+        if (key.empty()) {
+            arena_release(offset, bytes, arena_shader);
+            return;
+        }
+        std::lock_guard lock(code_copy_mutex);
+        const auto it = code_copies.find(key);
+        if (it == code_copies.end() || --it->second.users) return;
+        arena_release(it->second.offset, it->second.bytes, arena_shader);
+        code_copies.erase(it);
+    }
+
     // Console descriptor heaps (Xbox slot 14, docs/d3d12_vulkan.md section 3.4). The title gives the heap's address
     // itself: memory of its own, at a console VA the shaders would reach as heap_base + VA, past the arena. It fills
     // the heap through Create*View and CopyDescriptors, and also by writing 32-byte descriptor records into that
@@ -12058,7 +12118,7 @@ public:
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         modules_.clear();
-        if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
+        if (code_bytes_) device_.code_copy_release(code_key_, code_base_, code_bytes_);
         --live_pipeline_state_count;
     }
 
@@ -12218,6 +12278,12 @@ public:
     const std::vector<leonida::SubgroupRequest>& subgroup_requests() const {
         return native_owner_ ? native_owner_->subgroup_requests() : subgroup_requests_;
     }
+    // The program copy its shaders read their code base from: the console VA replay pushes, and its bytes (0: none).
+    std::uint64_t code_copy_va() const {
+        if (native_owner_) return native_owner_->code_copy_va();
+        return is_graphics_ ? graphics_.code_base : pipeline_.code_base;
+    }
+    VkDeviceSize code_copy_bytes() const { return native_owner_ ? native_owner_->code_copy_bytes() : code_bytes_; }
 
     // A VS (+ GS) (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the
     // VS's input signature by semantic name and index: location = the element's register, the translator's rule
@@ -13007,9 +13073,11 @@ public:
         graphics_.estimate = leonida::large_module_estimate(spirv_bytes);
 
         if (code_stage) {
+            // One copy per program, shared with the other PSOs of it (DeviceState::code_copy_acquire): the entry's
+            // key is the SHA-256 of these bytes, which the lookup above matched.
+            code_key_ = code_stage->entry->fssm_sha256;
             VkDeviceSize offset = 0;
-            if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
-            std::memcpy(device_.arena.mapped + offset, code_stage->fssm.data(), code_stage->fssm.size());
+            if (!device_.code_copy_acquire(code_key_, code_stage->fssm, offset)) return E_OUTOFMEMORY;
             code_bytes_ = code_stage->fssm.size();
             code_base_ = offset;
             graphics_.code_base = offset;
@@ -13180,8 +13248,11 @@ public:
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
         if (entry->uses_code_base || !entry->code_base_known) {
             const auto& code = program.bytes;
-            if (!device_.arena_allocate(code.size(), 256, code_base_, DeviceState::arena_shader)) return E_OUTOFMEMORY;
-            std::memcpy(device_.arena.mapped + code_base_, code.data(), code.size());
+            // One copy per program, shared with the other PSOs of it (DeviceState::code_copy_acquire): the entry's
+            // key is the SHA-256 of these bytes, which program_candidates matched.
+            code_key_ = program.kind == leonida::ComputeProgram::Kind::fssm ? entry->fssm_sha256
+                                                                             : entry->fspx_code_sha256;
+            if (!device_.code_copy_acquire(code_key_, code, code_base_)) return E_OUTOFMEMORY;
             code_bytes_ = code.size();
             pipeline_.code_base = code_base_;
         }
@@ -13861,6 +13932,7 @@ private:
     }
     VkDeviceSize code_base_ = 0;
     VkDeviceSize code_bytes_ = 0;
+    std::string code_key_;  // the program's key in DeviceState::code_copies; empty when the copy is this PSO's own
     bool registered_ = false;
     bool unregistered_ = false;  // taken out of the context's registry (unregister)
     bool is_graphics_ = false;
@@ -22120,6 +22192,14 @@ bool pipeline_stage_words(ID3D12PipelineState* pipeline, std::vector<std::vector
 
 long live_pipeline_states() { return live_pipeline_state_count.load(); }
 
+bool pipeline_code_base(ID3D12PipelineState* pipeline, std::uint64_t& va, std::uint64_t& bytes) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    if (!p || !p->code_copy_bytes()) return false;
+    va = p->code_copy_va();
+    bytes = p->code_copy_bytes();
+    return true;
+}
+
 bool write_placed_buffer_view(ID3D12Device* device, bool unordered, const void* view, std::uint64_t address,
                               std::uint64_t width, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
     Device* d = Device::from<Device>(device);
@@ -22434,6 +22514,16 @@ std::uint64_t device_arena_size(ID3D12Device* device) {
     if (!real) real = device;
     const Device* d = Device::from<Device>(real);
     return d ? d->state().arena.size : 0;
+}
+
+std::uint64_t arena_shader_bytes(ID3D12Device* device) {
+    if (!device) return 0;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    Device* d = Device::from<Device>(real);
+    if (!d) return 0;
+    std::lock_guard lock(d->state().arena.mutex);
+    return d->state().arena.use_in_use[DeviceState::arena_shader];
 }
 
 ImageMemoryStats image_memory_stats(ID3D12Device* device) {

@@ -917,7 +917,8 @@ The compute path, end to end:
   - Shader-visible descriptor heaps also live in it: the CPU handle is its host mapping and the GPU handle is the VA,
     so descriptor bytes the application writes itself are what shaders load.
   - Upload and readback buffers keep their own memory, and their VA is their device address minus the heap base.
-  - Shader programs (FSSM blobs) are copied in as the code base.
+  - Shader programs (FSSM blobs) are copied in as the code base, once per program: the PSOs made from one program
+    share its copy, which goes back to the arena with the last of them (`LEONIDA_SHARE_CODE_BASE`).
 - **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place in two layouts, both
   the console's (one dword per table; section 3.5, D3D-448): `pack_stage(Stage::Pixel)` for the graphics bind point
   (from s8; a signature past s31 there keeps `pack()`'s s0 layout, logged) and `pack_stage(Stage::Compute)` for the

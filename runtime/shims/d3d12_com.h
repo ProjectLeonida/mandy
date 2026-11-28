@@ -416,6 +416,9 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 
 // The size in bytes of the device's GPU address arena, or 0 without one. For tests.
 std::uint64_t device_arena_size(ID3D12Device* device);
+// The bytes of the device's GPU address arena that hold shader programs now: the copies pipelines read their code
+// base from. 0 without an arena. For tests.
+std::uint64_t arena_shader_bytes(ID3D12Device* device);
 // Copies `bytes` of the device's GPU address arena at console VA `va` (what shaders read there: a heap's GPU copy,
 // the null slots after it) into `out`. False without an arena or when the range is not inside it. For tests.
 bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);
@@ -641,6 +644,9 @@ bool pipeline_stage_words(ID3D12PipelineState* pipeline, std::vector<std::vector
                           std::string& why);
 // PSOs of any Vulkan device not yet deleted, counting one whose deletion waits for its running build (tests).
 long live_pipeline_states();
+// The program copy a Vulkan device's PSO reads its code base from: its console VA (the code base replay pushes) and
+// its bytes. False for a PSO with no such copy or one of another implementation. For tests.
+bool pipeline_code_base(ID3D12PipelineState* pipeline, std::uint64_t& va, std::uint64_t& bytes);
 
 // Unwraps an Xbox-ABI heap proxy if needed and inspects one of this module's descriptor heaps; returns its owning
 // device identity pointer, or nullptr when `heap` is null or belongs to another implementation.
