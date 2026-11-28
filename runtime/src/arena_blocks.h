@@ -43,6 +43,7 @@ public:
         free_bytes_ = size > reserved ? size - reserved : 0;
         if (free_bytes_) blocks_.emplace(reserved, free_bytes_);
         cuts_ = 0;
+        ++mutation_;
         fault_ = Fault::none;
         faults_ = 0;
         interrupted_ = false;
@@ -55,42 +56,43 @@ public:
     bool allocate(std::uint64_t bytes, std::uint64_t alignment, KeepOut&& keep_out, std::uint64_t& out) {
         if (!bytes || !alignment || bytes > size_) return false;
         interrupted_ = false;
-        // Blocks in offset order. A step carries only a block's offset and size; the iterator is gone before
-        // keep_out() runs and the next block is looked up from the map again, so a cut made under the walk
-        // (cuts() changed) is seen, and the search starts over on the map as it is now.
+        if (bytes > free_bytes_) return false;
+        // Blocks in offset order. Undersized or unaligned blocks never invoke keep_out(), so the walk advances
+        // sequentially without restarting from the tree root. Before calling keep_out(), block bounds are copied by
+        // value and a monotonic mutation counter detects any re-entrant modification (including reset()), restarting
+        // the walk cleanly rather than dereferencing a stale iterator.
         for (int attempt = 0; attempt < kAttempts; ++attempt) {
-            const std::uint64_t cuts = cuts_;
-            std::uint64_t cursor = reserved_;
-            for (;;) {
-                const auto next = blocks_.lower_bound(cursor);
-                if (next == blocks_.end()) return false;
+            const std::uint64_t generation = mutation_;
+            for (auto next = blocks_.begin(); next != blocks_.end();) {
                 const std::uint64_t block = next->first;
                 const std::uint64_t block_size = next->second;
+                if (block_size < bytes) {
+                    ++next;
+                    continue;
+                }
                 const std::uint64_t end = block + block_size;
                 std::uint64_t start = 0;
-                if (align_up(block, alignment, start)) {
-                    while (start < end && bytes <= end - start) {
-                        const std::uint64_t keep_out_end = keep_out(start, start + bytes);
-                        if (!keep_out_end) break;
-                        if (keep_out_end <= start || !align_up(keep_out_end, alignment, start)) {
-                            start = end;
-                            break;
-                        }
-                    }
-                } else {
-                    start = end;
+                if (!align_up(block, alignment, start) || start >= end || bytes > end - start) {
+                    ++next;
+                    continue;
                 }
-                if (cuts_ != cuts) break;  // the map moved under the walk: search the new one
+                while (start < end && bytes <= end - start) {
+                    const std::uint64_t keep_out_end = keep_out(start, start + bytes);
+                    if (!keep_out_end) break;
+                    if (keep_out_end <= start || !align_up(keep_out_end, alignment, start)) {
+                        start = end;
+                        break;
+                    }
+                }
+                if (mutation_ != generation) break;  // the map moved under the walk: search the new one
                 if (start < end && bytes <= end - start) {
-                    const auto target = blocks_.find(block);  // nothing held between steps
-                    if (target == blocks_.end() || target->second != block_size) break;
-                    cut(target, start, bytes);
+                    cut(next, start, bytes);
                     out = start;
                     return true;
                 }
-                cursor = end;
+                ++next;
             }
-            if (cuts_ == cuts) return false;  // nothing moved: a genuine refusal
+            if (mutation_ == generation) return false;  // nothing moved: a genuine refusal
         }
         interrupted_ = true;  // cut under the search kAttempts times: reported by the device
         return false;
@@ -118,6 +120,7 @@ public:
         std::uint64_t end = released_end;
         bool already_free = false;
         auto it = blocks_.lower_bound(offset);
+        Map::iterator keep = blocks_.end();
         if (it != blocks_.begin()) {
             const auto previous = std::prev(it);
             const std::uint64_t previous_end = previous->first + previous->second;
@@ -126,18 +129,35 @@ public:
                 begin = previous->first;
                 end = std::max(end, previous_end);
                 free_bytes_ -= previous->second;
-                it = blocks_.erase(previous);
+                keep = previous;
             }
         }
+        Map::node_type recycled;
         while (it != blocks_.end() && it->first <= end) {
             if (it->first < released_end) already_free = true;
             end = std::max(end, it->first + it->second);
             free_bytes_ -= it->second;
-            it = blocks_.erase(it);
+            if (keep == blocks_.end() && recycled.empty()) {
+                const auto next_it = std::next(it);
+                recycled = blocks_.extract(it);
+                it = next_it;
+            } else {
+                it = blocks_.erase(it);
+            }
         }
-        blocks_.emplace(begin, end - begin);
-        free_bytes_ += end - begin;
+        const std::uint64_t merged_size = end - begin;
+        if (keep != blocks_.end()) {
+            keep->second = merged_size;
+        } else if (!recycled.empty()) {
+            recycled.key() = begin;
+            recycled.mapped() = merged_size;
+            blocks_.insert(it, std::move(recycled));
+        } else {
+            blocks_.emplace_hint(it, begin, merged_size);
+        }
+        free_bytes_ += merged_size;
         ++cuts_;
+        ++mutation_;
         return note_fault(already_free ? Fault::double_free : Fault::none);
     }
 
@@ -214,6 +234,12 @@ public:
 
 private:
     static bool align_up(std::uint64_t value, std::uint64_t alignment, std::uint64_t& out) {
+        if ((alignment & (alignment - 1)) == 0) {
+            const std::uint64_t mask = alignment - 1;
+            if (value > std::numeric_limits<std::uint64_t>::max() - mask) return false;
+            out = (value + mask) & ~mask;
+            return true;
+        }
         const std::uint64_t rem = value % alignment;
         if (!rem) {
             out = value;
@@ -235,21 +261,26 @@ private:
     void cut(Map::iterator it, std::uint64_t start, std::uint64_t bytes) {
         const std::uint64_t offset = it->first;
         const std::uint64_t end = offset + it->second;
-        blocks_.erase(it);
-        free_bytes_ -= end - offset;
+        const std::uint64_t tail = start + bytes;
         if (start > offset) {
-            blocks_.emplace(offset, start - offset);
-            free_bytes_ += start - offset;
+            it->second = start - offset;
+            if (tail < end) blocks_.emplace_hint(std::next(it), tail, end - tail);
+        } else if (tail < end) {
+            const auto hint = std::next(it);
+            auto node = blocks_.extract(it);
+            node.key() = tail;
+            node.mapped() = end - tail;
+            blocks_.insert(hint, std::move(node));
+        } else {
+            blocks_.erase(it);
         }
-        if (start + bytes < end) {
-            blocks_.emplace(start + bytes, end - (start + bytes));
-            free_bytes_ += end - (start + bytes);
-        }
+        free_bytes_ -= bytes;
         ++cuts_;
+        ++mutation_;
     }
 
     Map blocks_;  // offset -> size
-    std::uint64_t reserved_ = 0, size_ = 0, free_bytes_ = 0, cuts_ = 0, faults_ = 0;
+    std::uint64_t reserved_ = 0, size_ = 0, free_bytes_ = 0, cuts_ = 0, mutation_ = 0, faults_ = 0;
     Fault fault_ = Fault::none;
     bool interrupted_ = false;
 };

@@ -291,6 +291,56 @@ int overflow_and_bounds() {
     EXPECT(b.check() == Blocks::Fault::none);
     EXPECT(b.consistent(0) && !b.consistent(1));
     EXPECT(!b.allocate(0x1000, kAlign, no_keep_out, out));
+
+    // Power-of-two alignment at 2^63 must refuse cleanly without overflow, and non-power-of-two alignments work.
+    b.reset(kReserved, kSize);
+    EXPECT(!b.allocate(0x1000, std::uint64_t(1) << 63, no_keep_out, out));
+    EXPECT(b.allocate(0x300, 300, no_keep_out, out) && (out % 300) == 0 && out >= kReserved);
+    EXPECT(b.release(out, 0x300) == Blocks::Fault::none);
+    EXPECT(one_block_of(b, kReserved, kSize - kReserved));
+
+    // Re-entrant reset() inside keep_out() when cuts() == 0 must be detected by the monotonic mutation counter.
+    b.reset(kReserved, kSize);
+    EXPECT(b.cuts() == 0);
+    bool did_reset = false;
+    const auto reset_keep_out = [&](std::uint64_t, std::uint64_t) -> std::uint64_t {
+        if (!did_reset) {
+            did_reset = true;
+            b.reset(kReserved + 0x4000, kSize);
+        }
+        return 0;
+    };
+    EXPECT(b.allocate(0x1000, kAlign, reset_keep_out, out) && did_reset && out == kReserved + 0x4000);
+    EXPECT(b.check() == Blocks::Fault::none && b.consistent(0x1000));
+
+    // Fragmented coalesce paths: right-neighbor-only merge, left-neighbor-only merge, 3-way merge,
+    // suffix/prefix/middle cuts, and bytes > free_bytes() fast rejection.
+    b.reset(kReserved, kReserved + 0x10000);
+    std::uint64_t s[8] = {};
+    for (int i = 0; i < 8; ++i) EXPECT(b.allocate(0x2000, kAlign, no_keep_out, s[i]));
+    EXPECT(b.free_bytes() == 0 && b.count() == 0);
+    EXPECT(!b.allocate(0x1000, kAlign, no_keep_out, out));
+    // Release odd slots (isolated), then even slots (right-only, 3-way, left-only merges).
+    EXPECT(b.release(s[1], 0x2000) == Blocks::Fault::none);
+    EXPECT(b.release(s[3], 0x2000) == Blocks::Fault::none);
+    EXPECT(b.release(s[5], 0x2000) == Blocks::Fault::none);
+    EXPECT(b.release(s[7], 0x2000) == Blocks::Fault::none);
+    EXPECT(b.count() == 4);
+    // Request larger than total free space fails immediately without calling keep_out.
+    int skipped_calls = 0;
+    EXPECT(!b.allocate(0x9000, kAlign, [&](std::uint64_t, std::uint64_t) { ++skipped_calls; return 0ull; }, out));
+    EXPECT(skipped_calls == 0);
+    // Middle cut inside a 0x4000 block (after merging s[2] with s[1] and s[3]), then suffix cut.
+    EXPECT(b.release(s[2], 0x2000) == Blocks::Fault::none);  // 3-way merge -> [s[1], s[4]) size 0x6000
+    EXPECT(b.allocate_at(s[1] + 0x1000, 0x2000));             // middle split -> [s[1], +0x1000) and [+0x3000, s[4])
+    EXPECT(b.allocate_at(s[1] + 0x5000, 0x1000));             // suffix cut -> [+0x3000, +0x5000)
+    EXPECT(b.release(s[0], 0x2000) == Blocks::Fault::none);  // right-only merge into [s[1], s[1]+0x1000)
+    EXPECT(b.release(s[4], 0x2000) == Blocks::Fault::none);  // 3-way merge
+    EXPECT(b.release(s[6], 0x2000) == Blocks::Fault::none);  // 3-way merge
+    EXPECT(b.release(s[1] + 0x1000, 0x2000) == Blocks::Fault::none);
+    EXPECT(b.release(s[1] + 0x5000, 0x1000) == Blocks::Fault::none);
+    EXPECT(b.check() == Blocks::Fault::none && b.consistent(0));
+    EXPECT(one_block_of(b, kReserved, 0x10000));
     return 0;
 }
 
