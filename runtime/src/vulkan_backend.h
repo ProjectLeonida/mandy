@@ -3396,6 +3396,12 @@ private:
                     }
                     return context_.depth24_->prepare(job, parts);
                 };
+            } else if (transfer_only) {
+                // The conversion is a compute dispatch with shader-stage barriers, which a transfer-only family may
+                // not record: drop the callbacks copied from context_.replay_ (enable_depth24), so its copies are
+                // refused as unsupported instead.
+                replay.depth24_prepare = {};
+                replay.depth24_run = {};
             }
             if (can_resolve_occlusion) {
                 replay.sum_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,

@@ -604,8 +604,10 @@ int main() {
             EXPECT(real_barrier2 != nullptr);
             context.vk.vkCmdPipelineBarrier2 = observe_host;
 
-            CommandList d24_rb_only, rgb96_rb_only, uav_clear_rb;
+            CommandList d24_rb_only, rgb96_rb_only, uav_clear_rb, d24_up_only, rgb96_up_only;
             EXPECT(d24_rb_only.copy_texture({fp_d24_rb, 0, 0, 0, loc_d24, false, {}}) && d24_rb_only.close());
+            EXPECT(d24_up_only.copy_texture({loc_d24, 0, 0, 0, fp_src, false, {}}) && d24_up_only.close());
+            EXPECT(rgb96_up_only.copy_texture({loc_rgb96, 0, 0, 0, fp_rgb96_src, false, {}}) && rgb96_up_only.close());
             EXPECT(rgb96_rb_only.copy_texture({fp_rgb96_rb, 0, 0, 0, loc_rgb96, false, {}}) && rgb96_rb_only.close());
             EXPECT(uav_clear_rb.clear_unordered_access({id_copy, true, 0, 0, slice_bytes, 4, 0, 0, 1}, false,
                                                        {0x13572468u, 0, 0, 0}, {}) &&
@@ -614,6 +616,8 @@ int main() {
             const CommandList* d24_ptr = &d24_rb_only;
             const CommandList* rgb96_ptr = &rgb96_rb_only;
             const CommandList* uav_ptr = &uav_clear_rb;
+            const CommandList* d24_up_ptr = &d24_up_only;
+            const CommandList* rgb96_up_ptr = &rgb96_up_only;
             for (const auto kind : {VulkanQueue::QueueKind::direct, VulkanQueue::QueueKind::compute,
                                     VulkanQueue::QueueKind::copy}) {
                 VulkanQueue typed(context, gpu.queue, gpu.family, kind);
@@ -621,6 +625,17 @@ int main() {
                 // Every kind here shares the test's one compute-capable family, so a copy queue runs the conversion
                 // as well; its barriers keep the shader stage and access, and so does the host readback's.
                 constexpr VkPipelineStageFlags2 compute = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+
+                // Uploads (buffer -> image) run the conversion before the copy: its barriers keep their shader
+                // stage and access on every kind too.
+                for (const CommandList* const* upload : {&d24_up_ptr, &rgb96_up_ptr}) {
+                    to_shader_barriers = from_shader_barriers = 0;
+                    watch_dispatch_barriers = true;
+                    EXPECT(typed.execute({upload, 1}) == ReplayResult::success);
+                    watch_dispatch_barriers = false;
+                    EXPECT(typed.idle());
+                    EXPECT(to_shader_barriers >= 1 && from_shader_barriers >= 1);
+                }
 
                 // depth24_as_float readback
                 for (std::uint32_t i = 0; i < slice_words; ++i) arena_ptr[d24_rb_off / 4 + i] = poison_word;
@@ -674,8 +689,29 @@ int main() {
                 EXPECT(host_src_access == VK_ACCESS_2_TRANSFER_WRITE_BIT);
                 for (std::uint32_t i = 0; i < slice_words; ++i) EXPECT(arena_ptr[copy_off / 4 + i] == 0x13572468u);
             }
+
+            // A copy queue on a transfer-only family (timbot103's review of #2469): the context's depth24
+            // callbacks must not reach it, so a depth24 or rgb96 copy there is refused before anything is
+            // recorded, and no conversion barrier with a shader stage is emitted. The test's family has compute;
+            // registering it as transfer-only makes the queue take that path.
+            context.set_transfer_only_family(gpu.family);
+            {
+                VulkanQueue dma(context, gpu.queue, gpu.family, VulkanQueue::QueueKind::copy);
+                EXPECT(dma.ok());
+                for (const CommandList* const* list : {&d24_ptr, &rgb96_ptr, &d24_up_ptr, &rgb96_up_ptr}) {
+                    to_shader_barriers = from_shader_barriers = 0;
+                    host_barriers = 0;
+                    watch_dispatch_barriers = true;
+                    EXPECT(dma.execute({list, 1}) == ReplayResult::unsupported);
+                    watch_dispatch_barriers = false;
+                    EXPECT(dma.idle());
+                    EXPECT(to_shader_barriers == 0 && from_shader_barriers == 0 && host_barriers == 0);
+                }
+            }
+            context.set_transfer_only_family(UINT32_MAX);
             context.vk.vkCmdPipelineBarrier2 = real_barrier2;
-            std::printf("depth24: host-readback visibility barriers (depth24, rgb96, buffer UAV clear) ok\n");
+            std::printf("depth24: host-readback visibility barriers (depth24, rgb96, buffer UAV clear), uploads, and "
+                        "no conversion on a transfer-only family ok\n");
         }
     }
 
