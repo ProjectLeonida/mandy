@@ -440,6 +440,19 @@ int check_placed_texture_views(ID3D12Device* device, void* pages) {
     EXPECT(placements.find(0x20000, 0x10000, fits) == &layers);
     placements.remove(0x10000, &layers);
     EXPECT(!placements.find(0x10000, 0, fits));
+    // Wrapping 32-bit mip/layer sums must be rejected, and duplicate va==alias probes each entry once.
+    {
+        auto wrap_mip = raw;
+        wrap_mip.first_mip = 0xffffffffu;
+        wrap_mip.mip_count = 1;
+        EXPECT(!placements.matches(wrap_mip, layers));
+        auto wrap_layer = raw;
+        wrap_layer.first_layer = 0xffffffffu;
+        wrap_layer.layer_count = 1;
+        EXPECT(!placements.matches(wrap_layer, layers));
+        unsigned visits = 0;
+        EXPECT(!placements.find(0x10000, 0x10000, [&](const auto&) { ++visits; return false; }) && visits == 1);
+    }
     Ref<ID3D12Resource> older, newer;
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, array, 0, IID_PPV_ARGS(&older.p)), S_OK);
     D3D12_RESOURCE_DESC single = array;
