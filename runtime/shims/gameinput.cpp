@@ -885,7 +885,19 @@ bool matches(const Callback& c, const Event& e) {
     }
 }
 
+// The token of the callback running on this thread, for kCurrentCallbackToken; 0 outside a callback.
+thread_local GameInputCallbackToken t_running_token = kInvalidCallbackToken;
+
+GameInputCallbackToken resolve_token(GameInputCallbackToken token) {
+    return token == kCurrentCallbackToken ? t_running_token : token;
+}
+
 void call(const Callback& c, const Event& e) {
+    struct Running {  // restored on return, so a callback that drives another delivery keeps its own token
+        GameInputCallbackToken saved = t_running_token;
+        explicit Running(GameInputCallbackToken t) { t_running_token = t; }
+        ~Running() { t_running_token = saved; }
+    } running(c.token);
     switch (c.type) {
         case CbType::Device:
             reinterpret_cast<GameInputDeviceCallback>(c.fn)(c.token, c.context, e.device, e.timestamp, e.current, e.previous);
@@ -2671,6 +2683,8 @@ public:
     }
 
     void STDMETHODCALLTYPE StopCallback(GameInputCallbackToken token) override {
+        token = resolve_token(token);
+        if (token == kInvalidCallbackToken) return;
         std::lock_guard lock(g().mu);
         for (Callback& c : g().callbacks)
             if (c.token == token) c.active = false;
@@ -2679,6 +2693,8 @@ public:
     // Removes the callback and, unless called from inside a callback, waits for one that is running to return.
     // VERIFY: the timeout is not honoured; the wait is for at most one callback.
     bool STDMETHODCALLTYPE UnregisterCallback(GameInputCallbackToken token, uint64_t) override {
+        token = resolve_token(token);
+        if (token == kInvalidCallbackToken) return false;
         State& s = g();
         bool found = false;
         {

@@ -168,6 +168,17 @@ DWORD g_reading_sleep_ms = 0;  // makes on_reading slow, for the Dispatch quota 
 SDL_Joystick* g_requeue_pad = nullptr;  // set: on_reading queues one more reading from inside the callback
 bool g_requeue_down = false;
 
+// A reading callback that cancels itself with GAMEINPUT_CURRENT_CALLBACK_TOKEN_VALUE on its first call.
+IGameInput* g_self_input = nullptr;
+bool g_self_stop = false;    // StopCallback instead of UnregisterCallback
+bool g_self_result = false;  // what UnregisterCallback returned inside the callback
+int g_self_calls = 0;
+void CALLBACK on_self_cancel(GameInputCallbackToken, void*, IGameInputReading*, bool) {
+    if (++g_self_calls != 1) return;
+    if (g_self_stop) g_self_input->StopCallback(kCurrentCallbackToken);
+    else g_self_result = g_self_input->UnregisterCallback(kCurrentCallbackToken, 0);
+}
+
 void CALLBACK on_reading(GameInputCallbackToken, void*, IGameInputReading* reading, bool) {
     if (reading) ++g_reading_events;
     if (g_reading_sleep_ms) Sleep(g_reading_sleep_ms);
@@ -2103,6 +2114,32 @@ int main(int argc, char** argv) {
     }
     if (wait) CloseHandle(wait);
     if (dispatcher) dispatcher->Release();
+
+    // ---- GAMEINPUT_CURRENT_CALLBACK_TOKEN_VALUE: the running callback inside one, nothing outside ----
+    // Measured on the host's GameInput (0.2309, Windows 11): UnregisterCallback(CURRENT) inside a callback returns
+    // true and removes it; outside a callback it returns false.
+    check(!input->UnregisterCallback(kCurrentCallbackToken, 0), "current token: UnregisterCallback outside a callback is false");
+    input->StopCallback(kCurrentCallbackToken);  // outside a callback: names nothing, stops nothing
+    g_self_input = input;
+    for (bool stop : {false, true}) {
+        g_self_stop = stop;
+        g_self_calls = 0;
+        g_self_result = false;
+        GameInputCallbackToken self_token = 0;
+        check(input->RegisterReadingCallback(dev, GameInputKindGamepad, 0.0f, nullptr, on_self_cancel, &self_token) == S_OK,
+              "current token: register the self-cancelling callback");
+        for (bool down : {true, false, true, false}) {  // four changes: without the token a callback sees several
+            SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_NORTH, down);
+            rt::gameinput::poll();
+        }
+        check(g_self_calls == 1, stop ? "current token: StopCallback inside the callback stops it (one call for four changes)"
+                                      : "current token: UnregisterCallback inside the callback removes it (one call for four changes)");
+        if (stop)
+            check(input->UnregisterCallback(self_token, 0), "current token: the stopped callback stays registered");
+        else
+            check(g_self_result && !input->UnregisterCallback(self_token, 0),
+                  "current token: UnregisterCallback returned true and the real token is gone");
+    }
 
     // ---- unplug and replug ----
     const size_t events_before_unplug = g_device_events.size();
