@@ -147,45 +147,101 @@ impl Port {
     }
 }
 
-/// The thread pool behind thread-pool ports: idle workers are reused, and a
-/// new one starts whenever more tasks wait than workers idle, so a callback
-/// that blocks on another never starves it. Workers stay for reuse.
+/// The thread pool behind thread-pool ports. Idle workers are reused, and
+/// while tasks wait there is always a worker idle or starting to take them:
+/// a task queued with none starts one, and a worker that takes a task while
+/// others still wait, with none idle or starting, starts the next before its
+/// task runs. So a callback that blocks on another never starves it, while a
+/// burst of short tasks is run by a few workers instead of a thread each.
+/// Each worker holds a stack and the title's per-thread state, so one that
+/// has waited out `linger` with no task leaves, down to `keep` idle ones.
 struct Pool {
-    /// Queued tasks and the number of idle workers.
-    state: Mutex<(VecDeque<Task>, usize)>,
+    state: Mutex<PoolState>,
     ready: Condvar,
+    linger: Duration,
+    keep: usize,
 }
 
-static POOL: Pool = Pool {
-    state: Mutex::new((VecDeque::new(), 0)),
-    ready: Condvar::new(),
-};
+struct PoolState {
+    tasks: VecDeque<Task>,
+    /// Workers waiting for a task.
+    idle: usize,
+    /// Workers started that have not looked for a task yet: each takes one
+    /// without waiting, so a task queued meanwhile has a worker coming.
+    starting: usize,
+    /// Every worker that has not left: idle, starting or running a task.
+    workers: usize,
+}
+
+/// Idle workers leave after 30 seconds without a task, down to four, so the
+/// pool goes back to a few threads once a burst is over.
+static POOL: Pool = Pool::new(Duration::from_secs(30), 4);
 
 impl Pool {
-    fn submit(&'static self, task: Task) {
-        let mut state = lock(&self.state);
-        state.0.push_back(task);
-        if state.0.len() > state.1 {
-            std::thread::spawn(move || self.work());
-        } else {
-            self.ready.notify_one();
+    const fn new(linger: Duration, keep: usize) -> Pool {
+        Pool {
+            state: Mutex::new(PoolState {
+                tasks: VecDeque::new(),
+                idle: 0,
+                starting: 0,
+                workers: 0,
+            }),
+            ready: Condvar::new(),
+            linger,
+            keep,
         }
     }
 
-    fn work(&self) {
+    fn submit(&'static self, task: Task) {
         let mut state = lock(&self.state);
+        state.tasks.push_back(task);
+        // An idle worker takes it, or the one starting does (and starts the
+        // next if more wait); with neither, one starts.
+        if state.idle > 0 {
+            self.ready.notify_one();
+        } else if state.starting == 0 {
+            self.start(state);
+        }
+    }
+
+    /// Starts a worker. The thread is created after the lock is let go, as
+    /// creating it takes a while and the other workers need the lock.
+    fn start(&'static self, mut state: MutexGuard<'_, PoolState>) {
+        state.starting += 1;
+        state.workers += 1;
+        drop(state);
+        std::thread::spawn(move || self.work());
+    }
+
+    fn work(&'static self) {
+        let mut state = lock(&self.state);
+        state.starting -= 1;
         loop {
-            while state.0.is_empty() {
-                state.1 += 1;
-                state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
-                state.1 -= 1;
-            }
-            let task = state.0.pop_front();
-            drop(state);
-            if let Some(task) = task {
+            if let Some(task) = state.tasks.pop_front() {
+                // This task may block on one still queued, so that one needs
+                // a worker of its own coming.
+                if !state.tasks.is_empty() && state.idle == 0 && state.starting == 0 {
+                    self.start(state);
+                } else {
+                    drop(state);
+                }
                 task.run(false);
+                state = lock(&self.state);
+                continue;
             }
-            state = lock(&self.state);
+            state.idle += 1;
+            let (next, waited) = self
+                .ready
+                .wait_timeout(state, self.linger)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+            state.idle -= 1;
+            // Leaving with the queue empty leaves no task without a worker.
+            if waited.timed_out() && state.tasks.is_empty() && state.idle >= self.keep {
+                state.workers -= 1;
+                tracing::debug!(workers = state.workers, "task pool: an idle worker leaves");
+                return;
+            }
         }
     }
 }
@@ -1541,6 +1597,66 @@ mod tests {
         }
         assert!(FIRST.load(Ordering::SeqCst));
         XTaskQueueCloseHandle(q);
+    }
+
+    /// The workers `pool` has started that have not left.
+    fn workers(pool: &Pool) -> usize {
+        lock(&pool.state).workers
+    }
+
+    /// Waits up to five seconds for `done`, and says whether it came.
+    fn within_seconds(done: impl Fn() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        while !done() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        done()
+    }
+
+    /// A burst of short callbacks (completions queued together, say) is run
+    /// by a few workers instead of a thread each, and the workers left idle
+    /// leave once the pool's linger is over, down to the ones it keeps.
+    #[test]
+    fn pool_workers_stay_few_in_a_burst_and_leave_when_idle() {
+        static BURST: Pool = Pool::new(Duration::from_millis(200), 1);
+        static RAN: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn ran(_: *mut c_void, _: bool) {
+            RAN.fetch_add(1, Ordering::SeqCst);
+        }
+        for _ in 0..256 {
+            BURST.submit(Task::new(std::ptr::null_mut(), ran));
+        }
+        assert!(within_seconds(|| RAN.load(Ordering::SeqCst) == 256));
+        let started = workers(&BURST);
+        assert!(started <= 32, "{started} workers for 256 short callbacks");
+
+        assert!(
+            within_seconds(|| workers(&BURST) == 1),
+            "{} workers still there",
+            workers(&BURST)
+        );
+        // The worker kept still runs what comes.
+        BURST.submit(Task::new(std::ptr::null_mut(), ran));
+        assert!(within_seconds(|| RAN.load(Ordering::SeqCst) == 257));
+    }
+
+    /// Callbacks queued together that each wait for all of them to have
+    /// started still all run: a queued task always has a worker coming.
+    #[test]
+    fn pool_callbacks_queued_together_may_wait_for_each_other() {
+        static MEET: Pool = Pool::new(Duration::from_millis(200), 0);
+        static STARTED: AtomicU32 = AtomicU32::new(0);
+        static MET: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn meet(_: *mut c_void, _: bool) {
+            STARTED.fetch_add(1, Ordering::SeqCst);
+            if within_seconds(|| STARTED.load(Ordering::SeqCst) == 8) {
+                MET.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for _ in 0..8 {
+            MEET.submit(Task::new(std::ptr::null_mut(), meet));
+        }
+        assert!(within_seconds(|| MET.load(Ordering::SeqCst) == 8));
     }
 
     /// A dispatcher thread's loop, `while (XTaskQueueDispatch(queue, port,
