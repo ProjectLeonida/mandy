@@ -11,6 +11,8 @@ import hashlib
 import os
 import struct
 
+from report_paths import work_root
+
 # DXBC SFI0 (Shader Feature Info) 64-bit bitmask flags (Microsoft DXC DxilConstants.h).
 SFI0_RESOURCE_DESCRIPTOR_HEAP_INDEXING = 1 << 25   # 0x02000000
 SFI0_SAMPLER_DESCRIPTOR_HEAP_INDEXING = 1 << 26    # 0x04000000
@@ -680,7 +682,7 @@ def read_dxbc_meta(data):
 
 def fssm_sha256_file(disasm_path, name):
     """SHA-256 hex digest of <disasm_dir>/../fssm/<name>.fssm, or None if absent."""
-    parent = os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))
+    parent = work_root(disasm_path)
     fssm = os.path.join(parent, "fssm", name + ".fssm")
     if not os.path.isfile(fssm):
         return None
@@ -692,7 +694,7 @@ def fspx_code_sha256_file(disasm_path, name):
     """SHA-256 hex digest of <disasm_dir>/../fspx/<name>.code, the kind-6 program tools/fspx_unpack.py writes for an
     FSPX shader without an FSSM blob, or None. The run time computes the same key from the bytes a compute PSO gets
     (docs/fspx.md, "Run-time lookup")."""
-    parent = os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))
+    parent = work_root(disasm_path)
     if os.path.isfile(os.path.join(parent, "fssm", name + ".fssm")):
         return None
     code = os.path.join(parent, "fspx", name + ".code")
@@ -706,7 +708,7 @@ def fspx_state_sha256_file(disasm_path, name):
     """SHA-256 hex digest of <disasm_dir>/../fspx/<name>.state, the program's kind-0 entry (dispatch state), or None.
     Two FSPX programs can share their kind-6 bytes and differ in kind 0; the run time tells them apart by this key
     when the bytecode carries kind 0 (docs/fspx.md, "Build and run-time lookup")."""
-    parent = os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))
+    parent = work_root(disasm_path)
     state = os.path.join(parent, "fspx", name + ".state")
     if not os.path.isfile(state):
         return None
@@ -729,7 +731,7 @@ def collect(disasm_path, name, blocks, succ, user_sgpr_limit=32, system_sgprs=()
                 meta["fspx_state_sha256"] = state_digest
 
     dxbc_info = {}
-    parent = os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))
+    parent = work_root(disasm_path)
     dxbc_path = os.path.join(parent, name + ".dxbc")
     if os.path.isfile(dxbc_path):
         with open(dxbc_path, "rb") as f:
