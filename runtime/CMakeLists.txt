@@ -2280,6 +2280,23 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_fence_lost_by_counter COMMAND vk_fence_lost_by_counter_test)
     set_tests_properties(vk_fence_lost_by_counter PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  # The deferred deletion queue after a device loss: what was queued and what is released later is destroyed while
+  # the context lives, not at its teardown (driver vkDestroyBuffer interposed).
+  add_executable(vk_deferred_destroy_lost_test test/vk_deferred_destroy_lost_test.cpp)
+  target_link_libraries(vk_deferred_destroy_lost_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_deferred_destroy_lost_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(vk_deferred_destroy_lost_test PRIVATE Threads::Threads)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_deferred_destroy_lost_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_deferred_destroy_lost COMMAND vk_deferred_destroy_lost_test)
+    set_tests_properties(vk_deferred_destroy_lost PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   # The bindless set under view churn (bounded table, spare generations) and failed allocations (host table, in-place
   # rewrite, a degraded flush instead of a refused submission).
   add_executable(vk_bindless_grow_test test/vk_bindless_grow_test.cpp)
