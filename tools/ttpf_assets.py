@@ -218,13 +218,23 @@ def complete_pool(source, directory, manifest, settings):
                 try:
                     if not pool.codecs(base, span) & bcpack.SUPPORTED_REBUILD_CODECS:
                         continue
-                    if decoder and desc["dimension"] == 1 and desc["format"] in decoder.formats:
+                    calibrated = decoder and desc["dimension"] == 1 and desc["format"] in decoder.formats
+                    if calibrated:
                         method = stamp.partition("+")[0]
-                        blob = decoder.dds(index)
                     else:
                         if profile is not None and strict is None:
                             strict = strict_stamp()   # once per pass: it reads and hashes six sources
                         method = strict or stamp
+                    # A distinct name keeps an existing lower-mip DDS usable until the manifest switches.
+                    name = f"{index:06d}_bcpack_{method[:19]}.dds"
+                    if row.get("BCPackDecoder") == method and row["File"] == name and (directory / name).is_file():
+                        # The same decoder wrote this file (a calibrated row when only the history changed): it
+                        # would write the same bytes again, and replacing a file in use stops the pass.
+                        row.pop("BCPackLimitation", None)
+                        continue
+                    if calibrated:
+                        blob = decoder.dds(index)
+                    else:
                         analysis = ttpf.analyze(pool, index)
                         blob = ttpf.texture_dds(pool, analysis, history=profiles.history)
                 except (ValueError, KeyError, IndexError, ttpf.BcpackRequired,
@@ -232,8 +242,6 @@ def complete_pool(source, directory, manifest, settings):
                     row["BCPackLimitation"] = str(exc)
                     blocked += 1
                     continue
-                # A distinct name keeps an existing lower-mip DDS usable until the manifest switches.
-                name = f"{index:06d}_bcpack_{method[:19]}.dds"
                 publish(directory / name, blob)
                 if isinstance(row.get("File"), str) and row["File"] != name:
                     superseded.add(row["File"])

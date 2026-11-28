@@ -527,6 +527,24 @@ class CompletePoolEarlyReturn(unittest.TestCase):
             self.assertEqual(calibrated_row["BCPackDecoder"], calibrated_stamp)
             self.assertEqual(strict_row["BCPackDecoder"], strict_stamp)
 
+            # A history edit redoes the strict fallback only: the calibrated file does not depend on the history.
+            calibrated_file = work / calibrated_row["File"]
+            history["bc1"]["confirmed"]["7"] = [0, 0, 0, 0, 0, 0]
+            history_path.write_text(json.dumps(history), encoding="utf-8", newline="\n")
+            settings = ttpf_assets.load_profile(work)
+            pool.descriptor.side_effect = [
+                {"base": 0, "dimension": 1, "format": 77, "mips": 1},
+                {"base": 8, "dimension": 1, "format": 71, "mips": 1},
+            ]
+            with mock.patch.object(ttpf_assets.os, "replace", side_effect=ttpf_assets.os.replace) as replace:
+                self.assertEqual(ttpf_assets.complete_pool("synthetic", work, manifest, settings), (1, 0))
+            calibrated.LocalDecoder.return_value.dds.assert_called_once_with(0)
+            self.assertEqual(texture_dds.call_count, 2)
+            self.assertNotIn(calibrated_file, [Path(call.args[1]) for call in replace.call_args_list])
+            self.assertEqual(calibrated_row["File"], calibrated_file.name)
+            self.assertEqual(calibrated_file.read_bytes(), b"calibrated")
+            self.assertNotEqual(strict_row["BCPackDecoder"], strict_stamp)
+
     def test_a_pool_hashes_the_decoder_sources_once_for_all_its_strict_fallback_rows(self):
         # With a profile, each row the calibrated decoder can't take falls back to strict decoding; hashing the
         # sources per row read them 32 times over for 32 rows. A new pass computes the stamp again.
