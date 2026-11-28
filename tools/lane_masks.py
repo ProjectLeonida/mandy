@@ -268,6 +268,15 @@ def step(state, ins, wave64=True):
             return
         else:
             put(state, a[0], None, wave64)
+    elif op in ("s_bitset0_b32", "s_bitset1_b32"):
+        dk = kind(state, a[0], wave64)
+        dst_t = a[0].get("t") if a[0]["k"] == "special" else None
+        if dk in MASK_KINDS:
+            if wave64 and dst_t in ("vcc_lo", "vcc_hi") and state.get("vcc") in MASK_KINDS:
+                return
+            put(state, a[0], dk, wave64)
+        else:
+            put(state, a[0], None, wave64)
     else:
         put(state, a[0], None, wave64)
         if ((op.startswith("v_") and "_co_" in op)
