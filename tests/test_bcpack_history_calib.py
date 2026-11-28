@@ -474,6 +474,33 @@ class PrefixDecoderAndCliTest(unittest.TestCase):
                 self.assertIn("ERROR:", msg)
                 self.assertNotIn("Traceback", msg)
 
+    def test_verify_rejects_confirmed_bits_without_values(self):
+        # A sparse table that leaves the values out: the decoder would read zeros as confirmed values.
+        cases = (
+            ("bc7", {"historyEndpointBits": {"5": [8] * 24}, "historyEndpointConfirmedBits": {"5": [8] * 24}},
+             "historyEndpoints", [0] * 24),
+            ("bc7", {"historyIndexBits": {"5": [4] * 32}, "historyIndexConfirmedBits": {"5": [4] * 32}},
+             "historyIndices", [0] * 32),
+            ("bc6h", {"endpointClass": {"5": 3}}, "endpointHistory", [[0] * 4] * 3),
+            ("bc6h", {"indexClass": {"5": 3}}, "indexHistory", [0] * 16),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "history.json")
+
+            def verify(key, section):
+                with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                    json.dump({key: section}, fh)
+                err = io.StringIO()
+                with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                    return calib.main(["--verify", path, "--codec", key]), err.getvalue()
+
+            for key, depths, table, values in cases:
+                with self.subTest(table=table):
+                    rc, err = verify(key, depths)
+                    self.assertEqual(rc, 2)
+                    self.assertIn(f"{table}[5] missing", err)
+                    self.assertEqual(verify(key, depths | {table: {"5": values}}), (0, ""))
+
 
 class ReferenceInversionTest(unittest.TestCase):
     def test_ref_pairs_inverts_all_six_codecs_for_strict_decode(self):

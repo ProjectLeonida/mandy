@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from typing import NamedTuple
 import zlib
 
 # `python -I` implies `-P`, so the script's directory is not on sys.path; the sibling modules are next to it.
@@ -31,17 +32,54 @@ def decoder_digest():
     return h.hexdigest()
 
 
-def strict_stamp():
+def strict_stamp(raw_history=None):
     # Ends in "-strict" (candidate() keeps such rows without a profile); its first 19 characters name the DDS.
-    return f"v1-{decoder_digest()[:16]}-strict"
+    digest = decoder_digest()
+    if raw_history is not None:
+        digest = hashlib.sha256(digest.encode() + raw_history).hexdigest()
+    return f"v1-{digest[:16]}-strict"
+
+
+class Profiles(NamedTuple):
+    calibration: dict | None = None
+    history: dict | None = None
+    strict_stamp: str | None = None
+
+
+def load_history(work):
+    """Read a combined history once and check its tables before opening any pool."""
+    path = Path(work, "bcpack-history.json")
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        raise ValueError(f"{path}: cannot read the history: {exc.strerror or exc}") from None
+    try:
+        history = json.loads(raw)
+        keys = {name.lower(): codec for codec, name in bcpack.CODEC_NAMES.items()}
+        if not isinstance(history, dict) or not history or history.keys() - keys.keys():
+            raise ValueError("expected a combined BCPack history object keyed by codec")
+        for key, section in history.items():
+            if not isinstance(section, dict):
+                raise ValueError(f"{key} history section must be a JSON object")
+        # The checks of bcpack_history_calib.py --verify: the table loaders check shapes only, so a confirmed depth
+        # above the known one, or without values, would publish a provisional decode as a strict DDS. Imported here,
+        # with a history only: the module reconfigures stdout and stderr when it loads.
+        import bcpack_history_calib
+        bcpack_history_calib.check_history_tables(history, [keys[key] for key in history])
+    except (ValueError, TypeError, OverflowError, RecursionError) as exc:
+        raise ValueError(f"{path}: invalid BCPack history: {exc}") from None
+    return history, strict_stamp(raw)
 
 
 def load_profile(work):
+    history, strict = load_history(work)
     path = Path(work, "bcpack-calibration.json")
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
-        return strict_stamp(), None
+        return strict or strict_stamp(), Profiles(history=history, strict_stamp=strict)
     except OSError as exc:
         raise ValueError(f"{path}: cannot read the calibration profile: {exc.strerror or exc}") from None
     try:
@@ -59,7 +97,10 @@ def load_profile(work):
     except (OSError, ImportError) as exc:
         raise RuntimeError("Calibrated texture export requires NumPy and the release build of "
                            "tools/bcpack_calibration (see its README.md)") from exc
-    return "v1-" + hashlib.sha256(decoder_digest().encode() + raw).hexdigest(), profile
+    stamp = "v1-" + hashlib.sha256(decoder_digest().encode() + raw).hexdigest()
+    if strict is not None:
+        stamp = f"{stamp}+{strict}"
+    return stamp, Profiles(profile, history, strict)
 
 
 def publish(path, data):
@@ -136,29 +177,31 @@ def finish_replaced(directory, manifest):
               "next to the full-chain files; the next build tries again", file=sys.stderr)
 
 
-def candidate(row, profile):
+def candidate(row, profiles):
     if row.get("DxgiFormat") not in ttpf.BC_FORMATS:
         return False
     if row.get("BCPackDecoder"):
-        return profile is not None or row["BCPackDecoder"].endswith("-strict")
+        return profiles.calibration is not None or row["BCPackDecoder"].endswith("-strict")
     return (row["File"] is None or row.get("BaseMipLevel", 0) > 0
             or row.get("Mips", 0) < row.get("SourceMips", 0))
 
 
 def complete_pool(source, directory, manifest, settings):
     """Publish full chains next to ordinary DDS files, then switch the catalog to them."""
-    stamp, profile = settings
+    stamp, profiles = settings
     directory = Path(directory)
     if manifest.get("BCPackPass") == stamp:
         finish_replaced(directory, manifest)
         return 0, 0
-    rows = [row for row in manifest["Textures"] if candidate(row, profile)]
+    rows = [row for row in manifest["Textures"] if candidate(row, profiles)]
     if not rows:
         return 0, 0
     written = blocked = 0
     superseded = set()   # the files the rows named before they were switched to a full chain
     with closing(ttpf.Pool(source)) as pool:
-        decoder = strict = None
+        decoder = None
+        strict = profiles.strict_stamp
+        profile = profiles.calibration
         if profile is not None:
             from calibrated_texture import LocalDecoder
             decoder = LocalDecoder(pool, profile)
@@ -175,22 +218,30 @@ def complete_pool(source, directory, manifest, settings):
                 try:
                     if not pool.codecs(base, span) & bcpack.SUPPORTED_REBUILD_CODECS:
                         continue
-                    if decoder and desc["dimension"] == 1 and desc["format"] in decoder.formats:
-                        method = stamp
-                        blob = decoder.dds(index)
+                    calibrated = decoder and desc["dimension"] == 1 and desc["format"] in decoder.formats
+                    if calibrated:
+                        method = stamp.partition("+")[0]
                     else:
                         if profile is not None and strict is None:
                             strict = strict_stamp()   # once per pass: it reads and hashes six sources
                         method = strict or stamp
+                    # A distinct name keeps an existing lower-mip DDS usable until the manifest switches.
+                    name = f"{index:06d}_bcpack_{method[:19]}.dds"
+                    if row.get("BCPackDecoder") == method and row["File"] == name and (directory / name).is_file():
+                        # The same decoder wrote this file (a calibrated row when only the history changed): it
+                        # would write the same bytes again, and replacing a file in use stops the pass.
+                        row.pop("BCPackLimitation", None)
+                        continue
+                    if calibrated:
+                        blob = decoder.dds(index)
+                    else:
                         analysis = ttpf.analyze(pool, index)
-                        blob = ttpf.texture_dds(pool, analysis)
+                        blob = ttpf.texture_dds(pool, analysis, history=profiles.history)
                 except (ValueError, KeyError, IndexError, ttpf.BcpackRequired,
                         bcpack.BcpackUnsupportedCodec, zlib.error) as exc:
                     row["BCPackLimitation"] = str(exc)
                     blocked += 1
                     continue
-                # A distinct name keeps an existing lower-mip DDS usable until the manifest switches.
-                name = f"{index:06d}_bcpack_{method[:19]}.dds"
                 publish(directory / name, blob)
                 if isinstance(row.get("File"), str) and row["File"] != name:
                     superseded.add(row["File"])
