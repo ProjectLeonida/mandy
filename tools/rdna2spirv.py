@@ -654,7 +654,7 @@ class Gen:
 
     def imm_val(self, a):
         """Integer literal value if 'a' is an immediate or known SGPR constant, else None."""
-        if a.get("abs") or a.get("neg"):
+        if a.get("abs") or a.get("neg") or a.get("sext") or a.get("sdwa_sel", "DWORD") != "DWORD":
             return None
         k = a.get("k")
         if k == "imm":
@@ -8519,7 +8519,7 @@ class Gen:
             self.emit(f"{r} = OpFAdd %float {self.flush_f32(m)} {z}")
             self.dst(a[0], self.tou(self.flush_f32(r)))
         elif op == "v_bfi_b32":
-            mask = None if "sdwa_sel" in a[1] else self.imm_val(a[1])
+            mask = self.imm_val(a[1])
             y, z = (self.src_u(t) for t in a[2:4])
             if mask == 0:
                 self.dst(a[0], z)
@@ -8723,8 +8723,8 @@ class Gen:
             self.dst(a[0], r)
         elif op == "v_bfm_b32":
             w, o = self.src_u(a[1]), self.src_u(a[2])
-            width = None if "sdwa_sel" in a[1] else self.imm_val(a[1])
-            offset = None if "sdwa_sel" in a[2] else self.imm_val(a[2])
+            width = self.imm_val(a[1])
+            offset = self.imm_val(a[2])
             if width is not None:
                 bits = (1 << (width & 31)) - 1
                 if offset is not None:
