@@ -1785,8 +1785,9 @@ mod relay_tests {
     }
 }
 
-/// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// Snapshot memory kept for reuse (already touched, so no page faults),
+/// each buffer with when it was given back ([`crate::host::coarse_ms`]).
+static POOL: Mutex<Vec<(Vec<u8>, u64)>> = Mutex::new(Vec::new());
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
@@ -1798,11 +1799,11 @@ fn pooled(n: usize) -> Vec<u8> {
     let fit = pool
         .iter()
         .enumerate()
-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
-        .min_by_key(|(_, v)| v.capacity())
+        .filter(|(_, (v, _))| v.capacity() >= n && v.capacity() <= most)
+        .min_by_key(|(_, (v, _))| v.capacity())
         .map(|(i, _)| i);
     let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
+        Some(i) => pool.swap_remove(i).0,
         None => Vec::with_capacity(n),
     };
     v.clear();
@@ -1828,11 +1829,12 @@ fn snapshots_kept() -> usize {
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
+    let now = crate::host::coarse_ms();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    pool.push((v, now));
+    pool.sort_by_key(|(v, _)| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
-    for v in pool.iter().take(snapshots_kept()) {
+    for (v, _) in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
         if kept > 0 && total > KEPT {
             break;
@@ -1843,6 +1845,54 @@ fn give_back(v: Vec<u8>) {
     let gone = pool.split_off(kept);
     drop(pool);
     drop(gone);
+}
+
+/// Lets go of the snapshot buffers no snapshot took for `idle_ms`
+/// ([`crate::host::ram_idle_ms`]). Nothing trimmed the pool: after a burst of
+/// submissions whose shaders write copies in the PC's memory it kept up to
+/// 512 MiB (or its largest buffer, a whole copy's size: 174 MB for the big
+/// heap's, run 24) for the rest of the run. A buffer a snapshot takes and
+/// gives back starts its idle time again.
+fn let_go_idle_snapshots(idle_ms: u64) {
+    let now = crate::host::coarse_ms();
+    let gone = idle_snapshots(&mut POOL.lock().unwrap_or_else(|e| e.into_inner()), now, idle_ms);
+    // (Given back to the kernel without the lock, as in `give_back`.)
+    drop(gone);
+}
+
+/// Takes out of `pool` the buffers given back `idle_ms` or more before
+/// `now`; the others keep their order.
+fn idle_snapshots(pool: &mut Vec<(Vec<u8>, u64)>, now: u64, idle_ms: u64) -> Vec<(Vec<u8>, u64)> {
+    pool.extract_if(.., |(_, at)| now.saturating_sub(*at) >= idle_ms).collect()
+}
+
+#[cfg(test)]
+mod snapshot_pool_tests {
+    use super::idle_snapshots;
+
+    /// Buffers no snapshot took for the idle time leave the pool, and those
+    /// given back since stay: the pool kept up to 512 MiB (or its largest
+    /// buffer) of the PC's memory for the rest of the run once a burst of
+    /// submissions had filled it.
+    #[test]
+    fn buffers_the_pool_kept_for_the_idle_time_go() {
+        const IDLE_MS: u64 = 10_000;
+        // Eight buffers given back at 1 s, as a burst leaves them (the
+        // pool's 512 MiB are eight of 64 MiB; these are smaller), and one at
+        // 9 s.
+        let mut pool: Vec<(Vec<u8>, u64)> = (0..8).map(|_| (Vec::with_capacity(64 << 10), 1_000)).collect();
+        pool.push((Vec::with_capacity(64 << 10), 9_000));
+        // Under the idle time: all stay.
+        assert!(idle_snapshots(&mut pool, 10_999, IDLE_MS).is_empty());
+        assert_eq!(pool.len(), 9);
+        // The idle time since the burst: its eight go, the newer one stays.
+        let gone = idle_snapshots(&mut pool, 11_000, IDLE_MS);
+        assert_eq!(gone.len(), 8, "{} of the eight idle buffers let go", gone.len());
+        assert_eq!(pool.iter().map(|(_, at)| *at).collect::<Vec<_>>(), [9_000]);
+        // And it goes once it has been idle as long; nothing is reserved.
+        assert_eq!(idle_snapshots(&mut pool, 19_000, IDLE_MS).len(), 1);
+        assert!(pool.is_empty());
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -3671,6 +3721,9 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
+    // The snapshot buffers no snapshot took for the PC memory's idle time
+    // go too, whether or not there are windows.
+    let_go_idle_snapshots(crate::host::ram_idle_ms(crate::host::available_physical_ram()));
     const IDLE_FRAMES: u64 = 4;
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
@@ -3724,7 +3777,7 @@ pub(crate) fn memory() -> [u64; 6] {
     };
     let (kept, kept_bytes) = {
         let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        (pool.len() as u64, pool.iter().map(|v| v.capacity() as u64).sum::<u64>())
+        (pool.len() as u64, pool.iter().map(|(v, _)| v.capacity() as u64).sum::<u64>())
     };
     [
         LIVE[0].load(Ordering::Relaxed),
