@@ -956,10 +956,104 @@ int main() {
         sw.update_idle_hint();
         EXPECT(!sw.may_have_work());
     }
+    {  // BatchExamine::max_version propagation (shared tiles, alias peers, raced writes during arm_batch, pure touch)
+       // and sync_tile_peers() zero-acquire/release skip when alias set is unchanged across remaps.
+        struct PeerAndVersionWatch : FakeWatch {
+            std::uint64_t acquire_calls = 0;
+            std::uint64_t release_calls = 0;
+            std::uintptr_t race_tile = 0;
+            Cell* acquire(std::uintptr_t tile) {
+                ++acquire_calls;
+                return FakeWatch::acquire(tile);
+            }
+            void release(std::uintptr_t tile) {
+                ++release_calls;
+                FakeWatch::release(tile);
+            }
+            void arm_batch(const std::uintptr_t* tiles, Cell* const* cell_ptrs, std::int8_t* results,
+                           std::size_t count) {
+                for (std::size_t i = 0; i < count; ++i) {
+                    const int r = FakeWatch::arm(tiles[i], *cell_ptrs[i]);
+                    if (r > 0 && race_tile && tiles[i] == race_tile) {
+                        // Simulate a write that raced between queue_tile() version read and arm_batch().
+                        cell_ptrs[i]->version.store(++serial, std::memory_order_release);
+                    }
+                    results[i] = static_cast<std::int8_t>(r > 0 ? 1 : (r == 0 ? 0 : -1));
+                }
+            }
+        };
+        PeerAndVersionWatch pw;
+        leonida::TitleTextureWatch<PeerAndVersionWatch> watch(pw);
+
+        const std::uintptr_t peer_a = 0x5100000000;
+        const std::uintptr_t peer_b = 0x5200000000;
+        const std::uintptr_t peer_c = 0x5300000000;
+        pw.alias[base] = {peer_b, peer_a};  // intentionally unsorted to test sorting + equality skip
+        watch.track(1, base, 2 * kTile);
+        watch.track(2, base + kTile, kTile);  // shares tile 1 with texture 1
+
+        std::vector<std::uint64_t> keys;
+        std::vector<leonida::TitleTextureWatch<PeerAndVersionWatch>::BatchExamine> res;
+        watch.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{1, 2}));
+        watch.examine_batch(keys, res);
+        EXPECT(res.size() == 2 && res[0].look == leonida::TitleTextureWatch<PeerAndVersionWatch>::Look::armed);
+        EXPECT(res[0].max_version == 1 && res[1].max_version == 1);
+
+        // Bump mapping on base with IDENTICAL peer set (different order + duplicate + self):
+        // sync_tile_peers() MUST skip acquire() and release() completely!
+        const std::uint64_t acq0 = pw.acquire_calls, rel0 = pw.release_calls;
+        pw.alias[base] = {peer_a, base, peer_b, peer_a};
+        pw.write(base, /*mapping=*/true);
+        const std::uint64_t ver_after_remap = pw.serial;
+        keys.clear();
+        watch.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{1}));
+        watch.examine_batch(keys, res);
+        EXPECT(pw.acquire_calls == acq0 && pw.release_calls == rel0);
+        EXPECT(res[0].max_version == ver_after_remap);
+
+        // Bump mapping on base with CHANGED peer set ({peer_a, peer_c}): acquires new peers, releases old.
+        pw.alias[base] = {peer_a, peer_c};
+        pw.write(base, /*mapping=*/true);
+        keys.clear();
+        watch.collect([&](std::uint64_t k) { keys.push_back(k); });
+        watch.examine_batch(keys, res);
+        EXPECT(pw.cells.count(peer_a) && pw.cells.count(peer_c) && !pw.cells.count(peer_b));
+        EXPECT(pw.acquire_calls > acq0 && pw.release_calls > rel0);
+
+        // Write through alias peer_c: max_version of texture 1 reflects peer_c's version!
+        pw.write(peer_c + 0x100);
+        const std::uint64_t peer_ver = pw.serial;
+        keys.clear();
+        watch.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{1}));
+        watch.examine_batch(keys, res);
+        EXPECT(res[0].max_version == peer_ver);
+
+        // Shared tile 1 written + raced during arm_batch(): post-arm max_version reflects raced version for BOTH keys!
+        pw.write(base + kTile);
+        pw.race_tile = base + kTile;
+        keys.clear();
+        watch.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{1, 2}));
+        watch.examine_batch(keys, res);
+        const std::uint64_t raced_ver = pw.serial;
+        EXPECT(res[0].max_version == raced_ver && res[1].max_version == raced_ver);
+        pw.race_tile = 0;
+
+        // Pure touch() with no dirty tiles: max_version still reads current cell versions accurately.
+        watch.touch(2);
+        keys.clear();
+        watch.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{2}));
+        watch.examine_batch(keys, res);
+        EXPECT(res[0].max_version == raced_ver);
+    }
     if (failures) return 1;
     std::puts("title texture watch: new, untouched, one page, two addresses, remap, every frame, unarmable, kernel "
               "write in progress, lost queue, O(1) fast-path, buffer-hot decoupling, 1-tile hash-before-reserve, "
               "note_changed arm-skip, 86k-tile region index, hot_generation skip, non_hot_arms, mirror piece hash, "
-              "examine_batch, 41k-tex scale bench");
+              "examine_batch, max_version, peer-skip, 41k-tex scale bench");
     return 0;
 }

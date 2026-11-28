@@ -426,6 +426,7 @@ public:
 
     struct BatchExamine {
         Look look = Look::armed;
+        std::uint64_t max_version = 0;
         std::vector<std::uintptr_t> written;
     };
 
@@ -452,9 +453,11 @@ public:
                 add_unarmed(a, tile);
                 tile.stale = true;
                 if (out[key_idx].look == Look::armed) out[key_idx].look = Look::unwatched;
+                out[key_idx].max_version = UINT64_MAX;
                 return;
             }
             if (tile.batch_arm_gen == bgen) {
+                out[key_idx].max_version = (std::max)(out[key_idx].max_version, tile.batch_arm_version);
                 if (tile.batch_arm_slot != kNoIndex) batch_tile_refs_.emplace_back(key_idx, tile.batch_arm_slot);
                 return;
             }
@@ -467,25 +470,13 @@ public:
                 if (version == tile.version) {
                     tile.batch_arm_gen = bgen;
                     tile.batch_arm_slot = kNoIndex;
+                    tile.batch_arm_version = version;
+                    out[key_idx].max_version = (std::max)(out[key_idx].max_version, version);
                     return;
                 }
             }
             if (mapping != tile.mapping) {
-                aliases_.clear();
-                watch_.aliases(a, aliases_);
-                auto old = std::move(tile.peers);
-                tile.peers.clear();
-                for (const std::uintptr_t peer : aliases_) {
-                    if (peer == a) continue;
-                    tile.peers.emplace_back(peer, watch_.acquire(peer));
-                    by_peer_[peer].push_back(a);
-                    hot_sync_needed_ = true;
-                }
-                for (const auto& [peer, cell] : old) {
-                    unlink_peer(peer, a);
-                    watch_.release(peer);
-                }
-                tile.mapping = mapping;
+                sync_tile_peers(a, tile, mapping);
             }
             std::uint64_t version = tile.primary->version.load(std::memory_order_acquire);
             for (const auto& [peer, cell] : tile.peers)
@@ -495,6 +486,8 @@ public:
             const std::uint32_t slot = static_cast<std::uint32_t>(batch_tiles_.size());
             tile.batch_arm_gen = bgen;
             tile.batch_arm_slot = slot;
+            tile.batch_arm_version = version;
+            out[key_idx].max_version = (std::max)(out[key_idx].max_version, version);
             batch_tiles_.push_back({a, &tile, version, pure_hot_recheck, 1});
             batch_reqs_.push_back({a, tile.primary, slot});
             for (const auto& [peer, cell] : tile.peers) batch_reqs_.push_back({peer, cell, slot});
@@ -504,9 +497,11 @@ public:
         for (std::size_t i = 0; i < n; ++i) {
             out[i].written.clear();
             out[i].look = Look::armed;
+            out[i].max_version = 0;
             const auto it = textures_.find(keys[i]);
             if (it == textures_.end()) {
                 out[i].look = Look::unwatched;
+                out[i].max_version = UINT64_MAX;
                 continue;
             }
             Texture& tex = it->second;
@@ -515,6 +510,19 @@ public:
                     if (tex.dirty_tiles.size() > 1) std::sort(tex.dirty_tiles.begin(), tex.dirty_tiles.end());
                     for (const std::uintptr_t a : tex.dirty_tiles) {
                         if (const auto t = tiles_.find(a); t != tiles_.end()) queue_tile(i, a, t->second);
+                    }
+                } else if (!watch_on) {
+                    out[i].look = Look::unwatched;
+                    out[i].max_version = UINT64_MAX;
+                } else {
+                    for (std::uintptr_t a = tex.first; a < tex.last; a += kTile) {
+                        if (const auto t = tiles_.find(a); t != tiles_.end()) {
+                            const Tile& tile = t->second;
+                            std::uint64_t ver = tile.primary->version.load(std::memory_order_acquire);
+                            for (const auto& [peer, cell] : tile.peers)
+                                ver = (std::max)(ver, cell->version.load(std::memory_order_acquire));
+                            out[i].max_version = (std::max)(out[i].max_version, ver);
+                        }
                     }
                 }
             } else {
@@ -563,7 +571,7 @@ public:
             else if (res < 0 && tile_res > 0) tile_res = -1;
         }
 
-        for (const BatchTile& bt : batch_tiles_) {
+        for (BatchTile& bt : batch_tiles_) {
             ++stats_.arms;
             if (!bt.pure_hot_recheck || bt.result <= 0) ++stats_.non_hot_arms;
             if (bt.result <= 0) {
@@ -574,14 +582,20 @@ public:
                 bt.tile->version = bt.version;
                 bt.tile->stale = false;
                 remove_unarmed(*bt.tile);
+                std::uint64_t post_ver = bt.tile->primary->version.load(std::memory_order_acquire);
+                for (const auto& [peer, cell] : bt.tile->peers)
+                    post_ver = (std::max)(post_ver, cell->version.load(std::memory_order_acquire));
+                bt.version = (std::max)(bt.version, post_ver);
             }
         }
 
         for (const auto& [key_idx, slot] : batch_tile_refs_) {
-            const int armed = batch_tiles_[slot].result;
+            const BatchTile& bt = batch_tiles_[slot];
+            const int armed = bt.result;
             Look& look = out[key_idx].look;
             if (!armed) look = Look::busy;
             else if (armed < 0 && look == Look::armed) look = Look::unwatched;
+            out[key_idx].max_version = (std::max)(out[key_idx].max_version, bt.version);
         }
     }
 
@@ -598,6 +612,7 @@ private:
         std::uint64_t pass_written_gen = 0;
         std::uint64_t hot_gen = 0;
         std::uint64_t batch_arm_gen = 0;
+        std::uint64_t batch_arm_version = 0;
         std::uint32_t batch_arm_slot = kNoIndex;
         std::uint32_t unarmed_index = kNoIndex;
         std::uint32_t hot_index = kNoIndex;
@@ -770,6 +785,40 @@ private:
         }
     }
 
+    void sync_tile_peers(std::uintptr_t address, Tile& tile, std::uint64_t mapping) {
+        aliases_.clear();
+        watch_.aliases(address, aliases_);
+        std::erase(aliases_, address);
+        if (aliases_.size() > 1) {
+            std::sort(aliases_.begin(), aliases_.end());
+            aliases_.erase(std::unique(aliases_.begin(), aliases_.end()), aliases_.end());
+        }
+        bool same_peers = aliases_.size() == tile.peers.size();
+        if (same_peers) {
+            for (std::size_t k = 0; k < aliases_.size(); ++k) {
+                if (tile.peers[k].first != aliases_[k]) {
+                    same_peers = false;
+                    break;
+                }
+            }
+        }
+        if (!same_peers) {
+            auto old = std::move(tile.peers);
+            tile.peers.clear();
+            tile.peers.reserve(aliases_.size());
+            for (const std::uintptr_t peer : aliases_) {
+                tile.peers.emplace_back(peer, watch_.acquire(peer));
+                by_peer_[peer].push_back(address);
+                hot_sync_needed_ = true;
+            }
+            for (const auto& [peer, cell] : old) {
+                unlink_peer(peer, address);
+                watch_.release(peer);
+            }
+        }
+        tile.mapping = mapping;
+    }
+
     int arm(std::uintptr_t address, Tile& tile) {
         if (!watch_.enabled()) {
             add_unarmed(address, tile);
@@ -786,21 +835,7 @@ private:
         }
         // The tile's other addresses follow its mapping: looked up again when xmem remapped it.
         if (mapping != tile.mapping) {
-            aliases_.clear();
-            watch_.aliases(address, aliases_);
-            auto old = std::move(tile.peers);
-            tile.peers.clear();
-            for (const std::uintptr_t peer : aliases_) {
-                if (peer == address) continue;
-                tile.peers.emplace_back(peer, watch_.acquire(peer));
-                by_peer_[peer].push_back(address);
-                hot_sync_needed_ = true;
-            }
-            for (const auto& [peer, cell] : old) {
-                unlink_peer(peer, address);
-                watch_.release(peer);
-            }
-            tile.mapping = mapping;
+            sync_tile_peers(address, tile, mapping);
         }
         // The version is read before arming: a write between the two moves it, and the next collect() sees that.
         // Always delegate through watch_.arm() on hot/stale/unarmed/moved tiles so kernel_writes pin checks

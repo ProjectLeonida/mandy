@@ -1716,13 +1716,13 @@ struct TitleTextureCells {
         constexpr std::uintptr_t kHostPage = leonida::geometry_writes::page_size;
 
         if (!count) return;
-        sync_known_protect();
-        if (known_protect_.size() > kMaxKnownProtectEntries) {
-            known_protect_.clear();
-            has_known_protect_ = false;
-        }
 
         for (std::size_t i = 0; i < count;) {
+            sync_known_protect();
+            if (known_protect_.size() > kMaxKnownProtectEntries) {
+                known_protect_.clear();
+                has_known_protect_ = false;
+            }
             std::size_t j = i + 1;
             while (j < count) {
                 const bool contiguous = (tiles[j] == tiles[j - 1] + kTile);
@@ -1741,10 +1741,11 @@ struct TitleTextureCells {
 
             run_versions_.resize(batch_n);
             run_pinned_.assign(batch_n, 0);
+            run_backed_.assign(batch_n, 0);
             run_eligible_.assign(batch_n, 0);
             run_failed_.assign(batch_n, 0);
 
-            // Snapshot versions BEFORE querying kernel pins or taking geometry_writes::state().mutex.
+            // Snapshot versions BEFORE querying kernel pins, table-page backing, or taking geometry_writes::mutex.
             for (std::size_t k = 0; k < batch_n; ++k)
                 run_versions_[k] = batch_cells[k]->version.load(std::memory_order_acquire);
 
@@ -1759,6 +1760,14 @@ struct TitleTextureCells {
                     for (; it < batch_tiles + batch_n && *it < p_hi; ++it)
                         run_pinned_[std::size_t(it - batch_tiles)] = 1;
                 });
+                // Table-backed pages have no host view (their alias peers are armed separately in batch_reqs_).
+                // Checked outside geometry_writes::state().mutex so g_frame_lock and s.mutex never nest; any
+                // concurrent remap bumps c->version and is caught below by run_versions_[k] != c->version.
+                if (leonida::title_frames::may_hold(pin_lo, pin_hi)) {
+                    for (std::size_t k = 0; k < batch_n; ++k) {
+                        if (!run_pinned_[k] && leonida::title_frames::backed(batch_tiles[k])) run_backed_[k] = 1;
+                    }
+                }
             }
 
             auto& s = leonida::geometry_writes::state();
@@ -1778,11 +1787,25 @@ struct TitleTextureCells {
                         results[i + k] = -1;  // write raced arming
                         continue;
                     }
+                    // Zero-syscall fast path: all 16 host pages already guarded read-only (e.g. armed by
+                    // HotColdTracking::CellGuard earlier in this leader pass; guaranteed cleared by reopen(),
+                    // Event::replaced, TitleVirtualProtect, and unmap_page), or a table-backed page with no host view.
+                    bool all_armed = true;
+                    for (const DWORD r : c->restore) {
+                        if (!r) {
+                            all_armed = false;
+                            break;
+                        }
+                    }
+                    if (all_armed || run_backed_[k]) {
+                        results[i + k] = 1;
+                        continue;
+                    }
                     run_eligible_[k] = 1;
                 }
 
-                // Short-lived VirtualQuery cache within this lock hold: reuse uniform writable MEM_COMMIT regions
-                // across non-contiguous tiles in the same batch while title_memory_map::generation() is unchanged.
+                // Short-lived VirtualQuery cache within this lock hold: reuse uniform writable or already-read-only
+                // MEM_COMMIT regions across non-contiguous tiles while title_memory_map::generation() is unchanged.
                 std::uintptr_t cached_lo = 0;
                 std::uintptr_t cached_hi = 0;
                 DWORD cached_protect = 0;
@@ -1874,7 +1897,11 @@ struct TitleTextureCells {
                             state = m.State;
                             protect = m.Protect;
                             guarded = leonida::geometry_writes::read_only(m.Protect);
-                            if (state == MEM_COMMIT && !(protect & PAGE_GUARD) && guarded && region_end > sub_hi) {
+                            const DWORD base_prot = protect & 255u;
+                            const bool cacheable_prot =
+                                guarded != 0 || base_prot == PAGE_READONLY || base_prot == PAGE_EXECUTE_READ;
+                            if (state == MEM_COMMIT && !(protect & PAGE_GUARD) && cacheable_prot &&
+                                region_end > sub_hi) {
                                 cached_lo = p;
                                 cached_hi = region_end;
                                 cached_protect = protect;
@@ -1936,6 +1963,8 @@ struct TitleTextureCells {
                                     t = t_end;
                                 }
                             }
+                        } else if (cached_hi && p >= cached_lo && end <= cached_hi) {
+                            cached_lo = end;
                         }
                         p = end;
                     }
@@ -1958,6 +1987,7 @@ struct TitleTextureCells {
     bool has_known_protect_ = false;
     std::vector<std::uint64_t> run_versions_;
     std::vector<std::uint8_t> run_pinned_;
+    std::vector<std::uint8_t> run_backed_;
     std::vector<std::uint8_t> run_eligible_;
     std::vector<std::uint8_t> run_failed_;
     void aliases(std::uintptr_t tile, std::vector<std::uintptr_t>& out) {
@@ -3647,6 +3677,8 @@ struct DeviceState {
         const std::vector<std::uintptr_t>* written_tiles = nullptr;     // non-null when per-tile sync filtering allowed
         const std::vector<std::uintptr_t>* tile_cmp_written = nullptr;  // non-null when partial-tile mirror cmp allowed
         const leonida::TilePieces* pieces = nullptr;
+        std::uint64_t max_version = 0;
+        bool ex_armed = false;
         bool active = false;
         // Outputs filled by page_mirror_check_batch():
         bool full_ok = false;
@@ -3662,7 +3694,9 @@ struct DeviceState {
         enum class Mode : std::uint8_t { none, full, partial_tiles } mode = Mode::none;
         std::uint64_t mirror_va = 0;
     };
-    void page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& items, std::vector<std::uint64_t>& feed_pages);
+    void page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& items, std::vector<std::uint64_t>& feed_pages,
+                                 std::uint64_t mirror_synced_serial = 0,
+                                 const std::function<void(std::size_t, std::function<void(std::size_t)>)>& parallel_run = {});
     // The CPU-view ranges of the registered GPU-written textures (render targets, depth, unordered access), by their
     // registry address. A texture over such memory is not filled from it (index_texture): the title's pages there
     // hold what the CPU last put there, never what our GPU renders into the image, and a fill uploaded those old
@@ -18427,8 +18461,10 @@ static thread_local bool t_page_mirror_just_synced = false;  // trivially destru
 //   - Marks all dirty/hot mirror pages across all eligible textures (deduplicated automatically per physical frame by
 //     TitleMirror::dirty()), runs ONE batched parallel TitleMirror::upload(), and evaluates range_sum() + chunk_at()
 //     (or partial-tile range_sum() comparison) for every texture in the same lock hold.
-void DeviceState::page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& items,
-                                          std::vector<std::uint64_t>& feed_pages) {
+void DeviceState::page_mirror_check_batch(
+    std::vector<TitleMirrorCheckItem>& items, std::vector<std::uint64_t>& feed_pages,
+    std::uint64_t mirror_synced_serial,
+    const std::function<void(std::size_t, std::function<void(std::size_t)>)>& parallel_run) {
     if (!page_mirror.mirror || items.empty()) return;
     constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
     constexpr std::uint64_t kPiece = leonida::shadow_keep::kPiece;
@@ -18454,6 +18490,7 @@ void DeviceState::page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& ite
     bool need_upload = false;
     auto& mirror = *page_mirror.mirror;
     auto* const tracking = page_mirror.tracking.get();
+    const bool any_pending = mirror.has_pending_binds();
 
     const auto mark_dirty_page = [&](std::uint64_t p) {
         if (mirror.dirty(p)) need_upload = true;
@@ -18463,21 +18500,25 @@ void DeviceState::page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& ite
         if (!va || !item.bytes || va + item.bytes < va) return false;
         const std::uint64_t end = va + item.bytes;
         for (std::uint64_t p = va & ~(kPage - 1); p < end; p += kPage) {
-            if (page_in_feed(p) || !mirror.mirrored(p) || mirror.has_pending(p)) return false;
+            if (page_in_feed(p) || !mirror.mirrored(p) || (any_pending && mirror.has_pending(p))) return false;
             if (p > UINT64_MAX - kPage) break;
         }
-        const bool filter_written = is_cpu_view && item.written_tiles && !item.written_tiles->empty();
-        for (std::uint64_t p = va & ~(kPage - 1); p < end; p += kPage) {
-            if (filter_written &&
-                !std::binary_search(item.written_tiles->begin(), item.written_tiles->end(),
-                                    static_cast<std::uintptr_t>(p))) {
+        const bool serial_clean = mirror_just_synced && mirror_synced_serial != 0 && item.ex_armed &&
+                                  item.max_version <= mirror_synced_serial;
+        if (!serial_clean) {
+            const bool filter_written = is_cpu_view && item.written_tiles && !item.written_tiles->empty();
+            for (std::uint64_t p = va & ~(kPage - 1); p < end; p += kPage) {
+                if (filter_written &&
+                    !std::binary_search(item.written_tiles->begin(), item.written_tiles->end(),
+                                        static_cast<std::uintptr_t>(p))) {
+                    if (p > UINT64_MAX - kPage) break;
+                    continue;
+                }
+                const bool clean_cpu =
+                    is_cpu_view && tracking && (tracking->unwritten(p) || (mirror_just_synced && tracking->hot(p)));
+                if (!clean_cpu) mark_dirty_page(p);
                 if (p > UINT64_MAX - kPage) break;
-                continue;
             }
-            const bool clean_cpu =
-                is_cpu_view && tracking && (tracking->unwritten(p) || (mirror_just_synced && tracking->hot(p)));
-            if (!clean_cpu) mark_dirty_page(p);
-            if (p > UINT64_MAX - kPage) break;
         }
         item.mode = TitleMirrorCheckItem::Mode::full;
         item.mirror_va = va;
@@ -18485,15 +18526,27 @@ void DeviceState::page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& ite
     };
 
     // Pass 1: classify each active item (full mirror vs partial-tile mirror vs CPU fallback) and mark dirty pages.
-    for (TitleMirrorCheckItem& item : items) {
+    std::uint64_t pass3_bytes = 0;
+    std::vector<std::size_t> pass3_indices;
+    pass3_indices.reserve(items.size());
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        TitleMirrorCheckItem& item = items[i];
         item.full_ok = false;
         item.single_chunk = false;
         item.tile_cmp = 0;
         item.mode = TitleMirrorCheckItem::Mode::none;
         item.mirror_va = 0;
         if (!item.active || !item.bytes) continue;
-        if (try_full_view(item, item.cpu, true)) continue;
-        if (item.gpu && item.gpu != item.cpu && try_full_view(item, item.gpu, false)) continue;
+        if (try_full_view(item, item.cpu, true)) {
+            pass3_bytes += item.bytes;
+            pass3_indices.push_back(i);
+            continue;
+        }
+        if (item.gpu && item.gpu != item.cpu && try_full_view(item, item.gpu, false)) {
+            pass3_bytes += item.bytes;
+            pass3_indices.push_back(i);
+            continue;
+        }
 
         if (item.tile_cmp_written && !item.tile_cmp_written->empty() && item.pieces &&
             (item.cpu & (kPiece - 1)) == 0 && (item.bytes & (kPiece - 1)) == 0) {
@@ -18510,19 +18563,25 @@ void DeviceState::page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& ite
                     break;
                 }
                 const std::uint64_t p = static_cast<std::uint64_t>(tile) & ~(kPage - 1);
-                if (page_in_feed(p) || !mirror.mirrored(p) || mirror.has_pending(p)) {
+                if (page_in_feed(p) || !mirror.mirrored(p) || (any_pending && mirror.has_pending(p))) {
                     all_ok = false;
                     break;
                 }
             }
             if (all_ok) {
                 item.mode = TitleMirrorCheckItem::Mode::partial_tiles;
-                for (const std::uintptr_t tile : *item.tile_cmp_written) {
-                    const std::uint64_t p = static_cast<std::uint64_t>(tile) & ~(kPage - 1);
-                    const bool clean_cpu =
-                        tracking && (tracking->unwritten(p) || (mirror_just_synced && tracking->hot(p)));
-                    if (!clean_cpu) mark_dirty_page(p);
+                const bool serial_clean = mirror_just_synced && mirror_synced_serial != 0 && item.ex_armed &&
+                                          item.max_version <= mirror_synced_serial;
+                if (!serial_clean) {
+                    for (const std::uintptr_t tile : *item.tile_cmp_written) {
+                        const std::uint64_t p = static_cast<std::uint64_t>(tile) & ~(kPage - 1);
+                        const bool clean_cpu =
+                            tracking && (tracking->unwritten(p) || (mirror_just_synced && tracking->hot(p)));
+                        if (!clean_cpu) mark_dirty_page(p);
+                    }
                 }
+                pass3_bytes += std::uint64_t(item.tile_cmp_written->size()) * kPage;
+                pass3_indices.push_back(i);
             }
         }
     }
@@ -18542,11 +18601,15 @@ void DeviceState::page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& ite
         if (mirror.counters().upload_failures != failures_before) return;
     }
 
-    // Pass 3: compute mirror range_sum / chunk_at / partial-tile comparison for all eligible items.
-    for (TitleMirrorCheckItem& item : items) {
+    // Pass 3: read-only mirror range_sum / chunk_at / partial-tile comparison into disjoint per-item outputs.
+    // Safe to fan out across title_read_pool() while holding page_mirror.mutex: only reads immutable mirror maps/sums.
+    const VkSemaphore mirror_timeline = page_mirror.timeline;
+    const std::uint64_t mirror_value = page_mirror.value;
+    const auto eval_item = [&](std::size_t slot_idx) {
+        TitleMirrorCheckItem& item = items[pass3_indices[slot_idx]];
         if (item.mode == TitleMirrorCheckItem::Mode::full) {
             std::uint64_t m_hash = 0;
-            if (!mirror.range_sum(item.mirror_va, item.bytes, m_hash)) continue;
+            if (!mirror.range_sum(item.mirror_va, item.bytes, m_hash)) return;
             VkBuffer buf = VK_NULL_HANDLE;
             VkDeviceSize off = 0;
             const bool has_chunk = mirror.chunk_at(item.mirror_va, buf, off);
@@ -18557,8 +18620,8 @@ void DeviceState::page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& ite
                 item.buffer = buf;
                 item.offset = off;
                 item.chunk_size = leonida::TitleMirror::kChunk;
-                item.timeline = page_mirror.timeline;
-                item.value = page_mirror.value;
+                item.timeline = mirror_timeline;
+                item.value = mirror_value;
             }
             item.mirror_hash = m_hash;
         } else if (item.mode == TitleMirrorCheckItem::Mode::partial_tiles) {
@@ -18581,6 +18644,12 @@ void DeviceState::page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& ite
             }
             item.tile_cmp = cmp;
         }
+    };
+    constexpr std::uint64_t kParallelRangeSumBytes = 8ull << 20;
+    if (parallel_run && pass3_indices.size() > 1 && pass3_bytes >= kParallelRangeSumBytes) {
+        parallel_run(pass3_indices.size(), eval_item);
+    } else {
+        for (std::size_t k = 0; k < pass3_indices.size(); ++k) eval_item(k);
     }
 }
 
@@ -18630,7 +18699,6 @@ void DeviceState::title_texture_unmapped(const void* resource, std::uint64_t add
     if (it != title_textures.end() && it->second->resource == resource) {
         it->second->stale = true;
         it->second->write_combined_known = false;
-        it->second->mirror_hash_valid = false;
         it->second->memory.retry();
         index_texture(*it->second);
         texture_watch.touch(address);
@@ -19626,12 +19694,14 @@ public:
             }
             const std::int64_t t0 = phases::now_ns();
             std::int64_t t1 = t0, t2 = t0;
+            std::uint64_t mirror_serial = 0;
             {
                 const phases::Scope timed(phases::shadows);
                 // First, while pending_ sparse binds are empty and before any map()/upload() mutates homes or agreed
                 // sums: copy retired GPU writes back to their physical frames.
                 state_.write_back_titles();
                 t1 = phases::now_ns();
+                mirror_serial = leonida::geometry_writes::state().serial.load(std::memory_order_acquire);
                 state_.refresh_page_mirror();  // what this submission's title-written addresses read
                 t2 = phases::now_ns();
             }
@@ -19669,7 +19739,7 @@ public:
             const std::int64_t t4 = phases::now_ns();
             {
                 const phases::Scope timed(phases::textures);
-                refresh_title_textures(/*mirror_just_synced=*/true);
+                refresh_title_textures(/*mirror_just_synced=*/true, mirror_serial);
             }
             const std::int64_t t5 = phases::now_ns();
             leader_guard.wb_ns = std::uint64_t(t1 - t0);
@@ -20937,7 +21007,7 @@ public:
         if (!srv.Shader4ComponentMapping) srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         std::array<std::uint32_t, 14> words{};
         std::memcpy(words.data(), resource_words, sizeof(words));
-        words[2] = words[3] = 0;  // the alignment says nothing about the texels
+        words[1] = words[2] = words[3] = words[13] = 0;  // struct padding and alignment say nothing about the texels
         bool written = false;
         {
             std::lock_guard lock(state_.title_texture_mutex);
@@ -21040,6 +21110,7 @@ public:
                 entry->layout_known = entry->layout_guessed = title_layout(d, entry->layout, why) &&
                                                               title_layout_fits(entry->layout, d, *texture, why);
                 std::memcpy(entry->desc.data(), &d, sizeof(d));
+                entry->desc[1] = entry->desc[2] = entry->desc[3] = entry->desc[13] = 0;
             }
         }
         // The memory a GPU-written texture covers: what the console's GPU renders there, our GPU renders into the image
@@ -21097,7 +21168,7 @@ public:
     // submitted before this submission's command buffers, behind all earlier work on every queue on the GPU and with
     // no CPU wait (TitleImageUpload, write_staged_title_image); this submission's draws, on whichever queue, see it.
     // Every changed texture of the pass goes in, with no budget: the planes of a video frame land together.
-    void refresh_title_textures(bool mirror_just_synced = false) {
+    void refresh_title_textures(bool mirror_just_synced = false, std::uint64_t mirror_synced_serial = 0) {
         if (t_in_title_textures) return;
         using clock = std::chrono::steady_clock;
         const auto now = clock::now();
@@ -21224,7 +21295,9 @@ public:
         //   5. Record and submit all uploads of the batch in ONE batched command buffer + ONE vkQueueSubmit.
         std::uint64_t filled = 0;
         title_job_count_ = 0;
-        std::uint64_t batch_bytes = 0;
+        std::size_t cpu_job_count = 0;
+        std::uint64_t cpu_batch_bytes = 0;
+        std::uint64_t gpu_scratch_bytes = 0;
         const auto next_title_job = [&]() -> TitleJob& {
             if (title_job_count_ == title_jobs_.size()) title_jobs_.emplace_back();
             TitleJob& job = title_jobs_[title_job_count_++];
@@ -21465,7 +21538,9 @@ public:
                 if (job.piece_sums.capacity() > 8192) std::vector<std::uint64_t>{}.swap(job.piece_sums);
             }
             title_job_count_ = 0;
-            batch_bytes = 0;
+            cpu_job_count = 0;
+            cpu_batch_bytes = 0;
+            gpu_scratch_bytes = 0;
         };
         const bool gpu_detile_on = leonida::title_gpu_detile_enabled();
 
@@ -21481,10 +21556,14 @@ public:
             title_candidates_.push_back({it->second, 0, 0, 0, false});
         }
 
+        auto t_after_mirror = fill_start;
         if (!title_candidates_.empty()) {
             // Stage 2: batch-arm all dirty tiles across all candidates in ONE watch.examine_batch() call, then run
             // readability, partial-mip budget, and image-backing checks.
             watch.examine_batch(title_candidate_keys_, title_examine_results_);
+            const auto t_after_arm = clock::now();
+            stats.examine_arm_ns +=
+                std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t_after_arm - fill_start).count());
             const bool have_mirror = state_.page_mirror.mirror != nullptr;
             if (have_mirror) title_mirror_checks_.resize(title_candidates_.size());
             bool any_mirror_active = false;
@@ -21537,10 +21616,15 @@ public:
                                               ex.written.size() <= tiles;
                     mc.tile_cmp_written = can_tile_cmp ? &ex.written : nullptr;
                     mc.pieces = can_tile_cmp ? &t.pieces : nullptr;
+                    mc.max_version = ex.max_version;
+                    mc.ex_armed = allow_filter;
                     mc.active = true;
                     any_mirror_active = true;
                 }
             }
+            const auto t_after_probe = clock::now();
+            stats.examine_probe_ns +=
+                std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t_after_probe - t_after_arm).count());
 
             // Stage 3: ONE page_mirror.mutex lock + ONE batched parallel TitleMirror::upload() for all candidates.
             if (have_mirror && any_mirror_active) {
@@ -21551,8 +21635,15 @@ public:
                     }
                     ~MirrorJustSyncedGuard() { t_page_mirror_just_synced = prev; }
                 } mirror_sync_guard{mirror_just_synced};
-                state_.page_mirror_check_batch(title_mirror_checks_, title_mirror_feed_pages_);
+                state_.page_mirror_check_batch(
+                    title_mirror_checks_, title_mirror_feed_pages_, mirror_synced_serial,
+                    [this](std::size_t count, std::function<void(std::size_t)> work) {
+                        title_read_pool().run(count, std::move(work));
+                    });
             }
+            t_after_mirror = clock::now();
+            stats.examine_mirror_ns += std::uint64_t(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t_after_mirror - t_after_probe).count());
 
             // Stage 4: dispatch unchanged skips, GPU mirror jobs, and CPU jobs into batched upload passes.
             for (std::size_t idx = 0; idx < title_candidates_.size(); ++idx) {
@@ -21619,8 +21710,9 @@ public:
                                     job.written = ex.written;
                                 }
                                 if (kind == rt::d3d12::TitleImageUpload::UploadKind::mirror_detile)
-                                    batch_bytes += job.span;
-                                if (title_job_count_ >= kTitleBatch || batch_bytes >= kTitleBatchBytes) run_batch();
+                                    gpu_scratch_bytes += job.span;
+                                if (title_job_count_ >= kTitleGpuBatch || gpu_scratch_bytes >= kTitleGpuBatchBytes)
+                                    run_batch();
                                 continue;
                             }
                         }
@@ -21662,19 +21754,30 @@ public:
                 }
                 job.write_combined = t.is_write_combined();
                 job.trace = leonida::dstorage::trace_enabled() && leonida::title_gpu_views::other_view(t.cpu);
-                batch_bytes += job.span;
-                if (title_job_count_ >= kTitleBatch || batch_bytes >= kTitleBatchBytes) run_batch();
+                ++cpu_job_count;
+                cpu_batch_bytes += job.span;
+                if (cpu_job_count >= kTitleBatch || cpu_batch_bytes >= kTitleBatchBytes ||
+                    title_job_count_ >= kTitleGpuBatch)
+                    run_batch();
             }
             title_candidates_.clear();
+        } else {
+            t_after_mirror = clock::now();
+            stats.examine_arm_ns +=
+                std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t_after_mirror - fill_start).count());
         }
         run_batch();
         watch.update_idle_hint();
         {
-            const auto pass_fill = std::uint64_t(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - fill_start).count());
+            const auto fill_end = clock::now();
+            const auto pass_fill =
+                std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(fill_end - fill_start).count());
+            const auto stage4_total =
+                std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(fill_end - t_after_mirror).count());
             stats.fill_ns += pass_fill;
             // What is not reading or submitting: naming, arming, mirror batch sync, readability, slot reservation.
             const std::uint64_t other = (stats.read_ns - read_before) + (stats.staged_ns - staged_before);
+            stats.examine_publish_ns += stage4_total > other ? stage4_total - other : 0;
             stats.examine_ns += pass_fill > other ? pass_fill - other : 0;
         }
         stats.filled_bytes += filled;
@@ -21768,15 +21871,19 @@ public:
             const double per_pass = 1e-6 / double((std::max)(std::uint64_t(1), title_split_passes_));
             std::fprintf(stderr,
                          "[rt] d3d12: title texture pass split, ms a pass: %.3f finding what to look at (%.3f lock "
-                         "wait), %.3f naming, arming and reserving, %.3f reading on %u threads (%.3f of it detiling, "
+                         "wait), %.3f naming, arming and reserving (%.3f arm, %.3f read+back, %.3f mirror, %.3f "
+                         "publish), %.3f reading on %u threads (%.3f of it detiling, "
                          "summed over them; %.1f MiB read whole a pass), %.3f recording and submitting the transfers\n",
                          double(stats.collect_ns) * per_pass, double(stats.lock_wait_ns) * per_pass,
-                         double(stats.examine_ns) * per_pass,
-                         double(stats.read_ns) * per_pass, title_read_pool_ ? title_read_pool_->threads() + 1 : 1,
+                         double(stats.examine_ns) * per_pass, double(stats.examine_arm_ns) * per_pass,
+                         double(stats.examine_probe_ns) * per_pass, double(stats.examine_mirror_ns) * per_pass,
+                         double(stats.examine_publish_ns) * per_pass, double(stats.read_ns) * per_pass,
+                         title_read_pool_ ? title_read_pool_->threads() + 1 : 1,
                          double(stats.detile_ns) * per_pass,
                          double(stats.read_bytes) / 1048576.0 / double((std::max)(std::uint64_t(1), title_split_passes_)),
                          double(stats.staged_ns) * per_pass);
-            stats.collect_ns = stats.lock_wait_ns = stats.examine_ns = stats.read_ns = stats.detile_ns =
+            stats.collect_ns = stats.lock_wait_ns = stats.examine_ns = stats.examine_arm_ns = stats.examine_probe_ns =
+                stats.examine_mirror_ns = stats.examine_publish_ns = stats.read_ns = stats.detile_ns =
                 stats.read_bytes = 0;
             stats.staged_ns = 0;
             title_split_passes_ = 0;
@@ -21807,6 +21914,7 @@ private:
         // reservation), the read threads' work (and of it the detile, summed over the threads), and the transfers'
         // recording and submission (staged_ns); bytes read whole.
         std::uint64_t lock_wait_ns = 0, collect_ns = 0, examine_ns = 0, read_ns = 0, detile_ns = 0, read_bytes = 0;
+        std::uint64_t examine_arm_ns = 0, examine_probe_ns = 0, examine_mirror_ns = 0, examine_publish_ns = 0;
         std::uint64_t staged_fills = 0, staged_fills_logged = 0, staged_ns = 0;
         std::uint64_t gpu_linear_fills = 0, gpu_detile_fills = 0, gpu_unchanged = 0, fast_passes = 0;
         // refresh_title_textures, since the last log line
@@ -21867,8 +21975,10 @@ private:
         std::vector<std::uint64_t> piece_sums;
         std::vector<std::uint64_t> columns;
     };
-    static constexpr std::size_t kTitleBatch = 64;                 // jobs processed together before reserving/submitting
-    static constexpr std::uint64_t kTitleBatchBytes = 64ull << 20; // or this many CPU-read bytes of them
+    static constexpr std::size_t kTitleBatch = 64;                      // CPU jobs processed together (<= kMaxSlots)
+    static constexpr std::size_t kTitleGpuBatch = 512;                  // total jobs (incl. GPU-mirror) per commit_batch
+    static constexpr std::uint64_t kTitleBatchBytes = 64ull << 20;      // CPU-read bytes per batch
+    static constexpr std::uint64_t kTitleGpuBatchBytes = 128ull << 20;  // GPU detile scratch bytes per batch
     std::deque<TitleJob> title_jobs_;                              // reusable job pool, under title_texture_mutex
     std::size_t title_job_count_ = 0;                              // active jobs in current batch
     std::vector<std::size_t> title_cpu_check_indices_;             // indices of jobs needing CPU read_title_job
@@ -22165,6 +22275,39 @@ private:
         });
     }
 
+    // Exact physical layout equivalence between two built console layouts (mode, size, mips, array, slice_bytes,
+    // tile/block dimensions, and per-mip offsets/pitches/extents). Used so a format-compatible slot-70 view on an
+    // already-confirmed slot-133 texture does not invalidate hashed/mirror_hash_valid/gpu_uploaded.
+    static bool title_layout_equal(const rt::xg_xs::Texture& a, const rt::xg_xs::Texture& b) {
+        if (a.mode != b.mode || a.tile_width != b.tile_width || a.tile_height != b.tile_height ||
+            a.tile_depth != b.tile_depth || a.array != b.array || a.slab_bytes != b.slab_bytes ||
+            a.format.bytes != b.format.bytes || a.format.side != b.format.side ||
+            a.layout.dimension != b.layout.dimension || a.layout.size != b.layout.size ||
+            a.layout.alignment != b.layout.alignment || a.layout.mips != b.layout.mips ||
+            a.layout.planes != b.layout.planes)
+            return false;
+        const auto& pa = a.layout.plane[0];
+        const auto& pb = b.layout.plane[0];
+        if (pa.size != pb.size || pa.slice_bytes != pb.slice_bytes || pa.standard_mips != pb.standard_mips ||
+            pa.tail_mips != pb.tail_mips)
+            return false;
+        for (unsigned m = 0; m < a.layout.mips && m < rt::xg_xs::kMaxMips; ++m) {
+            const auto& ma = pa.mips[m];
+            const auto& mb = pb.mips[m];
+            if (ma.offset != mb.offset || ma.size != mb.size || ma.slice_bytes != mb.slice_bytes ||
+                ma.pitch_texels != mb.pitch_texels || ma.pitch_bytes != mb.pitch_bytes ||
+                ma.padded_width != mb.padded_width || ma.padded_height != mb.padded_height ||
+                ma.padded_depth != mb.padded_depth || ma.width_elements != mb.width_elements ||
+                ma.height_elements != mb.height_elements || ma.depth != mb.depth || ma.in_tail != mb.in_tail ||
+                ma.swizzle != mb.swizzle || ma.tile_depth != mb.tile_depth ||
+                a.volume_mips[m].macro_offset != b.volume_mips[m].macro_offset ||
+                a.volume_mips[m].tail_x != b.volume_mips[m].tail_x ||
+                a.volume_mips[m].tail_y != b.volume_mips[m].tail_y)
+                return false;
+        }
+        return true;
+    }
+
     bool place_title_view(const rt::xg_xs::ResourceDesc& d, const std::array<std::uint32_t, 14>& words,
                           const D3D12_SHADER_RESOURCE_VIEW_DESC& srv, std::uint64_t address,
                           D3D12_CPU_DESCRIPTOR_HANDLE destination) {
@@ -22196,24 +22339,30 @@ private:
                 const char* why = nullptr;
                 rt::xg_xs::Texture layout;
                 if (title_layout(d, layout, why) && title_layout_fits(layout, d, *t->resource, why)) {
-                    static std::atomic<int> logged{0};
-                    if (t->mapped && logged.fetch_add(1, std::memory_order_relaxed) < 32)
-                        std::fprintf(stderr,
-                                     "[rt] d3d12: a slot-70 view gives mapped slot-133 texture 0x%llx its layout: Layout "
-                                     "0x%x (XG mode %u; was %s)\n",
-                                     static_cast<unsigned long long>(address), d.layout, layout.mode,
-                                     t->layout_guessed ? "guessed" : "unknown");
-                    t->memory.retry();
-                    t->write_combined_known = false;
-                    t->gpu_uploaded = false;
-                    t->mirror_hash_valid = false;
-                    t->invalidate_gpu_upload_cache();
-                    t->layout = layout;
-                    t->desc = words;
-                    t->layout_known = true;
-                    state_.index_texture(*t);
-                    t->layout_guessed = t->layout_from_xg = false;
-                    t->hashed = false;
+                    const bool same_layout = t->layout_known && !t->layout_guessed && !t->layout_from_xg &&
+                                             title_layout_equal(t->layout, layout);
+                    if (same_layout) {
+                        t->desc = words;
+                    } else {
+                        static std::atomic<int> logged{0};
+                        if (t->mapped && logged.fetch_add(1, std::memory_order_relaxed) < 32)
+                            std::fprintf(stderr,
+                                         "[rt] d3d12: a slot-70 view gives mapped slot-133 texture 0x%llx its layout: "
+                                         "Layout 0x%x (XG mode %u; was %s)\n",
+                                         static_cast<unsigned long long>(address), d.layout, layout.mode,
+                                         t->layout_guessed ? "guessed" : "unknown");
+                        t->memory.retry();
+                        t->write_combined_known = false;
+                        t->gpu_uploaded = false;
+                        t->mirror_hash_valid = false;
+                        t->invalidate_gpu_upload_cache();
+                        t->layout = layout;
+                        t->desc = words;
+                        t->layout_known = true;
+                        state_.index_texture(*t);
+                        t->layout_guessed = t->layout_from_xg = false;
+                        t->hashed = false;
+                    }
                 } else {
                     refuse_title_view(why, d, address);  // counted; the view of its image is still written
                 }
@@ -22225,7 +22374,8 @@ private:
             std::vector<DXGI_FORMAT> formats = t->formats;
             const bool same_shape = [&] {
                 auto a = t->desc, b = words;
-                a[8] = b[8] = 0;  // the format
+                a[1] = a[2] = a[3] = a[8] = a[13] = 0;  // padding, alignment and format
+                b[1] = b[2] = b[3] = b[8] = b[13] = 0;
                 return a == b && rt::xg_xs::format_info(t->desc[8]).bytes == rt::xg_xs::format_info(words[8]).bytes &&
                        rt::xg_xs::format_info(t->desc[8]).side == rt::xg_xs::format_info(words[8]).side;
             }();
@@ -22246,11 +22396,16 @@ private:
         return t && write(*t);
     }
 
-    // An image made for slot-70 views serves another view when it has the description and the view's format.
+    // An image made for slot-70 views serves another view when all non-format/non-padding/non-alignment description
+    // words match and the image's mutable format list already covers both the resource format and the view's format.
     static bool title_texture_matches(const TitleTexture& t, const std::array<std::uint32_t, 14>& words,
                                       const D3D12_SHADER_RESOURCE_VIEW_DESC& srv) {
+        auto a = t.desc, b = words;
+        a[1] = a[2] = a[3] = a[8] = a[13] = 0;
+        b[1] = b[2] = b[3] = b[8] = b[13] = 0;
+        if (a != b) return false;
         const auto has = [&](DXGI_FORMAT f) { return std::find(t.formats.begin(), t.formats.end(), f) != t.formats.end(); };
-        return t.desc == words && (srv.Format == DXGI_FORMAT_UNKNOWN || has(srv.Format));
+        return has(DXGI_FORMAT(words[8])) && (srv.Format == DXGI_FORMAT_UNKNOWN || has(srv.Format));
     }
 
     TitleTexture* make_title_texture(const rt::xg_xs::ResourceDesc& d, const std::array<std::uint32_t, 14>& words,
@@ -22472,14 +22627,21 @@ private:
         // If a deferred pending_stream image's pages have now arrived, back its VkImage and publish its views
         // immediately so existing and new slot-70 descriptors get their bindless indices, while still deferring the
         // texel upload to the batched refresh_title_textures() pass before GPU submission.
-        if ((t.unbound_bytes || (t.resource && t.resource->deferred_stream())) && title_texture_readable(t)) {
-            const unsigned from = fill_from(t);
-            if ((!from || !t.unbound_bytes || title_partial_bytes_ + t.unbound_bytes <= partial_mips_budget()) &&
-                back_title_texture(t)) {
-                if (t.resource && t.resource->deferred_stream()) t.resource->publish_streamed_texture(from);
+        bool checked_readable = false;
+        bool is_readable = false;
+        if (t.unbound_bytes || (t.resource && t.resource->deferred_stream())) {
+            checked_readable = true;
+            is_readable = title_texture_readable(t);
+            if (is_readable) {
+                const unsigned from = fill_from(t);
+                if ((!from || !t.unbound_bytes || title_partial_bytes_ + t.unbound_bytes <= partial_mips_budget()) &&
+                    back_title_texture(t)) {
+                    if (t.resource && t.resource->deferred_stream()) t.resource->publish_streamed_texture(from);
+                }
             }
         }
-        if (!t.hashed || t.stale) {
+        if ((!t.hashed || t.stale) &&
+            (!t.memory.pending() || (checked_readable ? is_readable : title_texture_readable(t)))) {
             t.stale = true;
             state_.texture_watch.touch(t.address);
         }
