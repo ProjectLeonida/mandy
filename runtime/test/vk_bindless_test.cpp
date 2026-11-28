@@ -745,7 +745,7 @@ int main(int argc, char** argv) {
         // arrays at the T#'s own index. The index spaces are per dimension and dense, so slot N of one dimension
         // and a 2D-array image's mirror slot N coincide: the set records which image owns a mirror slot, not just
         // that it is used.
-        {
+        if (!atomic_mode) {  // ps_tex only: these compares expect its texels in the target
             // A 2D-array image of two layers (layer 0 orange, layer 1 blue) with its own 2D-array and storage views
             // plus a 2D view of layer 0, which is what a mirror binds. The storage view puts the index in the
             // storage range, as in the index-space checks below.
@@ -990,7 +990,7 @@ int main(int argc, char** argv) {
         // and index 1 of the 2D arrays is `stored_view` (its own image, a red texel). The entry says the index is
         // bound in the 3D arrays only, so the 2D read must use the 2D array's fallback and read zeros - not
         // `stored_view`, which is what indexing the instruction's array with the other dimension's index would do.
-        {
+        if (!atomic_mode) {  // ps_tex only, as the mirror checks above
             EXPECT(stored_index == 1);
             VkImage volume = VK_NULL_HANDLE;
             VkImageView volume_view = VK_NULL_HANDLE;
@@ -1206,7 +1206,8 @@ int main(int argc, char** argv) {
                 std::printf("ps_imgatomic: %u validation errors\n", g_validation_errors);
                 return 1;
             }
-            return wrong || bad_rt ? 1 : 0;
+            // A compare() above would be one of the ps_tex checks, which this shader cannot pass: count it.
+            return wrong || bad_rt || mismatches ? 1 : 0;
         }
 
         // A view that comes and goes before the set is flushed is never written: a texture created and destroyed
