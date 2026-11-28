@@ -1,0 +1,59 @@
+# Builds and tests the optional launcher (launcher/, Rust) when it changes, so a change that breaks its build, its
+# lints or its tests shows up in CI. It needs no GPU, no display and no game files: the tests draw the window
+# offscreen on the CPU (iced's tiny-skia renderer) and run a stand-in script in place of make_game.py.
+name: Launcher
+
+on:
+  # What can break it: the launcher itself, the logo it builds in (include_bytes! of assets/logo.png), and this
+  # workflow. Every other change leaves it alone.
+  push:
+    branches: [main]
+    paths:
+      - "launcher/**"
+      - "assets/logo.png"
+      - ".github/workflows/launcher.yml"
+  pull_request:
+    paths:
+      - "launcher/**"
+      - "assets/logo.png"
+      - ".github/workflows/launcher.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Each non-PR run has its own group so a queued push or dispatch cannot replace it.
+  group: launcher-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  launcher:
+    name: launcher (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows first, as the project is; Linux for Wayland and X11 users and the same tests on another system.
+        os: [windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: launcher
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The runners' own rustup, no third-party action: the stable toolchain with its formatter and linter.
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustc --version
+      - name: Format
+        run: cargo fmt --check
+      - name: Lints
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests (offscreen on the CPU, no GPU, no game data)
+        run: cargo test --locked
