@@ -2150,9 +2150,11 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    (a backing, an alias range, title memory) go on an unbounded per-device list; at the next submission each heap
    fixes again exactly the slots whose records a change touches: a release or removal every half naming it, an
    addition the waiting halves over it. Nothing walks the heap or reads the copy for this. A zeroed range, a slot
-   the title rewrote and a heap destroyed drop their records. `console_heap_slot_records_test` checks that a release
-   of a buffer 10 of 60,010 slots name looks at those 10, and compares the copy with a full re-resolution through
-   random writes, releases, additions and alias changes.
+   the title rewrote and a heap destroyed drop their records, and an index bucket goes with the last half it holds:
+   the indexes hold the granules of the live halves, not every granule the session wrote a V# into.
+   `console_heap_slot_records_test` checks that a release of a buffer 10 of 60,010 slots name looks at those 10,
+   compares the copy with a full re-resolution and each lookup with a walk of every half through random writes,
+   releases, additions and alias changes, and that two halves moved 200,001 times hold 3 buckets (600,003 before).
    Console resource heap copies and shader-visible CBV/SRV/UAV heaps with at least 65,536 slots request
    64 MiB of zeroed padding after their last descriptor. `LEONIDA_HEAP_GUARD_MB` sets the padding in MiB
    (0 disables it). When arena space is tight, allocation can fall back to the heap alone. Only indices
