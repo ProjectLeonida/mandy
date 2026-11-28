@@ -16,6 +16,17 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "gta6rt must be built for x64 (run from an x64 Native Tools prompt or vcvars64.bat)")
 endif()
 
+# Target x86-64-v3 (AVX2, BMI1/2, FMA, F16C, LZCNT, POPCNT, MOVBE) on x86-64 hosts so SIMD hot paths
+# (shadow_keep::sum_of, descriptor-slot scans, texture hashing) and auto-vectorization emit 256-bit code.
+# Kept C/C++-only so ml64 does not receive an unknown switch, and skipped on non-x86-64 portable builds.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  if(MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX2>)
+  elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-march=x86-64-v3>)
+  endif()
+endif()
+
 # Portable root-signature model + packer to user SGPRs (no d3d12.h, no windows.h), and the host CPU preflight of
 # --init/--run (src/host_cpu.h). Built on every OS, so their tests run in the Linux and macOS jobs as well as with the
 # Windows runtime.

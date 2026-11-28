@@ -6073,7 +6073,6 @@ struct DeviceState {
                                                 bool blocking = true) {
         auto& m = page_mirror;
         if (!m.mirror || (ranges.empty() && !m.readback_async_pending.load(std::memory_order_acquire))) return 0;
-        using clock = std::chrono::steady_clock;
         constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
         std::vector<std::uint64_t> retry_pages;
         std::uint64_t written = 0;
