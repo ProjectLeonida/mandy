@@ -829,15 +829,18 @@ def test_wave32_bpermute_zeroes_inactive_and_missing_source_lanes(make_shader):
     assert not rdna2spirv.translate.last_gen.wave64
     shuffle = re.search(
         r"(%t\d+) = OpSelect %uint (%t\d+) %t\d+ %c0\n\s*"
+        r"(?:(?P<self>%t\d+) = OpLoad %uint %sg_lane\n\s*)?"
         r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 %true\n\s*"
-        r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \3 (%t\d+)\n\s*"
-        r"(%t\d+) = OpSelect %uint \4 \5 %t\d+\n\s*"
-        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 \1 \6\n\s*"
-        r"(%t\d+) = OpSelect %uint \4 %cffffffff %c0\n\s*"
-        r"(?P<result>%t\d+) = OpBitwiseAnd %uint \7 \8\n",
+        r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \4 (%t\d+)\n\s*"
+        r"(%t\d+) = OpSelect %uint \5 \6 (%t\d+)\n\s*"
+        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 \1 \7\n\s*"
+        r"(%t\d+) = OpSelect %uint \5 %cffffffff %c0\n\s*"
+        r"(?P<result>%t\d+) = OpBitwiseAnd %uint \9 \10\n",
         asm,
     )
     assert shuffle, "wave32 ds_bpermute must mask inactive and missing source lanes"
+    if shuffle.group("self") is not None:
+        assert shuffle.group(8) == shuffle.group("self"), "absent source lane must redirect to own subgroup lane"
     active_id = shuffle.group(2)
     assert (f"{active_id} = OpLoad %bool %active" in asm or f"OpStore %active {active_id}" in asm), \
         "source mask must read the active lane predicate"
@@ -848,14 +851,16 @@ WQM_DATA = "s_mov_b32 s20, 0x00800010\ns_mov_b32 s21, 1\ns_wqm_b64 s[22:23], s[2
 
 
 def test_wqm_on_a_lane_mask_gathers_the_quad_and_votes_scc(make_shader, monkeypatch):
-    """s_wqm on a lane mask ORs the lane's bit with its quad's (two OpGroupNonUniformQuadSwap, horizontal then
-    vertical) and SCC is the wave-wide any. Emulated, the four lanes of the quad come through %x_buf instead."""
+    """s_wqm on a lane mask in compute gathers the lane's 4-bit quad nibble via ballot (safe on partial subgroups
+    without GroupNonUniformQuad or absent-lane shuffles) and SCC is the wave-wide any. Emulated, the four lanes
+    of the quad come through %x_buf instead."""
     shader = make_shader(WQM_MASK, name="cs_wqm_mask_ci")
     asm = shader.translate()
     shader.validate(asm)
-    assert "OpCapability GroupNonUniformQuad" in asm
-    assert asm.count("OpGroupNonUniformQuadSwap %uint %c3") == 2
-    assert re.search(r"OpGroupNonUniformQuadSwap %uint %c3 %t\d+ %c0\n(?:.*\n)*?.*OpGroupNonUniformQuadSwap %uint %c3 %t\d+ %c1\n", asm)
+    assert "OpCapability GroupNonUniformBallot" in asm
+    assert "QuadSwap" not in asm and "GroupNonUniformQuad" not in asm
+    assert "OpGroupNonUniformShuffle" not in asm
+    assert re.search(r"OpGroupNonUniformBallot %v4uint_bal %c3 %t\d+\n(?:.*\n)*?.*OpBitwiseAnd %uint %t\d+ %cf\n", asm)
     assert "OpGroupNonUniformAny" in asm                   # SCC: any bit of the result in the wave
     monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
     emulated = shader.translate()
@@ -878,14 +883,15 @@ def test_wqm_on_data_is_a_bit_operation(make_shader):
 
 
 def test_wqm_without_quad_operations_outside_fragment_and_compute(make_shader):
-    """Quad operations are only guaranteed in fragment and compute shaders: a vertex shader shuffles from the four
-    lanes of the quad instead."""
+    """Quad operations are only guaranteed in fragment shaders (with guaranteed 2x2 helper quads): a vertex shader
+    gathers the four lanes of its quad via ballot nibble extraction instead, avoiding absent-lane shuffles."""
     shader = make_shader("v_cmp_gt_u32_e32 vcc_lo, 1, v0\ns_wqm_b32 s8, vcc_lo\nv_cndmask_b32_e64 v6, 0, 1, s8\n"
                          "exp pos0 v6, v6, v6, v6 done\ns_endpgm\n", name="vs_wqm_ci")
     asm = shader.translate()
     shader.validate(asm)
     assert "QuadSwap" not in asm and "GroupNonUniformQuad" not in asm
-    assert asm.count("OpGroupNonUniformShuffle") == 4
+    assert "OpGroupNonUniformShuffle" not in asm
+    assert re.search(r"OpGroupNonUniformBallot %v4uint_bal %c3 %t\d+\n(?:.*\n)*?.*OpBitwiseAnd %uint %t\d+ %cf\n", asm)
 
 
 def test_wave64_wqm_b32_changes_and_votes_only_its_half(make_shader):
@@ -1701,7 +1707,9 @@ def test_gather_d16_avoids_packhalf2x16(make_shader, suffix, last_addr):
     sh2.validate(asm2)
     assert "PackHalf2x16" not in asm2
     assert "OpBitwiseOr %uint" in asm2 and "OpSelect %uint" in asm2
-    for ty in ("%v4float", "%v4uint_st", "%v4int_st"):
+    uvec4 = re.search(r"(%\S+) = OpTypeVector %uint 4\b", asm2)
+    uvec4_ty = uvec4.group(1) if uvec4 else "%v4uint_st"
+    for ty in ("%v4float", uvec4_ty, "%v4int_st"):
         assert asm2.count(f"OpImageFetch {ty} ") == (0 if suffix == "lz" else 4)
 
 

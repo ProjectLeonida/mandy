@@ -307,9 +307,20 @@ int main(int argc, char** argv) {
     EXPECT(heavy->calls == 4 && heavy->runs == 2);
     EXPECT(light->calls == 2 && light->runs == 1);
     EXPECT(vertices->calls == 4 && vertices->runs == 1);
-    for (const auto* e : {heavy, light, vertices}) EXPECT(e->ms > 0 && e->ms < 2000);
-    // 66 times the loop: well over twice the time per call, whatever the fixed cost of a dispatch is here.
-    EXPECT(heavy->ms / 4 > 2 * (light->ms / 2));
+    // Apple Paravirtual GPUs (macOS VM runners under MoltenVK) advertise 64-bit timestamps and resolve all queries,
+    // but return constant timestamps within a command buffer (span == 0.0 ms). Verify all structural/query counts
+    // everywhere, and enforce positive-duration and relative-scaling checks whenever timestamps tick (or on any
+    // non-paravirtual device).
+    const bool paravirtual_constant_ts =
+        queue.span_ms == 0.0 && std::strstr(properties.deviceName, "Paravirtual") != nullptr;
+    if (paravirtual_constant_ts) {
+        std::printf("note: %s returned constant timestamps (span 0.0 ms); skipping positive-duration checks\n",
+                    properties.deviceName);
+    } else {
+        for (const auto* e : {heavy, light, vertices}) EXPECT(e->ms > 0 && e->ms < 2000);
+        // 66 times the loop: well over twice the time per call, whatever the fixed cost of a dispatch is here.
+        EXPECT(heavy->ms / 4 > 2 * (light->ms / 2));
+    }
     // Start, before heavy, after its first run (the barrier), before light, the draws and heavy, end: 7, all read.
     EXPECT(queue.submissions == 1 && queue.unread == 0 && queue.dropped == 0 && queue.stamps == 7);
     // Consecutive intervals: the pipelines and the other work add up to the span.

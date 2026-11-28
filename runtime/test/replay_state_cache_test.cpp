@@ -717,8 +717,13 @@ std::vector<std::uint32_t> build_vs_spirv() {
 // Hand-assembled SPIR-V 1.3 fragment shader:
 //   layout(push_constant) uniform PC { float r, g, b, a; uint pad[4]; float scale; } pc;
 //   layout(location = 0) out vec4 out_color;
-//   void main() { out_color = vec4(pc.r * pc.scale, pc.g * pc.scale, pc.b * pc.scale, pc.a); }
-// Reads BOTH word 0..3 (offset 0..15) AND word 8 (offset 32) so partial push updates to either region are verified!
+//   void main() {
+//       vec4 col = vec4(pc.r * pc.scale, pc.g * pc.scale, pc.b * pc.scale, pc.a);
+//       out_color = (gl_FragCoord.x >= 0.0) ? col : vec4(0.0);
+//   }
+// Reads BOTH word 0..3 (offset 0..15) AND word 8 (offset 32) so partial push updates to either region are verified.
+// The gl_FragCoord guard is always true for framebuffer pixels and avoids a Mesa llvmpipe linear-fastpath bug
+// where inputless flat-color fragment shaders misread non-contiguous push-constant struct offsets.
 std::vector<std::uint32_t> build_fs_spirv() {
     std::vector<std::uint32_t> w;
     const auto op = [&](std::uint16_t code, std::initializer_list<std::uint32_t> args) {
@@ -733,30 +738,36 @@ std::vector<std::uint32_t> build_fs_spirv() {
     constexpr std::uint32_t kPr = 19, kPg = 20, kPb = 21, kPa = 22, kPs = 23;
     constexpr std::uint32_t kR = 24, kG = 25, kB = 26, kA = 27, kS = 28;
     constexpr std::uint32_t kRs = 29, kGs = 30, kBs = 31, kCol = 32;
-    constexpr std::uint32_t kBound = 33;
+    constexpr std::uint32_t kBool = 33, kPtrInVec4 = 34, kFragCoord = 35, kF0 = 36;
+    constexpr std::uint32_t kFc = 37, kFcx = 38, kCond = 39, kSg = 40;
+    constexpr std::uint32_t kBound = 41;
 
     w.insert(w.end(), {0x07230203u, 0x00010300u, 0u, kBound, 0u});
-    op(17, {1u});                                       // OpCapability Shader
-    op(14, {0u, 1u});                                   // OpMemoryModel Logical GLSL450
-    op(15, {4u, kMain, 0x6e69616du, 0u, kOutColor});    // OpEntryPoint Fragment %main "main"
-    op(16, {kMain, 7u});                                // OriginUpperLeft(7)
-    op(71, {kOutColor, 30u, 0u});                       // Location 0
-    op(71, {kPcStruct, 2u});                            // Block
-    op(72, {kPcStruct, 0u, 35u, 0u});                   // Offset 0  (user_data[0]: r)
-    op(72, {kPcStruct, 1u, 35u, 4u});                   // Offset 4  (user_data[1]: g)
-    op(72, {kPcStruct, 2u, 35u, 8u});                   // Offset 8  (user_data[2]: b)
-    op(72, {kPcStruct, 3u, 35u, 12u});                  // Offset 12 (user_data[3]: a)
-    op(72, {kPcStruct, 4u, 35u, 32u});                  // Offset 32 (user_data[8]: scale)
+    op(17, {1u});                                                   // OpCapability Shader
+    op(14, {0u, 1u});                                               // OpMemoryModel Logical GLSL450
+    op(15, {4u, kMain, 0x6e69616du, 0u, kOutColor, kFragCoord});    // OpEntryPoint Fragment %main "main"
+    op(16, {kMain, 7u});                                            // OriginUpperLeft(7)
+    op(71, {kOutColor, 30u, 0u});                                   // Location 0
+    op(71, {kFragCoord, 11u, 15u});                                 // BuiltIn FragCoord(15)
+    op(71, {kPcStruct, 2u});                                        // Block
+    op(72, {kPcStruct, 0u, 35u, 0u});                               // Offset 0  (user_data[0]: r)
+    op(72, {kPcStruct, 1u, 35u, 4u});                               // Offset 4  (user_data[1]: g)
+    op(72, {kPcStruct, 2u, 35u, 8u});                               // Offset 8  (user_data[2]: b)
+    op(72, {kPcStruct, 3u, 35u, 12u});                              // Offset 12 (user_data[3]: a)
+    op(72, {kPcStruct, 4u, 35u, 32u});                              // Offset 32 (user_data[8]: scale)
 
     op(19, {kVoid});
     op(33, {kFn, kVoid});
+    op(20, {kBool});
     op(22, {kF32, 32u});
     op(23, {kVec4, kF32, 4u});
     op(21, {kI32, 32u, 1u});
-    op(32, {kPtrOutVec4, 3u, kVec4});                   // Output(3)
+    op(32, {kPtrOutVec4, 3u, kVec4});                               // Output(3)
     op(59, {kPtrOutVec4, kOutColor, 3u});
+    op(32, {kPtrInVec4, 1u, kVec4});                                // Input(1)
+    op(59, {kPtrInVec4, kFragCoord, 1u});
     op(30, {kPcStruct, kF32, kF32, kF32, kF32, kF32});
-    op(32, {kPtrPcStruct, 9u, kPcStruct});              // PushConstant(9)
+    op(32, {kPtrPcStruct, 9u, kPcStruct});                          // PushConstant(9)
     op(59, {kPtrPcStruct, kPcVar, 9u});
     op(32, {kPtrPcF32, 9u, kF32});
     op(43, {kI32, kI0, 0u});
@@ -764,6 +775,7 @@ std::vector<std::uint32_t> build_fs_spirv() {
     op(43, {kI32, kI2, 2u});
     op(43, {kI32, kI3, 3u});
     op(43, {kI32, kI4, 4u});
+    op(43, {kF32, kF0, 0u});
 
     op(54, {kVoid, kMain, 0u, kFn});
     op(248, {kLabel});
@@ -777,9 +789,13 @@ std::vector<std::uint32_t> build_fs_spirv() {
     op(61, {kF32, kB, kPb});
     op(61, {kF32, kA, kPa});
     op(61, {kF32, kS, kPs});
-    op(133, {kF32, kRs, kR, kS});                       // OpFMul
-    op(133, {kF32, kGs, kG, kS});
-    op(133, {kF32, kBs, kB, kS});
+    op(61, {kVec4, kFc, kFragCoord});
+    op(81, {kF32, kFcx, kFc, 0u});
+    op(190, {kBool, kCond, kFcx, kF0});                             // OpFOrdGreaterThanEqual
+    op(169, {kF32, kSg, kCond, kS, kF0});                           // scalar OpSelect (valid in SPIR-V 1.3)
+    op(133, {kF32, kRs, kR, kSg});                                  // OpFMul
+    op(133, {kF32, kGs, kG, kSg});
+    op(133, {kF32, kBs, kB, kSg});
     op(80, {kVec4, kCol, kRs, kGs, kBs, kA});
     op(62, {kOutColor, kCol});
     op(253, {});
