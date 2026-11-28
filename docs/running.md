@@ -51,7 +51,11 @@ reasons behind each step: [linux_proton.md](linux_proton.md#amd-on-linux-what-go
   `LEONIDA_SHADERS`, `LEONIDA_PIPELINE_CACHE_DIR` and `LEONIDA_DEVICE_FAULT`, before the first run. It built 3,693
   compute pipelines. Not `make_game.py --stages pipelines`: its cache never matches the runtime's driver keys.
   The pre-compile builds the programs `LEONIDA_SKIP_COMPUTE` names too (`--skip-listed` leaves them out) and ends
-  with one line that counts what it built, what was journaled already and what it left out.
+  with one line that counts what it built, what was journaled already and what it left out. After a rebuild of
+  gta6rt, run it again: files another build wrote are not counted as journaled already, and it says how many of them
+  the driver still took. Run it with the same `LEONIDA_DEVICE_FAULT` and `LEONIDA_AFTERMATH` as the boot: NVIDIA's
+  diagnostics config (`LEONIDA_DEVICE_FAULT=1`) compiles other pipelines, and a journal made without it gives such a
+  boot no hits.
 - **Driver and OS:** `amdgpu.lockup_timeout=30000,60000,10000,10000` on the kernel command line (the default is
   2000 ms; reboot needed).
 - **Environment:**

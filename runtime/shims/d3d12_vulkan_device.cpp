@@ -47,6 +47,7 @@
 #include "../src/vulkan_mesh_limits.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
+#include "../src/vulkan_device_config.h"
 #include "../src/compile_gate_calibration.h"
 #include "../src/pipeline_cache_file.h"
 #include "../src/pipeline_profile.h"
@@ -2882,6 +2883,15 @@ struct DeviceState {
     // has no file for may still be in it (build_compute asks it first, when it can ask without a compile).
     bool pipeline_cache_seeded = false;
     std::atomic<unsigned> journal_hits{0}, journal_writes{0}, journal_shared_hits{0};
+    // Builds whose journal file another gta6rt build wrote (or an older runtime, without a stamp), and how many of them
+    // the driver still found there.
+    std::atomic<unsigned> journal_other_build{0}, journal_other_build_hits{0};
+    // Builds whose journal file this build wrote under another device-create config (src/vulkan_device_config.h), and
+    // how many of them the driver still found there.
+    std::atomic<unsigned> journal_other_config{0}, journal_other_config_hits{0};
+    // Builds with no journal file that have one under the other NVIDIA diagnostics config setting: the driver does not
+    // take those across the setting (621.01), so they were compiled.
+    std::atomic<unsigned> journal_other_diagnostics{0};
     std::atomic<std::uint64_t> journal_bytes{0};  // on disk: counted at the cache's creation, then added to
     std::uint64_t journal_budget = leonida::pipeline_journal::default_budget;
     // Ask the shared cache first, with FAIL_ON_PIPELINE_COMPILE_REQUIRED, while the driver honours it.
@@ -11578,6 +11588,33 @@ std::unique_lock<leonida::SubmitMutex> compute_driver_turn(DeviceState& device) 
     return turn;
 }
 
+// LOCAL FIX (pipeline journal build stamp, pipeline_cache_journal.h): the binary that writes journal files, for their
+// stamp: a hash of this executable, read once. LEONIDA_PIPELINE_JOURNAL_BUILD (16 hex digits) names another, for tests.
+std::uint64_t journal_build() {
+    static const std::uint64_t build = [] {
+        char text[32] = {};
+        size_t length = 0;
+        if (getenv_s(&length, text, "LEONIDA_PIPELINE_JOURNAL_BUILD") == 0 && length > 1) {
+            char* end = nullptr;
+            const unsigned long long value = std::strtoull(text, &end, 16);
+            if (end && !*end && value) return std::uint64_t(value);
+            std::fprintf(stderr, "[rt] d3d12: pipeline journal: LEONIDA_PIPELINE_JOURNAL_BUILD=%s is not a nonzero hex "
+                                 "number; the executable's own build is used\n", text);
+        }
+        std::wstring path(32768, L'\0');
+        const DWORD n = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
+        if (!n || n >= path.size()) return std::uint64_t{0};
+        path.resize(n);
+        return leonida::pipeline_journal::file_build(std::filesystem::path(path));
+    }();
+    return build;
+}
+
+// What this process writes journal files as: its build and its device's create config.
+leonida::pipeline_journal::Writer journal_writer(const DeviceState& device) {
+    return {journal_build(), device.info.device_create_config};
+}
+
 // LOCAL FIX (pipeline journal, pipeline_cache_journal.h): one compute pipeline's own VkPipelineCache for the length
 // of its build. load() reads the journal file, before any driver call. In the build's one compile-gate turn,
 // create() makes the cache from the file's contents (seeded) or empty, and finish() takes the cache's data when the
@@ -11610,8 +11647,13 @@ public:
     bool has_file_data() const { return !file_.data.empty(); }
     bool found() const { return enabled_ && built_ && !write_; }  // the pipeline came out of the journal file
     bool written() const { return written_; }                     // publish() wrote the file
+    bool other_build() const { return other_build_; }             // the file came from another gta6rt build
+    bool other_config() const { return other_config_; }           // written under another device-create config
+    bool restamped() const { return restamped_; }                 // publish() stamped it as this build's after a hit
 
-    void load(std::filesystem::path path) {
+    // `restamp`: after a hit from a local file another build wrote, write it again with this build's stamp
+    // (precompile: the file is then journaled already for this build).
+    void load(std::filesystem::path path, bool restamp = false) {
         const auto& vk = device_.context->vk;
         if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache || !vk.vkGetPipelineCacheData) return;
         enabled_ = true;
@@ -11619,6 +11661,10 @@ public:
         namespace journal = leonida::pipeline_journal;
         const auto role = compile_helper::build_host.load() ? journal::ReadRole::materialize_local : journal::ReadRole::runtime;
         file_ = journal::read_with_seed(path_, pipeline_journal_roots().seed, device_.pso_identity, role);
+        const auto writer = journal_writer(device_);
+        other_build_ = file_.other_build(writer.build);
+        other_config_ = !other_build_ && file_.other_config(writer.config);
+        restamp_ = restamp && file_.other_writer(writer) && !file_.from_seed;
     }
 
     // In the build's driver turn.
@@ -11635,6 +11681,7 @@ public:
             info.pInitialData = nullptr;
             if (vk.vkCreatePipelineCache(device_.info.device, &info, nullptr, &cache) != VK_SUCCESS) cache = VK_NULL_HANDLE;
         }
+        if (restamp_ && seeded) keep_.swap(file_.data);  // written again with this build's stamp after a hit
         std::vector<char>().swap(file_.data);  // the driver has its own copy
     }
 
@@ -11667,8 +11714,29 @@ public:
     void publish() {
         namespace journal = leonida::pipeline_journal;
         if (!enabled_ || !built_) return;
+        if (other_build_) {
+            device_.journal_other_build.fetch_add(1);
+            if (!write_) device_.journal_other_build_hits.fetch_add(1);
+        }
+        if (other_config_) {
+            device_.journal_other_config.fetch_add(1);
+            if (!write_) device_.journal_other_config_hits.fetch_add(1);
+        }
         if (!write_) {
             report(device_.journal_hits.fetch_add(1) + 1, "found in their journal file");
+            if (!keep_.empty()) {
+                // A hit from another build's (or device config's) file: this writer's stamp on the same blob.
+                const auto file = journal::stamped(journal_writer(device_), keep_.data(), keep_.size());
+                std::vector<char>().swap(keep_);
+                if (!journal::write_entry(path_, file.data(), file.size())) {
+                    auto total = device_.journal_bytes.load();
+                    while (!device_.journal_bytes.compare_exchange_weak(
+                        total, journal::replace_bytes(total, file_.bytes, file.size()))) {
+                    }
+                    restamped_ = true;
+                }
+                return;
+            }
             journal::touch_local_hit(path_, file_, std::filesystem::file_time_type::clock::now());
             return;
         }
@@ -11677,9 +11745,12 @@ public:
                          name_, int(result_), data_size_);
             return;
         }
+        // The file: this build's and device config's stamp, then the blob.
+        const auto file = journal::stamped(journal_writer(device_), blob_.data(), blob_.size());
+        std::vector<char>().swap(blob_);
         // A rewrite replaces the file's old size. Two builds of one name at once may both count: the next boot's
         // tidy counts again.
-        if (journal::replace_bytes(device_.journal_bytes.load(), file_.bytes, blob_.size()) > device_.journal_budget) {
+        if (journal::replace_bytes(device_.journal_bytes.load(), file_.bytes, file.size()) > device_.journal_budget) {
             static std::atomic<bool> said{false};
             if (!said.exchange(true))
                 std::fprintf(stderr, "[rt] d3d12: pipeline journal: %llu bytes on disk, the %llu-byte budget "
@@ -11688,7 +11759,7 @@ public:
                              static_cast<unsigned long long>(device_.journal_budget));
             return;
         }
-        if (const std::error_code error = journal::write_entry(path_, blob_.data(), blob_.size())) {
+        if (const std::error_code error = journal::write_entry(path_, file.data(), file.size())) {
             static std::atomic<bool> said{false};
             if (!said.exchange(true))
                 std::fprintf(stderr, "[rt] d3d12: pipeline journal: could not write %ls: %s\n", path_.c_str(),
@@ -11696,7 +11767,7 @@ public:
             return;
         }
         auto total = device_.journal_bytes.load();
-        while (!device_.journal_bytes.compare_exchange_weak(total, journal::replace_bytes(total, file_.bytes, blob_.size()))) {
+        while (!device_.journal_bytes.compare_exchange_weak(total, journal::replace_bytes(total, file_.bytes, file.size()))) {
         }
         written_ = true;
         report(device_.journal_writes.fetch_add(1) + 1, "compiled and written to their journal file");
@@ -11707,8 +11778,13 @@ private:
     void report(unsigned count, const char* what) const {
         if (count != 1 && count % 100) return;
         std::fprintf(stderr, "[rt] d3d12: pipeline journal: %u compute pipeline(s) %s (so far: %u from journal files, "
-                             "%u written, %u from the shared cache)\n", count, what,
-                     device_.journal_hits.load(), device_.journal_writes.load(), device_.journal_shared_hits.load());
+                             "%u written, %u from the shared cache; from another build: %u, %u of them found; from "
+                             "another device config: %u, %u of them found; only under the other diagnostics config "
+                             "setting: %u)\n",
+                     count, what, device_.journal_hits.load(), device_.journal_writes.load(),
+                     device_.journal_shared_hits.load(), device_.journal_other_build.load(),
+                     device_.journal_other_build_hits.load(), device_.journal_other_config.load(),
+                     device_.journal_other_config_hits.load(), device_.journal_other_diagnostics.load());
     }
 
     DeviceState& device_;
@@ -11719,8 +11795,13 @@ private:
     bool built_ = false;
     bool write_ = false;
     bool written_ = false;
+    bool other_build_ = false;
+    bool other_config_ = false;
+    bool restamp_ = false;
+    bool restamped_ = false;
     std::filesystem::path path_;
     leonida::pipeline_journal::EntryFile file_;
+    std::vector<char> keep_;  // restamp: the file's blob, for a hit
     std::vector<char> blob_;
     std::size_t data_size_ = 0;
     VkResult result_ = VK_SUCCESS;
@@ -11739,13 +11820,18 @@ struct ComputeBuild {
     bool journal_hit = false;  // found in its journal file
     bool journaled = false;    // compiled and written to its journal file
     bool from_shared = false;  // found in the shared cache
+    bool other_build = false;  // its journal file came from another gta6rt build (or had no stamp)
+    bool other_config = false;  // its journal file came from this build under another device-create config
+    bool other_diagnostics = false;  // no journal file, but one under the other NVIDIA diagnostics config setting
+    bool restamped = false;    // ComputeBuildOptions::restamp_hits and that file was a hit: stamped as this build's
 };
 
 struct ComputeBuildOptions {
     const char* trigger = "dispatch";       // what asked: dispatch, warmup, dispatch-worker, precompile...
     const std::string* cache_key = nullptr;  // the title's PSO description key, for the compile trace
     bool serialize_big = true;               // LEONIDA_SERIAL_BIG_COMPILES=1: modules over 128 KiB one at a time
-    bool skip_journaled = false;             // precompile: leave a pipeline whose journal file exists alone
+    bool skip_journaled = false;             // precompile: leave a pipeline whose journal file this build wrote alone
+    bool restamp_hits = false;               // precompile: a hit from another build's file stamps it as this build's
     bool use_helper = true;                  // LEONIDA_COMPILE_HELPER: a missing journal file comes from the helper
     bool helper_wait = true;                 // wait for the helper's file (false: ask, and answer deferred)
     std::uint64_t helper_priority = 0;       // the request's urgency: 0 a dispatch, else the warm-up's module size
@@ -11817,21 +11903,40 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
         key.value(std::uint32_t(entry->binding_count != 0));
         // NVIDIA's diagnostics config (LEONIDA_DEVICE_FAULT=1, Aftermath) compiles with shader debug info: other
         // pipelines, kept apart so switching it on and off does not rewrite every file. Absent when off, so the
-        // names of ordinary boots stay as they were.
-        if (device.info.device_diagnostics_config) {
-            key.text("nv-diagnostics-config");
-            key.value(std::uint32_t(leonida::aftermath::extra_config_flags()));
+        // names of ordinary boots stay as they were. `other` names the file under the other setting: on NVIDIA
+        // 621.01 a file from one setting gave the other no hits, so finding only that one is reported.
+        leonida::pipeline_journal::Hasher other = key;
+        auto& diagnostics_key = device.info.device_diagnostics_config ? key : other;
+        diagnostics_key.text("nv-diagnostics-config");
+        diagnostics_key.value(std::uint32_t(leonida::aftermath::extra_config_flags()));
+        if (entry->binding_count) {
+            hash_bindless_layout(key, device.bindless->features());
+            hash_bindless_layout(other, device.bindless->features());
         }
-        if (entry->binding_count) hash_bindless_layout(key, device.bindless->features());
         const auto path = leonida::pipeline_journal::entry_path(journal_dir, "cs", key.digest());
         out.journal_path = path;
         if (options.key_only) return out;
-        // Precompile: a usable file is there already, so the pipeline is not built (only its header is read).
-        if (options.skip_journaled && leonida::pipeline_journal::entry_usable(path, device.pso_identity)) {
+        // Precompile: a usable file this build wrote is there already, so the pipeline is not built (only its stamp and
+        // header are read). One from another build is built against: the driver may no longer take it.
+        if (options.skip_journaled &&
+            leonida::pipeline_journal::entry_current(path, device.pso_identity, journal_writer(device))) {
             out.skipped = true;
             return out;
         }
-        journal.load(path);
+        journal.load(path, options.restamp_hits);
+        if (!journal.has_file_data() &&
+            leonida::pipeline_journal::entry_usable(
+                leonida::pipeline_journal::entry_path(journal_dir, "cs", other.digest()), device.pso_identity)) {
+            out.other_diagnostics = true;
+            device.journal_other_diagnostics.fetch_add(1);
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "[rt] d3d12: pipeline journal: %s has a journal file only for a device %s NVIDIA's "
+                                     "diagnostics config (LEONIDA_DEVICE_FAULT=1, LEONIDA_AFTERMATH=1), which the driver "
+                                     "does not take across that setting; run gta6rt --precompile-pipelines with this "
+                                     "boot's setting\n",
+                             entry->name.c_str(), device.info.device_diagnostics_config ? "without" : "with");
+        }
         // LOCAL FIX (compile helper, d3d12_compile_helper.h): no file, so this would be a compile in this process,
         // where the driver's lock it holds stops the title's submissions. The helper process compiles it into the file
         // instead, and the create below is a hit. Asked without waiting, the build answers deferred and is asked
@@ -11849,7 +11954,7 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
             } else {
                 const ULONGLONG asked = GetTickCount64();
                 if (helper.build(path, entry->name, device.pso_identity, &why)) {
-                    journal.load(path);
+                    journal.load(path, options.restamp_hits);
                     std::fprintf(stderr, "[rt] d3d12: compile helper built %s in %.1f s (%zu B SPIR-V, %s)\n",
                                  entry->name.c_str(), double(GetTickCount64() - asked) / 1000.0, bytes, trigger);
                 } else {
@@ -11955,6 +12060,9 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
     out.from_shared = from_shared;
     out.journal_hit = journal.found();
     out.journaled = journal.written();
+    out.other_build = journal.other_build();
+    out.other_config = journal.other_config();
+    out.restamped = journal.restamped();
     out.ms = GetTickCount64() - started;
     if (created == VK_SUCCESS && built && out.ms >= 2000)
         std::fprintf(stderr, "[rt] d3d12: compute pipeline %s took %.1f s to build (%zu B SPIR-V)\n",
@@ -23377,6 +23485,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                              "debug info, resource tracking or checkpoints\n");
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
+    // The pipeline journal stamps its files with this (src/vulkan_device_config.h): the driver's key holds it.
+    info.device_create_config = leonida::device_create_config(device_info);
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
     info.device = owned.device;
@@ -23605,6 +23715,9 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
     std::atomic<std::size_t> next{0};
     std::mutex progress_mutex;
     std::size_t done = 0, compiled = 0, skipped = 0, hits = 0, failed = 0, journaled = 0, elsewhere = 0;
+    std::size_t other_build = 0, other_build_hits = 0;  // built against a file another gta6rt build wrote
+    std::size_t other_config = 0, other_config_hits = 0;  // built against one written under another device config
+    std::size_t other_diagnostics = 0;  // no file, but one under the other diagnostics config setting
     std::uint64_t done_bytes = 0;
     std::mutex big_mutex;
     std::condition_variable big_free;
@@ -23625,6 +23738,7 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
             build_options.trigger = "precompile";
             build_options.serialize_big = false;  // nothing else is building; big_threads bounds them instead
             build_options.skip_journaled = !options.rebuild;
+            build_options.restamp_hits = true;
             build_options.use_helper = options.via_helper;
             build_options.mark_building = !options.via_helper;  // an entry another process is compiling is left to it
             ComputeBuild build;
@@ -23648,6 +23762,15 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
             else if (build.result != VK_SUCCESS || (!build.pipeline && !build.skipped)) ++failed;
             else if (build.journal_hit || build.from_shared) ++hits, what = "found in a cache";
             else ++compiled, what = build.journaled ? "compiled and journaled" : "compiled (not journaled)";
+            if (build.other_build && build.result == VK_SUCCESS && build.pipeline) {
+                ++other_build;
+                if (build.journal_hit) ++other_build_hits, what = "found in another build's journal file";
+            }
+            if (build.other_config && build.result == VK_SUCCESS && build.pipeline) {
+                ++other_config;
+                if (build.journal_hit) ++other_config_hits, what = "found in another device config's journal file";
+            }
+            if (build.other_diagnostics && build.result == VK_SUCCESS && build.pipeline) ++other_diagnostics;
             const double elapsed = std::chrono::duration<double>(Clock::now() - began).count();
             const double eta = done_bytes ? elapsed / double(done_bytes) * double(total_bytes - done_bytes) : 0.0;
             // Skips are not logged one by one (a resumed run skips thousands); every 100th is, with the counts.
@@ -23668,6 +23791,19 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
                  compiled + hits, compiled, hits, journaled, elsewhere, failed, listed_left_out, listed,
                  options.skip_listed ? " (--skip-listed)" : "", not_buildable, filtered,
                  std::chrono::duration<double>(Clock::now() - began).count());
+    if (other_build)
+        std::fprintf(stderr, "[precompile] %zu journal file(s) from another gta6rt build or without a build stamp: %zu "
+                             "still found by the driver (now stamped as this build's), %zu compiled again\n",
+                     other_build, other_build_hits, other_build - other_build_hits);
+    if (other_config)
+        std::fprintf(stderr, "[precompile] %zu journal file(s) from this build under another device config (device "
+                             "features, extensions, LEONIDA_DEVICE_FAULT or LEONIDA_AFTERMATH): %zu still found by the "
+                             "driver (now stamped with this config), %zu compiled again\n",
+                     other_config, other_config_hits, other_config - other_config_hits);
+    if (other_diagnostics)
+        std::fprintf(stderr, "[precompile] %zu entries had a journal file only for a device %s NVIDIA's diagnostics "
+                             "config: built for this setting\n",
+                     other_diagnostics, host.state().info.device_diagnostics_config ? "without" : "with");
     return failed ? 2 : 0;
 }
 

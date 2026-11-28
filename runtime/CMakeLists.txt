@@ -2024,6 +2024,10 @@ if(TARGET Vulkan::Headers)
   add_executable(vulkan_device_fault_test test/vulkan_device_fault_test.cpp)
   target_link_libraries(vulkan_device_fault_test PRIVATE Vulkan::Headers)
   add_test(NAME vulkan_device_fault COMMAND vulkan_device_fault_test)
+  # The device-create config the pipeline journal stamps its files with (src/vulkan_device_config.h), on the CPU.
+  add_executable(vulkan_device_config_test test/vulkan_device_config_test.cpp)
+  target_link_libraries(vulkan_device_config_test PRIVATE Vulkan::Headers)
+  add_test(NAME vulkan_device_config COMMAND vulkan_device_config_test)
   # The AMD breadcrumbs (LEONIDA_DEVICE_MARKERS): seq numbering, marker writes and the likely-hang verdict, on the CPU.
   add_executable(vulkan_device_markers_test test/vulkan_device_markers_test.cpp)
   target_link_libraries(vulkan_device_markers_test PRIVATE Vulkan::Headers)

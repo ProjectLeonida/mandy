@@ -112,6 +112,9 @@ struct VulkanDeviceInfo {
     bool device_checkpoints = false;
     bool device_diagnostics_config = false;
     bool device_markers = false;  // VK_AMD_buffer_marker enabled for LEONIDA_DEVICE_MARKERS=1
+    // leonida::device_create_config of the VkDeviceCreateInfo (src/vulkan_device_config.h): the pipeline journal's
+    // stamp. 0 for a caller-owned device.
+    std::uint64_t device_create_config = 0;
     bool separate_depth_stencil_layouts = true;
     bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled on this device.
     std::uint32_t max_push_constants_size = 0;
