@@ -1975,9 +1975,13 @@ void spin_for(LONGLONG us) {
 // its own or not, so whoever holds that lock exclusively (a map or an unmap of physical pages) must never wait for the
 // process heap meanwhile: it would wait for the faulting thread, which waits for it. While
 //   - threads take the process heap's lock (HeapLock, as HeapAlloc does inside, and the heap gate above) and, holding
-//     it, _aligned_malloc and _aligned_free and write a word into every page of a window whose pages are mapped fresh
+//     it, HeapAlloc and HeapFree a block and write a word into every page of a window whose pages are mapped fresh
 //     all the time (a first-touch commit, or a fault on a page that is being unmapped) and into a read-only page (a
-//     fault that isn't xmem's, as on a guarded shadow page);
+//     fault that isn't xmem's, as on a guarded shadow page). HeapAlloc, not this program's _aligned_malloc: the title's
+//     _aligned_malloc comes down to HeapAlloc, but a debug CRT's takes the CRT's own heap lock first, and any thread
+//     of this program that allocates through that CRT (vcruntime's exception dispatch does, past the heap gate) holds
+//     that lock while it waits for the process heap: holding HeapLock, the toucher would then deadlock with it
+//     without xmem in the cycle;
 //   - threads allocate physical pages, map them into their part of the window (as a run, or page by page through the
 //     scatter call), and unmap and free them, some freed while still mapped so that the unmap drops the last
 //     reference to their section;
@@ -2038,14 +2042,14 @@ void test_heap_lock_faults(const PhysicalApi& api) {
                 bool round_read_only = false;
                 AcquireSRWLockExclusive(&g_heap_gate);
                 HeapLock(heap);
-                void* block = _aligned_malloc(64 + (round % 32) * 160, 16);
+                void* block = HeapAlloc(heap, 0, 64 + (round % 32) * 160);
                 for (uint64_t p = 0; p < kPages; ++p) {
                     auto* const word =
                         static_cast<volatile uint32_t*>(static_cast<void*>(window + p * kPage64k)) + t;
                     round_missed += access_faults(word, true);
                 }
                 round_read_only = access_faults(static_cast<volatile uint32_t*>(static_cast<void*>(read_only)), true);
-                _aligned_free(block);
+                HeapFree(heap, 0, block);
                 HeapUnlock(heap);
                 ReleaseSRWLockExclusive(&g_heap_gate);
                 missed.fetch_add(round_missed, std::memory_order_relaxed);
