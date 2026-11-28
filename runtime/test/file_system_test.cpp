@@ -1434,6 +1434,26 @@ void run_checks(const std::filesystem::path& root) {
                   attributes_w(L"GAME:\\moved") == INVALID_FILE_ATTRIBUTES &&
                   std::filesystem::is_directory(own_t_folder(fresh)),
               "T:\\ cannot be moved");
+        // The T:\\ root is a drive root like GAME:\\ for every call that names a file, not its host folder: no
+        // attributes are set on it, and it is not deleted, write-opened or copied onto (kevincommits, #1608).
+        fresh = fresh_overlay();
+        attributes_w(L"T:\\");
+        SetLastError(0);
+        check(setattr_w(L"T:\\", FILE_ATTRIBUTE_HIDDEN) == FALSE && GetLastError() == ERROR_ACCESS_DENIED &&
+                  (::GetFileAttributesW(own_t_folder(fresh).c_str()) & FILE_ATTRIBUTE_HIDDEN) == 0,
+              "SetFileAttributesW(T:\\) is refused (ERROR_ACCESS_DENIED) and leaves the host folder alone");
+        SetLastError(0);
+        check(delete_w(L"T:\\") == FALSE && GetLastError() == ERROR_INVALID_NAME &&
+                  std::filesystem::is_directory(own_t_folder(fresh)),
+              "DeleteFileW(T:\\) is ERROR_INVALID_NAME, as for GAME:\\");
+        SetLastError(0);
+        HANDLE t_root_write = create_w(L"T:\\", GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, 0, nullptr);
+        check(t_root_write == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME,
+              "a write-open of T:\\ is ERROR_INVALID_NAME, as for GAME:\\");
+        if (t_root_write != INVALID_HANDLE_VALUE) ::CloseHandle(t_root_write);
+        SetLastError(0);
+        check(copy_w(L"GAME:\\data\\hello.txt", L"T:\\", FALSE) == FALSE && GetLastError() == ERROR_INVALID_NAME,
+              "CopyFileW onto T:\\ is ERROR_INVALID_NAME, as onto GAME:\\");
         fresh_overlay();
         attributes_w(L"T:\\");
         SetLastError(0);
@@ -1910,6 +1930,14 @@ void run_checks(const std::filesystem::path& root) {
               "listing long paths merges both roots and honors file and directory markers");
         check(attributes_w((guest_dir + L"legacy.bin").c_str()) == INVALID_FILE_ATTRIBUTES,
               "a read-only query respects the long file's delete marker");
+        // Recreating the removed folder takes its marker away through an extended-length path: the marker lies
+        // beyond MAX_PATH (kevincommits, #1608).
+        const DWORD recreated = mkdir_w((guest_dir + L"empty").c_str(), nullptr) != FALSE
+                                    ? attributes_w((guest_dir + L"empty").c_str()) : INVALID_FILE_ATTRIBUTES;
+        check(recreated != INVALID_FILE_ATTRIBUTES && (recreated & FILE_ATTRIBUTE_DIRECTORY) != 0,
+              "CreateDirectoryW recreates a removed folder whose marker is a path beyond MAX_PATH");
+        check(contains(list(first_w, next_w, find_close, (guest_dir + L"*").c_str()), L"empty"),
+              "the recreated long folder is listed again");
 
         // Compare the same merged listing against the short-path Win32 search, including the names
         // hidden by package deletion markers.
