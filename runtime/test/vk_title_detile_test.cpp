@@ -14,6 +14,7 @@
 #include "../src/vulkan_title_detile.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -438,8 +439,167 @@ int main() {
     }
 
     EXPECT(d.validation_errors() == 0);
-    std::printf("vk_title_detile_test: %u cases passed bit-for-bit (13 formats x 14 layout/mode/mip/array/odd/linear "
-                "cases, 0 validation errors)\n",
+
+    // Verify cached PFN_vk* (zero vkGetDeviceProcAddr calls during prepare/flush/emit), batched
+    // vkUpdateDescriptorSets (1 driver call for 4 textures), oldest_in_flight_scratch_value(), and kMaxScratchSlots==32.
+    {
+        static_assert(leonida::TitleDetilePipeline::kMaxScratchSlots == 32);
+        static PFN_vkGetDeviceProcAddr s_real_gdpa = nullptr;
+        static PFN_vkUpdateDescriptorSets s_real_update = nullptr;
+        static std::atomic<std::uint64_t> s_gdpa_calls{0};
+        static std::atomic<std::uint64_t> s_update_calls{0};
+        static std::atomic<std::uint32_t> s_update_writes{0};
+        struct CountingProc {
+            static VKAPI_ATTR void VKAPI_CALL update_ds(VkDevice dev, std::uint32_t write_count,
+                                                        const VkWriteDescriptorSet* writes, std::uint32_t copy_count,
+                                                        const VkCopyDescriptorSet* copies) {
+                s_update_calls.fetch_add(1, std::memory_order_relaxed);
+                s_update_writes.fetch_add(write_count, std::memory_order_relaxed);
+                s_real_update(dev, write_count, writes, copy_count, copies);
+            }
+            static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get(VkDevice dev, const char* name) {
+                s_gdpa_calls.fetch_add(1, std::memory_order_relaxed);
+                if (name && std::strcmp(name, "vkUpdateDescriptorSets") == 0) {
+                    s_real_update = reinterpret_cast<PFN_vkUpdateDescriptorSets>(s_real_gdpa(dev, name));
+                    return reinterpret_cast<PFN_vkVoidFunction>(&update_ds);
+                }
+                return s_real_gdpa(dev, name);
+            }
+        };
+        s_real_gdpa = d.device_proc;
+        s_gdpa_calls.store(0, std::memory_order_relaxed);
+        s_update_calls.store(0, std::memory_order_relaxed);
+        s_update_writes.store(0, std::memory_order_relaxed);
+
+        leonida::TitleDetilePipeline batch_pipe(
+            &CountingProc::get, d.device, props.limits,
+            [&d](const VkMemoryRequirements& req, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred) {
+                return alloc_memory(d, req, required, preferred);
+            });
+        const std::uint64_t gdpa_after_ctor = s_gdpa_calls.load(std::memory_order_acquire);
+        EXPECT(gdpa_after_ctor > 0);
+
+        namespace ct = leonida::console_texture;
+        constexpr std::size_t kBatchTex = 4;
+        std::vector<Buffer> srcs(kBatchTex);
+        std::vector<Image> imgs(kBatchTex);
+        std::vector<Buffer> rbs(kBatchTex);
+        std::vector<leonida::TitleDetileDesc> descs(kBatchTex);
+        std::vector<std::vector<std::uint8_t>> expected(kBatchTex);
+        std::vector<std::vector<VkBufferImageCopy>> regions(kBatchTex);
+        VkDeviceSize bases[kBatchTex]{}, ends[kBatchTex]{};
+        VkDeviceSize total_scratch = 0;
+
+        for (std::size_t i = 0; i < kBatchTex; ++i) {
+            ct::Desc cd{};
+            cd.dimension = ct::Dimension::tex2d;
+            cd.width = 64;
+            cd.height = 64;
+            cd.depth = 1;
+            cd.mips = 1;
+            cd.element_bytes = 4;
+            cd.block = 1;
+            cd.samples = 1;
+            cd.swizzle = (i % 2 == 0) ? ct::kSw64kbD : ct::kSw4kbS;
+            const auto lay = ct::Layout::make(cd);
+            EXPECT(lay.has_value());
+            descs[i] = to_detile_desc(*lay);
+            EXPECT(make_host_buffer(d, lay->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                    srcs[i]));
+            for (std::size_t b = 0; b < lay->size; ++b)
+                srcs[i].mapped[b] = static_cast<std::uint8_t>((b * (17 + i * 7) + i * 31) & 0xffu);
+            expected[i].resize(64u * 64u * 4u);
+            EXPECT(lay->detile(srcs[i].mapped, std::size_t(lay->size), 0, 0, expected[i].data(), expected[i].size(),
+                               64u * 4u, expected[i].size()) == ct::Error::ok);
+            EXPECT(make_image(d, VK_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, imgs[i]));
+            EXPECT(make_host_buffer(d, expected[i].size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT, rbs[i]));
+            const VkDeviceSize align = (std::max)(batch_pipe.min_storage_alignment(), VkDeviceSize(16));
+            bases[i] = leonida::detail::align_up_size(total_scratch, align);
+            EXPECT(leonida::TitleDetilePipeline::build_scratch_regions(descs[i], bases[i], 64, 64, regions[i], ends[i]));
+            total_scratch = ends[i];
+        }
+
+        auto* slot = batch_pipe.acquire_scratch(0, total_scratch, kBatchTex);
+        EXPECT(slot != nullptr);
+        std::vector<leonida::TitleDetileDispatch> dispatches;
+        std::vector<leonida::TitleDetilePipeline::PendingDescriptorUpdate> pending;
+        for (std::size_t i = 0; i < kBatchTex; ++i) {
+            EXPECT(batch_pipe.prepare_texture(*slot, srcs[i].handle, 0, descs[i], bases[i], ends[i], regions[i],
+                                              dispatches, &pending));
+        }
+        EXPECT(s_update_calls.load(std::memory_order_acquire) == 0);  // deferred until flush!
+        batch_pipe.flush_descriptor_updates(pending);
+        EXPECT(s_update_calls.load(std::memory_order_acquire) == 1);  // ONE batched vkUpdateDescriptorSets call!
+        EXPECT(s_update_writes.load(std::memory_order_acquire) == kBatchTex * 2u);
+
+        const bool ok = d.run([&](VkCommandBuffer cb) {
+            const auto barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+            const auto copy_b2i = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+            const auto copy_i2b = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+            VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mem.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+            mem.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barrier(cb, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem, 0, nullptr, 0,
+                    nullptr);
+            batch_pipe.emit_dispatches(cb, dispatches);
+            VkMemoryBarrier cs_to_x{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            cs_to_x.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            cs_to_x.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &cs_to_x, 0,
+                    nullptr, 0, nullptr);
+            for (std::size_t i = 0; i < kBatchTex; ++i) {
+                VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                to_dst.srcQueueFamilyIndex = to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                to_dst.image = imgs[i].handle;
+                to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                barrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                        nullptr, 1, &to_dst);
+                copy_b2i(cb, slot->buffer, imgs[i].handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         static_cast<std::uint32_t>(regions[i].size()), regions[i].data());
+                VkImageMemoryBarrier to_src = to_dst;
+                to_src.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                to_src.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                        1, &to_src);
+                VkBufferImageCopy rb{};
+                rb.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                rb.imageExtent = {64, 64, 1};
+                copy_i2b(cb, imgs[i].handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rbs[i].handle, 1, &rb);
+            }
+            VkMemoryBarrier host_vis{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            host_vis.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            host_vis.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_vis, 0, nullptr, 0,
+                    nullptr);
+            return true;
+        });
+        EXPECT(ok);
+        // Zero vkGetDeviceProcAddr calls after constructor (all PFN_vk* cached once!).
+        EXPECT(s_gdpa_calls.load(std::memory_order_acquire) == gdpa_after_ctor);
+        for (std::size_t i = 0; i < kBatchTex; ++i) {
+            EXPECT(std::memcmp(rbs[i].mapped, expected[i].data(), expected[i].size()) == 0);
+        }
+
+        // Verify oldest_in_flight_scratch_value() picks the smallest non-zero in-flight slot value.
+        slot->value = 42;
+        auto* slot2 = batch_pipe.acquire_scratch(0, 64, 1);
+        EXPECT(slot2 != nullptr && slot2 != slot);
+        slot2->value = 17;
+        EXPECT(batch_pipe.oldest_in_flight_scratch_value() == 17);
+        slot2->value = 0;
+        EXPECT(batch_pipe.oldest_in_flight_scratch_value() == 42);
+        slot->value = 0;
+        EXPECT(batch_pipe.oldest_in_flight_scratch_value() == 0);
+        EXPECT(d.validation_errors() == 0);
+    }
+
+    std::printf("vk_title_detile_test: %u cases + batched descriptor/cached PFN checks passed bit-for-bit "
+                "(13 formats x 14 layout/mode/mip/array/odd/linear cases, 0 validation errors)\n",
                 passed);
     return 0;
 }

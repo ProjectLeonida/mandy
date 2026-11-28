@@ -913,6 +913,49 @@ int main() {
                     "named/pass)\n",
                     per_pass_ms, kPasses, double(sw_watch.contiguous_runs) / double(kPasses), total_named / kPasses);
     }
+    {  // Slot-70 deferral contract: touch() on a clean tracked texture wakes may_have_work() and collect() so
+       // refresh_title_textures() never fast-skips it, and examine_batch() with 1 tile still routes through arm_batch().
+        struct SingleBatchWatch : FakeWatch {
+            std::uint64_t batch_calls = 0;
+            std::uint64_t single_calls = 0;
+            int arm(std::uintptr_t tile, Cell& c) {
+                ++single_calls;
+                return FakeWatch::arm(tile, c);
+            }
+            void arm_batch(const std::uintptr_t* tiles, Cell* const* cell_ptrs, std::int8_t* results,
+                           std::size_t count) {
+                ++batch_calls;
+                for (std::size_t i = 0; i < count; ++i) {
+                    const int r = FakeWatch::arm(tiles[i], *cell_ptrs[i]);
+                    results[i] = static_cast<std::int8_t>(r > 0 ? 1 : (r == 0 ? 0 : -1));
+                }
+            }
+            bool has_written() const { return !queue.empty() || overflow; }
+            std::uint64_t hot_generation() const { return 0; }
+        };
+        SingleBatchWatch sfw;
+        leonida::TitleTextureWatch<SingleBatchWatch> sw(sfw);
+        sw.track(101, base, kTile);
+        EXPECT(sw.may_have_work());
+        std::vector<std::uint64_t> keys;
+        sw.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{101}));
+        std::vector<leonida::TitleTextureWatch<SingleBatchWatch>::BatchExamine> res;
+        sw.examine_batch(keys, res);
+        sw.update_idle_hint();
+        EXPECT(sfw.batch_calls == 1 && sfw.single_calls == 0);  // even count==1 uses arm_batch()!
+        EXPECT(!sw.may_have_work());
+
+        // Existing texture deferred from slot-70 refresh_title_texture(): touch() MUST wake may_have_work() & collect().
+        sw.touch(101);
+        EXPECT(sw.may_have_work());
+        keys.clear();
+        sw.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{101}));
+        sw.examine_batch(keys, res);
+        sw.update_idle_hint();
+        EXPECT(!sw.may_have_work());
+    }
     if (failures) return 1;
     std::puts("title texture watch: new, untouched, one page, two addresses, remap, every frame, unarmable, kernel "
               "write in progress, lost queue, O(1) fast-path, buffer-hot decoupling, 1-tile hash-before-reserve, "

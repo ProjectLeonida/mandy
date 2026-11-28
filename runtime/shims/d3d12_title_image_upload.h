@@ -47,6 +47,7 @@ public:
         if (ready_) {
             {
                 std::lock_guard lock(d.context->submit_mutex());
+                d.context->clear_title_upload_locked(ready_);
                 d.context->retire_queue_idle_locked(ready_);
             }
             vk.vkDestroySemaphore(d.info.device, ready_, nullptr);
@@ -54,7 +55,6 @@ public:
         pool_ = VK_NULL_HANDLE;
         for (auto& slot : slots_) slot->command = VK_NULL_HANDLE;
         ready_ = VK_NULL_HANDLE;
-        consumers_.clear();
         detile_init_attempted_ = false;
     }
 
@@ -221,30 +221,32 @@ public:
                 const xg_xs::Texture& layout, Slot& slot, unsigned from = 0) {
         slot.reserved = false;
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, from, layout.layout.mips - from, 0, layout.array};
-        const auto result = d.context->write_staged_title_image(id, range, [&](const leonida::ReplayFunctions& replay,
-                                                                               const leonida::LayoutPieces& pieces,
-                                                                               const auto& waits) {
-            auto& vk = d.context->vk;
-            VkResult r = vk.vkResetCommandBuffer(slot.command, 0);
-            if (r != VK_SUCCESS) return r;
-            VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            if ((r = vk.vkBeginCommandBuffer(slot.command, &begin)) != VK_SUCCESS) return r;
-            leonida::detail::image_barrier(replay, slot.command, image, range, VK_IMAGE_LAYOUT_UNDEFINED,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            vk.vkCmdCopyBufferToImage(slot.command, slot.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                      static_cast<std::uint32_t>(slot.regions.size()), slot.regions.data());
-            for (const auto& piece : pieces)
-                leonida::detail::image_barrier(replay, slot.command, image, piece.range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    piece.layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_IMAGE_LAYOUT_GENERAL : piece.layout,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-            if ((r = vk.vkEndCommandBuffer(slot.command)) != VK_SUCCESS) return r;
-            const VkResult sr = submit_cmd(d, slot.command, waits, VK_NULL_HANDLE, 0);
-            if (sr == VK_SUCCESS) slot.value = value_;
-            return sr;
-        });
+        const auto result = d.context->write_staged_title_image(
+            id, range,
+            [&](const leonida::ReplayFunctions& replay, const leonida::LayoutPieces& pieces) -> VkResult {
+                auto& vk = d.context->vk;
+                VkResult r = vk.vkResetCommandBuffer(slot.command, 0);
+                if (r != VK_SUCCESS) return r;
+                VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                if ((r = vk.vkBeginCommandBuffer(slot.command, &begin)) != VK_SUCCESS) return r;
+                leonida::detail::image_barrier(replay, slot.command, image, range, VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                vk.vkCmdCopyBufferToImage(slot.command, slot.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                          static_cast<std::uint32_t>(slot.regions.size()), slot.regions.data());
+                for (const auto& piece : pieces)
+                    leonida::detail::image_barrier(replay, slot.command, image, piece.range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        piece.layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_IMAGE_LAYOUT_GENERAL : piece.layout,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                return vk.vkEndCommandBuffer(slot.command);
+            },
+            [&](const auto& waits) -> VkResult {
+                const VkResult sr = submit_cmd(d, slot.command, waits, VK_NULL_HANDLE, 0);
+                if (sr == VK_SUCCESS) slot.value = value_;
+                return sr;
+            });
         return result == VK_SUCCESS;
     }
 
@@ -290,7 +292,7 @@ public:
     }
 
     static constexpr std::size_t kMaxSlots = 64;
-    static constexpr std::size_t kMaxBatchCmds = 16;
+    static constexpr std::size_t kMaxBatchCmds = 64;
     struct Slot {
         VkBuffer buffer{};
         VkDeviceMemory memory{};
@@ -355,10 +357,6 @@ private:
             timeline.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
             VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &timeline};
             if (vk.vkCreateSemaphore(dev, &info, nullptr, &ready_) != VK_SUCCESS) return false;
-            for (const auto* qs : {&d.info.command_queues, &d.info.compute_queues, &d.info.copy_queues})
-                for (auto q : *qs)
-                    if (q && q != d.info.queue && std::find(consumers_.begin(), consumers_.end(), q) == consumers_.end())
-                        consumers_.push_back(q);
         }
         return true;
     }
@@ -459,9 +457,14 @@ private:
         leonida::TitleDetilePipeline::ScratchSlot* scratch_slot = nullptr;
         if (detile_sets > 0 && pipe) {
             scratch_slot = pipe->acquire_scratch(reached, total_scratch, detile_sets);
-            if (!scratch_slot && value_ > reached) {
-                // All scratch slots in flight: wait for the current timeline value and retry once.
-                if (wait_value(d, value_)) scratch_slot = pipe->acquire_scratch(value_, total_scratch, detile_sets);
+            if (!scratch_slot) {
+                // All scratch slots in flight: wait ONLY for the oldest in-flight scratch slot instead of draining the
+                // entire upload pipeline (`value_`).
+                const std::uint64_t oldest_scratch = pipe->oldest_in_flight_scratch_value();
+                if (oldest_scratch > reached && wait_value(d, oldest_scratch)) {
+                    reached = (std::max)(reached, oldest_scratch);
+                    scratch_slot = pipe->acquire_scratch(reached, total_scratch, detile_sets);
+                }
             }
         }
 
@@ -472,6 +475,8 @@ private:
         batch_targets_.clear();
         batch_targets_.reserve(count);
         batch_dispatches_.clear();
+        batch_descriptor_updates_.clear();
+        batch_descriptor_updates_.reserve(detile_sets);
         bool any_mirror = false;
         bool any_detile = false;
         VkSemaphore mirror_sem = VK_NULL_HANDLE;
@@ -505,7 +510,7 @@ private:
                 const std::size_t disp_start = batch_dispatches_.size();
                 if (!pipe->prepare_texture(*scratch_slot, item.mirror_buffer, item.mirror_offset, batch_descs_[i],
                                            batch_dst_bases_[i], batch_dst_ends_[i], batch_detile_regions_[i],
-                                           batch_dispatches_)) {
+                                           batch_dispatches_, &batch_descriptor_updates_)) {
                     batch_dispatches_.resize(disp_start);
                     continue;
                 }
@@ -523,15 +528,15 @@ private:
         }
 
         if (batch_prepared_.empty()) return;
+        if (pipe && !batch_descriptor_updates_.empty()) pipe->flush_descriptor_updates(batch_descriptor_updates_);
         if (any_mirror) leonida::submit_phases::note_change(leonida::submit_phases::change_textures);
 
-        // 3. Atomically capture all layouts, record all detile dispatches + copies + coalesced barriers, and submit
-        //    under ONE tracker_mutex_ + submit_mutex_ lock (LayoutTracker updates ONLY on VK_SUCCESS).
+        // 3. Atomically capture all layouts and record under tracker_mutex_ alone (submit_mutex_ is acquired only
+        //    around the single vkQueueSubmit, and LayoutTracker updates ONLY on VK_SUCCESS).
         const std::size_t n = batch_prepared_.size();
         const auto r = d.context->write_staged_title_images(
             std::span<const leonida::VulkanContext::StagedImageTarget>(batch_targets_.data(), batch_targets_.size()),
-            [&](const leonida::ReplayFunctions&, const std::vector<leonida::LayoutPieces>& all_pieces,
-                const auto& waits) -> VkResult {
+            [&](const leonida::ReplayFunctions&, const std::vector<leonida::LayoutPieces>& all_pieces) -> VkResult {
                 auto& vk = d.context->vk;
                 VkResult res = vk.vkResetCommandBuffer(bcmd->command, 0);
                 if (res != VK_SUCCESS) return res;
@@ -609,7 +614,9 @@ private:
                                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
                                         static_cast<std::uint32_t>(post_barriers_.size()), post_barriers_.data());
 
-                if ((res = vk.vkEndCommandBuffer(bcmd->command)) != VK_SUCCESS) return res;
+                return vk.vkEndCommandBuffer(bcmd->command);
+            },
+            [&](const auto& waits) -> VkResult {
                 const VkResult sr = submit_cmd(d, bcmd->command, waits, mirror_sem, mirror_val);
                 if (sr == VK_SUCCESS) {
                     bcmd->value = value_;
@@ -765,18 +772,10 @@ private:
             return r;
         }
         // Record this upload in retire_tickets_ under submit_mutex_ so note_mirror_bind() covers in-flight GPU mirror
-        // reads and freed TitleMirror homes cannot be reused while this upload is executing.
+        // reads and freed TitleMirror homes cannot be reused while this upload is executing, and publish (ready_, value_)
+        // lazily so each consumer queue waits on it on its next command-buffer submit_multi() (zero empty submits).
         d.context->record_submit_locked(ready_, value_);
-        VkTimelineSemaphoreSubmitInfo acquire{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-        acquire.waitSemaphoreValueCount = 1;
-        acquire.pWaitSemaphoreValues = &value_;
-        VkPipelineStageFlags stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-        VkSubmitInfo wait{VK_STRUCTURE_TYPE_SUBMIT_INFO, &acquire};
-        wait.waitSemaphoreCount = 1;
-        wait.pWaitSemaphores = &ready_;
-        wait.pWaitDstStageMask = &stages;
-        for (auto q : consumers_)
-            if ((r = d.context->queue_submit(q, 1, &wait, VK_NULL_HANDLE)) != VK_SUCCESS) return r;
+        d.context->note_title_upload_locked(ready_, value_);
         return VK_SUCCESS;
     }
 
@@ -791,6 +790,7 @@ private:
     std::vector<PreparedItem> batch_prepared_;
     std::vector<leonida::VulkanContext::StagedImageTarget> batch_targets_;
     std::vector<leonida::TitleDetileDispatch> batch_dispatches_;
+    std::vector<leonida::TitleDetilePipeline::PendingDescriptorUpdate> batch_descriptor_updates_;
     std::vector<leonida::TitleDetileDesc> batch_descs_;
     std::vector<VkDeviceSize> batch_dst_bases_;
     std::vector<VkDeviceSize> batch_dst_ends_;
@@ -800,7 +800,6 @@ private:
     VkCommandPool pool_{};
     VkSemaphore ready_{};
     std::uint64_t value_ = 0;
-    std::vector<VkQueue> consumers_;
     std::vector<VkBufferImageCopy> regions_;
 };
 

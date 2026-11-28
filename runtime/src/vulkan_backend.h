@@ -1391,11 +1391,13 @@ public:
         std::unique_lock lock(resource_mutex_);
         predicate_family_ = family;
         predicate_reducer_ = std::make_unique<PredicateReducer>(get, device_, memory, max_range);
+        bump_replay_version();
     }
     // Configure before submitting work, only when storageBuffer8BitAccess is enabled on the device.
     void configure_predicated_copy(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceLimits& limits) {
         std::unique_lock lock(resource_mutex_);
         predicated_copier_ = std::make_unique<PredicatedBufferCopier>(get, device_, limits);
+        bump_replay_version();
     }
     // Counts for DISPATCH-only ExecuteIndirect are read by a helper compute shader from GPU memory.
     // Requires Vulkan bufferDeviceAddress, already enabled for the D3D12 address arena.
@@ -1403,6 +1405,7 @@ public:
                                     const VkPhysicalDeviceLimits& limits) {
         std::unique_lock lock(resource_mutex_);
         counted_dispatch_ = std::make_unique<IndirectDispatchCounter>(get, device_, memory, limits);
+        bump_replay_version();
     }
     // Indexed quad lists are drawn from triangle indices a compute pass writes into the copy scratch
     // (quad_index_expand.h). Call only with bufferDeviceAddress enabled and after an enable_copy_scratch whose chunks
@@ -1410,7 +1413,7 @@ public:
     void configure_quad_indices(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceLimits& limits) {
         std::unique_lock lock(resource_mutex_);
         quad_indices_ = std::make_unique<QuadIndexExpander>(get, device_, limits);
-
+        bump_replay_version();
     }
 
     // Every ExecuteIndirect's arguments are clamped on the GPU into scratch before the indirect command reads them
@@ -1426,12 +1429,16 @@ public:
         // reading the application's argument buffer, which may hold a record no compute pass wrote. Off, or on a
         // device the pass cannot run on, the replay keeps the application's buffer as before.
         replay_.require_indirect_clamp = indirect_clamp_enabled();
-        if (!replay_.require_indirect_clamp) return;
+        if (!replay_.require_indirect_clamp) {
+            bump_replay_version();
+            return;
+        }
         indirect_clamp_ = std::make_unique<IndirectArgumentClamp>(get, device_, memory, limits, std::move(allocate),
                                                                  device_fault_.get(), std::move(families));
         if (!indirect_clamp_->loaded()) {
             indirect_clamp_.reset();
             replay_.require_indirect_clamp = false;
+            bump_replay_version();
             return;
         }
         // The preparation callback needs this submission's counter-slot batch, so it is set per ExecuteCommandLists
@@ -1439,6 +1446,7 @@ public:
         replay_.emit_indirect_clamp = [this](VkCommandBuffer command_buffer, const ClampedIndirect& job) {
             indirect_clamp_->emit(command_buffer, job);
         };
+        bump_replay_version();
     }
     VkDevice device() const { return device_; }
 
@@ -1450,6 +1458,7 @@ public:
         replay_.insert_label = labels.cmd_insert;
         replay_.begin_label = labels.cmd_begin;
         replay_.end_label = labels.cmd_end;
+        bump_replay_version();
     }
     bool debug_labels() const { return labels_.complete(); }
 
@@ -1589,7 +1598,10 @@ public:
     // True where a timestamp resolve must be ordered explicitly after the timestamps it copies (MoltenVK on Apple
     // GPUs, docs/d3d12_vulkan.md section 4.6). Set by the device before any queue uses it.
     bool order_timestamp_copies() const { return order_timestamp_copies_; }
-    void set_order_timestamp_copies(bool order) { order_timestamp_copies_ = order; }
+    void set_order_timestamp_copies(bool order) {
+        order_timestamp_copies_ = order;
+        bump_replay_version();
+    }
 
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
     // execute() copies replay_ under a shared resource_mutex_, so writers hold it uniquely.
@@ -1599,6 +1611,7 @@ public:
         std::unique_lock lock(resource_mutex_);
         replay_.heap_base = heap_base;
         replay_.heap_size = heap_size;
+        bump_replay_version();
     }
 
     // Zeroed memory for unbound vertex and index buffers to read (ReplayFunctions::zero_buffer).
@@ -1607,11 +1620,13 @@ public:
         replay_.zero_buffer = buffer;
         replay_.zero_offset = offset;
         replay_.zero_size = size;
+        bump_replay_version();
     }
 
     void set_depth_range_unrestricted(bool enabled) {
         std::unique_lock lock(resource_mutex_);
         replay_.depth_range_unrestricted = enabled;
+        bump_replay_version();
     }
 
     struct GeometryUpload {
@@ -1624,12 +1639,14 @@ public:
     void set_geometry_provider(GeometryProvider provider) {
         std::unique_lock lock(resource_mutex_);
         geometry_provider_=std::move(provider);
+        bump_replay_version();
     }
 
     // LOCAL: the copy-in fallback for vertex and index views in title memory (ReplayFunctions::title_memory).
     void set_title_memory(std::function<bool(std::uint64_t, std::uint64_t, VkBuffer&, VkDeviceSize&)> copy) {
         std::unique_lock lock(resource_mutex_);
         replay_.title_memory = std::move(copy);
+        bump_replay_version();
     }
 
     // Pre-expanded 32-bit triangle indices for non-indexed quad lists (ReplayFunctions::quad_indices).
@@ -1638,12 +1655,14 @@ public:
         replay_.quad_indices = buffer;
         replay_.quad_indices_offset = offset;
         replay_.quad_index_count = count;
+        bump_replay_version();
     }
 
     // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
     void set_color_attachment_format(std::function<bool(VkFormat)> check) {
         std::unique_lock lock(resource_mutex_);
         replay_.color_attachment_format = std::move(check);
+        bump_replay_version();
     }
     std::uint64_t heap_base() {
         std::shared_lock lock(resource_mutex_);
@@ -1752,6 +1771,7 @@ public:
     // Configure before queue creation, when the selected queue family supports compute.
     void set_occlusion_resolve_memory(const VkPhysicalDeviceMemoryProperties& memory) {
         occlusion_resolve_memory_ = memory;
+        bump_replay_version();
     }
 
     // A complete replacement of these color subresources from a staging buffer (TitleImageUpload): the title's CPU
@@ -1767,8 +1787,10 @@ public:
     // anything submitted later.
     template<class Copy>
     VkResult write_staged_title_image(ResourceId id, const VkImageSubresourceRange& range, Copy&& copy) {
-        std::lock_guard layout_lock(tracker_mutex_);
-        std::lock_guard queue_lock(submit_mutex_);
+        std::unique_lock layout_lock(tracker_mutex_, std::defer_lock);
+        submit_phases::lock_timed(layout_lock);
+        std::unique_lock queue_lock(submit_mutex_, std::defer_lock);
+        submit_phases::lock_timed(queue_lock);
         if (is_device_lost()) return VK_ERROR_DEVICE_LOST;
         LayoutPieces pieces;
         if (!tracker_.pieces(id, range, pieces) || pieces.empty()) return VK_ERROR_UNKNOWN;
@@ -1781,9 +1803,35 @@ public:
         return r;
     }
 
-    // Atomic batched variant of write_staged_title_image: acquires tracker_mutex_ and submit_mutex_ ONCE for all
-    // targets, collects every target's LayoutPieces + cross-queue waits, invokes `copy(replay, all_pieces, waits)`,
-    // and transitions UNDEFINED -> GENERAL in tracker_ ONLY if `copy` returns VK_SUCCESS.
+    // Split record/submit variant: holds tracker_mutex_ during command recording while leaving submit_mutex_ unlocked
+    // so presents, compiles, and cross-queue submits never stall on command recording. Acquires submit_mutex_ ONLY
+    // around snapshotting cross-queue `waits` and calling `submit(waits)`.
+    template<class Record, class Submit>
+    VkResult write_staged_title_image(ResourceId id, const VkImageSubresourceRange& range, Record&& record,
+                                      Submit&& submit) {
+        std::unique_lock layout_lock(tracker_mutex_, std::defer_lock);
+        submit_phases::lock_timed(layout_lock);
+        if (is_device_lost()) return VK_ERROR_DEVICE_LOST;
+        LayoutPieces pieces;
+        if (!tracker_.pieces(id, range, pieces) || pieces.empty()) return VK_ERROR_UNKNOWN;
+        VkResult r = observe_result(record(replay_, pieces), "title staging record");
+        if (r == VK_SUCCESS) {
+            std::unique_lock queue_lock(submit_mutex_, std::defer_lock);
+            submit_phases::lock_timed(queue_lock);
+            if (is_device_lost()) return VK_ERROR_DEVICE_LOST;
+            const auto waits = retire_tickets_.pending_through(submitted_ticket_.load(std::memory_order_acquire));
+            r = observe_result(submit(waits), "title staging upload");
+        }
+        if (r == VK_SUCCESS) {
+            for (const auto& p : pieces)
+                if (p.layout == VK_IMAGE_LAYOUT_UNDEFINED) tracker_.set(id, p.range, VK_IMAGE_LAYOUT_GENERAL);
+        }
+        return r;
+    }
+
+    // Atomic batched variant of write_staged_title_image: acquires tracker_mutex_ ONCE for all targets, records
+    // command buffers with submit_mutex_ UNLOCKED, then acquires submit_mutex_ ONLY for snapshotting cross-queue
+    // waits and submitting. Transitions UNDEFINED -> GENERAL in tracker_ ONLY if submit returns VK_SUCCESS.
     struct StagedImageTarget {
         ResourceId id{};
         VkImageSubresourceRange range{};
@@ -1791,8 +1839,10 @@ public:
     template<class Copy>
     VkResult write_staged_title_images(std::span<const StagedImageTarget> targets, Copy&& copy) {
         if (targets.empty()) return VK_SUCCESS;
-        std::lock_guard layout_lock(tracker_mutex_);
-        std::lock_guard queue_lock(submit_mutex_);
+        std::unique_lock layout_lock(tracker_mutex_, std::defer_lock);
+        submit_phases::lock_timed(layout_lock);
+        std::unique_lock queue_lock(submit_mutex_, std::defer_lock);
+        submit_phases::lock_timed(queue_lock);
         if (is_device_lost()) return VK_ERROR_DEVICE_LOST;
         std::vector<LayoutPieces> all_pieces(targets.size());
         for (std::size_t i = 0; i < targets.size(); ++i) {
@@ -1801,6 +1851,35 @@ public:
         }
         const auto waits = retire_tickets_.pending_through(submitted_ticket_.load(std::memory_order_acquire));
         const auto r = observe_result(copy(replay_, all_pieces, waits), "title staging upload batch");
+        if (r == VK_SUCCESS) {
+            for (std::size_t i = 0; i < targets.size(); ++i) {
+                for (const auto& p : all_pieces[i])
+                    if (p.layout == VK_IMAGE_LAYOUT_UNDEFINED)
+                        tracker_.set(targets[i].id, p.range, VK_IMAGE_LAYOUT_GENERAL);
+            }
+        }
+        return r;
+    }
+
+    template<class Record, class Submit>
+    VkResult write_staged_title_images(std::span<const StagedImageTarget> targets, Record&& record, Submit&& submit) {
+        if (targets.empty()) return VK_SUCCESS;
+        std::unique_lock layout_lock(tracker_mutex_, std::defer_lock);
+        submit_phases::lock_timed(layout_lock);
+        if (is_device_lost()) return VK_ERROR_DEVICE_LOST;
+        std::vector<LayoutPieces> all_pieces(targets.size());
+        for (std::size_t i = 0; i < targets.size(); ++i) {
+            if (!tracker_.pieces(targets[i].id, targets[i].range, all_pieces[i]) || all_pieces[i].empty())
+                return VK_ERROR_UNKNOWN;
+        }
+        VkResult r = observe_result(record(replay_, all_pieces), "title staging record batch");
+        if (r == VK_SUCCESS) {
+            std::unique_lock queue_lock(submit_mutex_, std::defer_lock);
+            submit_phases::lock_timed(queue_lock);
+            if (is_device_lost()) return VK_ERROR_DEVICE_LOST;
+            const auto waits = retire_tickets_.pending_through(submitted_ticket_.load(std::memory_order_acquire));
+            r = observe_result(submit(waits), "title staging upload batch");
+        }
         if (r == VK_SUCCESS) {
             for (std::size_t i = 0; i < targets.size(); ++i) {
                 for (const auto& p : all_pieces[i])
@@ -1913,10 +1992,17 @@ public:
     // `prepare` is called at the start of the command buffer of every ExecuteCommandLists, before the lists are
     // written: the device brings the bindless set 0 of the translated shaders up to date there (vulkan_bindless.h)
     // and records what the set needs first. When it fails, nothing of that call is executed.
-    void set_transfer_only_family(std::uint32_t family) { transfer_only_family_ = family; }
-    void set_graphics_family(std::uint32_t family) { graphics_family_ = family; }
+    void set_transfer_only_family(std::uint32_t family) {
+        transfer_only_family_ = family;
+        bump_replay_version();
+    }
+    void set_graphics_family(std::uint32_t family) {
+        graphics_family_ = family;
+        bump_replay_version();
+    }
     void set_compute_copy_aspects(std::function<VkImageAspectFlags(VkFormat)> check) {
         replay_.compute_copy_aspects = std::move(check);
+        bump_replay_version();
     }
 
     // `before` is called at the start of every submission of command lists (a held batch: when it is released),
@@ -1964,23 +2050,14 @@ public:
         return it == device_fault_->pipeline_names.end() ? nullptr : it->second[0];
     }
     void set_before_execute(std::function<void()> before) { before_execute_ = std::move(before); }
-    // Monotonic visibility epoch bumped on every ExecuteCommandLists / queue Signal / CPU Fence::Signal so
-    // before_execute_() can coalesce concurrent or back-to-back cross-queue refreshes while guaranteeing every
-    // CPU write before a batch's enqueue (or before a Wait-before-Signal fence was signaled) is visible.
+    // Monotonic visibility epoch bumped on ExecuteCommandLists and CPU Fence::Signal (tracked per-fence in
+    // QueueHolds) so before_execute_() can coalesce concurrent or back-to-back cross-queue refreshes while
+    // guaranteeing every CPU write before a batch's enqueue or a waited CPU Fence::Signal is visible.
     std::uint64_t next_visibility_seq() noexcept {
         return visibility_seq_.fetch_add(1, std::memory_order_acq_rel) + 1;
     }
     std::uint64_t current_visibility_seq() const noexcept {
         return visibility_seq_.load(std::memory_order_acquire);
-    }
-    void note_signaled_visibility_seq(std::uint64_t seq) noexcept {
-        std::uint64_t cur = signaled_visibility_seq_.load(std::memory_order_relaxed);
-        while (seq > cur && !signaled_visibility_seq_.compare_exchange_weak(cur, seq, std::memory_order_acq_rel,
-                                                                            std::memory_order_relaxed)) {
-        }
-    }
-    std::uint64_t signaled_visibility_seq() const noexcept {
-        return signaled_visibility_seq_.load(std::memory_order_acquire);
     }
     // Minimum visibility epoch required by the execute_now() invoking before_execute_() on this thread (0 outside).
     static std::uint64_t current_before_execute_seq() noexcept { return t_before_execute_seq_; }
@@ -2003,6 +2080,21 @@ public:
         semaphore = mirror_bind_semaphore_;
         value = mirror_bind_value_;
     }
+    // Publishes the latest staged title-texture upload timeline (caller holds submit_mutex_): every queue's next
+    // command-buffer submission waits lazily on `(semaphore, value)` in VulkanQueue::submit_multi() instead of
+    // submitting an empty wait-only vkQueueSubmit per consumer queue.
+    void note_title_upload_locked(VkSemaphore semaphore, std::uint64_t value) noexcept {
+        title_upload_semaphore_ = semaphore;
+        title_upload_value_ = value;
+    }
+    // Clears the published title-upload timeline before destroying `semaphore` (caller holds submit_mutex_).
+    void clear_title_upload_locked(VkSemaphore semaphore) noexcept {
+        if (title_upload_semaphore_ == semaphore) {
+            title_upload_semaphore_ = VK_NULL_HANDLE;
+            title_upload_value_ = 0;
+        }
+    }
+    std::uint64_t replay_version() const noexcept { return replay_version_.load(std::memory_order_acquire); }
     // Called at the end of every ExecuteCommandLists replay that called before_execute_, however it returns: by then
     // the submissions it made are recorded, so submitted_retire_ticket() covers them.
     void set_after_execute(std::function<void()> after) { after_execute_ = std::move(after); }
@@ -2052,6 +2144,7 @@ public:
         replay_.depth24_run = [this](VkCommandBuffer command_buffer, const Depth24Job& job) {
             depth24_->run(command_buffer, job);
         };
+        bump_replay_version();
     }
 
     bool has_depth24() {
@@ -2068,6 +2161,7 @@ public:
         scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate), extra_usage, std::move(families),
                                                     device_fault_.get());
         if (!scratch_->loaded()) scratch_.reset();
+        bump_replay_version();
     }
 
     // Called after that command buffer's submit: true when it was accepted, false when vkQueueSubmit failed. The
@@ -2535,7 +2629,8 @@ private:
 
     std::function<void()> before_execute_;
     std::atomic<std::uint64_t> visibility_seq_{0};
-    std::atomic<std::uint64_t> signaled_visibility_seq_{0};
+    std::atomic<std::uint64_t> replay_version_{1};
+    void bump_replay_version() noexcept { replay_version_.fetch_add(1, std::memory_order_release); }
     static inline thread_local std::uint64_t t_before_execute_seq_ = 0;  // trivially destructible (no TLS callback)
     std::function<void()> after_execute_;
     std::function<std::uint64_t()> on_enqueue_execute_;
@@ -2558,6 +2653,10 @@ private:
     MirrorBuffer mirror_buffer_;
     VkSemaphore mirror_bind_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t mirror_bind_value_ = 0;
+    // The latest staged title-texture upload timeline (d3d12_title_image_upload.h): every queue's next command-buffer
+    // submission waits for it lazily under submit_mutex_ instead of queuing empty wait submits per consumer queue.
+    VkSemaphore title_upload_semaphore_ = VK_NULL_HANDLE;
+    std::uint64_t title_upload_value_ = 0;
     std::uint64_t bindless_upload_version_ = 0;
     std::function<bool(VkCommandBuffer)> prelude_record_;
     std::function<void(bool, std::uint64_t)> prelude_commit_;
@@ -2673,8 +2772,7 @@ public:
         if (result != VK_SUCCESS) return false;
         {
             QueueHolds<VkSemaphore>::WorkGuard active(context_.holds());
-            context_.note_signaled_visibility_seq(context_.next_visibility_seq());
-            context_.holds().signaled(semaphore_, value);  // queues that held a batch for this value run it now
+            context_.holds().signaled(semaphore_, value, context_.next_visibility_seq());  // queues held on this fence run with this CPU visibility epoch
             context_.holds().pump_ready();
         }
         return true;
@@ -3127,19 +3225,20 @@ public:
     // ID3D12CommandQueue::Signal: the fence reaches `value` after all work submitted so far. Held behind earlier
     // held operations (or an active execution), so the fence does not run ahead of the work it follows. `pin`
     // keeps the fence object alive until the submission has completed, as D3D12 does.
+    // GPU-only queue Signals do NOT bump visibility_seq_ (any CPU writes made prior to ExecuteCommandLists were
+    // already covered by that execute's visibility_seq; CPU-to-GPU edges are tracked per-fence on Fence::Signal).
     bool signal(VkSemaphore fence, std::uint64_t value, const PinFn& pin = {}) {
-        const std::uint64_t vis_seq = context_.next_visibility_seq();
         if (async_on()) {
             Call call;
             call.kind = Call::Kind::signal;
             call.fence = fence;
             call.value = value;
-            call.visibility_seq = vis_seq;
+            call.visibility_seq = 0;
             if (pin) call.pin = pin();
             enqueue(std::move(call));
             return true;
         }
-        return signal_sync(fence, value, pin, {}, kUnsetEpoch, vis_seq);
+        return signal_sync(fence, value, pin, {}, kUnsetEpoch, 0);
     }
 
     bool signal_sync(VkSemaphore fence, std::uint64_t value, const PinFn& pin, std::shared_ptr<void> async_pin = {},
@@ -3570,10 +3669,207 @@ private:
         std::uint64_t visibility_seq = 0;
     };
 
+    struct Depth24Guard {
+        Depth24Converter* d24 = nullptr;
+        VkSemaphore progress = VK_NULL_HANDLE;
+        bool active = false;
+        ~Depth24Guard() {
+            if (active && d24) d24->retire(progress, 0);
+        }
+    };
+    struct ScratchGuard {
+        ScratchBuffers* scratch = nullptr;
+        VkSemaphore progress = VK_NULL_HANDLE;
+        bool active = false;
+        ~ScratchGuard() {
+            if (active && scratch) scratch->retire(progress, 0);
+        }
+    };
+
+    // Maximum CPU Fence::Signal visibility epoch among this submission's explicit user waits (0 if none waited on a
+    // CPU-signaled fence).
+    std::uint64_t exec_waits_vis_seq() const {
+        std::uint64_t max_seq = 0;
+        const std::size_t n = (std::min)(exec_user_wait_count_, exec_waits_.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint64_t s = context_.holds().signaled_vis_seq(exec_waits_[i], exec_wait_values_[i]);
+            if (s > max_seq) max_seq = s;
+        }
+        return max_seq;
+    }
+
+    // Rebuilds cached_replay_ from context_.replay_ only when context_.replay_version() changes (typically once per
+    // queue lifetime), avoiding copying 27 std::functions and allocating helper lambdas on every execute_now().
+    // Caller holds shared resource_mutex_.
+    void ensure_cached_replay_locked(bool transfer_only, bool can_resolve_occlusion) {
+        const std::uint64_t ver = context_.replay_version();
+        if (cached_replay_version_ == ver) return;
+        cached_replay_ = context_.replay_;
+        cached_replay_on_buffer_write_ = cached_replay_.on_buffer_write;
+        cached_replay_on_buffer_write_ctx_ = cached_replay_.on_buffer_write_context;
+        if (context_.geometry_provider_) {
+            cached_replay_.title_memory = [this](std::uint64_t va, std::uint64_t bytes, VkBuffer& buffer,
+                                                 VkDeviceSize& offset) {
+                if (!va || !bytes || bytes > UINT64_MAX - va) return false;
+                for (const auto& upload : geometry_uploads_) {
+                    if (va < upload.source || va - upload.source > upload.size ||
+                        bytes > upload.size - (va - upload.source))
+                        continue;
+                    buffer = upload.buffer;
+                    offset = upload.offset + (va - upload.source);
+                    return true;
+                }
+                VulkanContext::GeometryUpload upload;
+                if (!context_.geometry_provider_(va, bytes, upload)) return false;
+                buffer = upload.buffer;
+                offset = upload.offset;
+                geometry_uploads_.push_back(std::move(upload));
+                return true;
+            };
+        }
+        cached_replay_.graphics_family = family_ == context_.graphics_family_;
+        cached_replay_.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
+                                      : kind_ == QueueKind::compute ? detail::queue_stages_compute
+                                                                    : 0;
+        cached_replay_.prepare_khr_instances = [this](const BuildAccelerationStructure& build,
+                                                      VkDeviceAddress& address) {
+            return stage_khr_instances(cached_replay_, build, *exec_replay_state_.khr_stages, address);
+        };
+        cached_replay_.prepare_xdxr_table = [this](VkDeviceAddress& address, std::uint32_t& count) {
+            return stage_xdxr_table(*exec_replay_state_.khr_stages, address, count);
+        };
+        if (cached_replay_.write_acceleration_structures_properties) {
+            cached_replay_.prepare_khr_postbuild = [this](std::uint32_t count, VkQueryPool& pool,
+                                                          std::uint32_t& first) {
+                return allocate_khr_as_queries(count, *exec_replay_state_.khr_as_queries, pool, first);
+            };
+        }
+        if (kind_ != QueueKind::copy && context_.predicate_reducer_ && family_ == context_.predicate_family_) {
+            cached_replay_.prepare_predicate = [this](VkBuffer buffer, VkDeviceSize offset, PredicateCapture& out) {
+                return (*exec_replay_state_.pred_batch)->prepare(buffer, offset, out);
+            };
+            cached_replay_.capture_predicate = [this](VkCommandBuffer cb, const PredicateCapture& p) {
+                context_.predicate_reducer_->capture(cb, p);
+            };
+            if (context_.predicated_copier_) {
+                cached_replay_.prepare_predicated_copy = [this](VkBuffer source, VkBuffer destination, VkDeviceSize src,
+                                                                VkDeviceSize dst, VkDeviceSize size,
+                                                                std::vector<PredicatedCopyDispatch>& out) {
+                    return (*exec_replay_state_.copy_batch)->prepare(source, destination, src, dst, size, out);
+                };
+                cached_replay_.emit_predicated_copy = [this](VkCommandBuffer cb,
+                                                             const std::vector<PredicatedCopyDispatch>& jobs) {
+                    context_.predicated_copier_->emit(cb, jobs);
+                };
+            }
+        }
+        if (context_.scratch_) {
+            cached_replay_.copy_scratch = [this](VkDeviceSize bytes, VkBuffer& buffer, VkDeviceSize& offset) {
+                auto& tlock = *exec_replay_state_.tracker_lock;
+                if (!tlock.owns_lock()) submit_phases::lock_timed(tlock);
+                auto& guard = *exec_replay_state_.scratch_guard;
+                if (!guard.active) {
+                    guard.scratch = context_.scratch_.get();
+                    context_.scratch_->collect();
+                    guard.active = true;
+                }
+                return context_.scratch_->get(bytes, buffer, offset);
+            };
+        }
+        if (kind_ != QueueKind::copy && context_.indirect_clamp_) {
+            // IndirectArgumentClamp manages its own internal locks and per-Batch scratch chunks: prepare() runs
+            // concurrently across queues without acquiring context_.tracker_mutex_.
+            cached_replay_.prepare_indirect_clamp = [this](VkBuffer arguments, VkDeviceSize argument_offset,
+                                                           VkBuffer count, VkDeviceSize count_offset,
+                                                           std::uint32_t kind, std::uint32_t stride,
+                                                           std::uint32_t max_count, ClampedIndirect& out) {
+                auto& cb = *exec_replay_state_.clamp_batch;
+                if (!cb) cb = context_.indirect_clamp_->batch();
+                return cb->prepare(arguments, argument_offset, count, count_offset, kind, stride, max_count, out);
+            };
+        }
+        if (kind_ != QueueKind::copy && context_.counted_dispatch_) {
+            cached_replay_.prepare_counted_dispatch = [this](VkBuffer args, VkDeviceSize args_offset, VkBuffer count,
+                                                             VkDeviceSize count_offset, std::uint32_t stride,
+                                                             std::uint32_t maximum, CountedDispatch& out) {
+                auto& tlock = *exec_replay_state_.tracker_lock;
+                if (!tlock.owns_lock()) submit_phases::lock_timed(tlock);
+                auto& cb = *exec_replay_state_.counted_batch;
+                if (!cb) cb = context_.counted_dispatch_->batch();
+                return cb->prepare(args, args_offset, count, count_offset, stride, maximum, out);
+            };
+            cached_replay_.emit_counted_dispatch = [this](VkCommandBuffer cb, const CountedDispatch& job) {
+                context_.counted_dispatch_->emit(cb, job);
+            };
+        }
+        if (kind_ != QueueKind::copy && context_.quad_indices_ && context_.scratch_) {
+            cached_replay_.prepare_quad_indices = [this](VkBuffer indices, VkDeviceSize offset, VkIndexType type,
+                                                         std::uint64_t readable, std::uint32_t quads, VkBuffer scratch,
+                                                         VkDeviceSize scratch_offset, QuadIndexExpansion& out) {
+                auto& tlock = *exec_replay_state_.tracker_lock;
+                if (!tlock.owns_lock()) submit_phases::lock_timed(tlock);
+                return context_.quad_indices_->prepare(indices, offset, type, readable, quads, scratch, scratch_offset,
+                                                       out);
+            };
+            cached_replay_.emit_quad_indices = [this](VkCommandBuffer cb, const QuadIndexExpansion& job) {
+                context_.quad_indices_->emit(cb, job);
+            };
+        }
+        if (context_.depth24_ && !transfer_only) {
+            cached_replay_.depth24_prepare = [this](Depth24Job& job, std::vector<Depth24Job>& parts) {
+                auto& tlock = *exec_replay_state_.tracker_lock;
+                if (!tlock.owns_lock()) submit_phases::lock_timed(tlock);
+                auto& guard = *exec_replay_state_.depth24_guard;
+                if (!guard.active) {
+                    guard.d24 = context_.depth24_.get();
+                    context_.depth24_->collect();
+                    guard.active = true;
+                }
+                return context_.depth24_->prepare(job, parts);
+            };
+        }
+        if (can_resolve_occlusion) {
+            cached_replay_.sum_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                                  std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                occlusion_resolve_->sum(cb, pool, first, count, dst, offset);
+            };
+            cached_replay_.resolve_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                                             std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                occlusion_resolve_->normalize(cb, pool, first, count, dst, offset);
+            };
+            cached_replay_.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, VkQueryPool mesh_pool,
+                                                   VkQueryPool primitives_pool, const std::uint8_t* mesh,
+                                                   std::uint32_t first, std::uint32_t count, VkBuffer dst,
+                                                   VkDeviceSize offset) {
+                occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, primitives_pool, mesh, first, count, dst,
+                                                   offset);
+            };
+            cached_replay_.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                                         std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                occlusion_resolve_->sum_binary(cb, pool, first, count, dst, offset);
+            };
+        }
+        const auto& events = context_.vk;
+        if (context_.order_timestamp_copies() && events.vkCreateEvent && events.vkDestroyEvent && events.vkResetEvent &&
+            events.vkCmdSetEvent && events.vkCmdWaitEvents) {
+            cached_replay_.order_timestamp_copy = [this](VkCommandBuffer cb) {
+                const VkEvent event = take_event();
+                if (!event) return;
+                exec_replay_state_.slot->events.push_back(event);
+                const auto& vk = context_.vk;
+                vk.vkCmdSetEvent(cb, event, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                vk.vkCmdWaitEvents(cb, 1, &event, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, nullptr, 0, nullptr, 0, nullptr);
+                *exec_replay_state_.ordered_timestamps = true;
+            };
+        }
+        cached_replay_version_ = ver;
+    }
+
     ReplayResult execute_now(std::span<const CommandList* const> lists, std::uint64_t execute_call,
                              std::span<const std::size_t> batch_breaks = {},
                              std::span<const PendingSignal> trailing_signals = {},
-                             std::uint64_t visibility_seq = 0, bool from_held = false) {
+                             std::uint64_t visibility_seq = 0, bool /*from_held*/ = false) {
         const bool skip_before = skip_before_execute_.load(std::memory_order_acquire);
         // The "submit frame" line and the floor: this submission from before its first phase to after its last.
         std::optional<submit_phases::Submission> submission;
@@ -3585,8 +3881,8 @@ private:
         }
         if (!skip_before && context_.before_execute_) {
             std::uint64_t req_seq = visibility_seq ? visibility_seq : context_.current_visibility_seq();
-            if (from_held || exec_user_wait_count_ > 0)
-                req_seq = (std::max)(req_seq, context_.signaled_visibility_seq());
+            const std::uint64_t wait_vis = (std::max)(pending_wait_vis_seq_, exec_waits_vis_seq());
+            if (wait_vis > req_seq) req_seq = wait_vis;
             struct BeforeSeqGuard {
                 std::uint64_t prev;
                 explicit BeforeSeqGuard(std::uint64_t seq) noexcept : prev(VulkanContext::t_before_execute_seq_) {
@@ -3595,6 +3891,7 @@ private:
                 ~BeforeSeqGuard() { VulkanContext::t_before_execute_seq_ = prev; }
             } before_seq_guard{req_seq};
             context_.before_execute_();
+            pending_wait_vis_seq_ = 0;
         }
         struct AfterExecute {
             VulkanContext& context;
@@ -3793,30 +4090,8 @@ private:
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
         // Declared after tracker_lock so any early return after depth24_->prepare() retires uncommitted scratch/pools
         // with ticket 0 while tracker_lock is still held.
-        struct Depth24Guard {
-            Depth24Converter* d24 = nullptr;
-            VkSemaphore progress = VK_NULL_HANDLE;
-            bool active = false;
-            ~Depth24Guard() {
-                if (active && d24) d24->retire(progress, 0);
-            }
-        } depth24_guard{nullptr, progress_, false};
-        struct ScratchGuard {  // the same for the copy scratch
-            ScratchBuffers* scratch = nullptr;
-            VkSemaphore progress = VK_NULL_HANDLE;
-            bool active = false;
-            ~ScratchGuard() {
-                if (active && scratch) scratch->retire(progress, 0);
-            }
-        } scratch_guard{nullptr, progress_, false};
-        struct ClampGuard {  // and for the ExecuteIndirect clamp's record scratch
-            IndirectArgumentClamp* clamp = nullptr;
-            VkSemaphore progress = VK_NULL_HANDLE;
-            bool active = false;
-            ~ClampGuard() {
-                if (active && clamp) clamp->retire(progress, 0);
-            }
-        } clamp_guard{nullptr, progress_, false};
+        Depth24Guard depth24_guard{nullptr, progress_, false};
+        ScratchGuard scratch_guard{nullptr, progress_, false};
         // Kept between executions: prepare refills each list's entries in the storage the last execution left, where
         // making them fresh for every command was about half the layer's CPU cost per command (replay_cpu_bench).
         auto& prepared = prepared_;
@@ -3824,7 +4099,6 @@ private:
         // a queue that sees 8 lists and then 1 in every frame would rebuild them on each execution. The loops below
         // use only the first lists.size() entries, so stale entries are never prepared, queried or emitted.
         if (prepared.size() < lists.size()) prepared.resize(lists.size());
-        ReplayFunctions replay{};
         unsigned mesh_draws = 0;
         auto& geometry = geometry_uploads_;
         geometry.clear();
@@ -3832,6 +4106,22 @@ private:
         std::unique_ptr<PredicatedBufferCopier::Batch> copy_batch;
         std::unique_ptr<IndirectDispatchCounter::Batch> counted_batch;
         std::unique_ptr<IndirectArgumentClamp::Batch> clamp_batch;
+        bool ordered_timestamps = false;
+        exec_replay_state_ = {&tracker_lock, &khr_guard.stages, &khr_guard.as_queries, &batch,        &copy_batch,
+                              &counted_batch, &clamp_batch,     &depth24_guard,        &scratch_guard, nullptr,
+                              &ordered_timestamps};
+        struct ExecReplayStateGuard {
+            VulkanQueue* q;
+            ~ExecReplayStateGuard() {
+                q->exec_replay_state_ = {};
+                q->cached_replay_.compiles = nullptr;
+                q->cached_replay_.mesh_draw_count = nullptr;
+                q->cached_replay_.bindless_set = VK_NULL_HANDLE;
+                q->cached_replay_.gpu_profile = nullptr;
+                q->cached_replay_.on_buffer_write = q->cached_replay_on_buffer_write_;
+                q->cached_replay_.on_buffer_write_context = q->cached_replay_on_buffer_write_ctx_;
+            }
+        } exec_replay_guard{this};
         const auto& occlusion_memory = context_.occlusion_resolve_memory_;
         const bool can_resolve_occlusion = occlusion_memory.memoryTypeCount != 0;
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
@@ -3863,156 +4153,23 @@ private:
         for (int pass = 0;; ++pass) {
             submit_phases::lock_timed(resource_lock);
             bindless_commit = !skip_shader_prep ? context_.bindless_commit_ : std::function<void(bool)>{};
-            replay = context_.replay_;
+            ensure_cached_replay_locked(transfer_only, can_resolve_occlusion);
+            ReplayFunctions& replay = cached_replay_;
             mesh_draws = 0;
-            if (pipeline_profile::enabled()) replay.mesh_draw_count = &mesh_draws;
-            if (context_.geometry_provider_) {
-                replay.title_memory = [&](std::uint64_t va, std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
-                    if (!va || !bytes || bytes>UINT64_MAX-va) return false;
-                    for (const auto& upload : geometry) {
-                        if (va < upload.source || va-upload.source > upload.size || bytes > upload.size-(va-upload.source)) continue;
-                        buffer=upload.buffer; offset=upload.offset+(va-upload.source);
-                        return true;
-                    }
-                    VulkanContext::GeometryUpload upload;
-                    if (!context_.geometry_provider_(va,bytes,upload)) return false;
-                    buffer=upload.buffer;offset=upload.offset;
-                    geometry.push_back(std::move(upload));
-                    return true;
-                };
-            }
-            replay.graphics_family = family_ == context_.graphics_family_;
-            replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
-                                  : kind_ == QueueKind::compute ? detail::queue_stages_compute
-                                                                : 0;
-            replay.prepare_khr_instances = [this, &replay, &khr_guard](const BuildAccelerationStructure& build,
-                                                                       VkDeviceAddress& address) {
-                return stage_khr_instances(replay, build, khr_guard.stages, address);
-            };
-            replay.prepare_xdxr_table = [this, &khr_guard](VkDeviceAddress& address, std::uint32_t& count) {
-                return stage_xdxr_table(khr_guard.stages, address, count);
-            };
-            if (replay.write_acceleration_structures_properties) {
-                replay.prepare_khr_postbuild = [this, &khr_guard](std::uint32_t count, VkQueryPool& pool,
-                                                                  std::uint32_t& first) {
-                    return allocate_khr_as_queries(count, khr_guard.as_queries, pool, first);
-                };
-            }
+            replay.mesh_draw_count = pipeline_profile::enabled() ? &mesh_draws : nullptr;
+            replay.bindless_set = VK_NULL_HANDLE;
+            replay.gpu_profile = nullptr;
+            replay.on_buffer_write = cached_replay_on_buffer_write_;
+            replay.on_buffer_write_context = cached_replay_on_buffer_write_ctx_;
             if (captures) {
                 if (kind_ == QueueKind::copy || !context_.predicate_reducer_ || family_ != context_.predicate_family_)
                     return queue_unsupported(__LINE__);
                 // The helper's lazy pipeline is shared by queues. Serialize preparation with the tracker lock,
                 // retaining pipeline -> resource -> tracker -> submit lock order through emit and submission.
-                if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                if (!tracker_lock.owns_lock()) submit_phases::lock_timed(tracker_lock);
                 batch = context_.predicate_reducer_->batch(captures);
                 if (!batch) return queue_unsupported(__LINE__);
-                replay.prepare_predicate = [&](VkBuffer buffer, VkDeviceSize offset, PredicateCapture& out) {
-                    return batch->prepare(buffer, offset, out);
-                };
-                replay.capture_predicate = [&](VkCommandBuffer cb, const PredicateCapture& p) {
-                    context_.predicate_reducer_->capture(cb, p);
-                };
-                if (context_.predicated_copier_) {
-                    copy_batch = context_.predicated_copier_->batch();
-                    replay.prepare_predicated_copy = [&](VkBuffer source, VkBuffer destination, VkDeviceSize src,
-                                                         VkDeviceSize dst, VkDeviceSize size,
-                                                         std::vector<PredicatedCopyDispatch>& out) {
-                        return copy_batch->prepare(source, destination, src, dst, size, out);
-                    };
-                    replay.emit_predicated_copy = [&](VkCommandBuffer cb, const std::vector<PredicatedCopyDispatch>& jobs) {
-                        context_.predicated_copier_->emit(cb, jobs);
-                    };
-                }
-            }
-            if (context_.scratch_) {
-                replay.copy_scratch = [this, &tracker_lock, &scratch_guard](VkDeviceSize bytes, VkBuffer& buffer,
-                                                                            VkDeviceSize& offset) {
-                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                    if (!scratch_guard.active) {
-                        scratch_guard.scratch = context_.scratch_.get();
-                        context_.scratch_->collect();
-                        scratch_guard.active = true;
-                    }
-                    return context_.scratch_->get(bytes, buffer, offset);
-                };
-            }
-            if (kind_ != QueueKind::copy && context_.indirect_clamp_) {
-                // The record scratch belongs to this submission: collected here, retired below with its ticket. The
-                // counter slots are read back once that ticket completes (the batch's destructor).
-                replay.prepare_indirect_clamp = [this, &tracker_lock, &clamp_batch, &clamp_guard](
-                                                    VkBuffer arguments, VkDeviceSize argument_offset, VkBuffer count,
-                                                    VkDeviceSize count_offset, std::uint32_t kind, std::uint32_t stride,
-                                                    std::uint32_t max_count, ClampedIndirect& out) {
-                    // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
-                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                    if (!clamp_batch) clamp_batch = context_.indirect_clamp_->batch();
-                    if (!clamp_guard.active) {
-                        clamp_guard.clamp = context_.indirect_clamp_.get();
-                        context_.indirect_clamp_->collect();
-                        clamp_guard.active = true;
-                    }
-                    return clamp_batch->prepare(arguments, argument_offset, count, count_offset, kind, stride,
-                                                max_count, out);
-                };
-            }
-            if (kind_ != QueueKind::copy && context_.counted_dispatch_) {
-                replay.prepare_counted_dispatch = [this, &tracker_lock, &counted_batch](
-                    VkBuffer args, VkDeviceSize args_offset, VkBuffer count, VkDeviceSize count_offset,
-                    std::uint32_t stride, std::uint32_t maximum, CountedDispatch& out) {
-                    // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
-                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                    if (!counted_batch) counted_batch = context_.counted_dispatch_->batch();
-                    return counted_batch->prepare(args, args_offset, count, count_offset, stride, maximum, out);
-                };
-                replay.emit_counted_dispatch = [this](VkCommandBuffer cb, const CountedDispatch& job) {
-                    context_.counted_dispatch_->emit(cb, job);
-                };
-            }
-            if (kind_ != QueueKind::copy && context_.quad_indices_ && context_.scratch_) {
-                replay.prepare_quad_indices = [this, &tracker_lock](
-                    VkBuffer indices, VkDeviceSize offset, VkIndexType type, std::uint64_t readable, std::uint32_t quads,
-                    VkBuffer scratch, VkDeviceSize scratch_offset, QuadIndexExpansion& out) {
-                    // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
-                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                    return context_.quad_indices_->prepare(indices, offset, type, readable, quads, scratch,
-                                                           scratch_offset, out);
-                };
-                replay.emit_quad_indices = [this](VkCommandBuffer cb, const QuadIndexExpansion& job) {
-                    context_.quad_indices_->emit(cb, job);
-                };
-            }
-            if (context_.depth24_ && !transfer_only) {
-                replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
-                                                                               std::vector<Depth24Job>& parts) {
-                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                    if (!depth24_guard.active) {
-                        depth24_guard.d24 = context_.depth24_.get();
-                        context_.depth24_->collect();
-                        depth24_guard.active = true;
-                    }
-                    return context_.depth24_->prepare(job, parts);
-                };
-            }
-            if (can_resolve_occlusion) {
-                replay.sum_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
-                                              std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
-                    occlusion_resolve_->sum(cb, pool, first, count, dst, offset);
-                };
-                replay.resolve_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
-                                                          std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
-                    occlusion_resolve_->normalize(cb, pool, first, count, dst, offset);
-                };
-                replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, VkQueryPool mesh_pool,
-                                               VkQueryPool primitives_pool, const std::uint8_t* mesh,
-                                               std::uint32_t first, std::uint32_t count, VkBuffer dst,
-                                               VkDeviceSize offset) {
-                    occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, primitives_pool, mesh, first, count, dst,
-                                                      offset);
-                };
-                replay.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
-                                                     std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
-                    occlusion_resolve_->sum_binary(cb, pool, first, count, dst, offset);
-                };
+                if (context_.predicated_copier_) copy_batch = context_.predicated_copier_->batch();
             }
             segments = 0;
             statistics_segments = 0;
@@ -4057,10 +4214,6 @@ private:
                     context_.scratch_->retire(progress_, 0);
                     scratch_guard.active = false;
                 }
-                if (clamp_guard.active) {
-                    context_.indirect_clamp_->retire(progress_, 0);
-                    clamp_guard.active = false;
-                }
                 batch.reset();
                 copy_batch.reset();
                 counted_batch.reset();
@@ -4090,10 +4243,11 @@ private:
                                                    run_compiles, context_.large_compile_budget_, prior)
                                  : build_pipelines_serial(compiles, std::span(prepared).first(lists.size()),
                                                           prepare_result, prior);
-            replay.compiles = nullptr;
+            cached_replay_.compiles = nullptr;
             if (prepare_result != ReplayResult::success) return prepare_result;
             break;
         }
+        ReplayFunctions& replay = cached_replay_;
         const auto segment_pool = [this](VkQueryType type, std::uint32_t count,
                                          std::shared_ptr<OcclusionSegmentPool>& out) {
             const auto& vk = context_.vk;
@@ -4146,7 +4300,7 @@ private:
         // QueryReplay::plan() reads QueryPool::ended / occlusion and QueryReplay::commit() writes them after
         // resource_lock is unlocked. Hold tracker_mutex_ across plan -> emit -> submit -> commit so concurrent queues
         // see submission-order query state and remove_query_pool() waits until commit finishes.
-        if (has_queries && !tracker_lock.owns_lock()) tracker_lock.lock();
+        if (has_queries && !tracker_lock.owns_lock()) submit_phases::lock_timed(tracker_lock);
         QueryReplay queries;
         std::uint32_t base = 0, statistics_base = 0;
         for (std::size_t i = 0; i < lists.size(); ++i) {
@@ -4174,24 +4328,7 @@ private:
         slot->khr_as_queries = std::move(khr_guard.as_queries);
         khr_guard.as_queries.clear();
         command_buffer = slot->buffer;
-        // MoltenVK writes a timestamp at the end of a Metal encoder and resolves it with a blit that nothing orders
-        // after that write, so a copy in the same or the next command buffer reads the old value (docs section 4.6).
-        // An event set and waited for in this command buffer orders it after this submission's timestamps; a wait for
-        // this queue's previous submission orders it after earlier ones still running.
-        bool ordered_timestamps = false;
-        const auto& events = context_.vk;
-        if (context_.order_timestamp_copies() && events.vkCreateEvent && events.vkDestroyEvent && events.vkResetEvent &&
-            events.vkCmdSetEvent && events.vkCmdWaitEvents)
-            replay.order_timestamp_copy = [this, slot, &ordered_timestamps](VkCommandBuffer cb) {
-                const VkEvent event = take_event();
-                if (!event) return;
-                slot->events.push_back(event);
-                const auto& vk = context_.vk;
-                vk.vkCmdSetEvent(cb, event, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-                vk.vkCmdWaitEvents(cb, 1, &event, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, nullptr, 0, nullptr, 0, nullptr);
-                ordered_timestamps = true;
-            };
+        exec_replay_state_.slot = slot;
         const auto discard = [&] {
             if (context_.vk.vkResetCommandBuffer(command_buffer, 0) == VK_SUCCESS) slot->ticket = 0;
         };
@@ -4215,7 +4352,7 @@ private:
             context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &full, 0, nullptr, 0, nullptr);
         }
-        if (!tracker_lock.owns_lock()) tracker_lock.lock();
+        if (!tracker_lock.owns_lock()) submit_phases::lock_timed(tracker_lock);
         if (!skip_shader_prep && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             const bool ended = context_.observe_result(context_.vk.vkEndCommandBuffer(command_buffer),
                                                       "vkEndCommandBuffer") == VK_SUCCESS;
@@ -4230,10 +4367,6 @@ private:
             if (scratch_guard.active) {
                 context_.scratch_->retire(progress_, 0);
                 scratch_guard.active = false;
-            }
-            if (clamp_guard.active) {
-                context_.indirect_clamp_->retire(progress_, 0);
-                clamp_guard.active = false;
             }
             if (bindless_commit) bindless_commit(submitted);
             tracker_lock.unlock();
@@ -4496,10 +4629,6 @@ private:
         if (scratch_guard.active) {
             context_.scratch_->retire(progress_, submitted ? submitted_ : 0);
             scratch_guard.active = false;
-        }
-        if (clamp_guard.active) {
-            context_.indirect_clamp_->retire(progress_, submitted ? submitted_ : 0);
-            clamp_guard.active = false;
         }
         // Under tracker_mutex_, so no other flush comes between this submit and the set's note of whether it reached
         // the queue (it keeps a single upload obligation).
@@ -5629,37 +5758,63 @@ private:
             }
             heap_dedup.push_back({f, v, 0});
         };
-        std::uint64_t max_signal_vis_seq = 0;
         for (const PendingSignal& sig : extra_signals) {
-            max_signal_vis_seq = (std::max)(max_signal_vis_seq, sig.visibility_seq);
             add_dedup(sig.fence, sig.value);
         }
         const PendingSignal* const dedup_ptr = heap_dedup.empty() ? stack_dedup : heap_dedup.data();
         const std::size_t dedup_size = heap_dedup.empty() ? dedup_count : heap_dedup.size();
 
+        // A signal-only submit (no command buffer) does not run before_execute_(): carry any CPU-signaled fence
+        // visibility epoch from its consumed user waits to this queue's next execute_now().
+        const std::uint64_t consumed_wait_vis = command_buffer ? 0 : exec_waits_vis_seq();
         std::uint64_t mirror_bind_waited = 0;
+        VkSemaphore title_upload_waited_sem = VK_NULL_HANDLE;
+        std::uint64_t title_upload_waited_val = 0;
         VkResult res = VK_SUCCESS;
         {
             std::unique_lock lock(context_.submit_mutex(), std::defer_lock);
             submit_phases::lock_timed(lock);  // a wait for another queue's submit is counted (the frame line)
-            // Check the page mirror's latest bind under submit_mutex_ (serialized with note_mirror_bind() and
-            // record_submit_locked()), so every command-buffer submission stamped after note_mirror_bind() waits on
-            // the sparse bind before reading any mirrored page.
-            if (command_buffer && context_.mirror_bind_semaphore_ && context_.mirror_bind_value_ > mirror_bind_seen_) {
+            auto add_lazy_wait = [&](VkSemaphore sem, std::uint64_t val) {
                 if (!using_sparse) {
                     sparse_waits_ = exec_waits_;
                     sparse_values_ = exec_wait_values_;
                     using_sparse = true;
                 }
-                sparse_waits_.push_back(context_.mirror_bind_semaphore_);
-                sparse_values_.push_back(context_.mirror_bind_value_);
+                bool merged = false;
+                for (std::size_t i = 0; i < sparse_waits_.size(); ++i) {
+                    if (sparse_waits_[i] == sem) {
+                        if (val > sparse_values_[i]) sparse_values_[i] = val;
+                        merged = true;
+                        break;
+                    }
+                }
+                if (!merged) {
+                    sparse_waits_.push_back(sem);
+                    sparse_values_.push_back(val);
+                }
                 semaphores = sparse_waits_;
                 values = sparse_values_;
-                mirror_bind_waited = context_.mirror_bind_value_;
                 if (semaphores.size() > 16) {
                     submit_stages_.assign(semaphores.size(), kAllCmds);
                     stages_ptr = submit_stages_.data();
                 }
+            };
+            // Check the page mirror's latest bind under submit_mutex_ (serialized with note_mirror_bind() and
+            // record_submit_locked()), so every command-buffer submission stamped after note_mirror_bind() waits on
+            // the sparse bind before reading any mirrored page.
+            if (command_buffer && context_.mirror_bind_semaphore_ && context_.mirror_bind_value_ > mirror_bind_seen_) {
+                add_lazy_wait(context_.mirror_bind_semaphore_, context_.mirror_bind_value_);
+                mirror_bind_waited = context_.mirror_bind_value_;
+            }
+            // Check the latest staged title-texture upload timeline under submit_mutex_ (serialized with
+            // note_title_upload_locked()), so every queue waits lazily on its next command-buffer submit without
+            // empty wait-only vkQueueSubmits per consumer queue.
+            if (command_buffer && context_.title_upload_semaphore_ &&
+                (context_.title_upload_semaphore_ != title_upload_sem_seen_ ||
+                 context_.title_upload_value_ > title_upload_seen_)) {
+                add_lazy_wait(context_.title_upload_semaphore_, context_.title_upload_value_);
+                title_upload_waited_sem = context_.title_upload_semaphore_;
+                title_upload_waited_val = context_.title_upload_value_;
             }
             VkSemaphore stack_signals[17]{progress_};
             std::uint64_t stack_signal_values[17]{ticket};
@@ -5743,8 +5898,6 @@ private:
             if (ring) ring->end_submit(ring_at, diagnostic_ms() - submit_start, res);
             if (res == VK_SUCCESS) {
                 context_.record_submit_locked(progress_, ticket);
-                if (max_signal_vis_seq && signal_count > 1)
-                    context_.note_signaled_visibility_seq(max_signal_vis_seq);
                 for (std::uint32_t i = 1; i < signal_count; ++i)
                     context_.holds().signaled(signals_ptr[i], signal_values_ptr[i]);
             }
@@ -5763,6 +5916,11 @@ private:
         }
         if (ok) {
             if (mirror_bind_waited > mirror_bind_seen_) mirror_bind_seen_ = mirror_bind_waited;
+            if (title_upload_waited_sem) {
+                title_upload_sem_seen_ = title_upload_waited_sem;
+                title_upload_seen_ = title_upload_waited_val;
+            }
+            if (consumed_wait_vis > pending_wait_vis_seq_) pending_wait_vis_seq_ = consumed_wait_vis;
             submitted_ = ticket;
             submitted_gpu_.store(ticket, std::memory_order_release);
             clear_exec_waits(ticket);
@@ -5771,6 +5929,20 @@ private:
         }
         return ok;
     }
+
+    struct ExecReplayState {
+        std::unique_lock<std::mutex>* tracker_lock = nullptr;
+        std::vector<KhrInstanceStage>* khr_stages = nullptr;
+        std::vector<KhrAsQueryPool>* khr_as_queries = nullptr;
+        std::unique_ptr<PredicateReducer::Batch>* pred_batch = nullptr;
+        std::unique_ptr<PredicatedBufferCopier::Batch>* copy_batch = nullptr;
+        std::unique_ptr<IndirectDispatchCounter::Batch>* counted_batch = nullptr;
+        std::unique_ptr<IndirectArgumentClamp::Batch>* clamp_batch = nullptr;
+        Depth24Guard* depth24_guard = nullptr;
+        ScratchGuard* scratch_guard = nullptr;
+        CommandSlot* slot = nullptr;
+        bool* ordered_timestamps = nullptr;
+    };
 
     VulkanContext& context_;
     VkQueue queue_;
@@ -5786,7 +5958,15 @@ private:
     std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
     std::uint64_t bindless_upload_seen_ = 0;  // the bindless_upload_version_ this queue has waited for
     std::uint64_t mirror_bind_seen_ = 0;      // the page mirror's bind value this queue has waited for
+    VkSemaphore title_upload_sem_seen_ = VK_NULL_HANDLE;
+    std::uint64_t title_upload_seen_ = 0;     // the staged title-upload timeline value this queue has waited for
+    std::uint64_t pending_wait_vis_seq_ = 0;  // CPU Fence::Signal visibility epoch carried from signal-only wait
     std::uint64_t prelude_seen_ = 0;  // the prelude_version_ this queue has waited for (or recorded)
+    ReplayFunctions cached_replay_{};
+    std::uint64_t cached_replay_version_ = 0;
+    void (*cached_replay_on_buffer_write_)(void*) = nullptr;
+    void* cached_replay_on_buffer_write_ctx_ = nullptr;
+    ExecReplayState exec_replay_state_{};
     std::uint64_t last_sparse_ = 0;
     std::deque<PendingBindings> pending_bindings_;
     std::vector<VkSemaphore> waits_;

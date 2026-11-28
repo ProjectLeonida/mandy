@@ -2443,8 +2443,7 @@ public:
             }
             held->fetch_sub(1);
             if (signaled) {
-                context->note_signaled_visibility_seq(context->next_visibility_seq());
-                context->holds().signaled(semaphore, value);
+                context->holds().signaled(semaphore, value, context->next_visibility_seq());
                 context->holds().pump_ready();
             }
         });
