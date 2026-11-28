@@ -578,12 +578,18 @@ int main() {
             ++skipped;
             continue;
         }
-        if (live && SUCCEEDED(warp[i]) != c.warp_ok) {
-            std::printf("  WARP's verdict here differs from the measured column (%s): compared with the live answer\n",
-                        c.warp_ok ? "S_OK" : "a failure");
+        const bool warp_differs = live && SUCCEEDED(warp[i]) != c.warp_ok;
+        if (warp_differs) {
+            std::printf("  WARP's verdict here differs from the measured column (%s): compared with %s\n",
+                        c.warp_ok ? "S_OK" : "a failure",
+                        c.known == Known::match ? "the live answer" : "the measured column");
             ++warp_changed;
         }
-        const bool reference_ok = live ? SUCCEEDED(warp[i]) : c.warp_ok;
+        // A known-difference mark was recorded against the measured WARP column; when this box's WARP drifts
+        // from that column, the column stays the reference for the row (the layer's own behaviour is what the
+        // mark tracks). A `match` row keeps the live WARP answer authoritative.
+        const bool reference_ok = live && (c.known == Known::match || !warp_differs) ? SUCCEEDED(warp[i])
+                                                                                   : c.warp_ok;
         const bool layer_ok = SUCCEEDED(layer[i]);
         const bool want_layer_ok = c.known == Known::match ? reference_ok : !reference_ok;
         if (layer_ok != want_layer_ok) {
