@@ -3681,6 +3681,16 @@ private:
                                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &full, 0, nullptr, 0, nullptr);
         }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
+        // Another queue holds tracker_mutex_ through its vkQueueSubmit, so it can find the device lost while this batch
+        // waits here, past its own checks above. Once the device is lost, defer_destroy destroys released objects at
+        // once rather than after the next submission, and also what was queued before the loss. An image may then be
+        // gone whose view the bindless set's pending writes or shadow copy still name until its slot is released, and
+        // the flush below would hand that view to vkUpdateDescriptorSets. Nothing this batch records would reach the
+        // queue anyway: submit() refuses a lost device.
+        if (context_.is_device_lost()) {
+            discard();
+            return queue_unsupported(__LINE__);
+        }
         if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             const bool ended = context_.observe_result(context_.vk.vkEndCommandBuffer(command_buffer),
                                                       "vkEndCommandBuffer") == VK_SUCCESS;

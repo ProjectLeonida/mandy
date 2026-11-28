@@ -10,15 +10,20 @@
 //      takes the device's descriptor lock, which the caller holds; and until the slot is released the set's pending
 //      writes and shadow copy may still name the view, which a flush hands to vkUpdateDescriptorSets. At teardown the
 //      slot is released first, then its view is destroyed.
-// vkDestroyBuffer and vkDestroyImageView are interposed on a real device's table; only the buffers and views the test
-// made are counted. Skips with exit code 77 when no Vulkan 1.3 device is available;
+//   4. A batch that takes the tracker lock after the loss (another queue's vkQueueSubmit found it while this one
+//      waited for that lock) stops before it flushes the bindless set or records its lists: the loss is marked from
+//      the interposed vkBeginCommandBuffer, after the batch's first check of it.
+// vkDestroyBuffer, vkDestroyImageView and vkBeginCommandBuffer are interposed on a real device's table; only the
+// buffers and views the test made are counted. Skips with exit code 77 when no Vulkan 1.3 device is available;
 // LEONIDA_VK_VALIDATION=1 runs it under the validation layer. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string_view>
@@ -39,12 +44,14 @@ namespace driver {
 PFN_vkGetDeviceProcAddr real_get_device = nullptr;
 PFN_vkDestroyBuffer real_destroy_buffer = nullptr;
 PFN_vkDestroyImageView real_destroy_view = nullptr;
+PFN_vkBeginCommandBuffer real_begin = nullptr;
 
 std::mutex mutex;
 std::set<std::uint64_t> ours;        // the buffers and views the test made
 unsigned destroyed_buffers = 0;      // of ours
 unsigned destroyed_views = 0;        // of ours
 std::vector<std::uint64_t> events;   // bindless slot releases and destructions of our views, in order
+std::atomic<leonida::VulkanContext*> lose_at_begin{nullptr};
 
 void adopt(std::uint64_t handle) {
     std::lock_guard lock(mutex);
@@ -80,10 +87,18 @@ VKAPI_ATTR void VKAPI_CALL destroy_view(VkDevice device, VkImageView view, const
     real_destroy_view(device, view, allocator);
 }
 
+// As another queue's vkQueueSubmit returning VK_ERROR_DEVICE_LOST would, while this batch is past its own checks.
+VKAPI_ATTR VkResult VKAPI_CALL begin(VkCommandBuffer command_buffer, const VkCommandBufferBeginInfo* info) {
+    const VkResult result = real_begin(command_buffer, info);
+    if (auto* context = lose_at_begin.exchange(nullptr)) context->mark_device_lost("the test marks the device lost");
+    return result;
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
     const std::string_view n(name);
     if (n == "vkDestroyBuffer") return reinterpret_cast<PFN_vkVoidFunction>(destroy_buffer);
     if (n == "vkDestroyImageView") return reinterpret_cast<PFN_vkVoidFunction>(destroy_view);
+    if (n == "vkBeginCommandBuffer") return reinterpret_cast<PFN_vkVoidFunction>(begin);
     return real_get_device(device, name);
 }
 
@@ -91,6 +106,7 @@ void install(PFN_vkGetDeviceProcAddr device_proc, VkDevice device) {
     real_get_device = device_proc;
     real_destroy_buffer = reinterpret_cast<PFN_vkDestroyBuffer>(device_proc(device, "vkDestroyBuffer"));
     real_destroy_view = reinterpret_cast<PFN_vkDestroyImageView>(device_proc(device, "vkDestroyImageView"));
+    real_begin = reinterpret_cast<PFN_vkBeginCommandBuffer>(device_proc(device, "vkBeginCommandBuffer"));
 }
 }  // namespace driver
 
@@ -182,6 +198,46 @@ int main() {
         EXPECT(driver::events == expected);
     }
     std::puts("deferred deletion after a loss: buffers freed at once; bindless slots and their views kept, in order");
+
+    // 4
+    {
+        VulkanContext context(driver::get_device, d.device, true);
+        EXPECT(context.loaded());
+        unsigned prepared = 0;
+        context.set_bindless_prepare([&](VkCommandBuffer) {
+            ++prepared;
+            return true;
+        });
+        constexpr VkDeviceSize size = 4096;
+        const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        void* map = nullptr;
+        const VkBuffer a = d.buffer(size, usage, &map), b = d.buffer(size, usage, &map);  // d destroys them
+        EXPECT(a && b);
+        ResourceBinding binding;
+        binding.size = size;
+        binding.buffer = a;
+        context.add_resource(1, binding);
+        binding.buffer = b;
+        context.add_resource(2, binding);
+        CommandList copy;
+        EXPECT(copy.copy_buffer({2, 0, 1, 0, size}));
+        EXPECT(copy.close());
+        const CommandList* lists[] = {&copy};
+        auto queue = std::make_unique<VulkanQueue>(context, d.queue, d.family);
+        EXPECT(queue->ok());
+        EXPECT(queue->execute(lists) == ReplayResult::success);
+        EXPECT(prepared == 1);  // a batch on a live device flushes the set
+
+        driver::lose_at_begin = &context;
+        EXPECT(queue->execute(lists) == ReplayResult::unsupported);
+        EXPECT(driver::lose_at_begin.load() == nullptr);  // the interposer marked the loss, past the first check
+        EXPECT(context.is_device_lost());
+        EXPECT(prepared == 1);
+        queue.reset();
+        context.remove_resource(1);
+        context.remove_resource(2);
+    }
+    std::puts("a batch that takes the tracker lock after the loss stops before the bindless flush");
 
     EXPECT(d.validation_errors() == 0);
     std::puts("vk_deferred_destroy_lost: ok");
