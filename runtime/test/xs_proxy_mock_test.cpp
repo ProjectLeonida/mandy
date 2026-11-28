@@ -4893,6 +4893,11 @@ int check_console_command_list() {
     EXPECT(real_list->calls[59] == 1);
     EXPECT(real_list->args[59][0] == 0x10);
 
+    // Console slot 80 (DispatchX(x, y, z, flags)) -> PC slot 14 (Dispatch(x, y, z))
+    raw(list_proxy, 80, 16, 2, 1, 0x8020);
+    EXPECT(real_list->calls[14] == 1);
+    EXPECT(real_list->args[14][0] == 16 && real_list->args[14][1] == 2 && real_list->args[14][2] == 1);
+
     // Console slot 148 (AllocateUploadMemory) -> an upload-arena pointer (the boot stack's arena, which the merge
     // kept; main's stub returned 0)
     {

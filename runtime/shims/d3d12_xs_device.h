@@ -434,6 +434,7 @@ inline constexpr unsigned console_to_pc_list_slot(unsigned slot) {
     if (slot == 61) return 59;                 // ExecuteIndirect (Package)
     // Slot 85 is CopyTextureRegionX in the newer console layout; in the older one the tail sits two slots earlier
     // (list_tail_slot_name), and 85 is another method. The retail title has not been seen calling 85.
+    if (slot == 80) return 14;                 // DispatchX(x, y, z, flags) -> PC Dispatch
     if (slot == 85) return 16;                 // CopyTextureRegionX -> CopyTextureRegion
     if (slot == 139) return 10;                // Reset(allocator, pso), as the retail title calls it (measured, Pipodi)
     if (slot == 146) return 80;                // D3D12_BARRIER_GROUP (Package; PC GCL7)
