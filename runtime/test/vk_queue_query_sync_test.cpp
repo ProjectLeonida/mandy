@@ -6,6 +6,8 @@
 //      submission-order query state (no data race on QueryPool::ended / QueryPool::occlusion and no stale zero-fill).
 //   3. A transient vkQueueSubmit failure must preserve pending VulkanQueue::wait() timeline semaphores for the retry.
 //   4. Concurrent multi-queue query End/Resolve + add/remove_query_pool stress with zero Vulkan validation errors.
+//   5. A DEVICE_LOST first returned to completed_retire_ticket() must mark the context lost and retire nothing.
+//   6. A progress-semaphore query in acquire() must propagate DEVICE_LOST without treating a transient error as loss.
 // Skips with exit code 77 when no Vulkan 1.3 device is available. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
@@ -430,11 +432,33 @@ int main() {
             std::printf("queue/query sync: concurrent multi-queue query stress ok\n");
         }
 
-        // 5. A progress-semaphore query in acquire() can be the first Vulkan operation to discover
+        // 5. A DEVICE_LOST first observed by completed_retire_ticket() must mark the context lost and
+        //     retire no resources. Section 6 injects into the queue's own progress query instead.
+        {
+            VulkanContext retire_context(driver::get_device, d.device, true);
+            EXPECT(retire_context.loaded());
+            VulkanQueue retire_queue(retire_context, d.queue, d.family);
+            EXPECT(retire_queue.ok());
+            CommandList empty;
+            EXPECT(empty.close());
+            const CommandList* ptr = &empty;
+            EXPECT(retire_queue.execute({&ptr, 1}) == ReplayResult::success);
+            EXPECT(retire_queue.idle());
+            EXPECT(!retire_context.is_device_lost());
+            const auto before = driver::injected_counter_errors.load();
+            driver::fail_next_counter.store(VK_ERROR_DEVICE_LOST);
+            EXPECT(retire_context.completed_retire_ticket() == 0);
+            EXPECT(retire_context.is_device_lost());
+            EXPECT(driver::injected_counter_errors.load() == before + 1);
+            std::printf("queue/query sync: retire-ticket counter device loss marks context ok\n");
+        }
+
+        // 6. A progress-semaphore query in acquire() can be the first Vulkan operation to discover
         // device loss. A transient query failure must not poison a healthy queue, while DEVICE_LOST
         // must prevent acquiring/recycling and submitting new command buffers.
         {
             EXPECT(!context.is_device_lost());
+            const auto before_progress_loss = driver::injected_counter_errors.load();
             CommandList empty;
             EXPECT(empty.close());
             const CommandList* ptr = &empty;
@@ -443,7 +467,7 @@ int main() {
             driver::fail_next_counter.store(VK_ERROR_OUT_OF_HOST_MEMORY);
             const ReplayResult transient = queue_a.execute({&ptr, 1});
             const bool transient_ok = transient == ReplayResult::success && !context.is_device_lost() &&
-                                      driver::injected_counter_errors.load() == 1;
+                                      driver::injected_counter_errors.load() == before_progress_loss + 1;
 
             EXPECT(queue_a.idle());
             (void)context.completed_retire_ticket();
@@ -454,7 +478,7 @@ int main() {
                         "context_lost=%d, interceptions=%u\n", int(transient), int(after_loss), int(lost),
                         driver::injected_counter_errors.load());
             progress_loss_ok = transient_ok && after_loss == ReplayResult::unsupported && lost &&
-                               driver::injected_counter_errors.load() == 2;
+                               driver::injected_counter_errors.load() == before_progress_loss + 2;
             std::printf("queue/query sync: progress counter device loss %s\n",
                         progress_loss_ok ? "marks context and rejects work" : "NOT propagated");
         }
