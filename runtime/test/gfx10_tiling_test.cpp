@@ -121,8 +121,13 @@ int main() {
                 CHECK(offset == answers[mode_index][bpe_index][i]);
             }
             CHECK(check_surface(mode, bpe, 1, 1) == 0);
+            CHECK(check_surface(mode, bpe, 3, 5) == 0);
+            CHECK(check_surface(mode, bpe, 7, 1) == 0);
+            CHECK(check_surface(mode, bpe, 15, 3) == 0);
+            CHECK(check_surface(mode, bpe, 16, 2) == 0);
             CHECK(check_surface(mode, bpe, 33, 17) == 0);
             CHECK(check_surface(mode, bpe, 300, 130) == 0);
+            CHECK(check_surface(mode, bpe, surface.tile_width() + 1, surface.tile_height() + 1) == 0);
             CHECK(check_surface(mode, bpe, surface.tile_width() * 2, surface.tile_height() * 2) == 0);
             ++bpe_index;
         }

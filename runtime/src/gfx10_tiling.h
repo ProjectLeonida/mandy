@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include <span>
+#include <type_traits>
 
 namespace leonida::gfx10 {
 
@@ -79,6 +80,14 @@ public:
         next.width_ = width;
         next.height_ = height;
         next.element_bytes_ = element_bytes;
+        const unsigned bpe_bits = static_cast<unsigned>(std::countr_zero(element_bytes));
+        unsigned contig_x_bits = 0;
+        while (bpe_bits + contig_x_bits < next.bits_ &&
+               next.pattern_[bpe_bits + contig_x_bits] == static_cast<int>(contig_x_bits + 1)) {
+            ++contig_x_bits;
+        }
+        next.run_elements_ = std::size_t{1} << contig_x_bits;
+        next.run_bytes_ = next.run_elements_ * element_bytes;
         out = next;
         return true;
     }
@@ -113,6 +122,46 @@ private:
         return offset;
     }
 
+    template<bool ToTiled, std::size_t RunBytes>
+    void copy_runs(const std::byte* src, std::byte* dst, std::size_t pitch,
+                   const std::uint32_t* x_offsets, const std::uint32_t* y_offsets) const {
+        const auto tile_y_bits = std::countr_zero(tile_height_);
+        const std::size_t tile_y_mask = tile_height_ - 1;
+        const std::size_t runs_per_tile = tile_width_ / run_elements_;
+        const std::size_t full_tiles = width_ / tile_width_;
+        const std::size_t rem_elems = width_ - full_tiles * tile_width_;
+        const std::size_t rem_full_runs = rem_elems / run_elements_;
+        const std::size_t rem_tail_bytes = (rem_elems - rem_full_runs * run_elements_) * element_bytes_;
+        for (std::size_t y = 0; y < height_; ++y) {
+            const std::size_t row_tile_base = ((y >> tile_y_bits) * tiles_x_) << bits_;
+            const std::size_t y_off = y_offsets[y & tile_y_mask];
+            std::size_t lin = y * pitch;
+            for (std::size_t tx = 0; tx < full_tiles; ++tx) {
+                const std::size_t tile_base = row_tile_base + (tx << bits_) + y_off;
+                for (std::size_t r = 0; r < runs_per_tile; ++r) {
+                    const std::size_t tiled = tile_base + x_offsets[r];
+                    if constexpr (ToTiled) std::memcpy(dst + tiled, src + lin, RunBytes);
+                    else std::memcpy(dst + lin, src + tiled, RunBytes);
+                    lin += RunBytes;
+                }
+            }
+            if (rem_elems) {
+                const std::size_t tile_base = row_tile_base + (full_tiles << bits_) + y_off;
+                for (std::size_t r = 0; r < rem_full_runs; ++r) {
+                    const std::size_t tiled = tile_base + x_offsets[r];
+                    if constexpr (ToTiled) std::memcpy(dst + tiled, src + lin, RunBytes);
+                    else std::memcpy(dst + lin, src + tiled, RunBytes);
+                    lin += RunBytes;
+                }
+                if (rem_tail_bytes) {
+                    const std::size_t tiled = tile_base + x_offsets[rem_full_runs];
+                    if constexpr (ToTiled) std::memcpy(dst + tiled, src + lin, rem_tail_bytes);
+                    else std::memcpy(dst + lin, src + tiled, rem_tail_bytes);
+                }
+            }
+        }
+    }
+
     bool copy(std::span<const std::byte> source, std::span<std::byte> destination, std::size_t pitch,
               bool to_tiled) const {
         if (!size_) return false;
@@ -123,29 +172,56 @@ private:
         if (source.size() < (to_tiled ? linear_size : size_) ||
             destination.size() < (to_tiled ? size_ : linear_size) ||
             tiling_detail::overlap(source, destination)) return false;
-        const auto tile_x_bits = std::countr_zero(tile_width_);
-        std::size_t x_offsets[256]{};
-        for (std::size_t x = 0; x < tile_width_; ++x) {
+        const std::size_t runs_per_tile = tile_width_ / run_elements_;
+        std::uint32_t x_offsets[256]{};
+        for (std::size_t r = 0; r < runs_per_tile; ++r) {
+            const std::size_t x = r * run_elements_;
+            std::uint32_t off = 0;
             for (unsigned bit = 0; bit < bits_; ++bit) {
                 const int source_bit = pattern_[bit];
-                if (source_bit > 0) x_offsets[x] |= ((x >> (source_bit - 1)) & 1) << bit;
+                if (source_bit > 0) off |= static_cast<std::uint32_t>(((x >> (source_bit - 1)) & 1) << bit);
             }
+            x_offsets[r] = off;
         }
-        for (std::size_t y = 0; y < height_; ++y) {
-            std::size_t y_offset = 0;
+        const std::size_t y_entries = height_ < tile_height_ ? height_ : tile_height_;
+        std::uint32_t y_offsets[256]{};
+        for (std::size_t y = 0; y < y_entries; ++y) {
+            std::uint32_t off = 0;
             for (unsigned bit = 0; bit < bits_; ++bit) {
                 const int source_bit = pattern_[bit];
-                if (source_bit < 0) y_offset |= ((y >> (-source_bit - 1)) & 1) << bit;
+                if (source_bit < 0) off |= static_cast<std::uint32_t>(((y >> (-source_bit - 1)) & 1) << bit);
             }
-            const std::size_t tile_row = (y / tile_height_) * tiles_x_;
-            for (std::size_t x = 0; x < width_; ++x) {
-                const std::size_t linear = y * pitch + x * element_bytes_;
-                const std::size_t tiled = ((tile_row + (x >> tile_x_bits)) << bits_) +
-                                          y_offset + x_offsets[x & (tile_width_ - 1)];
-                std::memcpy(destination.data() + (to_tiled ? tiled : linear),
-                            source.data() + (to_tiled ? linear : tiled), element_bytes_);
-            }
+            y_offsets[y] = off;
         }
+        const auto dispatch = [&](auto tag) {
+            constexpr bool kToTiled = decltype(tag)::value;
+            switch (run_bytes_) {
+            case 8: copy_runs<kToTiled, 8>(source.data(), destination.data(), pitch, x_offsets, y_offsets); break;
+            case 16: copy_runs<kToTiled, 16>(source.data(), destination.data(), pitch, x_offsets, y_offsets); break;
+            case 32: copy_runs<kToTiled, 32>(source.data(), destination.data(), pitch, x_offsets, y_offsets); break;
+            default: {
+                const auto tile_x_bits = std::countr_zero(tile_width_);
+                const auto tile_y_bits = std::countr_zero(tile_height_);
+                for (std::size_t y = 0; y < height_; ++y) {
+                    const std::size_t tile_row = (y >> tile_y_bits) * tiles_x_;
+                    const std::size_t y_off = y_offsets[y & (tile_height_ - 1)];
+                    for (std::size_t x = 0; x < width_; ++x) {
+                        const std::size_t lin = y * pitch + x * element_bytes_;
+                        const std::size_t tiled = ((tile_row + (x >> tile_x_bits)) << bits_) + y_off +
+                                                  x_offsets[(x & (tile_width_ - 1)) / run_elements_] +
+                                                  (x & (run_elements_ - 1)) * element_bytes_;
+                        if constexpr (kToTiled)
+                            std::memcpy(destination.data() + tiled, source.data() + lin, element_bytes_);
+                        else
+                            std::memcpy(destination.data() + lin, source.data() + tiled, element_bytes_);
+                    }
+                }
+                break;
+            }
+            }
+        };
+        if (to_tiled) dispatch(std::true_type{});
+        else dispatch(std::false_type{});
         return true;
     }
 
@@ -153,6 +229,7 @@ private:
     unsigned bits_ = 0;
     std::size_t width_ = 0, height_ = 0, element_bytes_ = 0;
     std::size_t tile_width_ = 0, tile_height_ = 0, tiles_x_ = 0, size_ = 0;
+    std::size_t run_elements_ = 1, run_bytes_ = 1;
 };
 
 }  // namespace leonida::gfx10
