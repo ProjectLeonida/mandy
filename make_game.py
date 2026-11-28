@@ -23,7 +23,7 @@ Stages (each skips work that is already done, so a stopped build continues where
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V; then the same for the
               programs inside amd_fidelityfx_upscaler_xbox.dll, XboxBvhBuilder.dll and game_scarlett_master.exe
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
-              BCPack uses strict decoding by default. For local calibration use <work>/bcpack-calibration.json.
+              BCPack uses standalone BC1-BC7 decoding with fixed dictionaries; no local calibration is needed.
     runtime   build the loader (needs the game's executable to run, not to build). On Linux it is cross-built with
               clang-cl and an xwin SDK (docs/testing.md) and gta6rt.sh starts it with Wine; --runtime-build DIR
               takes a Windows build of runtime/ instead (the runtime-windows artifact of the Runtime workflow)
@@ -2412,7 +2412,7 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
     if pools:
         try:
             settings = ttpf_assets.load_profile(work)
-        except ValueError as exc:   # a hand-edited calibration profile is one build error, not a traceback
+        except ValueError as exc:   # invalid asset settings are one build error, not a traceback
             fail(str(exc))
     else:
         settings = None
@@ -2681,12 +2681,6 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         f.write(os.path.abspath(game))
     if work is not None:
         shader_dir = os.path.join(os.path.abspath(work), "shaders", "spirv")
-        from ttpf_mips import find_pools
-        if find_pools(game):
-            profile = os.path.join(os.path.dirname(shader_dir), "bcpack", "history.bcph")
-            native = os.path.join(build, "bcpack_history_train.exe")
-            trainer = ["--trainer", native] if os.name == "nt" and os.path.isfile(native) else []
-            py("build_dstorage_history.py", game, "--out", profile, "--if-needed", *trainer)
         # Wine's path converter takes the original Unix filename bytes. The Windows reader expects UTF-8.
         encoded = shader_dir.encode("utf-8") if os.name == "nt" else os.fsencode(shader_dir)
         pending = tempfile.NamedTemporaryFile(dir=out, delete=False)

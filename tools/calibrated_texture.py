@@ -15,7 +15,7 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
-import bcpack
+import bcpack_research as bcpack
 import bcpack_tables
 import replace_retry
 import ttpf_mips as ttpf

@@ -16,9 +16,8 @@ from file_mode import published_mode
 import ttpf_mips as ttpf
 
 
-# The modules that decode a full chain, next to this file. Both pass stamps hash them, so a pool completed by an
-# older decoder is done again, as one completed with another calibration is.
-DECODER_SOURCES = ("bcpack.py", "bcpack_tables.py", "bcpack_tables_bptc.py", "calibrated_texture.py",
+# Include every fixed decoder input so old exports are regenerated after a fix.
+DECODER_SOURCES = ("bcpack.py", "bcpack_standalone.py", "bcpack_standalone_tables.json",
                    "tex_headers.py", "ttpf_mips.py")
 
 
@@ -37,29 +36,8 @@ def strict_stamp():
 
 
 def load_profile(work):
-    path = Path(work, "bcpack-calibration.json")
-    try:
-        raw = path.read_bytes()
-    except FileNotFoundError:
-        return strict_stamp(), None
-    except OSError as exc:
-        raise ValueError(f"{path}: cannot read the calibration profile: {exc.strerror or exc}") from None
-    try:
-        # json.loads() on the bytes also detects a UTF-16 profile or one saved with a BOM.
-        profile = json.loads(raw)
-    except ValueError as exc:   # JSONDecodeError, or an encoding json cannot detect
-        # The profile is hand-written (make_game says where it goes), so a typo names the file, not a bare
-        # 'Expecting property name enclosed in double quotes'.
-        raise ValueError(f"{path}: not a JSON calibration profile: {exc}") from None
-    if not isinstance(profile, dict) or profile.get("version") != 1:
-        raise ValueError(f"Unsupported calibration version in {path}")
-    try:
-        from calibrated_texture import native
-        native()
-    except (OSError, ImportError) as exc:
-        raise RuntimeError("Calibrated texture export requires NumPy and the release build of "
-                           "tools/bcpack_calibration (see its README.md)") from exc
-    return "v1-" + hashlib.sha256(decoder_digest().encode() + raw).hexdigest(), profile
+    """Compatibility entry point: assets use the fixed standalone decoder."""
+    return strict_stamp(), None
 
 
 def publish(path, data):
@@ -140,14 +118,15 @@ def candidate(row, profile):
     if row.get("DxgiFormat") not in ttpf.BC_FORMATS:
         return False
     if row.get("BCPackDecoder"):
-        return profile is not None or row["BCPackDecoder"].endswith("-strict")
+        return True  # Regenerate exports produced by either historical decoder.
     return (row["File"] is None or row.get("BaseMipLevel", 0) > 0
             or row.get("Mips", 0) < row.get("SourceMips", 0))
 
 
 def complete_pool(source, directory, manifest, settings):
     """Publish full chains next to ordinary DDS files, then switch the catalog to them."""
-    stamp, profile = settings
+    stamp, _ = settings
+    profile = None
     directory = Path(directory)
     if manifest.get("BCPackPass") == stamp:
         finish_replaced(directory, manifest)
@@ -158,48 +137,34 @@ def complete_pool(source, directory, manifest, settings):
     written = blocked = 0
     superseded = set()   # the files the rows named before they were switched to a full chain
     with closing(ttpf.Pool(source)) as pool:
-        decoder = strict = None
-        if profile is not None:
-            from calibrated_texture import LocalDecoder
-            decoder = LocalDecoder(pool, profile)
-        try:
-            for row in rows:
-                index = row["Index"]
-                desc = pool.descriptor(index)
-                base = desc["base"]
-                if not pool.chunks or base < pool.chunks[0][0] or base >= pool.virtual_size:
+        for row in rows:
+            index = row["Index"]
+            desc = pool.descriptor(index)
+            base = desc["base"]
+            if not pool.chunks or base < pool.chunks[0][0] or base >= pool.virtual_size:
+                continue
+            span = pool.span(index, base)
+            if not span:
+                continue
+            try:
+                if not pool.codecs(base, span) & bcpack.SUPPORTED_REBUILD_CODECS:
                     continue
-                span = pool.span(index, base)
-                if not span:
-                    continue
-                try:
-                    if not pool.codecs(base, span) & bcpack.SUPPORTED_REBUILD_CODECS:
-                        continue
-                    if decoder and desc["dimension"] == 1 and desc["format"] in decoder.formats:
-                        method = stamp
-                        blob = decoder.dds(index)
-                    else:
-                        if profile is not None and strict is None:
-                            strict = strict_stamp()   # once per pass: it reads and hashes six sources
-                        method = strict or stamp
-                        analysis = ttpf.analyze(pool, index)
-                        blob = ttpf.texture_dds(pool, analysis)
-                except (ValueError, KeyError, IndexError, ttpf.BcpackRequired,
-                        bcpack.BcpackUnsupportedCodec, zlib.error) as exc:
-                    row["BCPackLimitation"] = str(exc)
-                    blocked += 1
-                    continue
-                # A distinct name keeps an existing lower-mip DDS usable until the manifest switches.
-                name = f"{index:06d}_bcpack_{method[:19]}.dds"
-                publish(directory / name, blob)
-                if isinstance(row.get("File"), str) and row["File"] != name:
-                    superseded.add(row["File"])
-                row.update(File=name, Mips=desc["mips"], BaseMipLevel=0, Limitation=None, BCPackDecoder=method)
-                row.pop("BCPackLimitation", None)
-                written += 1
-        finally:
-            if decoder:
-                decoder.read_chunk.cache_clear()
+                method = stamp
+                analysis = ttpf.analyze(pool, index)
+                blob = ttpf.texture_dds(pool, analysis)
+            except (ValueError, KeyError, IndexError, ttpf.BcpackRequired,
+                    bcpack.BcpackUnsupportedCodec, zlib.error) as exc:
+                row["BCPackLimitation"] = str(exc)
+                blocked += 1
+                continue
+            # A distinct name keeps an existing lower-mip DDS usable until the manifest switches.
+            name = f"{index:06d}_bcpack_{method[:19]}.dds"
+            publish(directory / name, blob)
+            if isinstance(row.get("File"), str) and row["File"] != name:
+                superseded.add(row["File"])
+            row.update(File=name, Mips=desc["mips"], BaseMipLevel=0, Limitation=None, BCPackDecoder=method)
+            row.pop("BCPackLimitation", None)
+            written += 1
     manifest["BCPackPass"] = stamp
     # The files the switched rows named before would otherwise stay in the folder, named by no row, so every
     # completed texture would be stored twice. They are listed in the manifest that switches the rows and removed

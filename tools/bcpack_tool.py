@@ -114,18 +114,7 @@ def decode_file(
     with open(in_path, "rb") as f:
         raw = f.read()
 
-    try:
-        data, prov = bcpack.decode_with_info(
-            raw, codec, out_size, allow_provisional=allow_provisional, history=history
-        )
-    except bcpack.BcpackError:
-        raise  # stream failures are already attributed to the stream, never to --history
-    except ValueError as e:
-        # json.JSONDecodeError from a --history file carries no filename; attribute it,
-        # but do not double-prefix messages that already name the history path.
-        if history is not None and os.path.basename(str(history)) not in str(e):
-            raise ValueError(f"{history}: {e}") from e
-        raise
+    data = bcpack.decode(raw, codec, out_size)
 
     parent = os.path.dirname(os.path.abspath(out_path))
     if parent:
@@ -202,21 +191,18 @@ def main(argv: list[str] | None = None) -> int:
     p_dec.add_argument(
         "--provisional",
         action="store_true",
-        help="Allow provisional history and signatures",
+        help="Legacy compatibility flag; fixed dictionaries are always used",
     )
     p_dec.add_argument(
         "--history",
         type=str,
         default=None,
-        help="Path to optional BC6H/BC7 history JSON or directory",
+        help="Legacy compatibility argument; the supplied file is not read",
     )
 
     args = parser.parse_args(argv)
 
-    # CLI-level guard: a missing/unreadable input or history file (OSError), a stream that fails
-    # structural or rANS validation (bcpack.BcpackError, a ValueError), or a malformed --history
-    # JSON (ValueError) must be one named line on stderr with exit status 2, not a traceback.
-    # bcpack.py's library-level behavior is unchanged.
+    # Invalid input or output is one named error with exit status 2, not a traceback.
     src = args.in_file if args.command == "decode" else args.file
     try:
         return _run(args)

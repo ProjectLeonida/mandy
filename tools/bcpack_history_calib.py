@@ -27,7 +27,7 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
-import bcpack  # noqa: E402
+import bcpack_research as bcpack  # noqa: E402
 import bcpack_tables as _tables  # noqa: E402
 import bcpack_tables_bptc as _bptc  # noqa: E402
 import ttpf_mips as _ttpf  # noqa: E402

@@ -33,7 +33,7 @@ for _p in (str(TESTS_DIR), str(TOOLS_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import bcpack  # noqa: E402
+import bcpack_research as bcpack  # noqa: E402
 import bcpack_tables  # noqa: E402
 import bcpack_tables_bptc as _bptc  # noqa: E402
 import test_bcpack as tb  # noqa: E402

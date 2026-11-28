@@ -459,53 +459,6 @@ bool extended_enabled() {
     return enabled;
 }
 
-// Calibrated predictor values stay in a local sidecar. Absent or invalid files retain the built-in codec policy.
-const leonida::bcpack::Calibration* bcpack_history() {
-    static const auto profile = []() -> std::unique_ptr<leonida::bcpack::Calibration> {
-        std::wstring explicit_path(32768, L'\0');
-        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_DSTORAGE_HISTORY", explicit_path.data(), DWORD(explicit_path.size()));
-        if (n >= explicit_path.size()) return {};
-        std::filesystem::path path;
-        if (n) {
-            explicit_path.resize(n);
-            if (explicit_path == L"0") return {};
-            path = explicit_path;
-        } else {
-            auto shaders = leonida::shader_paths::configured();
-            if (shaders.empty()) return {};
-            if (!shaders.has_filename()) shaders = shaders.parent_path();
-            path = shaders.parent_path() / "bcpack" / "history.bcph";
-        }
-        FILE* raw = nullptr;
-        if (_wfopen_s(&raw, path.c_str(), L"rb") || !raw) {
-            log_once("history-open", "could not open the local BCPack predictor profile");
-            return {};
-        }
-        std::unique_ptr<FILE, decltype(&std::fclose)> file(raw, &std::fclose);
-        auto table = std::make_unique<leonida::bcpack::Calibration>();
-        char magic[8];
-        if (std::fread(magic, 1, sizeof magic, raw) != sizeof magic || std::memcmp(magic, "BCPHIST1", 8) ||
-            std::fread(table.get(), 1, sizeof *table, raw) != sizeof *table || std::fgetc(raw) != EOF || std::ferror(raw)) {
-            log_once("history-format", "invalid local BCPack predictor profile");
-            return {};
-        }
-        unsigned bc6_ep = 0, bc6_ix = 0, bc7_ep = 0, bc7_ix = 0;
-        for (const auto& row : table->bc6) {
-            bc6_ep += row.ep_class != 0;
-            bc6_ix += row.ix_class != 0;
-        }
-        for (const auto& row : table->bc7) {
-            bc7_ep += unsigned(std::count_if(row.ep_bits.begin(), row.ep_bits.end(), [](auto v) {return v != 0;}));
-            bc7_ix += unsigned(std::count_if(row.ix_bits.begin(), row.ix_bits.end(), [](auto v) {return v != 0;}));
-        }
-        log_once("history-ok", std::string("loaded ") + (n ? "explicit" : "default") + " BCPack profile; BC6H endpoint/index rows " +
-                 std::to_string(bc6_ep) + "/256 " + std::to_string(bc6_ix) + "/256; BC7 endpoint/index fields " +
-                 std::to_string(bc7_ep) + "/6144 " + std::to_string(bc7_ix) + "/8192");
-        return table;
-    }();
-    return profile.get();
-}
-
 // Reads exactly "size" bytes at "offset" of a synchronous handle into "destination". Through kernel_writes, as the
 // title's own reads: the destination is title memory, which a kernel write cannot fault in (pages the D3D12 layer
 // keeps read-only, xmem pages that wait for their first touch), title_page_watch.h.
@@ -1147,10 +1100,6 @@ private:
         const unsigned bc = unsigned(options::bcpack(o)), sw = unsigned(options::swizzle(o));
         const bool pages = o & (options::kDestinationPages | options::kSourcePages);
         if ((bc || sw || pages) && !extended_enabled()) return E_NOTIMPL;
-        if (bc == DSTORAGE_BCPACK_MODE_BC2) {
-            log_once("bc2", "BC2 has no known BCPack block decoder (E_NOTIMPL)");
-            return E_NOTIMPL;
-        }
         const bool zlib = options::zlib(o);
         if ((zlib && bc) != (r.IntermediateSize != 0) || r.IntermediateSize > kMaxRequestBytes)
             return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
@@ -1270,25 +1219,11 @@ private:
         }
         if (bc) {
             std::vector<uint8_t> scratch(r.DestinationSize);
-            static const bool allow_fitted = [] {
-                char value[2]{};
-                return GetEnvironmentVariableA("LEONIDA_DSTORAGE_FITTED", value, sizeof value) != 1 || value[0] != '0';
-            }();
             const auto begin = Timing::start();
-            static const bool fast_entropy = [] {
-                char value[2]{};
-                return GetEnvironmentVariableA("LEONIDA_DSTORAGE_FAST_BCPACK", value, sizeof value) != 1 || value[0] != '0';
-            }();
             const char* failure = nullptr;
-            const auto quality = leonida::bcpack::decode(bc, data, scratch, allow_fitted, bc >= 6 ? bcpack_history() : nullptr, &failure, fast_entropy);
+            const auto quality = leonida::bcpack::decode(bc, data, scratch, &failure);
             e.timing.bcpack = Timing::elapsed(begin);
             if (quality == leonida::bcpack::Quality::failed) { e.reason = failure; return E_DSTORAGE_DECOMPRESSION_ERROR; }
-            if (quality == leonida::bcpack::Quality::fitted) {
-                static const bool reported = (log_once("fitted", "using fitted BCPack predictors"), true);
-                (void)reported;
-                if (leonida::dstorage::trace_enabled())
-                    std::fprintf(stderr, "[rt] ds-fitted bc=%u bytes=%u\n", bc, r.DestinationSize);
-            }
             data = std::move(scratch);
         }
         if (sw) {

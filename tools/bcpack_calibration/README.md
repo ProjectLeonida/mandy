@@ -1,6 +1,6 @@
-# Calibrated TTPF export
+# Offline calibrated TTPF research export
 
-The Python exporter can replay a locally measured reconstruction profile for 2D BC1, BC3, BC4, BC5, BC6H and BC7 textures and 2D arrays. A single-entry export accepts `--calibration PROFILE.json`. The assets stage discovers `<work>/bcpack-calibration.json`. The profile is data. The compiled library is loaded from this crate's release build directory.
+The Python exporter can replay a locally measured reconstruction profile for 2D BC1, BC3, BC4, BC5, BC6H and BC7 textures and 2D arrays. A single-entry export accepts `--calibration PROFILE.json`. The normal assets stage uses the fixed standalone decoder and ignores `<work>/bcpack-calibration.json`. The profile is data. The compiled library is loaded from this crate's release build directory.
 
 From the repository root, build with Rust/Cargo and run in the Python environment where NumPy is installed:
 
@@ -17,15 +17,22 @@ The synthetic test constructs its own BC1 pool and profile, runs the CLI and com
 
 Once built, the same library also speeds up the default strict path. Its `unpack_model` export (`src/model.rs`) is a line-by-line port of the lane-array model in `tools/bcpack.py` (`_decode_lanes_raw`, virtual zero bytes included), and `tools/bcpack.py` passes it its own probability tables. It therefore accepts exactly the streams the Python model accepts, with the same symbols. It is about 30 times faster than the Python model on synthetic chunks, and NumPy is not needed. When the library is not built, or a stream is refused, Python decodes the stream as before and raises its usual error. `python -I tests/test_bcpack_native.py` checks that the two agree, and `LEONIDA_BCPACK_NATIVE=0` turns the native path off.
 
-For BC1, BC3, BC4 and BC5 chunks, `decode_blocks` (`src/blocks.rs`) also rebuilds the blocks in the same call. It takes only the strict path: a chunk with a non-zero lane 1, or one that references a built-in history entry that is not confirmed, is decoded by Python, so errors and provisional entries do not change. On synthetic 16,384-block chunks, it is about 18 times faster than Python end to end for BC1, 38 times for BC4 and, measured the same way on a Windows PC, about 47 times for BC3 and 45 times for BC5.
+Production `tools/bcpack.py` uses only `unpack_model` from this library. Its fixed
+BC1-BC7 reconstruction runs in `bcpack_standalone.py`; it never calls the older
+`decode_blocks` or fitted exports. The older block fast path is retained only in
+`bcpack_research.py` for explicit research and its regression tests.
 
 The `unpack` export above runs `third_party/bcpack-rs`, which follows the hardware RTL. It is faster but refuses some streams the model accepts, for example every `q = 0` fragment whose omitted trailing zero byte comes before a symbol. That is why the strict path does not use it.
 
-## Automatic asset export
+## Normal asset export
 
-Run the ordinary build or `python -I make_game.py --game <package> --work <work> --stages assets`. The assets stage runs the C# exporter on each new pool and revisits existing pool manifests. It attempts full mip chains for missing and partial BCn entries whose allocation includes BCPack. With no profile, it uses the Python strict decoder. For calibrated 2D textures and arrays, install NumPy, build the library as above and place a matching profile at `<work>/bcpack-calibration.json` before running the stage.
+The assets stage uses fixed dictionaries for BC1-BC7 and does not load a local
+profile or train one. Missing and partial chains are revisited using the source
+hash of the standalone decoder. Each DDS is published before its manifest entry
+switches, so a failed reconstruction preserves the previous usable export.
+See [standalone decoder notes](../../docs/bcpack-standalone.md).
 
-The DDS files and their manifest are under `<work>/assets/ttpf/<pool>/` or `<work>/assets/ttpf_pack/<pack>/<pool>/`. The manifest keeps the asset key for model lookup and records the new filename, mip count and decoder. A failed reconstruction keeps the previous file reference and records the reason in `BCPackLimitation`. The stage publishes each DDS before replacing the pool manifest. A completed pass skips decoding on the next build. Adding or changing the profile triggers another pass.
+The profile format below belongs only to the explicit offline research exporter.
 
 ## Version 1 profile
 

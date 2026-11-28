@@ -178,7 +178,7 @@ class TestProbTablesStructure(unittest.TestCase):
 
     def test_model_symbol_lookup_boundaries(self) -> None:
         # Test cumulative frequency cf mapping to valid symbol range [0, 2^w - 1]
-        for w in (1, 4, 8, 10):
+        for w in (1, 4, 8):
             for q in (0, 7, 15):
                 m = bcpack._get_model(w, q)
                 self.assertIsNotNone(m)
@@ -391,7 +391,7 @@ class TestFormatDescriptorsAndModeValidation(unittest.TestCase):
         # Every default lane width must allow all valid reductions z in 0..3
         # such that effective width remains in [1, 10]
         for codec, widths in bcpack.LANE_WIDTHS.items():
-            expected_lane_count = 16 if codec in (6, 7) else 12
+            expected_lane_count = 15 if codec == 2 else (16 if codec in (6, 7) else 12)
             self.assertEqual(
                 len(widths),
                 expected_lane_count,

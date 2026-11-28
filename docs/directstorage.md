@@ -174,8 +174,8 @@ The first boot with the executable settles most of this: the dry-run report show
   excludes title destinations, allocator overhead and fixed decoder stacks. `LEONIDA_DSTORAGE_WORKERS=1`
   restores serial execution.
   Inflate expands LZ matches in bulk and batches Adler-32 reductions. `LEONIDA_DSTORAGE_FAST_INFLATE=0`
-  selects the original bytewise path. BCPack indexes the entropy model by the high slot byte.
-  `LEONIDA_DSTORAGE_FAST_BCPACK=0` selects the scalar bucket search.
+  selects the original bytewise path. BCPack uses the fixed reciprocal rANS model;
+  the standalone C++ decoder selects AVX2 only when both CPU and OS support it.
 - With `LEONIDA_DSTORAGE_TRACE=1`, `tools/dstorage_census.py <trace>` totals retirements, errors and bytes
   by shape, plus microseconds spent reading, inflating, decoding BC blocks, unshuffling, publishing and
   notifying. `--from-file story000` starts the measurement at the first story archive request and counts
@@ -184,35 +184,17 @@ The first boot with the executable settles most of this: the dry-run report show
 - The worker inflates zlib to `IntermediateSize` when BCPack follows, rebuilds standard BC blocks, then
   applies the optional DirectStorage macro-unshuffle. Each stage validates its entire output before a destination
   write. Typed zlib errors propagate through the combined path.
-- `runtime/src/bcpack.cpp` ports the interleaved rANS and strict block rebuilders from `tools/bcpack.py` for
-  BC1, BC3, BC4, BC5, BC6H and BC7. The predictor window holds 256 blocks. The build generates the lookup
-  tables from the existing codec modules. Damaged streams and missing predictors or inconsistent blocks
-  exceeding the reference tolerance give `E_DSTORAGE_DECOMPRESSION_ERROR`. BC2 has no reference decoder.
-  The runtime accepts the reference's fitted BC1/3/4/5 predictors for streamed art.
-  `LEONIDA_DSTORAGE_FITTED=0` requires confirmed entries. Fitted blocks can differ from console output.
-  The runtime stage of `make_game.py` generates `<work>/shaders/bcpack/history.bcph` locally.
-  The loader finds it relative to the shader folder selected by `LEONIDA_SHADERS` or the packaged
-  `shader_path.txt`. `LEONIDA_DSTORAGE_HISTORY` overrides the path; a value of `0` disables external history.
-  The load diagnostic reports BC6H row coverage and BC7 endpoint/index field coverage. Standalone generation:
-
-  ```sh
-  python3 -I tools/build_dstorage_history.py <game-root> --out <work>/shaders/bcpack/history.bcph
-  ```
-
-  The fitter follows the physical block offset of packed 2D mips, including those that start past the first
-  256 blocks of a stream. It combines adjacent mips from the same layer with full-stream index anchor
-  and shared-p-bit constraints. A shared p-bit can relate low red endpoint bits even when its sibling
-  mip supplies only the leading bits. These local fits preserve the recorded precision and exact reference
-  bits. A packed tail whose larger mips are BCPack-coded too has no raw or zlib sibling, so a history field that
-  only such tails use stayed unknown: in the game runs of 2026-11-25 two BC7 tail streams of one pool failed
-  with `missing-endpoint` (alpha fields of two history entries). For the streams that still start a chain at a
-  missing field, the fitter now decodes the nearest BCPack sibling with the profile so far and fits against it,
-  repeating while a round adds fields. The sibling may sit in the same refused BC7 stream: every block whose
-  chains start elsewhere is still determined, and the undetermined ones are left out of the reference. Those
-  fields are fitted, never confirmed, and fill only what the other fits left empty. On the 1.0.2.1 package this
-  raised the BC7 endpoint fields from 4,228 to 4,406 of 6,144; the runtime decoder then refuses 8 of 5,167 BC7
-  streams instead of 60 (both failing requests decode), and the 268 BC6H streams are unchanged (10 refused; a
-  refused BC6H sibling is not used as a reference yet). A profile can still lack endpoint values or exceed the reference consistency tolerance. Such a request reports a decompression error before publication.
+- `runtime/src/bcpack.cpp` wraps the standalone BC1-BC7 decoder vendored in
+  `third_party/x2w-bcpack`. BC2 is supported, including explicit alpha reconstruction.
+  The 256-block predictor windows use fixed format dictionaries. Decoding needs neither
+  the GDK nor a calibration file; `make_game.py` no longer trains or loads `history.bcph`.
+  The retired `LEONIDA_DSTORAGE_FITTED`, `LEONIDA_DSTORAGE_HISTORY` and
+  `LEONIDA_DSTORAGE_FAST_BCPACK` variables have no effect. Malformed streams fail with
+  `E_DSTORAGE_DECOMPRESSION_ERROR` before staged bytes reach the destination.
+  The D3D12 Rust runtime and Python assets exporter implement the same fixed format.
+  [Standalone decoder notes](bcpack-standalone.md) record provenance, verification and
+  overlap with the open calibration and performance pull requests. Existing calibration
+  tools remain explicit offline research tools; the production paths do not import them.
 - The four swizzle modes interleave stripes from request-wide component planes into 16 KiB (mode 1) or
   32 KiB (modes 2–4) groups. The enum names give the successive stripe widths. The shipped BC4 sample
   separates its endpoint planes from indices across the inflated source. The title's compute shader does

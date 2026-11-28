@@ -39,6 +39,20 @@ if(MSVC)
   target_link_options(root_signature_test PRIVATE /OPT:NOREF)
 endif()
 
+# Standalone BC1-BC7 decoding needs neither Windows nor the GDK.
+add_library(gta6rt_bcpack STATIC src/bcpack.cpp)
+add_executable(bcpack_test test/bcpack_test.cpp src/bcpack.cpp)
+# Keep the path override confined to the test binary; runtime always dispatches by CPU support.
+target_compile_definitions(bcpack_test PRIVATE X2W_BCPACK_LANE_TESTS)
+if(MSVC)
+  target_compile_options(gta6rt_bcpack PRIVATE /EHsc /W4 /permissive- /utf-8)
+  target_compile_options(bcpack_test PRIVATE /EHsc /W4 /permissive- /utf-8)
+endif()
+include(CTest)
+if(BUILD_TESTING)
+  add_test(NAME bcpack COMMAND bcpack_test "${CMAKE_CURRENT_SOURCE_DIR}/../tests/fixtures/bcpack-standalone.txt")
+endif()
+
 option(LEONIDA_BUILD_WINDOWS_RUNTIME "Build the Windows runtime, its shims and their tests" ${WIN32})
 if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # Custom CMAKE_CXX_FLAGS can replace MSVC's default /EHsc. Require C++ stack unwinding so error
@@ -208,16 +222,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
   set(bcpack_tools "${CMAKE_CURRENT_SOURCE_DIR}/../tools")
-  set(bcpack_tables "${CMAKE_CURRENT_BINARY_DIR}/bcpack_tables.inc")
-  add_custom_command(OUTPUT "${bcpack_tables}"
-    COMMAND "${Python3_EXECUTABLE}" -I "${bcpack_tools}/gen_bcpack_runtime_tables.py" "${bcpack_tables}"
-    DEPENDS "${bcpack_tools}/gen_bcpack_runtime_tables.py" "${bcpack_tools}/bcpack.py"
-            "${bcpack_tools}/bcpack_tables.py" "${bcpack_tools}/bcpack_tables_bptc.py"
-    VERBATIM)
-  add_executable(bcpack_history_train "../tools/bcpack_history_train.cpp" "${bcpack_tables}")
-  target_include_directories(bcpack_history_train PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-  add_library(gta6rt_bcpack STATIC src/bcpack.cpp "${bcpack_tables}")
-  target_include_directories(gta6rt_bcpack PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
   add_executable(gta6rt
     src/main.cpp
@@ -255,7 +259,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # exceptions (as for tiny_dll below). A source file property also applies to dstorage_test.
   set_source_files_properties(shims/dstorage.cpp src/thread_stacks.cpp
     PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang>:/EHa>")
-  add_dependencies(gta6rt gta6rt_tls_host bcpack_history_train)
+  add_dependencies(gta6rt gta6rt_tls_host)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
   # Static shim tables register themselves at startup; keep the linker from dropping their objects.
@@ -420,8 +424,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   set(dstorage_vectors "${CMAKE_CURRENT_BINARY_DIR}/dstorage_vectors.inc")
   add_custom_command(OUTPUT "${dstorage_vectors}"
     COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/test/dstorage_vectors.py" "${dstorage_vectors}"
-    DEPENDS test/dstorage_vectors.py ../tests/test_bcpack.py "${bcpack_tools}/bcpack.py"
-            "${bcpack_tools}/bcpack_tables.py" "${bcpack_tools}/bcpack_tables_bptc.py"
+    DEPENDS test/dstorage_vectors.py "${bcpack_tools}/bcpack.py"
+            "${bcpack_tools}/bcpack_standalone.py" "${bcpack_tools}/bcpack_standalone_tables.json"
+            ../tests/fixtures/bcpack-standalone.txt
     VERBATIM)
   add_executable(dstorage_test
     "${dstorage_vectors}"
