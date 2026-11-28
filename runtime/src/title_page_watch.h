@@ -343,6 +343,22 @@ inline bool view_at(std::uintptr_t va, std::uintptr_t bytes, Range& out) {
     return false;
 }
 
+// For every pair whose GPU-only range overlaps [begin, end): f(cpu_begin, cpu_end), the overlapping part named at the
+// pair's CPU view. A range may start before a pair or cover several (a release of a wider span, a collapsed release
+// queue). `f` runs under the views' shared lock: it only computes or records, it takes no other lock.
+template <class F>
+inline void for_each_gpu_overlap(std::uintptr_t begin, std::uintptr_t end, F&& f) {
+    State& s = state();
+    if (end <= begin || !s.count.load(std::memory_order_acquire)) return;
+    std::shared_lock lock(s.mutex);
+    for (const View& v : s.views) {
+        const std::uintptr_t v_end = v.gpu + v.size;
+        if (begin >= v_end || end <= v.gpu) continue;
+        const std::uintptr_t lo = (std::max)(begin, v.gpu), hi = (std::min)(end, v_end);
+        f(v.cpu + (lo - v.gpu), v.cpu + (hi - v.gpu));
+    }
+}
+
 // The other address of memory in a paired range: the CPU view's address for a GPU-only one and the GPU-only
 // address for a CPU view's; 0 outside every pair.
 inline std::uintptr_t other_view(std::uintptr_t va) {

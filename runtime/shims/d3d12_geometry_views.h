@@ -543,17 +543,17 @@ public:
     template<class Device, class OnRetire = NoopRetire, class Copy = NoCopy>
     void drain_released(Device& device, std::uint64_t retire_ticket, std::uint64_t completed_ticket,
                         OnRetire&& on_retire = {}, Copy&& final_copy = {}) {
-        std::vector<std::pair<Address, Address>> ranges;
+        std::vector<std::pair<Address, Address>> ranges, at_cpu;
         leonida::geometry_writes::take_released(releases_, ranges);
         for (const auto& [begin, end] : ranges) {
             retire_range(begin, end, retire_ticket, on_retire, final_copy);
-            leonida::title_gpu_views::Range pair{};
-            if (end > begin && leonida::title_gpu_views::view_at(begin, 1, pair) &&
-                begin >= pair.gpu && begin - pair.gpu < pair.size) {
-                const Address offset = begin - pair.gpu;
-                const Address span = (std::min)(end - begin, pair.size - offset);
-                retire_range(pair.cpu + offset, pair.cpu + offset + span, retire_ticket, on_retire, final_copy);
-            }
+            // The part of the range in each GPU-only twin it overlaps, at the twin's CPU view (where the views are
+            // keyed); collected first, as the twins' lock is not held while views are retired.
+            at_cpu.clear();
+            leonida::title_gpu_views::for_each_gpu_overlap(begin, end, [&](std::uintptr_t lo, std::uintptr_t hi) {
+                at_cpu.emplace_back(Address(lo), Address(hi));
+            });
+            for (const auto& [lo, hi] : at_cpu) retire_range(lo, hi, retire_ticket, on_retire, final_copy);
         }
         reap(device, completed_ticket);
     }
