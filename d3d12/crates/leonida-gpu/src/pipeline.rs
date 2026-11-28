@@ -1008,10 +1008,10 @@ mod tests {
     /// The stream layout the title builds (title+0x86f090): root
     /// signature, five shader slots (the first a mesh shader), blend, sample
     /// mask, rasterizer, depth-stencil 1, sample description, input layout,
-    /// topology, render target and depth formats: 0x2b0 bytes.
-    #[test]
-    fn streams_yield_their_shaders() {
-        let (ms, ps) = ([9u8; 7], [4u8; 5]);
+    /// topology, render target and depth formats: 0x2b0 bytes. With mesh
+    /// shader `ms`, pixel shader `ps`, topology type `topology` and one
+    /// render target of format 28.
+    fn mesh_stream(ms: &[u8], ps: &[u8], topology: u64) -> This {
         let mut stream = vec![0u8; 0x2b0];
         let mut put = |at: usize, v: u64| stream[at..at + 8].copy_from_slice(&v.to_le_bytes());
         for (at, kind) in [
@@ -1036,8 +1036,7 @@ mod tests {
         put(0x20, ms.len() as u64);
         put(0x30, ps.as_ptr() as u64);
         put(0x38, ps.len() as u64);
-        // Topology type 3 (triangles), one render target of format 28.
-        put(0x278, 14 | 3 << 32);
+        put(0x278, 14 | topology << 32);
         put(0x280, 15 | 28 << 32);
         put(0x2a0, 1 << 32);
         let desc = StreamDesc {
@@ -1047,6 +1046,14 @@ mod tests {
         let mut p = std::ptr::null();
         let hr = create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
         assert_eq!(hr, S_OK);
+        p
+    }
+
+    #[test]
+    fn streams_yield_their_shaders() {
+        let (ms, ps) = ([9u8; 7], [4u8; 5]);
+        // Topology type 3 (triangles).
+        let p = mesh_stream(&ms, &ps, 3);
         assert_eq!(shaders(p), [("mesh", ms.to_vec()), ("pixel", ps.to_vec())]);
         #[cfg(windows)]
         {
@@ -1057,5 +1064,24 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    /// Pipelines created with the same graphics state share one copy of it,
+    /// and one with another state has its own. Each title pipeline kept a
+    /// copy of its own for the session: 84,000 of them, of some 5,700
+    /// different states.
+    #[cfg(windows)]
+    #[test]
+    fn pipelines_of_one_graphics_state_share_it() {
+        let (ms, ps) = ([7u8; 9], [6u8; 3]);
+        let state = |p: This| -> *const host::GraphicsState {
+            pipeline(p).host.graphics.as_deref().unwrap()
+        };
+        let (a, b) = (mesh_stream(&ms, &ps, 3), mesh_stream(&ms, &ps, 3));
+        assert_eq!(state(a), state(b));
+        // Topology type 2 (lines).
+        let lines = mesh_stream(&ms, &ps, 2);
+        assert_ne!(state(a), state(lines));
+        assert_eq!(pipeline(lines).host.graphics.as_deref().unwrap().topology.0, 2);
     }
 }
