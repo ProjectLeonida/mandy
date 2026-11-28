@@ -888,7 +888,10 @@ def run_hw(kernels, oracle, asm):
         if k.L["words"] > limit:
             out[k.label] = f"skipped: the launcher reads back at most {limit} dwords, this kernel {k.L['words']}"
             continue
-        output = oracle.run([k.program(asm)], words=k.L["words"])[0]
+        res = oracle.run([k.program(asm)], words=k.L["words"])
+        if not res or not isinstance(res, (list, tuple)) or not res[0]:
+            raise RuntimeError(f"{k.label}: empty or missing oracle output")
+        output = res[0]
         why = output_problem(k, output)
         if why:
             raise RuntimeError(f"{k.label}: {why}")
@@ -983,10 +986,80 @@ def write_kernels(kernels, out_dir):
     return 0
 
 
+def validate_json_path(path: str) -> str | None:
+    """Validate JSON destination path upfront before running kernels. Returns error message or None."""
+    if not path or not path.strip():
+        return "--json (empty) is not a file path"
+    s = path.strip()
+    if os.path.isdir(path) or os.path.isdir(s):
+        return f"--json {path} is not a file path"
+    if s.endswith(("/", "\\")):
+        return f"--json {path} cannot end with a directory separator"
+    try:
+        resolved = os.path.abspath(s)
+        parent = os.path.dirname(resolved)
+        if os.path.exists(parent) and not os.path.isdir(parent):
+            return f"--json destination parent {parent!r} is not a directory"
+        if os.path.exists(resolved):
+            if os.path.isdir(resolved):
+                return f"--json {path} is not a file path"
+            if not os.access(resolved, os.W_OK):
+                return f"--json {path} is not writable"
+        elif os.path.exists(parent) and not os.access(parent, os.W_OK):
+            return f"--json destination parent directory {parent!r} is not writable"
+    except (OSError, ValueError) as exc:
+        return f"invalid --json destination {path!r}: {exc}"
+    return None
+
+
+def write_report(destination: str, data: dict) -> str | None:
+    """Atomically write JSON report with LF line endings and proper file mode. Returns error message or None."""
+    try:
+        dest_abs = os.path.abspath(destination)
+        parent = os.path.dirname(dest_abs)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = None
+        fd = None
+        try:
+            fd, tmp = tempfile.mkstemp(prefix="bvh_tri_report_", suffix=".tmp", dir=parent)
+            with open(fd, "w", encoding="utf-8", newline="\n") as f:
+                fd = None
+                json.dump(data, f, indent=1, allow_nan=False)
+                f.write("\n")
+            if os.name != "nt":
+                try:
+                    from file_mode import published_mode
+                    os.chmod(tmp, published_mode(dest_abs))
+                except (ImportError, OSError):
+                    pass
+            try:
+                from replace_retry import replace as replace_retry
+                replace_retry(tmp, dest_abs)
+            except ImportError:
+                os.replace(tmp, dest_abs)
+            tmp = None
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp is not None and os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    except (OSError, TypeError, ValueError) as exc:
+        return f"cannot write --json {destination}: {exc}"
+    return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--oracle", default="translator", help="translator (default), hw, or translator,hw")
     ap.add_argument("--kernel", action="append", default=[], help="run only this kernel (repeatable)")
+    ap.add_argument("--hw-arch", help="hardware architecture for the oracle (e.g. gfx1030)")
     ap.add_argument("--list", action="store_true", help="list the kernels and their cases")
     ap.add_argument("--write-kernels", metavar="DIR", help="write every kernel's lines and cases; no GPU")
     ap.add_argument("--json", dest="json_out", help="write every case's words to this file")
@@ -994,21 +1067,45 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.self_test:
         return self_test()
-    backends = tuple(dict.fromkeys(t.strip() for t in args.oracle.split(",")))
+    if args.oracle is None or not args.oracle.strip():
+        print("error: --oracle takes translator, hw or translator,hw", file=sys.stderr)
+        return 2
+    raw_tokens = [t.strip() for t in args.oracle.split(",")]
+    if any(not t for t in raw_tokens):
+        print("error: --oracle takes translator, hw or translator,hw", file=sys.stderr)
+        return 2
+    backends = tuple(dict.fromkeys(raw_tokens))
     if not backends or any(t not in ("translator", "hw") for t in backends):
         print("error: --oracle takes translator, hw or translator,hw", file=sys.stderr)
+        return 2
+    if args.hw_arch is not None and not args.hw_arch.strip():
+        print("error: --hw-arch cannot be empty or whitespace", file=sys.stderr)
         return 2
     kernels = build_kernels()
     if args.kernel:
         names = [k.label for k in kernels]
-        unknown = [n for n in args.kernel if n not in names]
+        expanded_kernels = []
+        for entry in args.kernel:
+            if not entry or not entry.strip():
+                print("error: --kernel cannot be empty or whitespace", file=sys.stderr)
+                return 2
+            for item in entry.split(","):
+                item = item.strip()
+                if not item:
+                    print("error: --kernel cannot contain empty tokens", file=sys.stderr)
+                    return 2
+                expanded_kernels.append(item)
+        unknown = [n for n in expanded_kernels if n not in names]
         if unknown:
             print(f"error: unknown kernel(s) {', '.join(unknown)} (known: {', '.join(names)})", file=sys.stderr)
             return 2
-        kernels = [k for k in kernels if k.label in args.kernel]
-    if args.json_out is not None and (not args.json_out.strip() or os.path.isdir(args.json_out)):
-        print(f"error: --json {args.json_out.strip() or '(empty)'} is not a file path", file=sys.stderr)
-        return 2
+        selected_set = set(expanded_kernels)
+        kernels = [k for k in kernels if k.label in selected_set]
+    if args.json_out is not None:
+        json_err = validate_json_path(args.json_out)
+        if json_err:
+            print(f"error: {json_err}", file=sys.stderr)
+            return 2
     if args.list:
         for k in kernels:
             print(f"{k.label:15} threads={k.threads:2} wave={k.wave} nsa={str(k.nsa):5} cases={len(k.cases)}")
@@ -1022,12 +1119,16 @@ def main(argv=None):
     if "hw" in backends:
         from hw_oracle import asm, runner
         try:
-            oracle = runner.open_oracle()
+            oracle = runner.open_oracle(arch=args.hw_arch)
         except runner.Unavailable as e:
             print(f"hardware oracle unavailable: {e}", file=sys.stderr)
             return 77
         try:
-            if asm.family(oracle.arch) != "gfx10":
+            try:
+                family = asm.family(oracle.arch)
+            except (ValueError, KeyError, AttributeError):
+                family = None
+            if family != "gfx10":
                 print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
                 return 77
             device = getattr(oracle, "device", oracle.arch)
@@ -1038,20 +1139,16 @@ def main(argv=None):
                 print(f"error: {e}", file=sys.stderr)
                 return 2
         finally:
-            oracle.close()
+            if hasattr(oracle, "close") and callable(oracle.close):
+                oracle.close()
     rows, bad = compare(kernels, tr, hw)
     srcs = [x for x, v in (("translator", tr), ("hardware", hw)) if v is not None]
-    print(f"summary: {len(rows)} results ({sum(r['lane'] is None for r in rows)} single-lane) of {len(kernels)} "
+    print(f"summary: {len(rows)} results ({sum(r.get('lane') is None for r in rows)} single-lane) of {len(kernels)} "
           f"kernels, {' and '.join(srcs)} against the rule, both forms: {len(rows) - bad} match, {bad} mismatch")
     if args.json_out is not None:
-        parent = os.path.dirname(os.path.abspath(args.json_out))
-        try:
-            os.makedirs(parent, exist_ok=True)
-            with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"device": device, "rows": rows}, f, indent=1)
-                f.write("\n")
-        except OSError as e:
-            print(f"error: cannot write --json {args.json_out}: {e}", file=sys.stderr)
+        write_err = write_report(args.json_out, {"device": device, "rows": rows})
+        if write_err:
+            print(f"error: {write_err}", file=sys.stderr)
             return 2
     return 1 if bad else 0
 

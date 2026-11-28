@@ -5,6 +5,7 @@ stand-in oracle. No GPU, no assembler.
 """
 import hashlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -199,6 +200,70 @@ class HardwarePath(unittest.TestCase):
                               capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 77, proc.stderr or proc.stdout)
 
+    def test_empty_oracle_output_raises_runtime_error(self):
+        class EmptyOracle:
+            arch = "gfx1030"
+
+            def run(self, programs, words):
+                return []
+
+        ks = kernels()
+        with self.assertRaises(RuntimeError) as cm:
+            probe.run_hw([ks["tri_g1a"]], EmptyOracle(), hw_asm)
+        self.assertIn("empty or missing oracle output", str(cm.exception))
+
+    def test_non_gfx10_oracle_skips(self):
+        class Gfx11Oracle:
+            arch = "gfx1100"
+            device = "Radeon RX 7900"
+
+            def close(self):
+                pass
+
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=Gfx11Oracle()):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                ret = probe.main(["--oracle", "hw", "--kernel", "tri_g1a"])
+            self.assertEqual(ret, 77)
+            self.assertIn("SKIP: gfx1100 is not GFX10", err.getvalue())
+
+    def test_unknown_arch_oracle_skips(self):
+        class UnknownArchOracle:
+            arch = "mystery_gpu"
+            device = "Mystery GPU"
+
+            def close(self):
+                pass
+
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=UnknownArchOracle()), \
+                unittest.mock.patch.object(hw_asm, "family", side_effect=ValueError("unknown arch")):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                ret = probe.main(["--oracle", "hw", "--kernel", "tri_g1a"])
+            self.assertEqual(ret, 77)
+            self.assertIn("SKIP: mystery_gpu is not GFX10", err.getvalue())
+
+    def test_hw_arch_plumbed_to_open_oracle(self):
+        calls = []
+
+        class DummyOracle:
+            arch = "gfx1030"
+            device = "RX 6800"
+
+            def close(self):
+                pass
+
+        def fake_open(arch=None):
+            calls.append(arch)
+            return DummyOracle()
+
+        with unittest.mock.patch.object(hw_runner, "open_oracle", side_effect=fake_open), \
+                unittest.mock.patch.object(probe, "run_hw", return_value={}):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                probe.main(["--oracle", "hw", "--hw-arch", "gfx1036", "--kernel", "tri_g1a"])
+        self.assertEqual(calls, ["gfx1036"])
+
 
 class CommandLine(unittest.TestCase):
     def test_bad_arguments_rejected_before_open_oracle(self):
@@ -210,6 +275,40 @@ class CommandLine(unittest.TestCase):
                         redirect_stderr(err):
                     self.assertEqual(probe.main(argv), 2)
                 self.assertIn("error:", err.getvalue())
+
+    def test_oracle_cli_validation(self):
+        for bad in ("", "   ", "translator,", ",hw", "translator,,hw", "vulkan", "hw,invalid"):
+            with self.subTest(bad=bad):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    self.assertEqual(probe.main(["--oracle", bad]), 2)
+                self.assertIn("error: --oracle takes translator, hw or translator,hw", err.getvalue())
+
+    def test_hw_arch_cli_validation(self):
+        for bad in ("", "   "):
+            with self.subTest(bad=bad):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    self.assertEqual(probe.main(["--hw-arch", bad]), 2)
+                self.assertIn("error: --hw-arch cannot be empty or whitespace", err.getvalue())
+
+    def test_kernel_cli_validation(self):
+        for argv in (["--kernel", ""], ["--kernel", "  "], ["--kernel", "tri_g1a,"],
+                     ["--kernel", ",tri_g1a"], ["--kernel", "tri_g1a,,tri_g1b"],
+                     ["--kernel", "tri_g1a,unknown_kernel"]):
+            with self.subTest(argv=argv):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    self.assertEqual(probe.main(argv), 2)
+                self.assertIn("error:", err.getvalue())
+
+    def test_kernel_comma_separated_and_repeated(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            ret = probe.main(["--list", "--kernel", "tri_g1a,tri_g1b", "--kernel", "tri_g2a"])
+        self.assertEqual(ret, 0)
+        lines = [line.split()[0] for line in out.getvalue().strip().splitlines() if not line.startswith(" ")]
+        self.assertEqual(lines, ["tri_g1a", "tri_g1b", "tri_g2a"])
 
     def test_json_directory_is_named_as_typed(self):
         # every other diagnostic in this tool prints the path the user typed; repr() doubled each backslash
@@ -225,6 +324,49 @@ class CommandLine(unittest.TestCase):
         with redirect_stderr(err):
             self.assertEqual(probe.main(["--json", "  "]), 2)
         self.assertEqual(err.getvalue(), "error: --json (empty) is not a file path\n")
+
+    def test_json_path_validation(self):
+        self.assertIn("(empty)", probe.validate_json_path("") or "")
+        self.assertIn("(empty)", probe.validate_json_path("   ") or "")
+        self.assertIn("directory separator", probe.validate_json_path("report.json/") or "")
+        self.assertIn("directory separator", probe.validate_json_path("report.json\\") or "")
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIn("is not a file path", probe.validate_json_path(tmp) or "")
+            file_as_parent = os.path.join(tmp, "file.txt")
+            with open(file_as_parent, "w", encoding="utf-8") as f:
+                f.write("text")
+            bad_child = os.path.join(file_as_parent, "report.json")
+            self.assertIn("is not a directory", probe.validate_json_path(bad_child) or "")
+            self.assertIsNone(probe.validate_json_path(os.path.join(tmp, "out.json")))
+
+    def test_write_report_and_json_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            valid_dest = os.path.join(tmp, "nested", "dir", "report.json")
+            err = probe.write_report(valid_dest, {"device": "test", "rows": [1, 2, 3]})
+            self.assertIsNone(err)
+            self.assertTrue(os.path.isfile(valid_dest))
+            with open(valid_dest, "rb") as f:
+                raw_bytes = f.read()
+            self.assertNotIn(b"\r\n", raw_bytes)
+            with open(valid_dest, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data, {"device": "test", "rows": [1, 2, 3]})
+
+            # Test JSON write via CLI with mocked run_translator and compare
+            cli_dest = os.path.join(tmp, "cli_report.json")
+            with unittest.mock.patch.object(probe, "run_translator", return_value={}), \
+                    unittest.mock.patch.object(probe, "compare", return_value=([{"case": "test", "lane": None}], 0)):
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    ret = probe.main(["--kernel", "tri_g1a", "--json", cli_dest])
+                self.assertEqual(ret, 0)
+                self.assertTrue(os.path.isfile(cli_dest))
+                with open(cli_dest, "rb") as f:
+                    cli_bytes = f.read()
+                self.assertNotIn(b"\r\n", cli_bytes)
+                with open(cli_dest, "r", encoding="utf-8") as f:
+                    cli_data = json.load(f)
+                self.assertEqual(cli_data["rows"], [{"case": "test", "lane": None}])
 
     def test_write_kernels(self):
         with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
