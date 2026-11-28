@@ -1,11 +1,13 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -105,7 +107,15 @@ public:
     };
 
     QueueHolds() { queue_holds::Registry::get().add(this, &has_progress_thunk); }
-    ~QueueHolds() { queue_holds::Registry::get().remove(this); }
+    ~QueueHolds() {
+        queue_holds::Registry::get().remove(this);
+        {
+            std::lock_guard bl(barrier_mutex_);
+            barrier_stop_ = true;
+        }
+        barrier_cv_.notify_all();
+        if (barrier_thread_.joinable()) barrier_thread_.join();
+    }
     QueueHolds(const QueueHolds&) = delete;
     QueueHolds& operator=(const QueueHolds&) = delete;
 
@@ -289,29 +299,54 @@ public:
         pump_ready();
     }
 
-    // Drops the callbacks of `owner` that have not run, and waits for one that is running.
-    // Lock order: never hold pump_mutex_ and barrier_mutex_ together (mutex_ is always leaf).
+    // Drops the callbacks of `owner` that have not run, and waits for any in-flight callback on the barrier thread.
+    // Lock order: pump_mutex_ -> barrier_mutex_ -> mutex_ (mutex_ is always leaf; barrier callbacks run unlocked).
     void cancel_after(const void* owner) {
+        std::int64_t removed_ready = 0;
         {
+            std::lock_guard bl(barrier_mutex_);
             std::lock_guard lock(mutex_);
-            auto erase_from = [&](std::deque<Barrier>& q) {
+            auto erase_from = [&](std::deque<Barrier>& q, bool is_ready) {
                 for (auto it = q.begin(); it != q.end();) {
                     if (it->owner == owner) {
                         it = q.erase(it);
                         barrier_count_.fetch_sub(1, std::memory_order_acq_rel);
+                        if (is_ready) ++removed_ready;
                     } else {
                         ++it;
                     }
                 }
             };
-            erase_from(barriers_);
-            erase_from(ready_barriers_);
+            erase_from(barriers_, false);
+            erase_from(ready_barriers_, true);
+            if (removed_ready) update_active_barrier_min_seq_locked();
         }
-        // Wait for any already-popped callback currently running in drain_ready_barriers().
+        if (removed_ready) {
+            barrier_drained_cv_.notify_all();
+            work_changed(-removed_ready);
+        }
+        // Wait for any already-popped callback currently running on the dedicated barrier thread.
         if (!in_barrier()) {
-            std::lock_guard bl(barrier_mutex_);
+            std::unique_lock bl(barrier_mutex_);
+            barrier_drained_cv_.wait(bl, [this] { return !barrier_running_; });
         }
         pump_ready();
+    }
+
+    // Waits until every satisfied barrier with `barrier.seq <= seq` that is queued in ready_barriers_ or currently
+    // running on the dedicated barrier thread has finished executing. Lock-free fast path when no matching barrier is
+    // active. Never waits on unsatisfied barriers still in barriers_.
+    void wait_barriers_drained(std::uint64_t seq) {
+        if (in_barrier()) return;
+        const std::uint64_t min_p1 = active_barrier_min_seq_.load(std::memory_order_acquire);
+        if (min_p1 == 0 || (min_p1 - 1) > seq) return;
+        std::unique_lock bl(barrier_mutex_);
+        barrier_drained_cv_.wait(bl, [this, seq] {
+            std::lock_guard lock(mutex_);
+            if (barrier_running_ && running_barrier_seq_ <= seq) return false;
+            if (!ready_barriers_.empty() && ready_barriers_.front().seq <= seq) return false;
+            return true;
+        });
     }
 
     // Held operations over all queues, for the cheap "is there anything to do" test.
@@ -320,8 +355,8 @@ public:
 
     // Releases every held operation that has become ready, in dependency order: a release can submit a Signal
     // that makes another queue's front ready, so passes repeat until one finds nothing new. Satisfied barriers
-    // (Present / after_held()) are popped in FIFO order under pump_mutex_ into ready_barriers_ and executed OUTSIDE
-    // pump_mutex_ under barrier_mutex_ so Presents stay strictly FIFO while never stalling cross-queue pump_ready().
+    // (Present / after_held()) are handed off in strict FIFO order to the dedicated barrier-drain thread (keeping
+    // active_work_ +1 until executed) so callers such as the list-value releaser never stall on Present.
     void pump_ready() {
         if (!any_held() && barrier_count_.load(std::memory_order_acquire) == 0) {
             signaled_unpumped_.store(false, std::memory_order_release);
@@ -334,7 +369,6 @@ public:
             std::unique_lock pump(pump_mutex_, std::try_to_lock);
             if (!pump) return;  // another thread is releasing and will see dirty_
             in_pump() = true;
-            bool collected_barriers = false;
             while (dirty_.exchange(false, std::memory_order_acq_rel)) {
                 signaled_unpumped_.store(false, std::memory_order_release);
                 bool progress = true;
@@ -344,25 +378,18 @@ public:
                         if (holder->release_ready()) {
                             progress = true;
                             if (collect_ready_barriers()) {
-                                collected_barriers = true;
-                                // Pause pumping to run satisfied barriers outside pump_mutex_ before draining
-                                // post-barrier work on the next pass.
+                                // Satisfied barriers were handed to the barrier thread; yield to let post-barrier
+                                // work drain on the next pass (which waits via wait_barriers_drained()).
                                 dirty_.store(true, std::memory_order_release);
                                 break;
                             }
                         }
                     }
-                    if (collected_barriers) break;
                 }
-                if (collected_barriers) break;
-                if (collect_ready_barriers()) {
-                    collected_barriers = true;
-                    break;
-                }
+                (void)collect_ready_barriers();
             }
             in_pump() = false;
             pump.unlock();
-            if (collected_barriers) drain_ready_barriers();
             if (!dirty_.load(std::memory_order_acquire)) return;
         }
     }
@@ -397,8 +424,25 @@ private:
         return holders_;
     }
 
+    // Called with both barrier_mutex_ and mutex_ held. Stores (min_seq + 1) of any running/ready barrier, or 0 if none.
+    void update_active_barrier_min_seq_locked() noexcept {
+        bool any = false;
+        std::uint64_t min_seq = UINT64_MAX;
+        if (barrier_running_) {
+            any = true;
+            min_seq = running_barrier_seq_;
+        }
+        if (!ready_barriers_.empty()) {
+            if (!any || ready_barriers_.front().seq < min_seq) min_seq = ready_barriers_.front().seq;
+            any = true;
+        }
+        active_barrier_min_seq_.store(any ? (min_seq == UINT64_MAX ? UINT64_MAX : min_seq + 1) : 0,
+                                      std::memory_order_release);
+    }
+
     // Called with pump_mutex_ held. Moves every satisfied barrier from barriers_ to ready_barriers_ in strict FIFO
-    // order without invoking any callback under pump_mutex_. True when at least one barrier became ready.
+    // order, increments active_work_ (+1 per ready barrier so has_progress() stays true until executed), and wakes the
+    // dedicated barrier thread. True when at least one barrier became ready.
     bool collect_ready_barriers() {
         bool moved = false;
         for (;;) {
@@ -406,54 +450,79 @@ private:
             std::uint64_t seq = 0;
             {
                 std::lock_guard lock(mutex_);
-                if (barriers_.empty()) return moved;
+                if (barriers_.empty()) break;
                 owner = barriers_.front().owner;
                 seq = barriers_.front().seq;
             }
+            bool blocked = false;
             for (Holder* holder : snapshot()) {
                 const std::uint64_t oldest = holder->oldest_held_seq();
-                if (oldest && oldest <= seq) return moved;
+                if (oldest && oldest <= seq) {
+                    blocked = true;
+                    break;
+                }
             }
+            if (blocked) break;
             {
+                std::lock_guard bl(barrier_mutex_);
                 std::lock_guard lock(mutex_);
                 if (barriers_.empty() || barriers_.front().seq != seq || barriers_.front().owner != owner)
                     continue;  // cancelled meanwhile
                 ready_barriers_.push_back(std::move(barriers_.front()));
                 barriers_.pop_front();
+                work_changed(1);
+                update_active_barrier_min_seq_locked();
+                if (!barrier_thread_.joinable() && !barrier_stop_) {
+                    barrier_thread_ = std::thread([this] { barrier_worker(); });
+                }
                 moved = true;
             }
         }
+        if (moved) barrier_cv_.notify_one();
+        return moved;
     }
 
-    // Called OUTSIDE pump_mutex_. Executes all queued ready_barriers_ in strict FIFO order under barrier_mutex_.
-    void drain_ready_barriers() {
-        if (in_barrier()) return;
+    // Dedicated thread that executes satisfied ready_barriers_ in strict FIFO order without blocking pump_ready() or
+    // the list-value releaser. Keeps active_work_ +1 across each barrier and signals barrier_drained_cv_ on completion.
+    void barrier_worker() {
+        in_barrier() = true;
         struct InBarrierGuard {
-            bool& flag;
-            explicit InBarrierGuard(bool& f) noexcept : flag(f) { flag = true; }
-            ~InBarrierGuard() { flag = false; }
-        };
+            ~InBarrierGuard() { in_barrier() = false; }
+        } guard;
         for (;;) {
-            std::unique_lock bl(barrier_mutex_);
-            InBarrierGuard running(in_barrier());
-            for (;;) {
-                Barrier next;
-                {
-                    std::lock_guard lock(mutex_);
-                    if (ready_barriers_.empty()) break;
-                    next = std::move(ready_barriers_.front());
-                    ready_barriers_.pop_front();
-                    barrier_count_.fetch_sub(1, std::memory_order_acq_rel);
-                }
-                next.fn();
-            }
-            bl.unlock();
-            bool more = false;
+            Barrier next;
             {
+                std::unique_lock bl(barrier_mutex_);
+                barrier_cv_.wait(bl, [this] {
+                    std::lock_guard lock(mutex_);
+                    return !ready_barriers_.empty() || barrier_stop_;
+                });
                 std::lock_guard lock(mutex_);
-                more = !ready_barriers_.empty();
+                if (ready_barriers_.empty()) {
+                    if (barrier_stop_) return;
+                    continue;
+                }
+                next = std::move(ready_barriers_.front());
+                ready_barriers_.pop_front();
+                barrier_count_.fetch_sub(1, std::memory_order_acq_rel);
+                barrier_running_ = true;
+                running_barrier_seq_ = next.seq;
+                update_active_barrier_min_seq_locked();
             }
-            if (!more) return;
+            try {
+                if (next.fn) next.fn();
+            } catch (...) {
+            }
+            next.fn = {};  // release captured objects outside locks
+            {
+                std::lock_guard bl(barrier_mutex_);
+                std::lock_guard lock(mutex_);
+                barrier_running_ = false;
+                running_barrier_seq_ = 0;
+                update_active_barrier_min_seq_locked();
+            }
+            barrier_drained_cv_.notify_all();
+            work_changed(-1);
         }
     }
 
@@ -463,7 +532,14 @@ private:
 
     mutable std::mutex mutex_;  // leaf: fences_, holders_, barriers_, ready_barriers_
     std::mutex pump_mutex_;     // one releasing thread; held across release_ready(), never across barrier callbacks
-    std::mutex barrier_mutex_;  // serializes ready_barriers_ execution in strict FIFO order outside pump_mutex_
+    std::mutex barrier_mutex_;  // guards barrier_thread_, barrier_running_, barrier_stop_, and barrier CVs
+    std::condition_variable barrier_cv_;
+    std::condition_variable barrier_drained_cv_;
+    std::thread barrier_thread_;
+    bool barrier_running_ = false;
+    bool barrier_stop_ = false;
+    std::uint64_t running_barrier_seq_ = 0;
+    std::atomic<std::uint64_t> active_barrier_min_seq_{0};  // 0 if none, else min(seq)+1 of running/ready barriers
     mutable std::shared_mutex holders_use_mutex_;  // shared by has_progress(), unique in detach() after erasing holder
     std::unordered_map<Semaphore, FenceState> fences_;
     std::vector<Holder*> holders_;

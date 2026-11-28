@@ -1419,7 +1419,14 @@ void arm_mirror_callback(const std::shared_ptr<MirrorLink>& link, ID3D12Fence* f
 }
 
 void wait_for_fence_progress(FenceMirror* mirror) {
+#ifdef LEONIDA_VULKAN_DEVICE
+    // Vulkan timeline semaphores are monotonic (cannot rewind); when SetEventOnCompletion succeeded, use a 1000 ms
+    // safety-net timeout instead of a 10 ms rewind poll to avoid thousands of idle Wine threadpool wakeups/s.
+    const LONGLONG poll_ms = mirror->arm_failed.load(std::memory_order_relaxed) ? 10 : 1000;
+    const LONGLONG kRewindPollInterval = -poll_ms * 10'000;  // relative 100 ns units
+#else
     constexpr LONGLONG kRewindPollInterval = -10 * 10'000;  // 10 ms in relative 100 ns units
+#endif
     ULARGE_INTEGER due{};
     due.QuadPart = static_cast<ULONGLONG>(kRewindPollInterval);
     FILETIME timeout{due.LowPart, due.HighPart};

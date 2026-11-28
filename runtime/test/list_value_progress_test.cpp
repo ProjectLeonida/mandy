@@ -6,7 +6,10 @@
 #include "../src/queue_holds.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #define CHECK(cond)                                                                \
@@ -315,6 +318,144 @@ int main() {
         }
 
         holds.detach(&holder);
+    }
+
+    // 12. Round 8 P0 TOCTOU + Present quiet-window debounce invariants:
+    //     (a) A write group or action whose GPU fence already completed (done >= target, awaiting take_landed()) MUST
+    //         count as active progress (running == true -> Reason::hold even at Present), never stuck!
+    //     (b) A 10 ms quiet debounce on Reason::present (matching Pump::choose_release()) defers unmet Present release
+    //         while progress occurred within the last 10 ms, while leaving Reason::cycle immediate and decide() pure.
+    {
+        const PendingGate gates[] = {gate(qa, 1, wait_x, 0, 0)};
+        Activity at_present;
+        at_present.presents = 1;
+        at_present.now_ms = 100;
+        at_present.title_call_ms = 95;
+
+        // Simulate write group whose GPU fence already retired (done == target, done != UINT64_MAX):
+        // must be classified as active progress (never passed to decide() as running == false).
+        const auto write_progress = [](std::uint64_t done, std::uint64_t target, bool submitted) {
+            return done != UINT64_MAX && (done >= target || submitted);
+        };
+        CHECK(write_progress(/*done=*/5, /*target=*/5, /*submitted=*/false));   // retired between take_landed & check
+        CHECK(write_progress(/*done=*/6, /*target=*/5, /*submitted=*/false));   // retired past target
+        CHECK(write_progress(/*done=*/4, /*target=*/5, /*submitted=*/true));    // in flight on GPU
+        CHECK(!write_progress(/*done=*/4, /*target=*/5, /*submitted=*/false));  // held in layer, not submitted
+        CHECK(!write_progress(UINT64_MAX, /*target=*/5, /*submitted=*/true));   // device lost
+
+        // Present quiet window helper matching Pump::choose_release(): gates ONLY Reason::present.
+        constexpr std::uint64_t kPresentQuietMs = 10;
+        const auto apply_present_quiet = [&](Decision d, std::uint64_t now_ms, std::uint64_t last_progress_ms) {
+            if (d.reason == Reason::present && now_ms >= last_progress_ms &&
+                now_ms - last_progress_ms < kPresentQuietMs)
+                return Decision{};
+            return d;
+        };
+        const Decision raw_present = run({}, gates, at_present);
+        CHECK(raw_present.reason == Reason::present && raw_present.gate == 0);  // decide() itself remains pure
+        CHECK(apply_present_quiet(raw_present, /*now_ms=*/100, /*last_progress_ms=*/95).reason == Reason::hold);
+        CHECK(apply_present_quiet(raw_present, /*now_ms=*/104, /*last_progress_ms=*/95).reason == Reason::hold);
+        CHECK(apply_present_quiet(raw_present, /*now_ms=*/105, /*last_progress_ms=*/95).reason == Reason::present);
+
+        // Cycle release is NOT delayed by the Present quiet window.
+        const PendingGate cycle_gates[] = {gate(qa, 1, wait_x), gate(qb, 1, wait_y)};
+        const PendingWriteGroup cycle_writes[] = {group(qb, 1, write_x), group(qa, 1, write_y)};
+        const Decision raw_cycle = run(cycle_writes, cycle_gates, at_present);
+        CHECK(raw_cycle.reason == Reason::cycle && raw_cycle.gate == 0);
+        CHECK(apply_present_quiet(raw_cycle, /*now_ms=*/100, /*last_progress_ms=*/100).reason == Reason::cycle);
+    }
+
+    // 13. Round 8 P2 QueueHolds dedicated barrier-drain thread guardrails (a), (b), (c):
+    //     (a) active_work_ / has_progress() stays true while barriers are queued or running on the barrier thread;
+    //     (b) wait_barriers_drained(seq) waits for ready/running barriers <= seq without blocking on barriers > seq;
+    //     (c) cancel_after(owner) cancels queued barriers (balancing active_work_) and waits for any running barrier;
+    //         ~QueueHolds() cleanly shuts down and joins the barrier thread.
+    {
+        struct SeqHolder final : leonida::QueueHolds<std::uint64_t>::Holder {
+            std::atomic<std::uint64_t> oldest{0};
+            bool release_ready() override { return false; }
+            void discard_waiting_on(std::uint64_t) override {}
+            std::uint64_t oldest_held_seq() override { return oldest.load(std::memory_order_acquire); }
+        };
+
+        {
+            leonida::QueueHolds<std::uint64_t> holds;
+            SeqHolder holder;
+            holds.attach(&holder);
+
+            // Hold seq 1 so barriers wait until released.
+            const std::uint64_t s1 = holds.next_seq();
+            holder.oldest.store(s1, std::memory_order_release);
+            holds.held_changed(1);
+
+            std::atomic<bool> in_b1{false}, go_b1{false}, b2_ran{false}, b3_ran{false};
+            std::mutex order_m;
+            std::vector<int> order;
+            int owner_a = 0, owner_cancel = 0;
+
+            holds.after_held(&owner_a, [&] {
+                in_b1.store(true, std::memory_order_release);
+                while (!go_b1.load(std::memory_order_acquire)) std::this_thread::yield();
+                std::lock_guard lk(order_m);
+                order.push_back(1);
+            });
+            holds.after_held(&owner_a, [&] {
+                b2_ran.store(true, std::memory_order_release);
+                std::lock_guard lk(order_m);
+                order.push_back(2);
+            });
+            holds.after_held(&owner_cancel, [&] { b3_ran.store(true, std::memory_order_release); });
+
+            // Release held op: pump_ready() hands barriers to the dedicated barrier thread and returns IMMEDIATELY!
+            holder.oldest.store(0, std::memory_order_release);
+            holds.held_changed(-1);
+            holds.pump_ready();
+
+            while (!in_b1.load(std::memory_order_acquire)) std::this_thread::yield();
+
+            // Guardrail (a): active_work_ / has_progress() MUST be true while b1 is running & b2/b3 are queued.
+            CHECK(holds.has_progress());
+            CHECK(leonida::queue_holds::any_progress());
+
+            // Guardrail (b): wait_barriers_drained(s1) MUST block until b1 & b2 finish; wait_barriers_drained(s1 - 1)
+            // returns immediately when s1 > 0.
+            if (s1 > 0) holds.wait_barriers_drained(s1 - 1);
+            std::atomic<bool> drained_s1{false};
+            std::thread waiter([&] {
+                holds.wait_barriers_drained(s1);
+                drained_s1.store(true, std::memory_order_release);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            CHECK(!drained_s1.load(std::memory_order_acquire));
+
+            // Guardrail (c): cancel_after(&owner_cancel) drops queued b3 and waits for running b1 before returning.
+            std::atomic<bool> cancel_done{false};
+            std::thread canceller([&] {
+                holds.cancel_after(&owner_cancel);
+                cancel_done.store(true, std::memory_order_release);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            CHECK(!cancel_done.load(std::memory_order_acquire));
+
+            go_b1.store(true, std::memory_order_release);
+            waiter.join();
+            canceller.join();
+
+            CHECK(drained_s1.load(std::memory_order_acquire));
+            CHECK(cancel_done.load(std::memory_order_acquire));
+            CHECK(b2_ran.load(std::memory_order_acquire));
+            CHECK(!b3_ran.load(std::memory_order_acquire));
+            CHECK((order == std::vector<int>{1, 2}));
+
+            // Once all barriers finished (and cancelled b3 decremented active_work_), has_progress() settles to false!
+            const auto settle = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            while (holds.has_progress() && std::chrono::steady_clock::now() < settle)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            CHECK(!holds.has_progress());
+            CHECK(!leonida::queue_holds::any_progress());
+
+            holds.detach(&holder);
+        }  // ~QueueHolds() cleanly stops and joins barrier_thread_
     }
 
     std::printf("list_value_progress_test: all checks passed\n");

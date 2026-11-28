@@ -238,10 +238,29 @@ inline bool enabled() {
 }
 inline void set_enabled(bool on) { enabled_state().store(on ? 1 : 0, std::memory_order_relaxed); }
 
-// The value a wait looks at, read through the kernel: memory that is not there is reported instead of faulting (a
-// fault would run every vectored handler of the process, the D3D12 layer's write-fault handler among them, from a
-// thread that may hold the pump's lock). The kernel's copy is not one access, so a value read while another thread
-// stores it could mix the two: it is read until two reads agree.
+#if defined(_MSC_VER)
+// Out-of-line aligned volatile load: clang-cl without /EHa only catches SEH faults raised by a call inside __try.
+// MUST omit `noexcept` (see src/guarded_copy.h): under /EHsc, clang-cl tags `noexcept` callees `nounwind` and emits a
+// plain `call` instead of `invoke`, stripping the __except handler so an access violation crashes the process.
+__declspec(noinline) inline std::uint64_t load_aligned_volatile(std::uintptr_t address, bool wide) {
+    return wide ? *reinterpret_cast<const volatile std::uint64_t*>(address)
+                : static_cast<std::uint64_t>(*reinterpret_cast<const volatile std::uint32_t*>(address));
+}
+
+// Separate __try frame (no C++ objects with destructors) for aligned reads in read_value().
+__declspec(noinline) inline bool read_aligned_volatile_seh(std::uintptr_t address, bool wide, std::uint64_t& out) {
+    __try {
+        out = load_aligned_volatile(address, wide);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+#endif
+
+// The value a wait looks at: aligned reads go through the frame table or an SEH-guarded volatile load (one atomic
+// access, no syscall), falling back to ReadProcessMemory on unaligned or faulted addresses. The kernel's copy is not
+// one access, so a value read while another thread stores it could mix the two: it is read until two reads agree.
 inline bool read_value(std::uint64_t address, bool wide, std::uint64_t& value) {
     value = 0;
     if (!address) return false;
@@ -254,6 +273,11 @@ inline bool read_value(std::uint64_t address, bool wide, std::uint64_t& value) {
                      : reinterpret_cast<const volatile std::uint32_t*>(frame.bytes)[0];
         return true;
     }
+#if defined(_MSC_VER)
+    if (address % bytes == 0 && read_aligned_volatile_seh(static_cast<std::uintptr_t>(address), wide, value)) {
+        return true;
+    }
+#endif
     const auto* at = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address));
     std::uint64_t last = 0;
     for (int attempt = 0; attempt < 4; ++attempt) {
@@ -867,15 +891,16 @@ private:
             const std::size_t start = flat_writes.size();
             for (const Write& w : wg.writes)
                 flat_writes.push_back({w.address, w.value, w.bytes, w.kind != WriteKind::value});
-            // Running: its Signal reached the GPU and the fence is not there yet. Held in the layer (behind a gate, a
-            // relayed wait or a title fence), it is not running.
-            const bool running = wg.queue->written->GetCompletedValue() < wg.value &&
-                                 signal_submitted(wg.queue->written, wg.value);
-            if (running) {
+            // Running or already completed (waiting for the next pass to land): its Signal reached the GPU, or the
+            // GPU retired it between take_landed() and here. Either way progress is guaranteed; if already done, wake
+            // the pump immediately so take_landed() lands it before considering any unmet release.
+            const UINT64 done = wg.queue->written->GetCompletedValue();
+            if (done != UINT64_MAX && (done >= wg.value || signal_submitted(wg.queue->written, wg.value))) {
                 last_progress_ms_ = now_ms;
+                if (done >= wg.value && wake_) SetEvent(wake_);
                 return gates_.size();
             }
-            groups.push_back({wg.queue.get(), wg.after_gate, running,
+            groups.push_back({wg.queue.get(), wg.after_gate, false,
                               std::span<const lvp::PendingWrite>(flat_writes).subspan(start, wg.writes.size())});
         }
         std::size_t total_waits = 0;
@@ -895,15 +920,28 @@ private:
         for (std::size_t i = 0; i < gates_.size(); ++i) {
             const Gate& g = gates_[i];
             const bool action = static_cast<bool>(g.action);
-            const bool action_running = action && g.queue->written->GetCompletedValue() < g.after &&
-                                        signal_submitted(g.queue->written, g.after);
-            if (action_running) last_progress_ms_ = now_ms;
-            view.push_back({g.queue.get(), g.value, action, action_running,
+            if (action) {
+                const UINT64 done = g.queue->written->GetCompletedValue();
+                if (done != UINT64_MAX && (done >= g.after || signal_submitted(g.queue->written, g.after))) {
+                    last_progress_ms_ = now_ms;
+                    if (done >= g.after && wake_) SetEvent(wake_);
+                    return gates_.size();
+                }
+            }
+            view.push_back({g.queue.get(), g.value, action, false,
                             std::span<const lvp::WaitPredicate>(flat_waits).subspan(ranges[i].first, ranges[i].second),
                             g.presents_at_hold, g.held_ms});
         }
         const lvp::Decision decision = lvp::decide(groups, view, activity, console_value_met);
         if (decision.reason == lvp::Reason::hold || decision.gate >= gates_.size()) return gates_.size();
+        // Gate ONLY Reason::present on a short quiet window after the last observed progress (leaving
+        // list_value_progress::decide() pure for unit tests) so sub-ms races from deferred CPU Fence::Signal
+        // callbacks or post-PresentX CPU writes settle before releasing a gate unmet.
+        constexpr std::uint64_t kPresentQuietMs = 10;
+        if (decision.reason == lvp::Reason::present && now_ms >= last_progress_ms_ &&
+            now_ms - last_progress_ms_ < kPresentQuietMs) {
+            return gates_.size();
+        }
         const Reason reason = decision.reason == lvp::Reason::cycle     ? Reason::cycle
                               : decision.reason == lvp::Reason::present ? Reason::present
                                                                         : Reason::stalled;

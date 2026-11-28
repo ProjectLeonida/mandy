@@ -76,6 +76,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -398,6 +399,7 @@ public:
         : device_(device), memory_(memory), features_(features), families_(std::move(families)),
           table_(64, descriptor_hash) {
         ok_ = vk_.load(get, device) && create_layout() && create_fallbacks() && create_table_buffers() && fill();
+        sync_fast_state();
     }
 
     ~BindlessSet() {
@@ -451,11 +453,18 @@ public:
     // that bound the previous set keeps it, intact, until release_retired() frees it.
     VkDescriptorSet set() const { return set_; }
 
+    // Lock-free clean-state queries for the submission hot path (published with release semantics after every mutation
+    // under the owner's descriptor lock, so clean submissions skip descriptor_mutex completely).
+    bool needs_prepare() const noexcept { return needs_prepare_.load(std::memory_order_acquire); }
+    VkDescriptorSet current_set() const noexcept { return current_set_.load(std::memory_order_acquire); }
+    bool needs_commit() const noexcept { return needs_commit_.load(std::memory_order_acquire); }
+
     // The fallback images are created with undefined contents: record this once, in a command buffer that executes
     // before anything uses the set. It moves them to GENERAL, the layout their descriptors name, and zeroes them.
     bool fallbacks_ready() const { return fallbacks_ready_; }
     void record_fallback_init(VkCommandBuffer command_buffer) {
         fallbacks_ready_ = true;
+        sync_fast_state();
         std::vector<VkImageMemoryBarrier> barriers;
         std::vector<const FallbackImage*> images;
         for (const auto& image : fallback_images_) images.push_back(&image);
@@ -673,6 +682,7 @@ public:
         table_dirty_ |= result != DescriptorTable::InsertResult::unchanged;
         existing_entries_changed_ |= result == DescriptorTable::InsertResult::replaced ||
                                      result == DescriptorTable::InsertResult::added_with_relocation;
+        if (table_dirty_) needs_prepare_.store(true, std::memory_order_release);
         return true;
     }
     // The T#'s own dimension, whose kind the set derives from the index it gave out (image_kind_at): a caller that
@@ -685,6 +695,7 @@ public:
     bool erase_key(const DescriptorKey& key) {
         if (!table_.erase(key)) return false;
         table_dirty_ = true;
+        needs_prepare_.store(true, std::memory_order_release);
         return true;
     }
     const DescriptorTable& table() const { return table_; }
@@ -713,10 +724,12 @@ public:
         upload_in_flight_ = false;
         if (submitted) {
             table_on_gpu_ = true;  // the current buffers hold a table the GPU was given
+            sync_fast_state();
             return;
         }
         table_dirty_ = true;
         force_full_upload_ = true;
+        sync_fast_state();
     }
 
     // Writes the pending descriptor changes and uploads the table, in `command_buffer`, before the commands that use
@@ -735,6 +748,10 @@ public:
     bool flush(VkCommandBuffer command_buffer, std::uint64_t retire_ticket = 0,
                const std::function<std::uint64_t()>& completed_ticket = {}) {
         if (!command_buffer) return false;
+        struct FastStateGuard {
+            BindlessSet* self;
+            ~FastStateGuard() { self->sync_fast_state(); }
+        } fast_guard{this};
         bool replaced = false;
         bool written = true;
         const bool must_replace = flush_replaces_table();
@@ -809,6 +826,7 @@ public:
             }
         }
         retired_.resize(kept);
+        sync_fast_state();
     }
     bool has_retired() const { return !retired_.empty(); }
     // True when the last flush() started a new generation: its table upload is in that flush's command buffer, so
@@ -1422,6 +1440,15 @@ private:
             pending_.push_back({binding, index, info});
         else
             pending_[at->second].info = info;
+        needs_prepare_.store(true, std::memory_order_release);
+    }
+
+    void sync_fast_state() noexcept {
+        const bool prep =
+            !fallbacks_ready_ || table_dirty_ || !table_uploaded_ || !pending_.empty() || !retired_.empty();
+        current_set_.store(set_, std::memory_order_release);
+        needs_commit_.store(upload_in_flight_, std::memory_order_release);
+        needs_prepare_.store(prep, std::memory_order_release);
     }
 
     void write_sampler(std::uint32_t index, VkSampler sampler) {
@@ -1511,6 +1538,9 @@ private:
     // Every descriptor written to the set (the table's binding aside), to fill the next generation's set.
     std::array<std::vector<VkDescriptorImageInfo>, bindless::bindings.size()> shadow_;
     std::array<std::vector<std::uint8_t>, bindless::bindings.size()> shadow_written_;
+    std::atomic<bool> needs_prepare_{true};
+    std::atomic<VkDescriptorSet> current_set_{VK_NULL_HANDLE};
+    std::atomic<bool> needs_commit_{false};
 };
 
 } // namespace leonida

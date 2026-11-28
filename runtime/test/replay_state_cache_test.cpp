@@ -18,6 +18,7 @@
 #endif
 
 #include "../src/vulkan_backend.h"
+#include "../src/vulkan_bindless.h"
 #include "../src/vulkan_replay.h"
 #include "vk_test_device.h"
 
@@ -2173,6 +2174,226 @@ void test_rendering_scope_batching_and_fast_paths() {
     std::puts("rendering scope batching, LayoutTracker no-op elision & prepare fast path: ok");
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Part 6: Round 8 WS3 replay floor cuts: CommandList::close() cached summary, EmitScratch reuse,
+//         VulkanContext::unbuilt_sync_pipelines_ atomic fast-path + pass-0 fallback, and BindlessSet clean atomics.
+void test_r8_replay_floor_cuts() {
+    // 6a: CommandList::close() caches predication_captures, runs_shaders, has_rt_ds_clear, and reset() clears them.
+    {
+        CommandList l;
+        CHECK(l.close());
+        CHECK(l.commands().empty() && l.predication_captures() == 0 && !l.runs_shaders() && !l.has_rt_ds_clear());
+
+        CHECK(l.reset());
+        CHECK(l.uav_barrier({}));
+        CHECK(l.copy_buffer({1, 0, 2, 0, 64}));
+        CHECK(l.set_predication({3, 0, d3d12_predication::equal_zero}));
+        CHECK(l.set_predication({0, 0, 0}));  // turning predication off does NOT increment captures
+        CHECK(l.set_predication({3, 8, d3d12_predication::not_equal_zero}));
+        CHECK(l.close());
+        CHECK(l.predication_captures() == 2 && !l.runs_shaders() && !l.has_rt_ds_clear());
+
+        CHECK(l.reset());
+        CHECK(l.predication_captures() == 0 && !l.runs_shaders() && !l.has_rt_ds_clear());
+        TargetView tv{};
+        tv.resource = 1;
+        tv.layer_count = 1;
+        CHECK(l.clear_render_target(tv, ClearColor{}));
+        Dispatch d{};
+        d.pipeline = 1;
+        d.x = d.y = d.z = 1;
+        CHECK(l.dispatch(d));
+        CHECK(l.close());
+        CHECK(l.predication_captures() == 0 && l.runs_shaders() && l.has_rt_ds_clear());
+
+        CHECK(l.reset());
+        CHECK(l.clear_depth_stencil(tv, clear_depth, 1.0f, 0));
+        CHECK(l.close());
+        CHECK(!l.runs_shaders() && l.has_rt_ds_clear());
+
+        CHECK(l.reset());
+        ExecuteIndirect ei{};
+        ei.kind = IndirectKind::dispatch;
+        ei.argument_buffer = 2;
+        ei.stride = 16;
+        ei.max_count = 1;
+        CHECK(l.execute_indirect(ei));
+        CHECK(l.close());
+        CHECK(l.runs_shaders() && !l.has_rt_ds_clear());
+    }
+
+    // 6b: EmitScratch reuse across repeated emit() calls preserves vector capacity without reallocating.
+    {
+        MockEnv env;
+        const auto resolve = [&env](ResourceId id) { return env.resolve(id); };
+        const VkCommandBuffer cb = fake_handle<VkCommandBuffer>(0x2);
+
+        CommandList list;
+        const Draw d = env.base_draw(1, false);
+        CHECK(list.draw(d) && list.close());
+        PreparedList prep;
+        CHECK(prepare(list, resolve, env.vk, prep) == ReplayResult::success);
+
+        EmitScratch scratch;
+        scratch.many_barriers.reserve(8);
+        const void* orig_ptr = scratch.many_barriers.data();
+        const std::size_t orig_cap = scratch.many_barriers.capacity();
+        g_mc.reset();
+        ReplayStateCache cache;
+        emit(prep, cb, env.vk, nullptr, nullptr, &cache, &scratch);
+        emit(prep, cb, env.vk, nullptr, nullptr, &cache, &scratch);
+        CHECK(g_mc.draws == 2);
+        CHECK(scratch.many_barriers.data() == orig_ptr && scratch.many_barriers.capacity() == orig_cap);
+    }
+
+    // 6c & 6d: Live Vulkan checks for unbuilt_sync_pipelines_ atomic fast-path (+ pass-0 fallback) and BindlessSet
+    //          lock-free clean atomics (needs_prepare / current_set / needs_commit).
+    vktest::Device dev;
+    if (!dev.create()) {
+        std::puts("r8 replay floor cuts (CPU): ok (GPU part skipped: no Vulkan device)");
+        return;
+    }
+
+    // 6c: VulkanContext unbuilt_sync_pipelines_ atomic fast-path.
+    {
+        VulkanContext ctx(dev.device_proc, dev.device, true, dev.conditional_rendering, dev.buffer_device_address);
+        CHECK(ctx.loaded());
+        CHECK(!ctx.has_unbuilt_sync_pipelines());
+
+        // Pre-built pipeline does NOT arm unbuilt_sync_pipelines_.
+        ComputePipeline prebuilt{};
+        prebuilt.pipeline = fake_handle<VkPipeline>(0x900);
+        ctx.add_pipeline(1, prebuilt);
+        CHECK(!ctx.has_unbuilt_sync_pipelines());
+
+        // Unbuilt synchronous compute pipeline arms unbuilt_sync_pipelines_; building clears it back to 0.
+        bool is_built = false;
+        ComputePipeline lazy{};
+        lazy.build_context = &is_built;
+        lazy.built = +[](void* ctx) -> VkPipeline {
+            return *static_cast<bool*>(ctx) ? fake_handle<VkPipeline>(0x901) : VK_NULL_HANDLE;
+        };
+        lazy.build = +[](void* ctx) -> VkPipeline {
+            *static_cast<bool*>(ctx) = true;
+            return fake_handle<VkPipeline>(0x901);
+        };
+        ctx.add_pipeline(2, lazy);
+        CHECK(ctx.has_unbuilt_sync_pipelines());
+        ctx.note_sync_pipelines_built(1);
+        CHECK(!ctx.has_unbuilt_sync_pipelines());
+
+        // Unused unbuilt pipeline clears after kWarmEmptyScans consecutive empty scans with no new registrations.
+        ctx.add_pipeline(3, lazy);
+        CHECK(ctx.has_unbuilt_sync_pipelines());
+        const std::uint64_t gen = ctx.sync_pipeline_gen();
+        for (int i = 0; i < 16; ++i) ctx.note_empty_pipeline_scan(gen);
+        CHECK(!ctx.has_unbuilt_sync_pipelines());
+    }
+
+    // 6d: BindlessSet lock-free clean atomics (needs_prepare / current_set / needs_commit).
+    {
+        VkPhysicalDeviceMemoryProperties mem_props{};
+        const auto get_mem = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+            dev.instance_proc(dev.instance, "vkGetPhysicalDeviceMemoryProperties"));
+        CHECK(get_mem != nullptr);
+        get_mem(dev.physical, &mem_props);
+
+        BindlessFeatures features{};
+        features.update_after_bind = false;
+        features.partially_bound = false;
+        BindlessSet set(dev.device_proc, dev.device, mem_props, features);
+        CHECK(set.ok());
+        CHECK(set.needs_prepare());
+        CHECK(set.current_set() == set.set() && set.current_set() != VK_NULL_HANDLE);
+        CHECK(!set.needs_commit());
+
+        const auto create_pool = dev.fn<PFN_vkCreateCommandPool>("vkCreateCommandPool");
+        const auto destroy_pool = dev.fn<PFN_vkDestroyCommandPool>("vkDestroyCommandPool");
+        const auto alloc_cb = dev.fn<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers");
+        const auto begin_cb = dev.fn<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer");
+        const auto end_cb = dev.fn<PFN_vkEndCommandBuffer>("vkEndCommandBuffer");
+        const auto queue_submit = dev.fn<PFN_vkQueueSubmit>("vkQueueSubmit");
+        const auto queue_wait = dev.fn<PFN_vkQueueWaitIdle>("vkQueueWaitIdle");
+
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.queueFamilyIndex = dev.family;
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        CHECK(create_pool(dev.device, &pci, nullptr, &pool) == VK_SUCCESS);
+        VkCommandBuffer cb = VK_NULL_HANDLE;
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = pool;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = 1;
+        CHECK(alloc_cb(dev.device, &cai, &cb) == VK_SUCCESS);
+
+        auto record_and_submit = [&](auto&& fn) {
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            CHECK(begin_cb(cb, &bi) == VK_SUCCESS);
+            fn(cb);
+            CHECK(end_cb(cb) == VK_SUCCESS);
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &cb;
+            CHECK(queue_submit(dev.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+            CHECK(queue_wait(dev.queue) == VK_SUCCESS);
+        };
+
+        // First flush: initializes fallbacks & uploads initial table -> needs_commit becomes true until result reported.
+        record_and_submit([&](VkCommandBuffer c) {
+            set.record_fallback_init(c);
+            CHECK(set.flush(c, 1));
+            CHECK(set.needs_commit());
+        });
+        set.table_upload_result(true);
+        CHECK(!set.needs_commit());
+        CHECK(!set.needs_prepare());
+        CHECK(set.current_set() == set.set());
+
+        // Inserting a key dirties needs_prepare(); flushing + committing clears it back to false.
+        DescriptorKey key{};
+        key[0] = 0x12345678u;
+        CHECK(set.insert_key(key, 0, 0));
+        CHECK(set.needs_prepare());
+        record_and_submit([&](VkCommandBuffer c) {
+            CHECK(set.flush(c, 2));
+            CHECK(set.needs_commit());
+        });
+        set.table_upload_result(true);
+        CHECK(!set.needs_commit());
+        CHECK(!set.needs_prepare());
+
+        // Replacing an existing key replaces the generation (updates current_set() and keeps needs_prepare() true
+        // while a retired generation waits for release_retired()).
+        const VkDescriptorSet old_set = set.current_set();
+        CHECK(set.insert_key(key, 1, 0));
+        CHECK(set.needs_prepare());
+        record_and_submit([&](VkCommandBuffer c) {
+            CHECK(set.flush(c, 3));
+        });
+        set.table_upload_result(true);
+        CHECK(set.current_set() == set.set() && set.current_set() != old_set);
+        CHECK(set.has_retired() && set.needs_prepare());  // retired generation still pending release
+        set.release_retired(3);
+        CHECK(!set.has_retired() && !set.needs_prepare());
+
+        // Erasing a key dirties needs_prepare() again.
+        CHECK(set.erase_key(key));
+        CHECK(set.needs_prepare());
+        record_and_submit([&](VkCommandBuffer c) {
+            CHECK(set.flush(c, 4));
+        });
+        set.table_upload_result(true);
+        CHECK(!set.needs_prepare());
+
+        destroy_pool(dev.device, pool, nullptr);
+        CHECK(dev.validation_errors() == 0);
+    }
+
+    std::puts("r8 replay floor cuts (CommandList summary, EmitScratch, unbuilt_sync_pipelines_, BindlessSet atomics): ok");
+}
+
 }  // namespace
 
 int main() {
@@ -2181,6 +2402,7 @@ int main() {
     test_gpu_live_validation();
     test_batch_parallel_sync_pipeline_compile();
     test_rendering_scope_batching_and_fast_paths();
+    test_r8_replay_floor_cuts();
     if (g_failures) {
         std::fprintf(stderr, "replay_state_cache_test: %d failure(s)\n", g_failures);
         return 1;
