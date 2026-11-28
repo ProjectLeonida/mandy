@@ -31,7 +31,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <initializer_list>
 #include <vector>
 
 #ifndef LEONIDA_TEST_CS_SPV
@@ -153,6 +152,7 @@ D3D12_SHADER_RESOURCE_VIEW_DESC raw_srv(UINT first_word, UINT words) {
     return desc;
 }
 
+constexpr UINT kCodeWord = 6000;  // word 1 of the synthetic shader container
 constexpr UINT kElements = 64, kBytes = kElements * 4;
 constexpr UINT64 kPages = 64 * 1024;
 constexpr UINT kSrvWord = 256;   // the V# reads title words 256..319
@@ -533,20 +533,24 @@ struct WriteBack {
     ID3D12Resource* out;
     ID3D12DescriptorHeap* heap;
     UINT64 gpu;
+    ID3D12CommandQueue* queue = nullptr;  // the context's when null
 };
 
-// Dispatch each root UAV in the given order, then wait for the submission.
-int submit_write(WriteBack& s, std::initializer_list<UINT64> addresses, UINT base = 0, UINT step = 1) {
+// One submission that dispatches through a root UAV at `va` (and at `va2` too, when given) and waits for it. With
+// `wait` false it is only executed (no signal: the caller knows when it is done). False on a failed call.
+int submit_write(WriteBack& s, std::uint64_t va, std::uint64_t va2 = 0, bool wait = true) {
     EXPECT(s.allocator->Reset() == S_OK);
     EXPECT(s.list->Reset(s.allocator, s.c->pso) == S_OK);
     ID3D12DescriptorHeap* heaps[] = {s.heap};
     s.list->SetDescriptorHeaps(1, heaps);
     s.list->SetComputeRootSignature(s.c->root);
-    s.list->SetComputeRoot32BitConstant(0, base, 0);
-    s.list->SetComputeRoot32BitConstant(0, step, 1);
+    s.list->SetComputeRoot32BitConstant(0, 0, 0);
+    s.list->SetComputeRoot32BitConstant(0, 1, 1);  // the step: a word the shader writes
+    s.list->SetComputeRootUnorderedAccessView(1, va);
     s.list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{s.gpu});
-    for (const UINT64 va : addresses) {
-        s.list->SetComputeRootUnorderedAccessView(1, va);
+    s.list->Dispatch(1, 1, 1);
+    if (va2) {
+        s.list->SetComputeRootUnorderedAccessView(1, va2);
         s.list->Dispatch(1, 1, 1);
     }
     D3D12_RESOURCE_BARRIER to_copy{};
@@ -558,9 +562,11 @@ int submit_write(WriteBack& s, std::initializer_list<UINT64> addresses, UINT bas
     s.list->ResourceBarrier(1, &to_copy);
     EXPECT(s.list->Close() == S_OK);
     ID3D12CommandList* lists[] = {s.list};
-    s.c->queue->ExecuteCommandLists(1, lists);
-    EXPECT(rt::d3d12::last_execute_result(s.c->queue) == leonida::ReplayResult::success);
-    EXPECT(SUCCEEDED(s.c->queue->Signal(s.c->fence, ++s.c->fence_value)));
+    ID3D12CommandQueue* queue = s.queue ? s.queue : s.c->queue;
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(queue) == leonida::ReplayResult::success);
+    if (!wait) return 0;
+    EXPECT(SUCCEEDED(queue->Signal(s.c->fence, ++s.c->fence_value)));
     s.c->fence->SetEventOnCompletion(s.c->fence_value, nullptr);  // a null event waits, as D3D12 does
     return 0;
 }
@@ -608,7 +614,7 @@ int check_placed_write_back(Context& c, bool geometry) {
                 reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p)};
 
     const std::vector<std::uint32_t> before(words, words + kElements);
-    EXPECT(submit_write(s, {title_va}) == 0);
+    EXPECT(submit_write(s, title_va) == 0);
     UINT untouched = 0;
     for (UINT i = 0; i < kElements; ++i) untouched += words[i] == before[i];
     // An imported buffer is the same memory and needs no copy; only a shadow owes the pages the GPU's words.
@@ -619,7 +625,7 @@ int check_placed_write_back(Context& c, bool geometry) {
         EXPECT(untouched == kElements);
     }
 
-    EXPECT(submit_write(s, {title_va}) == 0);
+    EXPECT(submit_write(s, title_va) == 0);
     std::vector<std::uint32_t> written(words, words + kElements);
     UINT reached = 0, changed = 0, nonzero = 0;
     for (UINT i = 0; i < kElements; ++i) {
@@ -634,7 +640,7 @@ int check_placed_write_back(Context& c, bool geometry) {
 
     // The title writes its own words over the result: the next submission copies them forward and they stay.
     for (UINT i = 0; i < kElements; ++i) words[i] = 0xB16B00B5u;
-    EXPECT(submit_write(s, {title_va}) == 0);
+    EXPECT(submit_write(s, title_va) == 0);
     UINT kept = 0;
     for (UINT i = 0; i < kElements; ++i) kept += words[i] == 0xB16B00B5u;
     std::printf("placed buffer write back: the title's own words survived %u/%u\n", kept, kElements);
@@ -647,15 +653,23 @@ int check_placed_write_back(Context& c, bool geometry) {
     EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(c.inner, upper_pages, desc, 0xFFFFFFFFu,
                                                                IID_PPV_ARGS(&upper.p))));
     EXPECT(upper->GetGPUVirtualAddress() == upper_va);
-    constexpr UINT read_root = 0xfffffffeu;  // cs_user_data reads word i + 64 and writes it plus base to word i
+    const UINT64 cpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p);
+    EXPECT(cpu);
+    constexpr UINT page_words = UINT(kPages / sizeof(*words));
     for (bool upper_first : {true, false}) {
-        const UINT addend = upper_first ? 7u : 11u;
-        const std::initializer_list<UINT64> order{upper_first ? upper_va : title_va, upper_first ? title_va : upper_va};
-        EXPECT(submit_write(s, order, addend, read_root) == 0);
-        EXPECT(submit_write(s, order, addend, read_root) == 0);  // retire the first submission's writes
+        const UINT64 first = upper_first ? upper_va : title_va;
+        const UINT64 second = upper_first ? title_va : upper_va;
+        // cs_user_data adds the table's four words, its code word and the lane index.
+        // Point it past the output in the first buffer so each ordering has a different result.
+        const UINT64 table_data = aliases.shader_va(first) + kBytes;
+        std::memcpy(reinterpret_cast<void*>(cpu), &table_data, sizeof(table_data));
+        EXPECT(submit_write(s, first, second) == 0);
+        EXPECT(submit_write(s, first, second) == 0);  // retire the first submission's writes
+        const UINT source_word = (upper_first ? page_words : 0u) + kElements;
         for (UINT i = 0; i < allocation_bytes / sizeof(*words); ++i) {
-            const bool written_word = (i % (kPages / sizeof(*words))) < kElements;
-            const UINT expected = written_word ? 0xA0000000u + (i + kElements) * 3u + addend : 0xA0000000u + i * 3u;
+            const UINT lane = i % page_words;
+            const UINT expected = lane < kElements ? 0xA0000000u + (source_word + lane % 4) * 3u + kCodeWord + lane
+                                                   : 0xA0000000u + i * 3u;
             if (words[i] != expected) {
                 std::fprintf(stderr, "adjacent buffers (%s first): word %u got %08x, expected %08x\n",
                              upper_first ? "upper" : "lower", i, words[i], expected);
@@ -706,12 +720,12 @@ int check_window_write_back(Context& c, bool geometry) {
     // The shader writes the range the root UAV names, which is the title's own pages here, far past the arena: the
     // resolve already has to make a window for them before the submission.
     EXPECT(aliases.shader_va(ring_va) == ring_va);
-    EXPECT(submit_write(s, {ring_va}) == 0);
+    EXPECT(submit_write(s, ring_va) == 0);
     EXPECT(aliases.shader_va(ring_va) != ring_va);  // a window was made for the title's pages
     if (!geometry) EXPECT(ring[0] == 0);  // the copy took the write: the pages get it only after the next submission
 
     // The next submission's refresh copies the GPU's writes back, before it copies the pages forward.
-    EXPECT(submit_write(s, {ring_va}) == 0);
+    EXPECT(submit_write(s, ring_va) == 0);
     const std::vector<std::uint32_t> written(ring, ring + kElements);
     UINT nonzero = 0;
     for (std::uint32_t w : written) nonzero += w != 0;
@@ -719,7 +733,7 @@ int check_window_write_back(Context& c, bool geometry) {
     EXPECT(nonzero > 0);
 
     // The same submission again: the pages keep what they hold, the values do not drift.
-    EXPECT(submit_write(s, {ring_va}) == 0);
+    EXPECT(submit_write(s, ring_va) == 0);
     UINT stable = 0;
     for (UINT i = 0; i < kElements; ++i) stable += ring[i] == written[i];
     std::printf("write back: the pages kept those words across two submissions %u/%u\n", stable, kElements);
@@ -727,7 +741,7 @@ int check_window_write_back(Context& c, bool geometry) {
 
     // A write by the title after a submission is copied forward over the result again, not overwritten by it.
     for (UINT i = 0; i < kElements; ++i) ring[i] = 0xB16B00B5u;
-    EXPECT(submit_write(s, {ring_va}) == 0);
+    EXPECT(submit_write(s, ring_va) == 0);
     UINT kept = 0;
     for (UINT i = 0; i < kElements; ++i) kept += ring[i] == 0xB16B00B5u;
     std::printf("write back: the title's own words survived the next submission %u/%u\n", kept, kElements);
@@ -1230,7 +1244,7 @@ int main(int argc, char** argv) {
     EXPECT(device_status == vktest::DeviceStatus::ready);
 
     std::vector<std::uint8_t> fssm = {'F', 'S', 'S', 'M'};
-    put32(fssm, 6000);
+    put32(fssm, kCodeWord);
     for (std::uint32_t i = 0; i < 14; ++i) put32(fssm, 0xbf810000u + i);
     const auto container = shader_container(fssm);
     const testfiles::ScratchDir scratch("leonida_title_va_test");
