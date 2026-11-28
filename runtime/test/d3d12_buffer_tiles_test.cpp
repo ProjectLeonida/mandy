@@ -113,6 +113,18 @@ bool run(ID3D12Device& device, Results& result, bool layer = false) {
     const D3D12_TILE_REGION_SIZE all{tiles_per_buffer, FALSE, 0, 0, 0};
     queue->CopyTileMappings(b.Get(), &origin, a.Get(), &origin, &all, D3D12_TILE_MAPPING_FLAG_NONE);
     EXPECT(SUCCEEDED(device.GetDeviceRemovedReason()));
+    if (layer) {
+        // No copy is allowed in a bundle: CopyTiles of a reserved buffer fails the bundle's Close, as it does for a
+        // sparse image and as CopyBufferRegion does (the same call is valid on the direct list below).
+        ComPtr<ID3D12CommandAllocator> bundle_allocator;
+        ComPtr<ID3D12GraphicsCommandList> bundle;
+        EXPECT(SUCCEEDED(device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&bundle_allocator))));
+        EXPECT(SUCCEEDED(device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.Get(), nullptr,
+                                                 IID_PPV_ARGS(&bundle))));
+        bundle->CopyTiles(a.Get(), &origin, &all, upload.Get(), tile_bytes,
+                          D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+        EXPECT(bundle->Close() == E_INVALIDARG);
+    }
     lists[0]->CopyTiles(a.Get(), &origin, &all, upload.Get(), tile_bytes,
                         D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
     D3D12_RESOURCE_BARRIER alias{};
