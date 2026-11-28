@@ -42,6 +42,7 @@ struct Counts {
     std::atomic<unsigned long long> values[4]{};
     std::atomic<unsigned long long> by_reason[reason_count]{};
     void report(std::FILE* out = stderr) const {
+        if (!out) return;
         char line[1280];
         int pos = std::snprintf(
             line, sizeof(line),
@@ -88,13 +89,15 @@ inline unsigned long long reason_skips(Reason reason) {
 }
 
 inline void note(Event event) {
+    const unsigned index = static_cast<unsigned>(event);
+    if (index >= 4u) return;
     auto& c = counts();
-    const auto n = 1 + c.values[static_cast<unsigned>(event)].fetch_add(1, std::memory_order_relaxed);
+    const auto n = 1 + c.values[index].fetch_add(1, std::memory_order_relaxed);
     if ((n & (n - 1)) == 0) c.report();
 }
 
 inline void skip(Event event, Reason reason) {
-    if (static_cast<unsigned>(reason) >= reason_count) return;
+    if (static_cast<unsigned>(event) >= 4u || static_cast<unsigned>(reason) >= reason_count) return;
     static std::atomic_flag shown[reason_count]{};
     if (!shown[reason].test_and_set(std::memory_order_relaxed))
         std::fprintf(stderr, "[rt] indirect graphics skipped: %s\n", reason_name(reason));
