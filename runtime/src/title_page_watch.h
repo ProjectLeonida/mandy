@@ -39,7 +39,9 @@
 //    faulting page.
 //
 // Successful title memory map changes also invalidate the shadows' cached protection state. The shadows' own
-// protection changes stay local to their trackers.
+// protection changes stay local to their trackers. A reserved page of the title's placeholders and physical-page
+// windows (title_reservations, below) changes only through such a change, so a shadow doesn't ask about it again
+// until one names it.
 //
 // The shadows themselves are brought up to date in one place, DeviceState::refresh_shadows in
 // d3d12_vulkan_device.cpp, which VulkanQueue::execute_now calls (VulkanContext::set_before_execute) before every
@@ -719,6 +721,85 @@ std::uint64_t ask(std::uint64_t reader, const Runs& runs, Dirty&& dirty, Refused
 }
 
 }  // namespace leonida::title_write_watch
+
+// 7. The title's xmem reservations (title_reservations): its placeholders and physical-page windows, from the
+//    reservation to its release. Nothing but xmem and the title's own memory calls changes their pages, and those
+//    record every change in title_memory_map (a placeholder refuses a plain commit, and the title doesn't commit
+//    inside a window with VirtualAlloc: see the windows in xmem.cpp). A shadow takes a page there that is reserved
+//    and not mapped as zero until the journal names it, instead of asking VirtualQuery at every submission: under
+//    Wine a query waits for the virtual-memory lock, and the world's thousands of 64 KiB placeholders made the
+//    queries most of a refresh.
+namespace leonida::title_reservations {
+
+// Allocates from host_heap, as title_write_watch does: the D3D12 layer asks under a tracker's lock.
+struct State {
+    std::shared_mutex mutex;                                // ranges
+    host_heap::map<std::uintptr_t, std::uintptr_t> ranges;  // base -> end; apart, never touching
+    std::atomic<std::size_t> count{0};                      // ranges.size(), read without the lock
+    std::atomic<std::uint64_t> generation{1};               // moved whenever a range was released or dropped
+};
+
+inline State& state() {
+    static State s;
+    return s;
+}
+
+// xmem: [base, base + size) was reserved as a placeholder or a physical-page window of the title's. Inside one range
+// already, it is part of that reservation (a window replacing part of a placeholder). A range it only overlaps was
+// released without xmem seeing it, and goes whole, as xmem's tables drop it: nothing outside the new reservation is
+// known to be one of the title's any more.
+inline void add(std::uintptr_t base, std::uintptr_t size) {
+    if (!size) return;
+    State& s = state();
+    const std::uintptr_t end = base + size;
+    std::unique_lock lock(s.mutex);
+    auto it = s.ranges.upper_bound(base);
+    if (it != s.ranges.begin() && std::prev(it)->second > base) --it;
+    if (it != s.ranges.end() && it->first <= base && it->second >= end) return;  // inside one range already
+    bool erased = false;
+    while (it != s.ranges.end() && it->first < end) {
+        it = s.ranges.erase(it);
+        erased = true;
+    }
+    s.ranges.emplace(base, end);
+    s.count.store(s.ranges.size(), std::memory_order_release);
+    if (erased) s.generation.fetch_add(1, std::memory_order_release);
+}
+
+// xmem: [start, end) was released.
+inline void forget(std::uintptr_t start, std::uintptr_t end) {
+    State& s = state();
+    if (start >= end || !s.count.load(std::memory_order_acquire)) return;
+    std::unique_lock lock(s.mutex);
+    auto it = s.ranges.lower_bound(start);
+    if (it != s.ranges.begin() && std::prev(it)->second > start) --it;
+    bool erased = false;
+    while (it != s.ranges.end() && it->first < end) {
+        const std::uintptr_t base = it->first, until = it->second;
+        it = s.ranges.erase(it);
+        erased = true;
+        if (base < start) s.ranges.emplace(base, start);
+        if (until > end) it = s.ranges.emplace(end, until).first;
+    }
+    if (!erased) return;
+    s.count.store(s.ranges.size(), std::memory_order_release);
+    s.generation.fetch_add(1, std::memory_order_release);
+}
+
+// Moved whenever a reservation was released: what a shadow keeps of the reserved pages starts again. (A reservation
+// made covers pages no shadow had settled: they were in no range until then, or in one released since.)
+inline std::uint64_t generation() { return state().generation.load(std::memory_order_acquire); }
+
+// Whether [begin, end) is inside one of the title's xmem reservations.
+inline bool contains(std::uintptr_t begin, std::uintptr_t end) {
+    State& s = state();
+    if (!s.count.load(std::memory_order_acquire)) return false;
+    std::shared_lock lock(s.mutex);
+    auto it = s.ranges.upper_bound(begin);
+    return it != s.ranges.begin() && (--it)->second >= end;
+}
+
+}  // namespace leonida::title_reservations
 
 namespace leonida::kernel_writes {
 

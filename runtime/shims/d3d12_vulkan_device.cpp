@@ -329,7 +329,8 @@ void copy_run(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, boo
 //   - pages this tracker made read-only weren't written: skipped;
 //   - other readable pages (read-only or copy-on-write pages of the title's own, pages another tracker protected)
 //     can't be watched: copied every time, as before;
-//   - pages not committed, or not readable, are zero in the copies (written once);
+//   - pages not committed, or not readable, are zero in the copies (written once); one that is reserved in the
+//     title's xmem reservations (title_reservations) is not asked about again until the journal names it;
 //   - pages xmem reports mapped at another address too (title_page_watch.h): a write through the other address
 //     doesn't fault here, so their 64 KiB blocks are guarded at every address by the geometry watch's cells
 //     (update_aliased) and copied when a cell's version moved. Without the other addresses (no xmem), or while a
@@ -589,6 +590,7 @@ public:
         zeroed_.clear();
         copy_bytes_ = {};
         std::uint64_t queries = 0;
+        const std::uint64_t reservations = leonida::title_reservations::generation();
         // LEONIDA_SHADOW_FULL_WALK=1 queries every page at every refresh, as before the generation skip.
         static const bool always_full_walk = [] {
             char value[8] = {};
@@ -612,6 +614,11 @@ public:
             full_walk = true;
         refresh_walked_all_ = full_walk;
         refresh_protects_ = alias_arms_;
+        if (reservations != reservation_generation_) {  // one released since: its pages are asked about again
+            reservation_generation_ = reservations;
+            for (std::uint8_t& s : state_)
+                if ((s & (kZero | kHot)) == kZero) s &= std::uint8_t(~kClean);
+        }
         if (pinned_) {
             for (std::uint8_t& s : state_) s &= ~kPinned;
             pinned_ = false;
@@ -639,9 +646,15 @@ public:
             // Wine (NtQueryVirtualMemory waits for Wine's virtual-memory lock, which the mapping threads hold), a
             // fifth of the submitting thread's time. So are aliased pages whose cells no write reached (aliased_clean):
             // a mapping, commitment or protection change over a cell moves its version too.
+            // A page reserved in the title's xmem reservations is passed over at every refresh (kZero | kClean): only
+            // xmem's and the title's memory calls change it, and the journal names each of them. After the story load
+            // the walk made 450-7,500 queries a refresh of such pages, one for each of the stream pools' unmapped
+            // 64 KiB slots, 1.5 us each when nothing else mapped memory and 15-70 us under that lock while the title's
+            // mapping threads were busy: most of a walk of 100-330 ms a submission (RTX 3090, Wine 11).
             const auto skip = [&](std::size_t i) {
                 const std::uint8_t s = state_[i];
-                return unchanged(s) || ((s & ~(kZero | kProtected)) == kAliased && aliased_clean(i)) ||
+                return unchanged(s) || s == (kZero | kClean) ||
+                       ((s & ~(kZero | kProtected)) == kAliased && aliased_clean(i)) ||
                        (!copy_aliased_ && (s == kAliased || s == kZero || s == (kZero | kAliased)));
             };
             if (!full_walk && skip(i0)) {
@@ -666,20 +679,34 @@ public:
                     break;
                 }
             const bool streaming = (region.Protect & PAGE_WRITECOMBINE) != 0;
+            if (kind != Kind::zero)
+                for (std::size_t i = i0; i < i1; ++i)
+                    if (state_[i] & kZero) state_[i] &= std::uint8_t(~kClean);  // committed or mapped now
             switch (kind) {
-            case Kind::zero:
+            case Kind::zero: {
+                // Reserved, private, and inside the title's xmem reservations: passed over until the journal names it
+                // (see skip above). Aliased, pinned and write-watched pages are left out: a first touch through a
+                // physical page's other address is journaled for that address alone, and a pin or a write watch is
+                // the business of the passes before the walk.
+                const bool settled = region.State == MEM_RESERVE && region.Type == MEM_PRIVATE &&
+                                     leonida::title_reservations::contains(at, next);
                 for (std::size_t i = i0; i < i1; ++i) {
-                    if (state_[i] & kZero) continue;
-                    const auto [offset, bytes] = span_of(i, i + 1);
-                    zero_targets(offset, bytes);
-                    leonida::shadow_keep::forget(sums_.data(), first_, begin_ + offset, begin_ + offset + bytes);
-                    if (!zeroed_.empty() && zeroed_.back().offset + zeroed_.back().bytes == offset)
-                        zeroed_.back().bytes += bytes;
-                    else
-                        zeroed_.push_back({offset, bytes, false});
-                    state_[i] = std::uint8_t(kZero | (state_[i] & (kAliased | kPinned | kWatched)));
+                    if (!(state_[i] & kZero)) {
+                        const auto [offset, bytes] = span_of(i, i + 1);
+                        zero_targets(offset, bytes);
+                        leonida::shadow_keep::forget(sums_.data(), first_, begin_ + offset, begin_ + offset + bytes);
+                        if (!zeroed_.empty() && zeroed_.back().offset + zeroed_.back().bytes == offset)
+                            zeroed_.back().bytes += bytes;
+                        else
+                            zeroed_.push_back({offset, bytes, false});
+                        state_[i] = std::uint8_t(kZero | (state_[i] & (kAliased | kPinned | kWatched)));
+                    }
+                    const bool alone = (state_[i] & ~(kClean | kRequery)) == kZero;
+                    state_[i] = settled && alone ? std::uint8_t(state_[i] | kClean)
+                                                 : std::uint8_t(state_[i] & ~kClean);
                 }
                 break;
+            }
             case Kind::writable:
             case Kind::read_only:
                 for (std::size_t i = i0; i < i1;) {
@@ -1012,7 +1039,8 @@ private:
         kAliased = 4,    // xmem maps its physical page at another address too
         kPinned = 8,     // a kernel write into it may be in flight (leonida::kernel_writes)
         kWatched = 16,   // in a write-watched reservation (leonida::title_write_watch)
-        kClean = 32,     // hot, and not written since it was copied after an asking
+        kClean = 32,     // hot, and not written since it was copied after an asking; on a zero page: reserved in
+                         // the title's xmem reservations, passed over until the journal names it
         kHot = 64,       // write-watched and asked about at every refresh, never guarded
         kRequery = 128,  // its mapping, commitment or protection changed (title_memory_map): queried at the next walk
     };
@@ -1507,6 +1535,7 @@ private:
     Vector<std::uint8_t> clean_;
     Vector<std::uintptr_t> rearm_;
     std::uint64_t alias_arms_ = 0;  // arm() calls of the last update_aliased()
+    std::uint64_t reservation_generation_ = ~std::uint64_t(0);  // the xmem reservations its zero pages were settled under
     std::uint64_t map_generation_ = ~std::uint64_t(0);
     bool pinned_ = false;  // some page has kPinned
     Vector<Job> jobs_;    // refresh() only, which DeviceState::shadow_mutex serializes

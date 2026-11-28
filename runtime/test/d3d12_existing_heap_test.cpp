@@ -870,6 +870,62 @@ int check_commit_changes(ID3D12Device* device) {
     return failures;
 }
 
+// A reserved range that xmem registered as one of the title's reservations (leonida::title_reservations: what
+// XMemVirtualAlloc makes of a physical-page window), with a shadow over it. Its pages are zero in the copies, and a
+// refresh stops asking about them. A page the title commits there, which its VirtualAlloc shim journals, arrives at
+// the next submission, and so does its decommit. A range xmem lets go is asked about again, as any reserved page is.
+int check_reserved_pages(ID3D12Device* device) {
+    const char* who = "vulkan slot-133 reserved pages";
+    constexpr SIZE_T size = 4 * 0x10000;
+    auto* pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE));
+    EXPECT(pages != nullptr);
+    const auto base = reinterpret_cast<std::uintptr_t>(pages);
+    leonida::title_reservations::add(base, size);
+    int failures = 0;
+    {
+        Ref<ID3D12Resource> buffer;
+        buffer.p = place_shadow(device, pages, size);
+        EXPECT(buffer.p != nullptr);
+        GpuReader reader;
+        if (reader.init(device, size)) return 1;
+        std::vector<std::uint8_t> want(size, 0), got;
+        wchar_t flag[2]{};
+        const bool full_walk = GetEnvironmentVariableW(L"LEONIDA_SHADOW_FULL_WALK", flag, 2) == 1 && flag[0] == L'1';
+        // Two submissions: the first asks about the range, the next one only on a full walk.
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(first_difference(got, want) == -1);
+        EXPECT(rt::d3d12::title_shadow_refresh_queries(device) == (full_walk ? 1u : 0u));
+        // Committed and written.
+        std::uint8_t* later = pages + 2 * 0x10000;
+        EXPECT(VirtualAlloc(later, 0x1000, MEM_COMMIT, PAGE_READWRITE) == later);
+        leonida::title_memory_map::changed();  // as the title's VirtualAlloc shim does
+        for (UINT64 i = 0; i < 0x1000; ++i) want[2 * 0x10000 + i] = later[i] = pattern_byte(i, 43);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        long long wrong = first_difference(got, want);
+        if (wrong >= 0) std::fprintf(stderr, "%s: page committed in a reservation: first wrong byte at %lld\n", who, wrong);
+        EXPECT(wrong == -1);
+        // Decommitted: zeros again, the rest as it was.
+        EXPECT(VirtualFree(later, 0x1000, MEM_DECOMMIT));
+        leonida::title_memory_map::changed();  // as the title's VirtualFree shim does
+        std::fill(want.begin() + 2 * 0x10000, want.begin() + 2 * 0x10000 + 0x1000, std::uint8_t(0));
+        EXPECT(reader.read(buffer.p, got) == 0);
+        wrong = first_difference(got, want);
+        if (wrong >= 0) std::fprintf(stderr, "%s: page decommitted in a reservation: first wrong byte at %lld\n", who, wrong);
+        EXPECT(wrong == -1);
+        // Let go by xmem: asked about again.
+        leonida::title_reservations::forget(base, base + size);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(reader.read(buffer.p, got) == 0);
+        EXPECT(rt::d3d12::title_shadow_refresh_queries(device) >= 1u);
+        EXPECT(first_difference(got, want) == -1);
+    }
+    std::printf("%s: the reserved pages of a registered reservation are not asked about again; a committed one arrives\n",
+                who);
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return failures;
+}
+
 // The negative control, and the case it stands for. One pagefile-backed section (SEC_RESERVE, half committed, as xmem
 // backs physical pages) is mapped at two addresses, A and B; the shadow is placed at A. A write through B doesn't fault
 // at A, so without a mark the page it changed is not copied: the GPU still reads the old bytes. That shows the test
@@ -2256,6 +2312,7 @@ int check_written_pages_all(ID3D12Device* device) {
         }
     }
     failures += check_commit_changes(device);
+    failures += check_reserved_pages(device);
     failures += check_concurrent_writes(device, false);
     if (leonida::title_write_watch::enabled()) failures += check_concurrent_writes(device, true);
     failures += check_aliased_write(device);
