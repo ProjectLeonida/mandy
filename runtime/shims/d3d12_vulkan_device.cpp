@@ -1672,6 +1672,191 @@ struct TitleTextureCells {
         // Refused otherwise: a write raced the arming (it is in the queue), or VirtualQuery or VirtualProtect failed.
         return leonida::geometry_writes::arm(tile, cell) ? 1 : -1;
     }
+    // Batched arming of sorted, unique 64 KiB tiles: coalesces kernel-pin checks, geometry_writes::state().mutex
+    // acquisitions, and contiguous VirtualQuery/VirtualProtect runs across all examined textures in a pass.
+    // results[i]: 1 = armed (or hot & unpinned), 0 = busy (pinned), -1 = failed / raced write.
+    void arm_batch(const std::uintptr_t* tiles, Cell* const* cells, std::int8_t* results, std::size_t count) {
+        constexpr std::size_t kMaxBatchRunPages = 1024;  // up to 64 MiB per contiguous VirtualProtect run
+        constexpr std::size_t kMaxLockBatchPages = 128;  // pages per pin check + geometry_writes lock hold
+        constexpr std::uintptr_t kTile = leonida::geometry_writes::tile_size;
+        constexpr std::uintptr_t kHostPage = leonida::geometry_writes::page_size;
+
+        if (!count) return;
+        if (count == 1) {
+            results[0] = static_cast<std::int8_t>(arm(tiles[0], *cells[0]));
+            return;
+        }
+
+        for (std::size_t i = 0; i < count;) {
+            std::size_t j = i + 1;
+            while (j < count) {
+                const bool contiguous = (tiles[j] == tiles[j - 1] + kTile);
+                const std::size_t len = j - i;
+                if (len < kMaxLockBatchPages) {
+                    ++j;
+                } else if (contiguous && len < kMaxBatchRunPages) {
+                    ++j;
+                } else {
+                    break;
+                }
+            }
+            const std::size_t batch_n = j - i;
+            const std::uintptr_t* const batch_tiles = tiles + i;
+            Cell* const* const batch_cells = cells + i;
+
+            run_versions_.resize(batch_n);
+            run_pinned_.assign(batch_n, 0);
+            run_eligible_.assign(batch_n, 0);
+            run_failed_.assign(batch_n, 0);
+
+            // Snapshot versions BEFORE querying kernel pins or taking geometry_writes::state().mutex.
+            for (std::size_t k = 0; k < batch_n; ++k)
+                run_versions_[k] = batch_cells[k]->version.load(std::memory_order_acquire);
+
+            const std::uintptr_t pin_lo = batch_tiles[0];
+            const std::uintptr_t last_tile = batch_tiles[batch_n - 1];
+            const std::uintptr_t pin_hi = (last_tile <= UINTPTR_MAX - kTile) ? (last_tile + kTile) : UINTPTR_MAX;
+            // Querying an OVERLAPPED pin can fault into xmem: NEVER call under geometry_writes::state().mutex.
+            if (pin_lo < pin_hi) {
+                leonida::kernel_writes::for_each_pin(pin_lo, pin_hi, [&](std::uintptr_t p_lo, std::uintptr_t p_hi) {
+                    const std::uintptr_t first_tile = p_lo & ~(kTile - 1);
+                    const std::uintptr_t* it = std::lower_bound(batch_tiles, batch_tiles + batch_n, first_tile);
+                    for (; it < batch_tiles + batch_n && *it < p_hi; ++it)
+                        run_pinned_[std::size_t(it - batch_tiles)] = 1;
+                });
+            }
+
+            auto& s = leonida::geometry_writes::state();
+            {
+                std::lock_guard lock(s.mutex);
+                for (std::size_t k = 0; k < batch_n; ++k) {
+                    if (run_pinned_[k]) {
+                        results[i + k] = 0;  // busy: kernel write in progress (even on hot tiles)
+                        continue;
+                    }
+                    Cell* const c = batch_cells[k];
+                    if (c->hot) {
+                        results[i + k] = 1;
+                        continue;
+                    }
+                    if (run_versions_[k] != c->version.load(std::memory_order_relaxed)) {
+                        results[i + k] = -1;  // write raced arming
+                        continue;
+                    }
+                    run_eligible_[k] = 1;
+                }
+
+                // Short-lived VirtualQuery cache within this lock hold: reuse uniform writable MEM_COMMIT regions
+                // across non-contiguous tiles in the same batch while title_memory_map::generation() is unchanged.
+                std::uintptr_t cached_lo = 0;
+                std::uintptr_t cached_hi = 0;
+                DWORD cached_protect = 0;
+                DWORD cached_guarded = 0;
+                std::uint64_t cached_gen = 0;
+
+                for (std::size_t sub_start = 0; sub_start < batch_n;) {
+                    if (!run_eligible_[sub_start]) {
+                        ++sub_start;
+                        continue;
+                    }
+                    std::size_t sub_end = sub_start + 1;
+                    while (sub_end < batch_n && run_eligible_[sub_end] &&
+                           batch_tiles[sub_end] == batch_tiles[sub_end - 1] + kTile) {
+                        ++sub_end;
+                    }
+                    const std::uintptr_t sub_lo = batch_tiles[sub_start];
+                    const std::uintptr_t sub_hi = sub_lo + (sub_end - sub_start) * kTile;
+
+                    for (std::uintptr_t p = sub_lo; p < sub_hi;) {
+                        std::uintptr_t region_end = 0;
+                        DWORD state = 0;
+                        DWORD protect = 0;
+                        DWORD guarded = 0;
+                        bool from_cache = false;
+
+                        if (p >= cached_lo && p < cached_hi &&
+                            leonida::title_memory_map::generation() == cached_gen) {
+                            region_end = cached_hi;
+                            state = MEM_COMMIT;
+                            protect = cached_protect;
+                            guarded = cached_guarded;
+                            from_cache = true;
+                        } else {
+                            const std::uint64_t gen_before = leonida::title_memory_map::generation();
+                            MEMORY_BASIC_INFORMATION m{};
+                            if (!VirtualQuery(reinterpret_cast<void*>(p), &m, sizeof m)) {
+                                const std::size_t tile_k = sub_start + std::size_t((p - sub_lo) / kTile);
+                                run_failed_[tile_k] = 1;
+                                p = (p & ~(kTile - 1)) + kTile;
+                                continue;
+                            }
+                            region_end = reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize;
+                            state = m.State;
+                            protect = m.Protect;
+                            guarded = leonida::geometry_writes::read_only(m.Protect);
+                            if (state == MEM_COMMIT && !(protect & PAGE_GUARD) && guarded && region_end > sub_hi) {
+                                cached_lo = p;
+                                cached_hi = region_end;
+                                cached_protect = protect;
+                                cached_guarded = guarded;
+                                cached_gen = gen_before;
+                            } else {
+                                cached_hi = 0;
+                            }
+                        }
+
+                        const std::uintptr_t end = (std::min)(sub_hi, region_end);
+                        if (end <= p) {
+                            const std::size_t tile_k = sub_start + std::size_t((p - sub_lo) / kTile);
+                            run_failed_[tile_k] = 1;
+                            cached_hi = 0;
+                            p = (p & ~(kTile - 1)) + kTile;
+                            continue;
+                        }
+                        if (state == MEM_COMMIT && !(protect & PAGE_GUARD) && guarded) {
+                            DWORD old{};
+                            if (VirtualProtect(reinterpret_cast<void*>(p), end - p, guarded, &old)) {
+                                for (std::uintptr_t q = p; q < end; q += kHostPage) {
+                                    const std::size_t tile_k = sub_start + std::size_t((q - sub_lo) / kTile);
+                                    const std::size_t sub_p = std::size_t((q & (kTile - 1)) / kHostPage);
+                                    batch_cells[tile_k]->restore[sub_p] = protect;
+                                }
+                                if (cached_hi) cached_lo = end;
+                            } else if (from_cache) {
+                                cached_hi = 0;
+                                continue;
+                            } else {
+                                cached_hi = 0;
+                                for (std::uintptr_t t = p; t < end;) {
+                                    const std::uintptr_t t_end = (std::min)(end, (t & ~(kTile - 1)) + kTile);
+                                    const std::size_t tile_k = sub_start + std::size_t((t - sub_lo) / kTile);
+                                    if (VirtualProtect(reinterpret_cast<void*>(t), t_end - t, guarded, &old)) {
+                                        for (std::uintptr_t q = t; q < t_end; q += kHostPage) {
+                                            const std::size_t sub_p = std::size_t((q & (kTile - 1)) / kHostPage);
+                                            batch_cells[tile_k]->restore[sub_p] = protect;
+                                        }
+                                    } else {
+                                        run_failed_[tile_k] = 1;
+                                    }
+                                    t = t_end;
+                                }
+                            }
+                        }
+                        p = end;
+                    }
+
+                    for (std::size_t k = sub_start; k < sub_end; ++k)
+                        results[i + k] = run_failed_[k] ? -1 : 1;
+                    sub_start = sub_end;
+                }
+            }
+            i = j;
+        }
+    }
+    std::vector<std::uint64_t> run_versions_;
+    std::vector<std::uint8_t> run_pinned_;
+    std::vector<std::uint8_t> run_eligible_;
+    std::vector<std::uint8_t> run_failed_;
     void aliases(std::uintptr_t tile, std::vector<std::uintptr_t>& out) {
         if (const auto f = leonida::geometry_writes::aliases.load(std::memory_order_acquire)) f(tile, out);
     }
@@ -3352,17 +3537,29 @@ struct DeviceState {
     TitleTextureCells texture_cells;
     leonida::TitleTextureWatch<TitleTextureCells> texture_watch{texture_cells};
     void index_texture(const TitleTexture& t);
-    bool page_mirror_texture_chunk(std::uint64_t cpu, std::uint64_t gpu, std::uint64_t bytes, VkBuffer& buffer,
-                                   VkDeviceSize& offset, VkDeviceSize& chunk_size, VkSemaphore& timeline,
-                                   std::uint64_t& value, std::uint64_t& mirror_hash, bool& single_chunk,
-                                   const std::vector<std::uintptr_t>* written_tiles = nullptr,
-                                   std::unordered_set<std::uint8_t*>* synced_frames = nullptr,
-                                   bool reuse_synced_frames = false);
-    int page_mirror_tiles_unchanged(std::uint64_t cpu, std::uint64_t bytes,
-                                    const std::vector<std::uintptr_t>& written_tiles,
-                                    const leonida::TilePieces& pieces,
-                                    std::unordered_set<std::uint8_t*>* synced_frames = nullptr,
-                                    bool reuse_synced_frames = false);
+    struct TitleMirrorCheckItem {
+        std::uint64_t cpu = 0;
+        std::uint64_t gpu = 0;
+        std::uint64_t bytes = 0;
+        const std::vector<std::uintptr_t>* written_tiles = nullptr;     // non-null when per-tile sync filtering allowed
+        const std::vector<std::uintptr_t>* tile_cmp_written = nullptr;  // non-null when partial-tile mirror cmp allowed
+        const leonida::TilePieces* pieces = nullptr;
+        bool active = false;
+        // Outputs filled by page_mirror_check_batch():
+        bool full_ok = false;
+        bool single_chunk = false;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        VkDeviceSize chunk_size = 0;
+        VkSemaphore timeline = VK_NULL_HANDLE;
+        std::uint64_t value = 0;
+        std::uint64_t mirror_hash = 0;
+        int tile_cmp = 0;  // +1 unchanged, -1 changed, 0 unknown/fallback
+        // Internal scratch for page_mirror_check_batch():
+        enum class Mode : std::uint8_t { none, full, partial_tiles } mode = Mode::none;
+        std::uint64_t mirror_va = 0;
+    };
+    void page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& items, std::vector<std::uint64_t>& feed_pages);
     // The CPU-view ranges of the registered GPU-written textures (render targets, depth, unordered access), by their
     // registry address. A texture over such memory is not filled from it (index_texture): the title's pages there
     // hold what the CPU last put there, never what our GPU renders into the image, and a fill uploaded those old
@@ -17362,145 +17559,165 @@ void DeviceState::index_texture(const TitleTexture& t) {
     }
 }
 
-bool DeviceState::page_mirror_texture_chunk(std::uint64_t cpu, std::uint64_t gpu, std::uint64_t bytes,
-                                            VkBuffer& buffer, VkDeviceSize& offset, VkDeviceSize& chunk_size,
-                                            VkSemaphore& timeline, std::uint64_t& value, std::uint64_t& mirror_hash,
-                                            bool& single_chunk, const std::vector<std::uintptr_t>* written_tiles,
-                                            std::unordered_set<std::uint8_t*>* synced_frames,
-                                            bool reuse_synced_frames) {
-    single_chunk = false;
-    if (!page_mirror.mirror || !bytes) return false;
-    // Lock order: title_texture_mutex -> page_mirror.mutex (acyclic: nothing under page_mirror.mutex ever takes
-    // title_texture_mutex). Called AFTER watch.examine() has re-armed the texture's tiles and AFTER
-    // refresh_title_textures() drained any pre-pass xmem feed. Never call refresh_page_mirror()/flush_page_mirror()
-    // mid-batch (that could unbind pages already queued for earlier textures in the same batch): if a new remap
-    // landed mid-batch, return false so this texture safely uses the CPU path.
-    std::lock_guard lock(page_mirror.mutex);
-    if (page_mirror.feed_pending.load(std::memory_order_acquire)) return false;
+// Single-lock batched TitleMirror check & sync for all examined textures of a refresh_title_textures() pass:
+//   - Acquires page_mirror.mutex ONCE per pass (eliminating per-texture lock contention with refresh_page_mirror and
+//     write_back_batch).
+//   - Snapshots pending xmem remaps from page_mirror.feed under shared feed_lock (lock order: title_texture_mutex ->
+//     page_mirror.mutex -> feed_lock) and rejects ONLY textures whose own pages overlap an unapplied remap, instead of
+//     aborting the whole pass on unrelated buffer remaps.
+//   - Marks all dirty/hot mirror pages across all eligible textures (deduplicated automatically per physical frame by
+//     TitleMirror::dirty()), runs ONE batched parallel TitleMirror::upload(), and evaluates range_sum() + chunk_at()
+//     (or partial-tile range_sum() comparison) for every texture in the same lock hold.
+void DeviceState::page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& items,
+                                          std::vector<std::uint64_t>& feed_pages) {
+    if (!page_mirror.mirror || items.empty()) return;
     constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
-    const auto check_va = [&](std::uint64_t va, bool is_cpu_view) -> bool {
-        if (!va || va + bytes < va) return false;
-        VkBuffer buf = VK_NULL_HANDLE;
-        VkDeviceSize off = 0;
-        const bool has_chunk = page_mirror.mirror->chunk_at(va, buf, off);
-        const bool in_one_chunk = has_chunk && bytes <= leonida::TitleMirror::kChunk - off;
-        const std::uint64_t end = va + bytes;
+    constexpr std::uint64_t kPiece = leonida::shadow_keep::kPiece;
+
+    std::lock_guard lock(page_mirror.mutex);
+
+    feed_pages.clear();
+    if (page_mirror.feed_pending.load(std::memory_order_acquire)) {
+        AcquireSRWLockShared(&page_mirror.feed_lock);
+        feed_pages.reserve(page_mirror.feed.size());
+        for (const auto& c : page_mirror.feed) feed_pages.push_back(static_cast<std::uint64_t>(c.page) & ~(kPage - 1));
+        ReleaseSRWLockShared(&page_mirror.feed_lock);
+        if (feed_pages.size() > 1) {
+            std::sort(feed_pages.begin(), feed_pages.end());
+            feed_pages.erase(std::unique(feed_pages.begin(), feed_pages.end()), feed_pages.end());
+        }
+    }
+    const auto page_in_feed = [&](std::uint64_t p) -> bool {
+        return !feed_pages.empty() && std::binary_search(feed_pages.begin(), feed_pages.end(), p);
+    };
+
+    bool need_upload = false;
+    auto& mirror = *page_mirror.mirror;
+    auto* const tracking = page_mirror.tracking.get();
+
+    const auto mark_dirty_page = [&](std::uint64_t p) {
+        if (mirror.dirty(p)) {
+            need_upload = true;
+            if (page_mirror.readback_in_flight) {
+                if (std::uint8_t* const f = mirror.frame_at(p)) page_mirror.readback_invalidated.insert(f);
+            }
+        }
+    };
+
+    const auto try_full_view = [&](TitleMirrorCheckItem& item, std::uint64_t va, bool is_cpu_view) -> bool {
+        if (!va || !item.bytes || va + item.bytes < va) return false;
+        const std::uint64_t end = va + item.bytes;
         for (std::uint64_t p = va & ~(kPage - 1); p < end; p += kPage) {
-            if (!page_mirror.mirror->mirrored(p) || page_mirror.mirror->has_pending(p)) return false;
+            if (page_in_feed(p) || !mirror.mirrored(p) || mirror.has_pending(p)) return false;
             if (p > UINT64_MAX - kPage) break;
         }
-        const bool filter_written = is_cpu_view && written_tiles && !written_tiles->empty();
-        bool need_upload = false;
-        std::vector<std::uint8_t*> newly_synced;
+        const bool filter_written = is_cpu_view && item.written_tiles && !item.written_tiles->empty();
         for (std::uint64_t p = va & ~(kPage - 1); p < end; p += kPage) {
-            // When TitleTextureWatch proved only a subset of tiles were written (armed read-only on the rest), skip
-            // re-uploading untouched cold or MEM_WRITE_WATCH pages.
             if (filter_written &&
-                !std::binary_search(written_tiles->begin(), written_tiles->end(), static_cast<std::uintptr_t>(p))) {
+                !std::binary_search(item.written_tiles->begin(), item.written_tiles->end(),
+                                    static_cast<std::uintptr_t>(p))) {
                 if (p > UINT64_MAX - kPage) break;
                 continue;
             }
-            // For the CPU view, cold pages untouched since T0 have tracking->unwritten(p) == true (zero extra copy).
-            // For a dual-view GPU address (va != cpu), shadow_write_fault bumps the CPU view's cell, so always sync
-            // into the mirror home (unless the corresponding CPU page is provably unwritten).
-            const bool clean_cpu = is_cpu_view && page_mirror.tracking && page_mirror.tracking->unwritten(p);
-            if (!clean_cpu) {
-                std::uint8_t* const f = page_mirror.mirror->frame_at(p);
-                if (reuse_synced_frames && synced_frames && f && synced_frames->count(f)) {
-                    if (p > UINT64_MAX - kPage) break;
-                    continue;
-                }
-                if (page_mirror.mirror->dirty(p)) {
-                    need_upload = true;
-                    if (synced_frames && f) newly_synced.push_back(f);
-                    if (page_mirror.readback_in_flight && f) page_mirror.readback_invalidated.insert(f);
-                }
-            }
+            const bool clean_cpu = is_cpu_view && tracking && tracking->unwritten(p);
+            if (!clean_cpu) mark_dirty_page(p);
             if (p > UINT64_MAX - kPage) break;
         }
-        if (need_upload) {
-            const std::uint64_t failures_before = page_mirror.mirror->counters().upload_failures;
-            page_mirror.uploads += page_mirror.mirror->upload();
-            // Do not upload zeroed fallback pieces or poison mirror_hash when hooks_.copy failed mid-sync.
-            if (page_mirror.mirror->counters().upload_failures != failures_before) return false;
-            if (synced_frames) {
-                for (std::uint8_t* f : newly_synced) synced_frames->insert(f);
-            }
-        }
-        std::uint64_t m_hash = 0;
-        if (!page_mirror.mirror->range_sum(va, bytes, m_hash)) return false;
-        single_chunk = in_one_chunk;
-        if (in_one_chunk) {
-            buffer = buf;
-            offset = off;
-            chunk_size = leonida::TitleMirror::kChunk;
-            timeline = page_mirror.timeline;
-            value = page_mirror.value;
-        }
-        mirror_hash = m_hash;
+        item.mode = TitleMirrorCheckItem::Mode::full;
+        item.mirror_va = va;
         return true;
     };
-    if (check_va(cpu, true)) return true;
-    if (gpu && gpu != cpu && check_va(gpu, false)) return true;
-    return false;
-}
 
-// Fast per-tile mirror check for partially-mirrored textures (e.g., a multi-tile texture whose only written tile is a
-// hot buffer page in TitleMirror while its remaining tiles are unmirrored). Compares each written tile's 256-byte
-// piece-sum hash in TitleMirror against `pieces.hashes[i]` in ~15 ns (zero CPU read of title memory, zero
-// TitleReadPool wakeup). Returns: +1 = all written tiles unchanged, -1 = a written tile definitely changed,
-// 0 = cannot determine via mirror (fall back to CPU path).
-int DeviceState::page_mirror_tiles_unchanged(std::uint64_t cpu, std::uint64_t bytes,
-                                             const std::vector<std::uintptr_t>& written_tiles,
-                                             const leonida::TilePieces& pieces,
-                                             std::unordered_set<std::uint8_t*>* synced_frames,
-                                             bool reuse_synced_frames) {
-    if (!page_mirror.mirror || !bytes || written_tiles.empty()) return 0;
-    if ((cpu & (leonida::shadow_keep::kPiece - 1)) != 0 || (bytes & (leonida::shadow_keep::kPiece - 1)) != 0) return 0;
-    std::lock_guard lock(page_mirror.mutex);
-    if (page_mirror.feed_pending.load(std::memory_order_acquire)) return 0;
-    constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
-    const std::uintptr_t base_tile = static_cast<std::uintptr_t>(cpu) & ~(leonida::TilePieces::kTile - 1);
-    for (const std::uintptr_t tile : written_tiles) {
-        if (tile < base_tile) return 0;
-        const std::size_t idx = (tile - base_tile) / leonida::TilePieces::kTile;
-        if (idx >= pieces.hashes.size()) return 0;
-        const std::uint64_t p = static_cast<std::uint64_t>(tile) & ~(kPage - 1);
-        if (!page_mirror.mirror->mirrored(p) || page_mirror.mirror->has_pending(p)) return 0;
-    }
-    bool need_upload = false;
-    std::vector<std::uint8_t*> newly_synced;
-    for (const std::uintptr_t tile : written_tiles) {
-        const std::uint64_t p = static_cast<std::uint64_t>(tile) & ~(kPage - 1);
-        const bool clean_cpu = page_mirror.tracking && page_mirror.tracking->unwritten(p);
-        if (!clean_cpu) {
-            std::uint8_t* const f = page_mirror.mirror->frame_at(p);
-            if (reuse_synced_frames && synced_frames && f && synced_frames->count(f)) continue;
-            if (page_mirror.mirror->dirty(p)) {
-                need_upload = true;
-                if (synced_frames && f) newly_synced.push_back(f);
-                if (page_mirror.readback_in_flight && f) page_mirror.readback_invalidated.insert(f);
+    // Pass 1: classify each active item (full mirror vs partial-tile mirror vs CPU fallback) and mark dirty pages.
+    for (TitleMirrorCheckItem& item : items) {
+        item.full_ok = false;
+        item.single_chunk = false;
+        item.tile_cmp = 0;
+        item.mode = TitleMirrorCheckItem::Mode::none;
+        item.mirror_va = 0;
+        if (!item.active || !item.bytes) continue;
+        if (try_full_view(item, item.cpu, true)) continue;
+        if (item.gpu && item.gpu != item.cpu && try_full_view(item, item.gpu, false)) continue;
+
+        if (item.tile_cmp_written && !item.tile_cmp_written->empty() && item.pieces &&
+            (item.cpu & (kPiece - 1)) == 0 && (item.bytes & (kPiece - 1)) == 0) {
+            const std::uintptr_t base_tile = static_cast<std::uintptr_t>(item.cpu) & ~(leonida::TilePieces::kTile - 1);
+            bool all_ok = true;
+            for (const std::uintptr_t tile : *item.tile_cmp_written) {
+                if (tile < base_tile) {
+                    all_ok = false;
+                    break;
+                }
+                const std::size_t idx = (tile - base_tile) / leonida::TilePieces::kTile;
+                if (idx >= item.pieces->hashes.size()) {
+                    all_ok = false;
+                    break;
+                }
+                const std::uint64_t p = static_cast<std::uint64_t>(tile) & ~(kPage - 1);
+                if (page_in_feed(p) || !mirror.mirrored(p) || mirror.has_pending(p)) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if (all_ok) {
+                item.mode = TitleMirrorCheckItem::Mode::partial_tiles;
+                for (const std::uintptr_t tile : *item.tile_cmp_written) {
+                    const std::uint64_t p = static_cast<std::uint64_t>(tile) & ~(kPage - 1);
+                    const bool clean_cpu = tracking && tracking->unwritten(p);
+                    if (!clean_cpu) mark_dirty_page(p);
+                }
             }
         }
     }
+
+    // Pass 2: ONE batched parallel upload across all dirty mirror pages of the pass.
     if (need_upload) {
-        const std::uint64_t failures_before = page_mirror.mirror->counters().upload_failures;
-        page_mirror.uploads += page_mirror.mirror->upload();
-        if (page_mirror.mirror->counters().upload_failures != failures_before) return 0;
-        if (synced_frames) {
-            for (std::uint8_t* f : newly_synced) synced_frames->insert(f);
+        const std::uint64_t failures_before = mirror.counters().upload_failures;
+        page_mirror.uploads += mirror.upload();
+        // Do not upload zeroed fallback pieces or poison mirror_hash when hooks_.copy failed mid-sync.
+        if (mirror.counters().upload_failures != failures_before) return;
+    }
+
+    // Pass 3: compute mirror range_sum / chunk_at / partial-tile comparison for all eligible items.
+    for (TitleMirrorCheckItem& item : items) {
+        if (item.mode == TitleMirrorCheckItem::Mode::full) {
+            std::uint64_t m_hash = 0;
+            if (!mirror.range_sum(item.mirror_va, item.bytes, m_hash)) continue;
+            VkBuffer buf = VK_NULL_HANDLE;
+            VkDeviceSize off = 0;
+            const bool has_chunk = mirror.chunk_at(item.mirror_va, buf, off);
+            const bool in_one_chunk = has_chunk && item.bytes <= leonida::TitleMirror::kChunk - off;
+            item.full_ok = true;
+            item.single_chunk = in_one_chunk;
+            if (in_one_chunk) {
+                item.buffer = buf;
+                item.offset = off;
+                item.chunk_size = leonida::TitleMirror::kChunk;
+                item.timeline = page_mirror.timeline;
+                item.value = page_mirror.value;
+            }
+            item.mirror_hash = m_hash;
+        } else if (item.mode == TitleMirrorCheckItem::Mode::partial_tiles) {
+            const std::uintptr_t base_tile = static_cast<std::uintptr_t>(item.cpu) & ~(leonida::TilePieces::kTile - 1);
+            int cmp = 1;
+            for (const std::uintptr_t tile : *item.tile_cmp_written) {
+                const std::size_t idx = (tile - base_tile) / leonida::TilePieces::kTile;
+                const auto [offset, length] =
+                    leonida::TilePieces::part(static_cast<std::uintptr_t>(item.cpu), item.bytes, tile);
+                if (!length) continue;
+                std::uint64_t h = 0;
+                if (!mirror.range_sum(item.cpu + offset, length, h)) {
+                    cmp = 0;
+                    break;
+                }
+                if (h != item.pieces->hashes[idx]) {
+                    cmp = -1;
+                    break;
+                }
+            }
+            item.tile_cmp = cmp;
         }
     }
-    for (const std::uintptr_t tile : written_tiles) {
-        const std::size_t idx = (tile - base_tile) / leonida::TilePieces::kTile;
-        const auto [offset, length] =
-            leonida::TilePieces::part(static_cast<std::uintptr_t>(cpu), bytes, tile);
-        if (!length) continue;
-        std::uint64_t h = 0;
-        if (!page_mirror.mirror->range_sum(cpu + offset, length, h)) return 0;
-        if (h != pieces.hashes[idx]) return -1;
-    }
-    return 1;
 }
 
 void DeviceState::title_texture_mapped(const void* resource, std::uint64_t address) {
@@ -19907,6 +20124,7 @@ public:
         // Waits for a slot-70 view that is filling a texture: skipping would leave this submission a write behind.
         // No deadlock: before_execute holds no lock, and the registry's holders never wait for this thread.
         std::unique_lock lock(state_.title_texture_mutex);
+        const auto locked = clock::now();
         title_refresh_in_flight_.fetch_add(1, std::memory_order_seq_cst);
         struct TitleRefreshGuard {
             std::atomic<std::uint32_t>& n;
@@ -19914,6 +20132,7 @@ public:
         } in_flight{title_refresh_in_flight_};
         std::optional<InTitleTextures> inside(std::in_place);
         TitleTextureStats& stats = title_stats_;
+        stats.lock_wait_ns += std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(locked - now).count());
         auto& watch = state_.texture_watch;
         const std::uint64_t fast_skips = title_fast_passes_.exchange(0, std::memory_order_relaxed);
         stats.fast_passes += fast_skips;
@@ -19957,10 +20176,12 @@ public:
         if (map_all || overflow) {
             watch.note_changed_and_for_each(0, UINTPTR_MAX, remapped, map_all);
         } else {
+            // Merge map changes and noted texel writes into disjoint sorted spans so duplicate/adjacent ranges (or
+            // repeated full-space title_memory_map::changed() calls) touch each watched tile at most once.
+            if (!written.empty())
+                title_map_changes_.insert(title_map_changes_.end(), written.begin(), written.end());
+            leonida::merge_title_writes(title_map_changes_);
             for (const auto& [from, to] : title_map_changes_)
-                watch.note_changed_and_for_each(from, to, remapped);
-            // A noted write (XG, DirectStorage) can be the texture's first bytes: its memory is probed again too.
-            for (const auto& [from, to] : written)
                 watch.note_changed_and_for_each(from, to, remapped);
         }
         if (state_.titles_named_pending.load(std::memory_order_acquire)) {
@@ -19981,7 +20202,7 @@ public:
         title_named_.clear();
         watch.collect([&](std::uint64_t key) { title_named_.push_back(key); });
         const auto collected = clock::now();
-        stats.collect_ns += std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(collected - now).count());
+        stats.collect_ns += std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(collected - locked).count());
         // Not filled: with no backing yet or after a failed upload it is looked at again next pass. Memory not
         // readable yet waits for its mapping (xmem's change names it), except a texture the title mapped, whose
         // pages may be committed under the pointer Map gave without xmem (the probe answers each pass). Its tiles
@@ -19995,13 +20216,12 @@ public:
             }
         };
         // Batched texture refresh:
-        //   1. Fast mirror_hash / per-tile TitleMirror::range_sum check skips unchanged textures in ~15 ns (both GPU-
-        //      uploaded and 256B-aligned CPU-uploaded textures, plus partially-mirrored hot-tile textures).
-        //   2. Hash-before-reserve for remaining CPU-checked textures on TitleReadPool using 4-lane piece hashing
-        //      (and MOVNTDQA streaming copies for write-combined memory).
-        //   3. Only reserve staging slots & detile on CPU for CPU jobs whose bytes actually changed.
-        //   4. Mirrored textures eligible for GPU mirror upload (linear direct copy or GPU compute detile from
-        //      TitleMirror) bypass CPU whole-reads, CPU detiling, and host staging completely.
+        //   1. Filter eligible textures and batch-arm all dirty tiles in one watch.examine_batch() call.
+        //   2. Batch all TitleMirror checks/uploads in ONE page_mirror.mutex hold + ONE parallel TitleMirror::upload()
+        //      (skipping unchanged textures in ~15 ns, rejecting only pages overlapping pending xmem remaps).
+        //   3. Hash-before-reserve for remaining CPU-checked textures on TitleReadPool using 4-lane piece hashing
+        //      (comparing both t.hash and t.mirror_hash so CPU fallback after GPU upload never re-uploads unchanged).
+        //   4. Only reserve staging slots & detile on CPU for CPU jobs whose bytes actually changed.
         //   5. Record and submit all uploads of the batch in ONE batched command buffer + ONE vkQueueSubmit.
         std::uint64_t filled = 0;
         title_job_count_ = 0;
@@ -20016,6 +20236,7 @@ public:
             job.span = 0;
             job.hash = 0;
             job.previous.reset();
+            job.previous_mirror_hash.reset();
             job.pieces.hashes.clear();
             job.piece_sums.clear();
             job.written.clear();
@@ -20143,6 +20364,9 @@ public:
                     ++(job.whole ? stats.unchanged : stats.unchanged_parts);
                     if (job.whole) {
                         t.pieces = std::move(job.pieces);
+                        t.hash = job.hash;
+                        t.hashed = true;
+                        t.gpu_uploaded = false;
                         if (job.mirror_hash_valid) {
                             t.mirror_hash = job.mirror_hash;
                             t.mirror_hash_span = job.span;
@@ -20245,163 +20469,197 @@ public:
             batch_bytes = 0;
         };
         const bool gpu_detile_on = leonida::title_gpu_detile_enabled();
-        // Drain any xmem physical-page remap that landed between refresh_page_mirror() (T0) and watch.collect() (T2)
-        // ONCE before starting the batch loop (never mid-batch, which could unbind pages already queued for earlier
-        // textures in the same batch).
-        if (!title_named_.empty() && state_.page_mirror.mirror &&
-            state_.page_mirror.feed_pending.load(std::memory_order_acquire)) {
-            state_.refresh_page_mirror();
-            state_.flush_page_mirror();
-        }
-        title_synced_frames_.clear();
+
+        // Stage 1: filter eligible textures once from title_named_ (no repeated std::map lookups).
+        title_candidate_keys_.clear();
+        title_candidates_.clear();
         for (const std::uint64_t key : title_named_) {
             const auto it = state_.title_textures.find(key);
             if (it == state_.title_textures.end() || !it->second->resource) continue;
-            const std::shared_ptr<TitleTexture> entry = it->second;
-            TitleTexture& t = *entry;
+            TitleTexture& t = *it->second;
             if (t.gpu_written || !t.layout_known) continue;
-            // Armed before it is read: a write from now on is in the next pass. A kernel write still in progress
-            // over it: read once it is done (its tile stays unarmed, so the next pass names it again).
-            const std::uint64_t non_hot_arms_before = watch.stats().non_hot_arms;
-            const auto look = watch.examine(key, &title_written_);
-            if (look == leonida::TitleTextureWatch<TitleTextureCells>::Look::busy) {
-                ++stats.busy;
-                continue;
-            }
-            const bool allow_record_synced = look == leonida::TitleTextureWatch<TitleTextureCells>::Look::armed;
-            const bool reuse_synced_frames =
-                allow_record_synced && watch.stats().non_hot_arms == non_hot_arms_before;
-            ++stats.checked;
-            if (!title_texture_readable(t)) {
-                not_filled(t);
-                continue;
-            }
-            const unsigned from = fill_from(t);
-            const std::uint64_t span = fill_bytes(t);
-            if (from && t.unbound_bytes && title_partial_bytes_ + t.unbound_bytes > partial_mips_budget()) {
-                ++stats.partial_refused;
-                t.stale = false;
-                continue;
-            }
-            if (!back_title_texture(t)) {
-                not_filled(t);
-                continue;
-            }
-            const std::size_t tiles = std::size_t(((t.cpu + span + 0xffff) & ~std::uint64_t(0xffff)) -
-                                                  (t.cpu & ~std::uint64_t(0xffff))) >>
-                                      16;
-            bool mirror_proved_changed = false;
-            // Mirror fast-path: check if all pages of this texture are mirrored in TitleMirror. Even for textures
-            // first uploaded on CPU (or chunk-straddling / non-GPU-detileable / partial-mip), matching the 256-byte
-            // piece-sum digest skips unchanged textures in ~15 ns with zero CPU reads or thread-pool wakeups.
-            if (state_.page_mirror.mirror) {
-                VkBuffer m_buf = VK_NULL_HANDLE;
-                VkDeviceSize m_off = 0, m_chunk = 0;
-                VkSemaphore m_tl = VK_NULL_HANDLE;
-                std::uint64_t m_val = 0, m_hash = 0;
-                bool m_single_chunk = false;
-                if (state_.page_mirror_texture_chunk(t.cpu, t.address, span, m_buf, m_off, m_chunk, m_tl, m_val, m_hash,
-                                                     m_single_chunk,
-                                                     (allow_record_synced && !t.stale) ? &title_written_ : nullptr,
-                                                     allow_record_synced ? &title_synced_frames_ : nullptr,
-                                                     reuse_synced_frames)) {
-                    const bool had_mirror_hash =
-                        t.fills && t.mirror_hash_valid && from == t.filled_from && span == t.mirror_hash_span;
-                    if (had_mirror_hash && m_hash == t.mirror_hash) {
-                        ++stats.unchanged_parts;
-                        ++stats.gpu_unchanged;
-                        t.stale = false;
-                        continue;
-                    }
-                    if (had_mirror_hash) mirror_proved_changed = true;
-                    if (gpu_detile_on && from == 0 && m_single_chunk) {
-                        rt::d3d12::TitleImageUpload::UploadKind kind{};
-                        bool gpu_ok = false;
-                        if (t.gpu_upload_cached_offset == m_off && t.gpu_upload_cached_chunk == m_chunk) {
-                            gpu_ok = t.gpu_upload_cached_ok;
-                            kind = t.gpu_upload_cached_kind;
-                        } else {
-                            {
-                                std::lock_guard upload(state_.title_upload_mutex);
-                                gpu_ok = state_.title_upload.can_gpu_upload(state_, t.resource->title_binding(),
-                                                                            t.layout, m_off, m_chunk, kind);
-                            }
-                            t.gpu_upload_cached_offset = m_off;
-                            t.gpu_upload_cached_chunk = m_chunk;
-                            t.gpu_upload_cached_ok = gpu_ok;
-                            t.gpu_upload_cached_kind = kind;
-                        }
-                        if (gpu_ok) {
-                            TitleJob& job = next_title_job();
-                            job.entry = entry;
-                            job.resource = t.resource;
-                            job.span = span;
-                            job.previous = (t.hashed && t.fills && !t.gpu_uploaded && t.filled_from == 0)
-                                               ? std::optional<std::uint64_t>(t.hash)
-                                               : std::nullopt;
-                            job.gpu_mirror = true;
-                            job.gpu_kind = kind;
-                            job.mirror_buffer = m_buf;
-                            job.mirror_offset = m_off;
-                            job.mirror_chunk_size = m_chunk;
-                            job.mirror_timeline = m_tl;
-                            job.mirror_value = m_val;
-                            job.mirror_hash = m_hash;
-                            job.mirror_hash_valid = true;
-                            // If a multi-tile unaligned texture already has CPU piece hashes (no mirror_hash) and only
-                            // a subset of tiles were written, check those tiles first to skip unchanged uploads.
-                            if (!t.stale && !mirror_proved_changed && tiles > 1 && job.previous &&
-                                t.pieces.valid_for(t.cpu, job.span) && !title_written_.empty() &&
-                                title_written_.size() < tiles) {
-                                job.compare = true;
-                                job.written = title_written_;
-                            }
-                            if (kind == rt::d3d12::TitleImageUpload::UploadKind::mirror_detile) batch_bytes += job.span;
-                            if (title_job_count_ >= kTitleBatch || batch_bytes >= kTitleBatchBytes) run_batch();
-                            continue;
-                        }
-                    }
-                } else if (!t.stale && t.fills && !t.gpu_uploaded && from == t.filled_from &&
-                           t.pieces.valid_for(t.cpu, span) && !title_written_.empty() &&
-                           title_written_.size() <= tiles) {
-                    // Partially-mirrored texture (e.g., only the written hot-buffer tile is in TitleMirror): check
-                    // written tiles directly against TitleMirror::range_sum() in ~15 ns before touching CPU threads.
-                    const int tile_cmp = state_.page_mirror_tiles_unchanged(
-                        t.cpu, span, title_written_, t.pieces, allow_record_synced ? &title_synced_frames_ : nullptr,
-                        reuse_synced_frames);
-                    if (tile_cmp > 0) {
-                        ++stats.unchanged_parts;
-                        ++stats.gpu_unchanged;
-                        t.stale = false;
-                        continue;
-                    }
-                    if (tile_cmp < 0) mirror_proved_changed = true;
+            title_candidate_keys_.push_back(key);
+            title_candidates_.push_back({it->second, 0, 0, 0, false});
+        }
+
+        if (!title_candidates_.empty()) {
+            // Stage 2: batch-arm all dirty tiles across all candidates in ONE watch.examine_batch() call, then run
+            // readability, partial-mip budget, and image-backing checks.
+            watch.examine_batch(title_candidate_keys_, title_examine_results_);
+            const bool have_mirror = state_.page_mirror.mirror != nullptr;
+            if (have_mirror) title_mirror_checks_.resize(title_candidates_.size());
+            bool any_mirror_active = false;
+
+            for (std::size_t idx = 0; idx < title_candidates_.size(); ++idx) {
+                TitleCandidate& cand = title_candidates_[idx];
+                TitleTexture& t = *cand.entry;
+                const auto& ex = title_examine_results_[idx];
+                if (ex.look == leonida::TitleTextureWatch<TitleTextureCells>::Look::busy) {
+                    ++stats.busy;
+                    if (have_mirror) title_mirror_checks_[idx].active = false;
+                    continue;
+                }
+                ++stats.checked;
+                if (!title_texture_readable(t)) {
+                    not_filled(t);
+                    if (have_mirror) title_mirror_checks_[idx].active = false;
+                    continue;
+                }
+                const unsigned from = fill_from(t);
+                const std::uint64_t span = fill_bytes(t);
+                if (from && t.unbound_bytes && title_partial_bytes_ + t.unbound_bytes > partial_mips_budget()) {
+                    ++stats.partial_refused;
+                    t.stale = false;
+                    if (have_mirror) title_mirror_checks_[idx].active = false;
+                    continue;
+                }
+                if (!back_title_texture(t)) {
+                    not_filled(t);
+                    if (have_mirror) title_mirror_checks_[idx].active = false;
+                    continue;
+                }
+                const std::size_t tiles = std::size_t(((t.cpu + span + 0xffff) & ~std::uint64_t(0xffff)) -
+                                                      (t.cpu & ~std::uint64_t(0xffff))) >>
+                                          16;
+                cand.from = from;
+                cand.span = span;
+                cand.tiles = tiles;
+                cand.active = true;
+
+                if (have_mirror) {
+                    const bool allow_filter = ex.look == leonida::TitleTextureWatch<TitleTextureCells>::Look::armed;
+                    auto& mc = title_mirror_checks_[idx];
+                    mc.cpu = t.cpu;
+                    mc.gpu = t.address;
+                    mc.bytes = span;
+                    mc.written_tiles = (allow_filter && !t.stale) ? &ex.written : nullptr;
+                    const bool can_tile_cmp = !t.stale && t.fills && !t.gpu_uploaded && from == t.filled_from &&
+                                              t.pieces.valid_for(t.cpu, span) && !ex.written.empty() &&
+                                              ex.written.size() <= tiles;
+                    mc.tile_cmp_written = can_tile_cmp ? &ex.written : nullptr;
+                    mc.pieces = can_tile_cmp ? &t.pieces : nullptr;
+                    mc.active = true;
+                    any_mirror_active = true;
                 }
             }
-            // CPU upload path: hash-before-reserve for ALL textures including tiles == 1 (`<= tiles`).
-            TitleJob& job = next_title_job();
-            job.entry = entry;
-            job.resource = t.resource;
-            job.from = from;
-            job.span = span;
-            job.previous = (t.hashed && t.fills && !t.gpu_uploaded && from == t.filled_from)
-                               ? std::optional<std::uint64_t>(t.hash)
-                               : std::nullopt;
-            job.compare = !t.stale && !mirror_proved_changed && job.previous && t.pieces.valid_for(t.cpu, job.span) &&
-                          !title_written_.empty() && title_written_.size() <= tiles;
-            if (job.compare) {
-                job.written = title_written_;
-            } else if (!mirror_proved_changed) {
-                ++stats.whole_by[!job.previous                            ? 0
-                                 : !t.pieces.valid_for(t.cpu, job.span) ? 1
-                                 : tiles == 1                           ? 2
-                                 : !title_written_.empty()              ? 3
-                                                                        : 4];
+
+            // Stage 3: ONE page_mirror.mutex lock + ONE batched parallel TitleMirror::upload() for all candidates.
+            if (have_mirror && any_mirror_active) {
+                state_.page_mirror_check_batch(title_mirror_checks_, title_mirror_feed_pages_);
             }
-            job.write_combined = t.is_write_combined();
-            job.trace = leonida::dstorage::trace_enabled() && leonida::title_gpu_views::other_view(t.cpu);
-            batch_bytes += job.span;
-            if (title_job_count_ >= kTitleBatch || batch_bytes >= kTitleBatchBytes) run_batch();
+
+            // Stage 4: dispatch unchanged skips, GPU mirror jobs, and CPU jobs into batched upload passes.
+            for (std::size_t idx = 0; idx < title_candidates_.size(); ++idx) {
+                TitleCandidate& cand = title_candidates_[idx];
+                if (!cand.active || !cand.entry->resource) continue;
+                TitleTexture& t = *cand.entry;
+                const auto& ex = title_examine_results_[idx];
+                const unsigned from = cand.from;
+                const std::uint64_t span = cand.span;
+                const std::size_t tiles = cand.tiles;
+                bool mirror_proved_changed = false;
+
+                if (have_mirror) {
+                    const auto& mc = title_mirror_checks_[idx];
+                    if (mc.full_ok) {
+                        const bool had_mirror_hash =
+                            t.fills && t.mirror_hash_valid && from == t.filled_from && span == t.mirror_hash_span;
+                        if (had_mirror_hash && mc.mirror_hash == t.mirror_hash) {
+                            ++stats.unchanged_parts;
+                            ++stats.gpu_unchanged;
+                            t.stale = false;
+                            continue;
+                        }
+                        if (had_mirror_hash) mirror_proved_changed = true;
+                        if (gpu_detile_on && from == 0 && mc.single_chunk) {
+                            rt::d3d12::TitleImageUpload::UploadKind kind{};
+                            bool gpu_ok = false;
+                            if (t.gpu_upload_cached_offset == mc.offset && t.gpu_upload_cached_chunk == mc.chunk_size) {
+                                gpu_ok = t.gpu_upload_cached_ok;
+                                kind = t.gpu_upload_cached_kind;
+                            } else {
+                                {
+                                    std::lock_guard upload(state_.title_upload_mutex);
+                                    gpu_ok = state_.title_upload.can_gpu_upload(state_, t.resource->title_binding(),
+                                                                                t.layout, mc.offset, mc.chunk_size,
+                                                                                kind);
+                                }
+                                t.gpu_upload_cached_offset = mc.offset;
+                                t.gpu_upload_cached_chunk = mc.chunk_size;
+                                t.gpu_upload_cached_ok = gpu_ok;
+                                t.gpu_upload_cached_kind = kind;
+                            }
+                            if (gpu_ok) {
+                                TitleJob& job = next_title_job();
+                                job.entry = cand.entry;
+                                job.resource = t.resource;
+                                job.span = span;
+                                job.previous = (t.hashed && t.fills && !t.gpu_uploaded && t.filled_from == 0)
+                                                   ? std::optional<std::uint64_t>(t.hash)
+                                                   : std::nullopt;
+                                job.gpu_mirror = true;
+                                job.gpu_kind = kind;
+                                job.mirror_buffer = mc.buffer;
+                                job.mirror_offset = mc.offset;
+                                job.mirror_chunk_size = mc.chunk_size;
+                                job.mirror_timeline = mc.timeline;
+                                job.mirror_value = mc.value;
+                                job.mirror_hash = mc.mirror_hash;
+                                job.mirror_hash_valid = true;
+                                if (!t.stale && !mirror_proved_changed && tiles > 1 && job.previous &&
+                                    t.pieces.valid_for(t.cpu, job.span) && !ex.written.empty() &&
+                                    ex.written.size() < tiles) {
+                                    job.compare = true;
+                                    job.written = ex.written;
+                                }
+                                if (kind == rt::d3d12::TitleImageUpload::UploadKind::mirror_detile)
+                                    batch_bytes += job.span;
+                                if (title_job_count_ >= kTitleBatch || batch_bytes >= kTitleBatchBytes) run_batch();
+                                continue;
+                            }
+                        }
+                    } else if (mc.tile_cmp > 0) {
+                        ++stats.unchanged_parts;
+                        ++stats.gpu_unchanged;
+                        t.stale = false;
+                        continue;
+                    } else if (mc.tile_cmp < 0) {
+                        mirror_proved_changed = true;
+                    }
+                }
+
+                // CPU upload path: hash-before-reserve for ALL textures including tiles == 1 (`<= tiles`), and compare
+                // t.mirror_hash on whole reads so CPU fallback after a GPU upload never re-uploads unchanged bytes.
+                TitleJob& job = next_title_job();
+                job.entry = cand.entry;
+                job.resource = t.resource;
+                job.from = from;
+                job.span = span;
+                job.previous = (t.hashed && t.fills && !t.gpu_uploaded && from == t.filled_from)
+                                   ? std::optional<std::uint64_t>(t.hash)
+                                   : std::nullopt;
+                job.previous_mirror_hash =
+                    (t.fills && t.mirror_hash_valid && from == t.filled_from && span == t.mirror_hash_span)
+                        ? std::optional<std::uint64_t>(t.mirror_hash)
+                        : std::nullopt;
+                job.compare = !t.stale && !mirror_proved_changed && job.previous &&
+                              t.pieces.valid_for(t.cpu, job.span) && !ex.written.empty() &&
+                              ex.written.size() <= tiles;
+                if (job.compare) {
+                    job.written = ex.written;
+                } else if (!mirror_proved_changed) {
+                    ++stats.whole_by[!job.previous && !job.previous_mirror_hash ? 0
+                                     : !t.pieces.valid_for(t.cpu, job.span)     ? 1
+                                     : tiles == 1                               ? 2
+                                     : !ex.written.empty()                      ? 3
+                                                                                : 4];
+                }
+                job.write_combined = t.is_write_combined();
+                job.trace = leonida::dstorage::trace_enabled() && leonida::title_gpu_views::other_view(t.cpu);
+                batch_bytes += job.span;
+                if (title_job_count_ >= kTitleBatch || batch_bytes >= kTitleBatchBytes) run_batch();
+            }
+            title_candidates_.clear();
         }
         run_batch();
         watch.update_idle_hint();
@@ -20409,12 +20667,12 @@ public:
             const auto pass_fill = std::uint64_t(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - fill_start).count());
             stats.fill_ns += pass_fill;
-            // What is not reading or submitting: naming, arming, readability, slot reservation.
+            // What is not reading or submitting: naming, arming, mirror batch sync, readability, slot reservation.
             const std::uint64_t other = (stats.read_ns - read_before) + (stats.staged_ns - staged_before);
             stats.examine_ns += pass_fill > other ? pass_fill - other : 0;
         }
         stats.filled_bytes += filled;
-        stats.max_pass_bytes = std::max(stats.max_pass_bytes, filled);
+        stats.max_pass_bytes = (std::max)(stats.max_pass_bytes, filled);
         std::vector<Resource*> release;
         if (!retired_title_textures_.empty()) {
             std::int64_t next_due = 0;
@@ -20435,7 +20693,7 @@ public:
         title_pass_ = false;
         const std::uint64_t pass_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - now).count();
         stats.refresh_ns += pass_ns;
-        stats.max_refresh_ns = std::max(stats.max_refresh_ns, pass_ns);
+        stats.max_refresh_ns = (std::max)(stats.max_refresh_ns, pass_ns);
         if (now - stats.last_log >= std::chrono::seconds(10)) {
             stats.last_log = now;
             title_last_log_ns_.store(now_ns, std::memory_order_release);
@@ -20473,7 +20731,7 @@ public:
                          static_cast<unsigned long long>(w.arm_busy - l.arm_busy),
                          static_cast<unsigned long long>(w.arm_failures - l.arm_failures),
                          static_cast<unsigned long long>(w.overflows - l.overflows), watch.textures(), watch.tiles(),
-                         watch.unarmed(), double(stats.refresh_ns) * 1e-6 / double(std::max<std::uint64_t>(1, stats.passes)),
+                         watch.unarmed(), double(stats.refresh_ns) * 1e-6 / double((std::max)<std::uint64_t>(1, stats.passes)),
                          double(stats.max_refresh_ns) * 1e-6);
             const auto& o = state_.over_gpu_target;
             std::fprintf(stderr,
@@ -20501,17 +20759,19 @@ public:
                          static_cast<unsigned long long>(stats.whole_by[4]));
             stats.read_whole = stats.unchanged_parts = stats.gpu_unchanged = stats.first_named = 0;
             stats.whole_by = {};
-            const double per_pass = 1e-6 / double(std::max<std::uint64_t>(1, title_split_passes_));
+            const double per_pass = 1e-6 / double((std::max)<std::uint64_t>(1, title_split_passes_));
             std::fprintf(stderr,
-                         "[rt] d3d12: title texture pass split, ms a pass: %.3f finding what to look at, %.3f naming, "
-                         "arming and reserving, %.3f reading on %u threads (%.3f of it detiling, summed over them; "
-                         "%.1f MiB read whole a pass), %.3f recording and submitting the transfers\n",
-                         double(stats.collect_ns) * per_pass, double(stats.examine_ns) * per_pass,
+                         "[rt] d3d12: title texture pass split, ms a pass: %.3f finding what to look at (%.3f lock "
+                         "wait), %.3f naming, arming and reserving, %.3f reading on %u threads (%.3f of it detiling, "
+                         "summed over them; %.1f MiB read whole a pass), %.3f recording and submitting the transfers\n",
+                         double(stats.collect_ns) * per_pass, double(stats.lock_wait_ns) * per_pass,
+                         double(stats.examine_ns) * per_pass,
                          double(stats.read_ns) * per_pass, title_read_pool_ ? title_read_pool_->threads() + 1 : 1,
                          double(stats.detile_ns) * per_pass,
-                         double(stats.read_bytes) / 1048576.0 / double(std::max<std::uint64_t>(1, title_split_passes_)),
+                         double(stats.read_bytes) / 1048576.0 / double((std::max)<std::uint64_t>(1, title_split_passes_)),
                          double(stats.staged_ns) * per_pass);
-            stats.collect_ns = stats.examine_ns = stats.read_ns = stats.detile_ns = stats.read_bytes = 0;
+            stats.collect_ns = stats.lock_wait_ns = stats.examine_ns = stats.read_ns = stats.detile_ns =
+                stats.read_bytes = 0;
             stats.staged_ns = 0;
             title_split_passes_ = 0;
             stats.refresh_ns = stats.max_refresh_ns = stats.max_pass_bytes = 0;
@@ -20536,10 +20796,11 @@ private:
         std::uint64_t partial_fills = 0, partial_textures = 0, partial_upgrades = 0, partial_refused = 0;
         std::uint64_t read_whole = 0, unchanged_parts = 0, first_named = 0;
         std::array<std::uint64_t, 5> whole_by{};  // why read whole: first, no parts, one tile, all written, none
-        // Split of refresh_ns: up to the textures to look at (map changes, notes, the watch's queue), naming and arming
-        // them (examine, readability, slot reservation), the read threads' work (and of it the detile, summed over the
-        // threads), and the transfers' recording and submission (staged_ns); bytes read whole.
-        std::uint64_t collect_ns = 0, examine_ns = 0, read_ns = 0, detile_ns = 0, read_bytes = 0;
+        // Split of refresh_ns: waiting on title_texture_mutex (lock_wait_ns), up to the textures to look at (map
+        // changes, notes, the watch's queue), naming and arming them (examine, mirror batch, readability, slot
+        // reservation), the read threads' work (and of it the detile, summed over the threads), and the transfers'
+        // recording and submission (staged_ns); bytes read whole.
+        std::uint64_t lock_wait_ns = 0, collect_ns = 0, examine_ns = 0, read_ns = 0, detile_ns = 0, read_bytes = 0;
         std::uint64_t staged_fills = 0, staged_fills_logged = 0, staged_ns = 0;
         std::uint64_t gpu_linear_fills = 0, gpu_detile_fills = 0, gpu_unchanged = 0, fast_passes = 0;
         // refresh_title_textures, since the last log line
@@ -20557,9 +20818,19 @@ private:
     };
     TitleTextureStats title_stats_;                                 // under title_texture_mutex
     bool title_pass_ = false;                                      // in refresh_title_textures, likewise
+    struct TitleCandidate {
+        std::shared_ptr<TitleTexture> entry;
+        unsigned from = 0;
+        std::uint64_t span = 0;
+        std::size_t tiles = 0;
+        bool active = false;
+    };
     std::vector<std::uint64_t> title_named_;                       // refresh scratch, under title_texture_mutex
-    std::vector<std::uintptr_t> title_written_;                    // likewise
-    std::unordered_set<std::uint8_t*> title_synced_frames_;        // mirror frames synced this pass, likewise
+    std::vector<std::uint64_t> title_candidate_keys_;              // likewise
+    std::vector<TitleCandidate> title_candidates_;                 // likewise
+    std::vector<leonida::TitleTextureWatch<TitleTextureCells>::BatchExamine> title_examine_results_;  // likewise
+    std::vector<DeviceState::TitleMirrorCheckItem> title_mirror_checks_;  // likewise
+    std::vector<std::uint64_t> title_mirror_feed_pages_;           // likewise
     std::uint64_t title_split_passes_ = 0;                         // passes since the split's last log line
     // One texture of a refresh batch: what the serial part found (the slot reserved for it, the last fill's hash) and
     // what a TitleReadPool thread read (read_title_job).
@@ -20570,6 +20841,7 @@ private:
         unsigned from = 0;
         std::uint64_t span = 0, hash = 0;
         std::optional<std::uint64_t> previous;
+        std::optional<std::uint64_t> previous_mirror_hash;
         leonida::TilePieces pieces;                // the texture's, then (read whole) the new ones
         std::vector<std::uintptr_t> written;       // its tiles written since its last read (compare)
         bool compare = false, whole = false, precopied = false;
@@ -21428,7 +21700,10 @@ private:
             }
         }
         job.hash = job.pieces.combined();
-        job.unchanged = job.previous && *job.previous == job.hash;
+        const bool same_hash = job.previous && *job.previous == job.hash;
+        const bool same_mirror =
+            job.previous_mirror_hash && job.mirror_hash_valid && *job.previous_mirror_hash == job.mirror_hash;
+        job.unchanged = same_hash || same_mirror;
     }
 
     // Parallel CPU detile into the staging slot reserved ONLY for changed CPU jobs.

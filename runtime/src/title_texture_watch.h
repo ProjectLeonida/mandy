@@ -33,10 +33,11 @@
 //   void take_written(std::vector<std::uintptr_t>& tiles, bool& overflow);  // the queue since the last call
 //   bool enabled();                              // a write-fault handler is installed: arming is allowed
 //   void hot_tiles(std::vector<std::uintptr_t>&); // tiles another owner leaves writable: written at every look
-//   Optional lock-free hints (detected via requires):
+//   Optional lock-free hints and batch arming (detected via requires):
 //   bool has_written() const;                    // true if take_written() has queued tiles
 //   std::uint64_t hot_generation() const;        // monotonic counter bumped on every hot-set change (preferred)
 //   std::size_t hot_count() const;               // fallback when hot_generation() is not provided
+//   void arm_batch(const std::uintptr_t* tiles, Cell* const* cells, std::int8_t* results, std::size_t count);
 //
 // Not thread-safe (except may_have_work()): the caller holds the title texture registry's lock.
 #include <algorithm>
@@ -191,7 +192,7 @@ public:
                 add_region_tile(a, tile);
                 added_tile = true;
             }
-            tile.textures.push_back(key);
+            tile.textures.emplace_back(key, &t);
         }
         if (added_tile) {
             hot_sync_needed_ = true;
@@ -208,9 +209,12 @@ public:
             const auto t = tiles_.find(a);
             if (t == tiles_.end()) continue;
             auto& vec = t->second.textures;
-            if (const auto pos = std::find(vec.begin(), vec.end(), key); pos != vec.end()) {
-                *pos = vec.back();
-                vec.pop_back();
+            for (std::size_t idx = 0; idx < vec.size(); ++idx) {
+                if (vec[idx].first == key) {
+                    vec[idx] = vec.back();
+                    vec.pop_back();
+                    break;
+                }
             }
             if (vec.empty()) {
                 drop(a, t->second);
@@ -250,9 +254,9 @@ public:
         if (from >= to || tiles_.empty()) return;
         const std::uint64_t stamp = ++over_gen_;
         for_each_tile_in(from, to, [&](std::uintptr_t, Tile& tile) {
-            for (const Key k : tile.textures) {
-                if (const auto tex = textures_.find(k); tex != textures_.end() && tex->second.over_gen != stamp) {
-                    tex->second.over_gen = stamp;
+            for (const auto& [k, tex] : tile.textures) {
+                if (tex->over_gen != stamp) {
+                    tex->over_gen = stamp;
                     f(k);
                 }
             }
@@ -266,9 +270,9 @@ public:
         const std::uint64_t stamp = ++over_gen_;
         for_each_tile_in(from, to, [&](std::uintptr_t addr, Tile& tile) {
             note_tile_changed(addr, tile, rearm);
-            for (const Key k : tile.textures) {
-                if (const auto tex = textures_.find(k); tex != textures_.end() && tex->second.over_gen != stamp) {
-                    tex->second.over_gen = stamp;
+            for (const auto& [k, tex] : tile.textures) {
+                if (tex->over_gen != stamp) {
+                    tex->over_gen = stamp;
                     f(k);
                 }
             }
@@ -358,20 +362,16 @@ public:
             last_hot_stamp_ = cur_hot_stamp;
             hot_sync_needed_ = false;
         } else if (!active_hot_tiles_.empty()) {
-            for (const std::uintptr_t a : active_hot_tiles_) {
-                if (const auto it = tiles_.find(a); it != tiles_.end()) {
-                    it->second.hot_gen = gen;
-                    mark_tile_pass(a, it->second, gen, false);
-                }
+            for (const auto& [a, tp] : active_hot_tiles_) {
+                tp->hot_gen = gen;
+                mark_tile_pass(a, *tp, gen, false);
             }
         }
 
         // 5. Tiles not armed: whatever their version says, a write there need not have faulted.
-        for (const std::uintptr_t a : unarmed_list_) {
-            const auto it = tiles_.find(a);
-            if (it == tiles_.end()) continue;
-            it->second.stale = true;
-            mark_tile_pass(a, it->second, gen, true);
+        for (const auto& [a, tp] : unarmed_list_) {
+            tp->stale = true;
+            mark_tile_pass(a, *tp, gen, true);
         }
 
         std::sort(named_.begin(), named_.end());
@@ -424,17 +424,181 @@ public:
         return look;
     }
 
+    struct BatchExamine {
+        Look look = Look::armed;
+        std::vector<std::uintptr_t> written;
+    };
+
+    // Batched examine() over all keys of a pass: deduplicates shared tiles and alias peers across keys, sorts all
+    // tiles needing arming by address, and issues one watch_.arm_batch() call (coalescing pin checks, geometry-watch
+    // lock holds, and contiguous VirtualQuery/VirtualProtect runs). Falls back to watch_.arm() when the Watch type
+    // does not provide arm_batch(). Preserves exact per-key Look (busy > unwatched > armed) and written-tile semantics.
+    void examine_batch(const std::vector<Key>& keys, std::vector<BatchExamine>& out) {
+        const std::size_t n = keys.size();
+        out.resize(n);
+        if (!n) return;
+        const std::uint64_t gen = pass_gen_;
+        const std::uint64_t bgen = ++batch_arm_gen_;
+        const bool watch_on = watch_.enabled();
+
+        batch_tiles_.clear();
+        batch_reqs_.clear();
+        batch_tile_refs_.clear();
+
+        auto queue_tile = [&](std::size_t key_idx, std::uintptr_t a, Tile& tile) {
+            if (tile.pass_written_gen == gen || tile.stale || tile.unarmed_index != kNoIndex)
+                out[key_idx].written.push_back(a);
+            if (!watch_on) {
+                add_unarmed(a, tile);
+                tile.stale = true;
+                if (out[key_idx].look == Look::armed) out[key_idx].look = Look::unwatched;
+                return;
+            }
+            if (tile.batch_arm_gen == bgen) {
+                if (tile.batch_arm_slot != kNoIndex) batch_tile_refs_.emplace_back(key_idx, tile.batch_arm_slot);
+                return;
+            }
+            const std::uint64_t mapping = tile.primary->mapping.load(std::memory_order_acquire);
+            if (!tile.stale && tile.unarmed_index == kNoIndex && tile.hot_index == kNoIndex &&
+                tile.hot_gen != pass_gen_ && mapping == tile.mapping) {
+                std::uint64_t version = tile.primary->version.load(std::memory_order_acquire);
+                for (const auto& [peer, cell] : tile.peers)
+                    version = (std::max)(version, cell->version.load(std::memory_order_acquire));
+                if (version == tile.version) {
+                    tile.batch_arm_gen = bgen;
+                    tile.batch_arm_slot = kNoIndex;
+                    return;
+                }
+            }
+            if (mapping != tile.mapping) {
+                aliases_.clear();
+                watch_.aliases(a, aliases_);
+                auto old = std::move(tile.peers);
+                tile.peers.clear();
+                for (const std::uintptr_t peer : aliases_) {
+                    if (peer == a) continue;
+                    tile.peers.emplace_back(peer, watch_.acquire(peer));
+                    by_peer_[peer].push_back(a);
+                    hot_sync_needed_ = true;
+                }
+                for (const auto& [peer, cell] : old) {
+                    unlink_peer(peer, a);
+                    watch_.release(peer);
+                }
+                tile.mapping = mapping;
+            }
+            std::uint64_t version = tile.primary->version.load(std::memory_order_acquire);
+            for (const auto& [peer, cell] : tile.peers)
+                version = (std::max)(version, cell->version.load(std::memory_order_acquire));
+            const bool pure_hot_recheck = !tile.stale && tile.unarmed_index == kNoIndex && tile.hot_gen == pass_gen_ &&
+                                          mapping == tile.mapping && version == tile.version;
+            const std::uint32_t slot = static_cast<std::uint32_t>(batch_tiles_.size());
+            tile.batch_arm_gen = bgen;
+            tile.batch_arm_slot = slot;
+            batch_tiles_.push_back({a, &tile, version, pure_hot_recheck, 1});
+            batch_reqs_.push_back({a, tile.primary, slot});
+            for (const auto& [peer, cell] : tile.peers) batch_reqs_.push_back({peer, cell, slot});
+            batch_tile_refs_.emplace_back(key_idx, slot);
+        };
+
+        for (std::size_t i = 0; i < n; ++i) {
+            out[i].written.clear();
+            out[i].look = Look::armed;
+            const auto it = textures_.find(keys[i]);
+            if (it == textures_.end()) {
+                out[i].look = Look::unwatched;
+                continue;
+            }
+            Texture& tex = it->second;
+            if (tex.dirty_gen == gen) {
+                if (tex.dirty_tiles_gen == gen) {
+                    if (tex.dirty_tiles.size() > 1) std::sort(tex.dirty_tiles.begin(), tex.dirty_tiles.end());
+                    for (const std::uintptr_t a : tex.dirty_tiles) {
+                        if (const auto t = tiles_.find(a); t != tiles_.end()) queue_tile(i, a, t->second);
+                    }
+                }
+            } else {
+                for (std::uintptr_t a = tex.first; a < tex.last; a += kTile) {
+                    if (const auto t = tiles_.find(a); t != tiles_.end()) queue_tile(i, a, t->second);
+                }
+            }
+        }
+
+        if (batch_tiles_.empty()) return;
+
+        if (batch_reqs_.size() > 1) {
+            std::sort(batch_reqs_.begin(), batch_reqs_.end(),
+                      [](const BatchArmReq& lhs, const BatchArmReq& rhs) { return lhs.va < rhs.va; });
+        }
+
+        batch_arm_vas_.clear();
+        batch_arm_cells_.clear();
+        batch_req_unique_.resize(batch_reqs_.size());
+        for (std::size_t r = 0; r < batch_reqs_.size(); ++r) {
+            if (r > 0 && batch_reqs_[r].va == batch_reqs_[r - 1].va) {
+                batch_req_unique_[r] = batch_arm_vas_.size() - 1;
+            } else {
+                batch_req_unique_[r] = batch_arm_vas_.size();
+                batch_arm_vas_.push_back(batch_reqs_[r].va);
+                batch_arm_cells_.push_back(batch_reqs_[r].cell);
+            }
+        }
+
+        const std::size_t unique_n = batch_arm_vas_.size();
+        batch_arm_results_.assign(unique_n, -1);
+        if constexpr (requires(Watch& w, const std::uintptr_t* vas, Cell* const* cells, std::int8_t* res,
+                               std::size_t count) { w.arm_batch(vas, cells, res, count); }) {
+            watch_.arm_batch(batch_arm_vas_.data(), batch_arm_cells_.data(), batch_arm_results_.data(), unique_n);
+        } else {
+            for (std::size_t u = 0; u < unique_n; ++u) {
+                const int r = watch_.arm(batch_arm_vas_[u], *batch_arm_cells_[u]);
+                batch_arm_results_[u] = static_cast<std::int8_t>(r > 0 ? 1 : (r == 0 ? 0 : -1));
+            }
+        }
+
+        for (std::size_t r = 0; r < batch_reqs_.size(); ++r) {
+            const int res = batch_arm_results_[batch_req_unique_[r]];
+            int& tile_res = batch_tiles_[batch_reqs_[r].slot].result;
+            if (res == 0) tile_res = 0;
+            else if (res < 0 && tile_res > 0) tile_res = -1;
+        }
+
+        for (const BatchTile& bt : batch_tiles_) {
+            ++stats_.arms;
+            if (!bt.pure_hot_recheck || bt.result <= 0) ++stats_.non_hot_arms;
+            if (bt.result <= 0) {
+                ++(bt.result ? stats_.arm_failures : stats_.arm_busy);
+                add_unarmed(bt.address, *bt.tile);
+                bt.tile->stale = true;
+            } else {
+                bt.tile->version = bt.version;
+                bt.tile->stale = false;
+                remove_unarmed(*bt.tile);
+            }
+        }
+
+        for (const auto& [key_idx, slot] : batch_tile_refs_) {
+            const int armed = batch_tiles_[slot].result;
+            Look& look = out[key_idx].look;
+            if (!armed) look = Look::busy;
+            else if (armed < 0 && look == Look::armed) look = Look::unwatched;
+        }
+    }
+
 private:
     static constexpr std::uint32_t kNoIndex = ~std::uint32_t(0);
     static constexpr std::uintptr_t kRegion = std::uintptr_t(16) << 20;  // 16 MiB buckets (<= 256 tiles each)
 
+    struct Texture;
     struct Tile {
         Cell* primary = nullptr;
         std::uint64_t version = 0, mapping = 0;  // as last armed; mapping 0: peers not looked up yet
         std::vector<std::pair<std::uintptr_t, Cell*>> peers;
-        std::vector<Key> textures;
+        std::vector<std::pair<Key, Texture*>> textures;
         std::uint64_t pass_written_gen = 0;
         std::uint64_t hot_gen = 0;
+        std::uint64_t batch_arm_gen = 0;
+        std::uint32_t batch_arm_slot = kNoIndex;
         std::uint32_t unarmed_index = kNoIndex;
         std::uint32_t hot_index = kNoIndex;
         std::uint32_t region_index = kNoIndex;
@@ -448,18 +612,30 @@ private:
         std::uint64_t over_gen = 0;
         std::vector<std::uintptr_t> dirty_tiles;
     };
+    struct BatchTile {
+        std::uintptr_t address = 0;
+        Tile* tile = nullptr;
+        std::uint64_t version = 0;
+        bool pure_hot_recheck = false;
+        int result = 1;
+    };
+    struct BatchArmReq {
+        std::uintptr_t va = 0;
+        Cell* cell = nullptr;
+        std::uint32_t slot = 0;
+    };
 
     void add_unarmed(std::uintptr_t address, Tile& tile) {
         if (tile.unarmed_index != kNoIndex) return;
         tile.unarmed_index = static_cast<std::uint32_t>(unarmed_list_.size());
-        unarmed_list_.push_back(address);
+        unarmed_list_.emplace_back(address, &tile);
     }
     void remove_unarmed(Tile& tile) {
         if (tile.unarmed_index == kNoIndex) return;
         const std::uint32_t idx = tile.unarmed_index;
-        const std::uintptr_t last = unarmed_list_.back();
+        const auto last = unarmed_list_.back();
         unarmed_list_[idx] = last;
-        if (idx + 1 < unarmed_list_.size()) tiles_.find(last)->second.unarmed_index = idx;
+        if (idx + 1 < unarmed_list_.size()) last.second->unarmed_index = idx;
         unarmed_list_.pop_back();
         tile.unarmed_index = kNoIndex;
     }
@@ -467,21 +643,19 @@ private:
     void add_active_hot(std::uintptr_t address, Tile& tile) {
         if (tile.hot_index != kNoIndex) return;
         tile.hot_index = static_cast<std::uint32_t>(active_hot_tiles_.size());
-        active_hot_tiles_.push_back(address);
+        active_hot_tiles_.emplace_back(address, &tile);
     }
     void remove_active_hot(Tile& tile) {
         if (tile.hot_index == kNoIndex) return;
         const std::uint32_t idx = tile.hot_index;
-        const std::uintptr_t last = active_hot_tiles_.back();
+        const auto last = active_hot_tiles_.back();
         active_hot_tiles_[idx] = last;
-        if (idx + 1 < active_hot_tiles_.size()) tiles_.find(last)->second.hot_index = idx;
+        if (idx + 1 < active_hot_tiles_.size()) last.second->hot_index = idx;
         active_hot_tiles_.pop_back();
         tile.hot_index = kNoIndex;
     }
     void clear_active_hot() {
-        for (const std::uintptr_t a : active_hot_tiles_) {
-            if (const auto it = tiles_.find(a); it != tiles_.end()) it->second.hot_index = kNoIndex;
-        }
+        for (const auto& [a, tp] : active_hot_tiles_) tp->hot_index = kNoIndex;
         active_hot_tiles_.clear();
     }
 
@@ -489,7 +663,7 @@ private:
         if (tile.region_index != kNoIndex) return;
         auto& vec = region_tiles_[address & ~(kRegion - 1)];
         tile.region_index = static_cast<std::uint32_t>(vec.size());
-        vec.push_back(address);
+        vec.emplace_back(address, &tile);
     }
     void remove_region_tile(std::uintptr_t address, Tile& tile) {
         if (tile.region_index == kNoIndex) return;
@@ -498,9 +672,9 @@ private:
         if (rit != region_tiles_.end()) {
             auto& vec = rit->second;
             const std::uint32_t idx = tile.region_index;
-            const std::uintptr_t last = vec.back();
+            const auto last = vec.back();
             vec[idx] = last;
-            if (idx + 1 < vec.size()) tiles_.find(last)->second.region_index = idx;
+            if (idx + 1 < vec.size()) last.second->region_index = idx;
             vec.pop_back();
             if (vec.empty()) region_tiles_.erase(rit);
         }
@@ -536,10 +710,8 @@ private:
         for (auto it = region_tiles_.lower_bound(first_region); it != region_tiles_.end() && it->first < to; ++it) {
             const std::uintptr_t region_start = it->first;
             const bool full_region = region_start >= first && (to - region_start >= kRegion);
-            for (const std::uintptr_t addr : it->second) {
-                if (full_region || (addr >= first && addr < to)) {
-                    if (const auto found = tiles_.find(addr); found != tiles_.end()) f(addr, found->second);
-                }
+            for (const auto& [addr, tp] : it->second) {
+                if (full_region || (addr >= first && addr < to)) f(addr, *tp);
             }
         }
     }
@@ -571,20 +743,15 @@ private:
     void mark_tile_pass(std::uintptr_t address, Tile& tile, std::uint64_t gen, bool from_unarmed,
                         bool set_stale = true) {
         if (set_stale) tile.stale = true;
-        const bool first_this_pass = tile.pass_written_gen != gen;
-        if (first_this_pass) tile.pass_written_gen = gen;
-        for (const Key k : tile.textures) {
-            const auto it = textures_.find(k);
-            if (it == textures_.end()) continue;
-            Texture& tex = it->second;
-            mark_key_pass(k, tex, gen, from_unarmed);
-            if (first_this_pass) {
-                if (tex.dirty_tiles_gen != gen) {
-                    tex.dirty_tiles_gen = gen;
-                    tex.dirty_tiles.clear();
-                }
-                tex.dirty_tiles.push_back(address);
+        if (tile.pass_written_gen == gen) return;  // already marked every texture on this tile this pass
+        tile.pass_written_gen = gen;
+        for (const auto& [k, tex] : tile.textures) {
+            mark_key_pass(k, *tex, gen, from_unarmed);
+            if (tex->dirty_tiles_gen != gen) {
+                tex->dirty_tiles_gen = gen;
+                tex->dirty_tiles.clear();
             }
+            tex->dirty_tiles.push_back(address);
         }
     }
 
@@ -648,7 +815,11 @@ private:
                                       mapping == tile.mapping && version == tile.version;
         ++stats_.arms;
         int result = watch_.arm(address, *tile.primary);
-        for (const auto& [peer, cell] : tile.peers) result = (std::min)(result, watch_.arm(peer, *cell) + 0);
+        for (const auto& [peer, cell] : tile.peers) {
+            const int r = watch_.arm(peer, *cell);
+            if (r == 0) result = 0;
+            else if (r < 0 && result > 0) result = -1;
+        }
         if (!pure_hot_recheck || result <= 0) ++stats_.non_hot_arms;
         if (result <= 0) {
             ++(result ? stats_.arm_failures : stats_.arm_busy);
@@ -682,15 +853,23 @@ private:
     std::unordered_map<std::uintptr_t, Tile> tiles_;
     std::unordered_map<std::uintptr_t, std::vector<std::uintptr_t>> by_peer_;
     std::unordered_map<Key, Texture> textures_;
-    std::vector<std::uintptr_t> unarmed_list_;
-    std::vector<std::uintptr_t> active_hot_tiles_;
-    std::map<std::uintptr_t, std::vector<std::uintptr_t>> region_tiles_;
+    std::vector<std::pair<std::uintptr_t, Tile*>> unarmed_list_;
+    std::vector<std::pair<std::uintptr_t, Tile*>> active_hot_tiles_;
+    std::map<std::uintptr_t, std::vector<std::pair<std::uintptr_t, Tile*>>> region_tiles_;
     std::vector<std::uintptr_t> pending_noted_tiles_;
     std::vector<Key> pending_dirty_keys_;
     std::vector<Key> named_;
     std::vector<std::uintptr_t> written_, aliases_, hot_;
+    std::vector<BatchTile> batch_tiles_;
+    std::vector<BatchArmReq> batch_reqs_;
+    std::vector<std::pair<std::size_t, std::uint32_t>> batch_tile_refs_;
+    std::vector<std::uintptr_t> batch_arm_vas_;
+    std::vector<Cell*> batch_arm_cells_;
+    std::vector<std::size_t> batch_req_unique_;
+    std::vector<std::int8_t> batch_arm_results_;
     std::uint64_t pass_gen_ = 0;
     std::uint64_t over_gen_ = 0;
+    std::uint64_t batch_arm_gen_ = 0;
     std::uint64_t last_hot_stamp_ = 0;
     bool hot_sync_needed_ = false;
     std::atomic<bool> has_pending_{false};
