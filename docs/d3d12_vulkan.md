@@ -92,7 +92,8 @@ enough for the bundled middleware's `d3d12_xs` calls, not for the game. The laye
   start handles returned in RAX at heap slots 9/10. Implement the public chain plus those measured overrides
   explicitly; do not assume every slot. On the retail executable's higher device slots (`runtime/shims/d3d12_xs_device.cpp`),
   slot 86 routes `CreatePipelineState(desc, riid, out)` to PC slot 47 (`ID3D12Device2::CreatePipelineState`) and keeps
-  a deep copy of the stream on the PSO it returns; slot 55 (`CreateDerivedPipelineState(pBasePSO, n, pRecords, riid,
+  a deep copy of the stream on the PSO it returns (its shader bytecode once per content for the process, shared by
+  every PSO whose stream carries the same bytes); slot 55 (`CreateDerivedPipelineState(pBasePSO, n, pRecords, riid,
   out)`, `n` = 1..4 records of 0x14c bytes: a u32 tag, then the payload at +4) patches a copy of that stream and creates
   the PSO through the same path. Tags 0 (`D3D12_DEPTH_STENCIL_DESC`, on DEPTH_STENCIL or DEPTH_STENCIL1), 1
   (`D3D12_RASTERIZER_DESC`), 2 (`D3D12_BLEND_DESC`) and 3 (sample mask) are the TomBox layout (GPL-3.0,
