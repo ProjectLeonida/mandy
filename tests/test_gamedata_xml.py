@@ -399,5 +399,73 @@ class GamedataXmlTest(unittest.TestCase):
                 self.assertNotIn("Traceback", p.stderr)
 
 
+    def test_write_csv_and_json_preserve_existing_on_replace_failure(self):
+        doc = self.write("alpha.xml", ALPHA)
+        existing_csv = self.write("existing.csv", b"original-csv\n")
+        existing_json = self.write("existing.json", b"{\"original\": true}\n")
+        if os.name == "posix":
+            os.chmod(existing_csv, 0o444)
+            os.chmod(existing_json, 0o444)
+        try:
+            with mock.patch.object(g.replace_retry, "replace", side_effect=OSError(13, "locked")), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc_csv = g.main([doc, "--csv", existing_csv])
+                rc_json = g.main([doc, "--json", existing_json])
+            self.assertEqual(rc_csv, 2)
+            self.assertEqual(rc_json, 2)
+            with open(existing_csv, "rb") as f:
+                self.assertEqual(f.read(), b"original-csv\n")
+            with open(existing_json, "rb") as f:
+                self.assertEqual(f.read(), b"{\"original\": true}\n")
+            leftovers = [name for name in os.listdir(self.root) if name.endswith(".tmp")]
+            self.assertEqual(leftovers, [])
+        finally:
+            if os.name == "posix":
+                os.chmod(existing_csv, 0o644)
+                os.chmod(existing_json, 0o644)
+
+    def test_write_json_rejects_nan_and_ends_with_newline(self):
+        out = os.path.join(self.root, "out.json")
+        with self.assertRaises(ValueError):
+            g.write_json(out, {"bad": float("nan")})
+        self.assertFalse(os.path.exists(out))
+        self.assertEqual([name for name in os.listdir(self.root) if name.endswith(".tmp")], [])
+
+        g.write_json(out, {"ok": 1})
+        with open(out, "rb") as f:
+            raw = f.read()
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertEqual(json.loads(raw.decode("utf-8")), {"ok": 1})
+
+    def test_xml_files_sorts_subdirectories_in_place(self):
+        seen_dirs = []
+
+        def fake_walk(root, onerror=None):
+            dirs = ["z_dir", "a_dir"]
+            yield root, dirs, []
+            seen_dirs.append(list(dirs))
+            for d in dirs:
+                yield os.path.join(root, d), [], ["item.xml"]
+
+        with mock.patch.object(g.os, "walk", side_effect=fake_walk):
+            paths = list(g.xml_files(self.root))
+        self.assertEqual(seen_dirs, [["a_dir", "z_dir"]])
+        self.assertEqual(
+            paths,
+            [os.path.join(self.root, "a_dir", "item.xml"),
+             os.path.join(self.root, "z_dir", "item.xml")],
+        )
+
+    def test_main_accepts_explicit_argv(self):
+        doc = self.write("alpha.xml", ALPHA)
+        out_json = os.path.join(self.root, "argv.json")
+        out_csv = os.path.join(self.root, "argv.csv")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = g.main([doc, "--json", out_json, "--csv", out_csv, "--check"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.isfile(out_json))
+        self.assertTrue(os.path.isfile(out_csv))
+
+
 if __name__ == "__main__":
     unittest.main()
