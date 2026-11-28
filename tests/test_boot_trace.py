@@ -615,6 +615,21 @@ class BootTraceTests(unittest.TestCase):
         self.assertIn(f"  XMem physical page observations: {len(observations)}", text.getvalue())
         return text.getvalue(), startup["xmem_physical_pages"]
 
+    def test_xmem_attribute_samples_and_private_counts(self):
+        self.write(self.startup, [
+            {"kind": "xmem_attributes", "attributes": "0x10", "size": 0, "api": "XMemAlloc", "caller": "private"},
+            {"kind": "xmem_attributes", "attributes": "0x20", "api": "XMemFree"},
+            {"kind": "xmem_attributes", "size": True},
+        ])
+        report = bt.summarize(bt.parse_startup(self.startup, 2), None)
+        samples = report["startup"]["xmem_attributes"]
+        self.assertEqual([r["size"] for r in samples], [0, None])
+        self.assertIn("XMemAlloc attributes 0x10 size 0", bt.format_text(report, 2))
+        counts = bt.counts_only(report)
+        self.assertEqual(counts["startup"]["xmem_attributes_count"], 3)
+        self.assertNotIn("private", json.dumps(counts))
+        self.assertEqual(bt.parse_startup(self.startup, 0)["xmem_attributes"], [])
+
     def test_single_xmem_physical_pages_observation(self):
         observation = {
             "api": "XMemAllocatePhysicalPages", "attributes": "0x0", "pages": 0, "caller": "0x20",

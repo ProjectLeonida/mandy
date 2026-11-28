@@ -94,6 +94,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "exceptions": [],
         "exception_count": 0,
         "xmem_physical_pages": [],
+        "xmem_attributes": [],
         "exit": None,
         "error": None,
     }
@@ -187,18 +188,19 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                     trace["exceptions"].append(detail)
                 else:
                     trace["exceptions"][-1] = detail
-            elif kind == "xmem_physical_pages":
-                samples = trace["xmem_physical_pages"]
+            elif kind in ("xmem_physical_pages", "xmem_attributes"):
+                samples = trace[kind]
                 if len(samples) < limit:
                     attributes = event.get("attributes")
-                    pages = event.get("pages")
+                    quantity = "pages" if kind == "xmem_physical_pages" else "size"
+                    value = event.get(quantity)
                     record = {
                         "attributes": (
                             attributes
                             if isinstance(attributes, str) and re.fullmatch(r"0x[0-9a-fA-F]{1,16}", attributes)
                             else None
                         ),
-                        "pages": pages if type(pages) is int and 0 <= pages < (1 << 64) else None,
+                        quantity: value if type(value) is int and 0 <= value < (1 << 64) else None,
                     }
                     for key in ("api", "caller"):
                         value = event.get(key)
@@ -347,6 +349,7 @@ def counts_only(summary: dict) -> dict:
             unimplemented_imports=len(startup["unimplemented"]),
             int3_skipped=len(startup["int3_skipped"]),
             xmem_physical_pages_count=startup["kinds"].get("xmem_physical_pages", 0),
+            xmem_attributes_count=startup["kinds"].get("xmem_attributes", 0),
             exit_observed=startup["exit"] is not None,
         )
     if d3d12 := summary["d3d12"]:
@@ -440,6 +443,15 @@ def format_text(summary: dict, limit: int) -> str:
                 out.append(f"    code {exc['code']} at {exc['at']}{detail}")
                 if exc.get("stack"):
                     out.append(f"      stack: {_tail(exc['stack'], limit)}")
+        if count := startup["kinds"].get("xmem_attributes"):
+            out.append(f"  XMem attribute observations: {count}")
+            shown = startup["xmem_attributes"][:limit]
+            for item in shown:
+                size = f" size {item['size']}" if item["size"] is not None else ""
+                out.append(f"    {item['api'] or '?'} attributes {item['attributes'] or '?'}{size}"
+                           f" from {item['caller'] or '?'}")
+            if len(shown) < count:
+                out.append(f"    ... {count - len(shown)} more")
         if count := startup["kinds"].get("xmem_physical_pages"):
             out.append(f"  XMem physical page observations: {count}")
             shown = startup.get("xmem_physical_pages", [])[:limit]
