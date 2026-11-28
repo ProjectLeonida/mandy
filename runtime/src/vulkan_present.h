@@ -701,6 +701,10 @@ private:
                 if (disk_sample) pending_capture_ = frame.done;
             }
         }
+        // LEONIDA_CAPTURE: a frame due a file has it written here, once its copy is done, not by the next present. A
+        // run ends with the device and this presenter alive (gta6rt's ExitProcess runs no destructor), so a file left
+        // for later lost the last frame. Only frames due a file wait, as the present dump above does for its frames.
+        if (const VkResult r = finish_pending_capture(); r != VK_SUCCESS) return stop(r);
         if (result == VK_ERROR_SURFACE_LOST_KHR) {
             // The surface was lost during the present (display disconnected, a driver reset of the window's
             // plane): vkd3d keeps rendering to nothing, and the next present recreates surface and swapchain.
