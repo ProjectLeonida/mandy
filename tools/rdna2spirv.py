@@ -17549,7 +17549,8 @@ def writes_exec(ins):
         return False
     if a and a[0]["k"] == "special" and a[0]["t"].startswith("exec"):
         return True
-    if bop in VOP3_TWO_DESTS and len(a) > 1 and a[1]["k"] == "special" and a[1]["t"].startswith("exec"):
+    if (bop in VOP3_TWO_DESTS and not (bop.endswith("ci_u32") and len(a) == 3)
+            and len(a) > 1 and a[1]["k"] == "special" and a[1]["t"].startswith("exec")):
         return True
     return False
 
@@ -18269,7 +18270,7 @@ def widen_wave64_masks(insns):
         if op.startswith("v_cmp") and len(a) == 3:
             at = (0,)
         elif op.startswith("v_") and "_co_ci_" in op:
-            at = (1, 4)
+            at = (1, 4) if len(a) > 3 else ()
         elif op.startswith("v_") and "_co_" in op or op in ("v_mad_u64_u32", "v_mad_i64_i32",
                                                             "v_div_scale_f32", "v_div_scale_f64"):
             at = (1,)

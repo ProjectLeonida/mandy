@@ -301,7 +301,9 @@ def operands(ins):
             dests, srcs = [a[0]], [a[0], *a[1:]]
         else:
             dests, srcs = [a[0]], list(a[1:])
-        if op.startswith("v_") and len(a) > 2 and (
+        if op.startswith("v_") and op.endswith("ci_u32") and "_co_" in op and len(a) == 3:
+            defs.append("vcc")
+        elif op.startswith("v_") and len(a) > 2 and (
                 "_co_" in op or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) \
                 and a[1].get("k") in ("sgpr", "special", "slist"):
             dests, srcs = [a[0], a[1]], list(a[2:])
