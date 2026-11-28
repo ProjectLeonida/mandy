@@ -40,21 +40,37 @@ class TileProbeInputTest(unittest.TestCase):
         self.assertIn("missing.bin", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
-    def test_offset_outside_the_file_is_an_error(self):
-        # Before: -5 quietly probed the last five bytes, the file size and more printed nothing, and both exited 0.
-        for offset in ("-5", "16384", "99999"):
+    def test_negative_offset_is_a_usage_error(self):
+        # Before: -5 quietly probed the file's tail, then exited 1 via a bare SystemExit instead of 2.
+        p = self.run_tool(self.blob, "--offset", "-5")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertEqual(p.stderr.strip(), "ERROR: --offset must not be negative")
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(p.stdout, "")
+
+    def test_offset_at_or_past_the_end_is_a_usage_error(self):
+        # Before: the file size and beyond printed nothing and exited 1, indistinguishable from a failed probe.
+        for offset in ("16384", "99999"):
             with self.subTest(offset=offset):
                 p = self.run_tool(self.blob, "--offset", offset)
-                self.assertEqual(p.returncode, 1, p.stderr)
-                self.assertIn("outside", p.stderr)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn(f"--offset {offset} is past the end of blob", p.stderr)
+                self.assertIn("(16384 bytes)", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
                 self.assertEqual(p.stdout, "")
 
-    def test_empty_file_is_an_error(self):
+    def test_empty_file_is_a_short_sample_not_a_bad_offset(self):
         empty = os.path.join(self.tmp.name, "empty.bin")
         open(empty, "wb").close()
         p = self.run_tool(empty)
         self.assertEqual(p.returncode, 1, p.stderr)
-        self.assertIn("0 bytes", p.stderr)
+        self.assertIn("no layout fits", p.stderr)
+        self.assertNotIn("past the end", p.stderr)
+        # offset 0 on an empty blob is fine, offset 5 is not: that one is past the end, exit 2
+        p = self.run_tool(empty, "--offset", "5")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("is past the end of blob", p.stderr)
+        self.assertIn("(0 bytes)", p.stderr)
 
     def test_a_sample_with_no_candidate_layout_is_an_error(self):
         # Before: an 8-byte or 4 KiB blob printed nothing, wrote no preview and exited 0.
