@@ -673,6 +673,15 @@ class ExportTest(unittest.TestCase):
                           "--part", hex(self.offsets[1]), "--report", self.packs)
         self.assertEqual(r.returncode, 2)
 
+    def test_same_nonexistent_glb_and_report_paths_are_refused(self):
+        out = os.path.join(self.tmp.name, "not-created", "same.glb")
+        r = self.run_tool(self.packs, out, "--skeleton", hex(self.offsets[0]), "--part", hex(self.offsets[1]),
+                          "--report", out)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("the GLB and the report are the same path", r.stderr)
+        self.assertFalse(os.path.exists(out))
+        self.assertFalse(os.path.exists(os.path.dirname(out)))
+
     def test_report_directory_is_refused_before_writing_a_glb(self):
         out = os.path.join(self.tmp.name, "out.glb")
         report = os.path.join(self.tmp.name, "report")
