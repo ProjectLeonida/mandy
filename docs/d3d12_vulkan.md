@@ -3656,6 +3656,10 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   copies. On a device without `VK_EXT_host_image_copy` every colour title image, linear placements too, takes the
   staged upload: the refresh before a submission has no other way to fill one, and without it the title's textures
   stayed zero (a flat green intro movie). An allocation failure retries the original host-copyable image.
+  The staging buffers are a ring of four slots, each as large as the largest texture it has carried; a slot
+  over `LEONIDA_TITLE_UPLOAD_KEEP_MB` (4) idle for `LEONIDA_TITLE_UPLOAD_IDLE_MS` (2000) after its transfer completed
+  is freed by the periodic texture pass, which never waits for it (`src/title_upload_trim.h`). The mem probe counts
+  them as staging and its texture line says how many were freed.
   `LEONIDA_TITLE_IMAGE_STAGING=0`
   restores the original placement policy. With `LEONIDA_MEM_PROBE`, each title image class logs its
   Vulkan memory type mask, mask without host transfer, and selected type.

@@ -362,6 +362,8 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_TITLE_TEXTURE_PERIOD_MS` | `16` | The shortest time between two passes over the textures filled from the title's memory. |
 | `LEONIDA_TITLE_TEXTURE_CHECK_KB` | `4096` | How many KiB of those textures one pass hashes to find changed ones. |
 | `LEONIDA_TITLE_TEXTURE_FILL_MB` | `32` | How many MiB of changed textures one pass fills again; the rest waits for the next pass. |
+| `LEONIDA_TITLE_UPLOAD_IDLE_MS` | `2000` | How long a slot of the title-texture upload ring (the host-visible buffers whole textures are detiled into) stays unused before its buffer is freed, once its transfer has completed. `0` keeps every slot's buffer until the device goes, as before. |
+| `LEONIDA_TITLE_UPLOAD_KEEP_MB` | `4` | A slot of that ring this size or smaller is never freed, so steady small uploads do not allocate each time. |
 | `LEONIDA_TEXTURE_HASH_BUDGET_US` | `400` | Microseconds a pass may spend hashing before it stops at a texture boundary. `0` leaves the byte budget alone to bound it. |
 | `LEONIDA_TEXTURE_SWEEP_BUDGET_US` | `400` | Microseconds a pass may spend on residency checks and uploads between textures. |
 | `LEONIDA_TITLE_BUFFERS_MB` | `512` | The most memory, in MiB, of buffers made over the title's own memory for vertex and index views that name it. |
