@@ -252,6 +252,28 @@ class SamplesAndGuiTests(unittest.TestCase):
         args = leonida_mods.build_parser().parse_args(["--dir", "mods", "gui"])
         self.assertEqual(args.command, "gui")
 
+    def test_missing_tkinter_names_the_platform_package(self):
+        # Homebrew's Python has no Tkinter: the hint names python-tk@<this version>, not the Debian package.
+        from unittest import mock
+        import builtins
+        real_import = builtins.__import__
+
+        def no_tkinter(name, *args, **kwargs):
+            if name == "tkinter" or name.startswith("tkinter."):
+                raise ImportError("No module named '_tkinter'")
+            return real_import(name, *args, **kwargs)
+
+        args = leonida_mods.build_parser().parse_args(["--dir", "mods", "gui"])
+        for platform, osname, want in (("darwin", "posix", "brew install python-tk@%d.%d" % sys.version_info[:2]),
+                                       ("linux", "posix", "sudo apt install python3-tk"),
+                                       ("win32", "nt", "python.org with Tcl/Tk")):
+            with self.subTest(platform=platform), mock.patch("builtins.__import__", no_tkinter), \
+                    mock.patch.object(leonida_mods.sys, "platform", platform), \
+                    mock.patch.object(leonida_mods.os, "name", osname):
+                with self.assertRaises(leonida_mods.ModsError) as ctx:
+                    leonida_mods.run_gui(args, None)
+                self.assertIn(want, str(ctx.exception))
+
     def test_windows_launcher_opens_the_gui(self):
         launcher = (ROOT / "Mods.bat").read_text(encoding="utf-8")
         self.assertIn("leonida_mods.py", launcher)
