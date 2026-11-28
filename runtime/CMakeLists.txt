@@ -846,6 +846,9 @@ if(BUILD_TESTING)
 
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
+  # The title-memory ranges a submission reached merge into disjoint ranges, none dropped (src/title_write_ranges.h).
+  add_executable(title_write_ranges_test test/title_write_ranges_test.cpp)
+  add_test(NAME title_write_ranges COMMAND title_write_ranges_test)
 
   # The title's own window, where PresentX shows its frames (shims/title_window.h): user32 only, no device.
   if(WIN32)
