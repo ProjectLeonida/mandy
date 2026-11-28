@@ -826,6 +826,9 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/translator_deps.cmake")
 if(BUILD_TESTING)
   add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
   add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
+  # Portable CPU-only bit-exact detile/tile oracle and error checks for console_texture_layout.h.
+  add_executable(console_texture_layout_test test/console_texture_layout_test.cpp)
+  add_test(NAME console_texture_layout COMMAND console_texture_layout_test)
 
   add_executable(d3d12_xs_frame_events_test test/d3d12_xs_frame_events_test.cpp)
   add_test(NAME d3d12_xs_frame_events COMMAND d3d12_xs_frame_events_test)

@@ -237,16 +237,12 @@ public:
     // depth_pitch.
     Error detile(const uint8_t* tiled, size_t tiled_len, uint32_t mip, uint32_t slice, uint8_t* linear,
                  size_t linear_len, size_t row_pitch, size_t depth_pitch) const {
-        return walk(tiled_len, mip, slice, linear_len, row_pitch, depth_pitch, [&](size_t t, size_t l, size_t n) {
-            std::memcpy(linear + l, tiled + t, n);
-        });
+        return transfer<true>(tiled, tiled_len, mip, slice, linear, linear_len, row_pitch, depth_pitch);
     }
     // The reverse of detile(): linear rows into tiled memory.
     Error tile(uint8_t* tiled, size_t tiled_len, uint32_t mip, uint32_t slice, const uint8_t* linear,
                size_t linear_len, size_t row_pitch, size_t depth_pitch) const {
-        return walk(tiled_len, mip, slice, linear_len, row_pitch, depth_pitch, [&](size_t t, size_t l, size_t n) {
-            std::memcpy(tiled + t, linear + l, n);
-        });
+        return transfer<false>(tiled, tiled_len, mip, slice, linear, linear_len, row_pitch, depth_pitch);
     }
 
     // Byte offsets inside a block of each element coordinate bit, per axis; empty for linear and XOR/MSAA modes.
@@ -461,10 +457,46 @@ private:
         return (uint64_t{x / bw} << std::countr_zero(alignment)) + pattern_[0][x % bw];
     }
 
-    // Visits contiguous runs as (tiled byte offset, linear byte offset, length).
-    template <class Copy>
-    Error walk(size_t tiled_len, uint32_t mip, uint32_t slice, size_t linear_len, size_t row_pitch,
-               size_t depth_pitch, Copy&& copy) const {
+    struct Run {
+        size_t tiled, linear, len;
+    };
+
+    template <bool ToLinear, size_t FixedLen, class TiledPtr, class LinearPtr>
+    static void copy_rows_fixed(TiledPtr tiled, LinearPtr linear, uint32_t height, uint32_t y_tail, int bh_log2,
+                                uint32_t bh_mask, uint64_t pitch_blocks, int align_log2, const uint32_t* pat_y,
+                                uint32_t pat_z_inner, uint64_t base, size_t linear_slice, size_t row_pitch,
+                                const Run* runs, size_t body_count, bool has_tail) {
+        const Run tail = has_tail ? runs[body_count] : Run{};
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint32_t yy = y + y_tail;
+            const size_t tiled_row = static_cast<size_t>(
+                base + ((uint64_t{yy >> bh_log2} * pitch_blocks) << align_log2) +
+                (pat_y[yy & bh_mask] | pat_z_inner));
+            const size_t linear_row = linear_slice + size_t{y} * row_pitch;
+            auto* const t_row = tiled + tiled_row;
+            auto* const l_row = linear + linear_row;
+            for (size_t i = 0; i < body_count; ++i) {
+                const size_t t_off = runs[i].tiled;
+                const size_t l_off = runs[i].linear;
+                if constexpr (FixedLen != 0) {
+                    if constexpr (ToLinear) std::memcpy(l_row + l_off, t_row + t_off, FixedLen);
+                    else std::memcpy(t_row + t_off, l_row + l_off, FixedLen);
+                } else {
+                    if constexpr (ToLinear) std::memcpy(l_row + l_off, t_row + t_off, runs[i].len);
+                    else std::memcpy(t_row + t_off, l_row + l_off, runs[i].len);
+                }
+            }
+            if (has_tail) {
+                if constexpr (ToLinear) std::memcpy(l_row + tail.linear, t_row + tail.tiled, tail.len);
+                else std::memcpy(t_row + tail.tiled, l_row + tail.linear, tail.len);
+            }
+        }
+    }
+
+    // Copies one subresource between tiled memory and linear rows with stack-buffered runs and fixed-width dispatch.
+    template <bool ToLinear, class TiledPtr, class LinearPtr>
+    Error transfer(TiledPtr tiled, size_t tiled_len, uint32_t mip, uint32_t slice, LinearPtr linear, size_t linear_len,
+                   size_t row_pitch, size_t depth_pitch) const {
         if (mip >= mips.size()) return Error::invalid;
         const Mip& m = mips[mip];
         const uint32_t depth = m.depth;
@@ -485,37 +517,151 @@ private:
             return Error::too_small;
         const size_t need = depth_offset + row_offset + bytes;
         if (tiled_len < size || linear_len < need || row_pitch < bytes) return Error::too_small;
-        const bool is_linear = desc.swizzle == kLinear;
-        // The row and depth contribute one common base to every column, so the same contiguous runs repeat on
-        // every row, including mip tails.
-        struct Run {
-            size_t tiled, linear, len;
-        };
-        std::vector<Run> runs;
-        if (!is_linear) {
-            size_t first_linear = 0, first_tiled = static_cast<size_t>(column(m, 0));
-            for (uint32_t x = 1; x < m.width; ++x) {
-                const size_t off = static_cast<size_t>(column(m, x));
-                const size_t at = x * n;
-                if (off != first_tiled + (at - first_linear)) {
-                    runs.push_back({first_tiled, first_linear, at - first_linear});
-                    first_tiled = off;
-                    first_linear = at;
+
+        if (desc.swizzle == kLinear) {
+            const size_t tiled_row_stride = size_t{m.pitch} * n;
+            const bool contiguous_slice = row_pitch == bytes && tiled_row_stride == bytes;
+            const size_t slice_bytes = bytes * m.height;
+            for (uint32_t z = 0; z < depth; ++z) {
+                const auto [s, inner] = split(first + z);
+                (void)inner;
+                const size_t base = static_cast<size_t>(uint64_t{s} * slice_size + m.offset);
+                const size_t linear_slice = size_t{z} * depth_pitch;
+                if (contiguous_slice) {
+                    if constexpr (ToLinear) std::memcpy(linear + linear_slice, tiled + base, slice_bytes);
+                    else std::memcpy(tiled + base, linear + linear_slice, slice_bytes);
+                } else {
+                    for (uint32_t y = 0; y < m.height; ++y) {
+                        const size_t t_row = base + size_t{y} * tiled_row_stride;
+                        const size_t l_row = linear_slice + size_t{y} * row_pitch;
+                        if constexpr (ToLinear) std::memcpy(linear + l_row, tiled + t_row, bytes);
+                        else std::memcpy(tiled + t_row, linear + l_row, bytes);
+                    }
                 }
             }
-            runs.push_back({first_tiled, first_linear, bytes - first_linear});
+            return Error::ok;
         }
+
+        // The row and depth contribute one common base to every column, so the same contiguous runs repeat on
+        // every row, including mip tails.
+        const uint32_t bw = block[0], bh = block[1];
+        const int bw_log2 = std::countr_zero(bw);
+        const uint32_t bw_mask = bw - 1u;
+        const int bh_log2 = std::countr_zero(bh);
+        const uint32_t bh_mask = bh - 1u;
+        const int align_log2 = std::countr_zero(alignment);
+        const uint32_t x_tail = m.tail ? m.tail->x : 0u;
+        const uint32_t y_tail = m.tail ? m.tail->y : 0u;
+        const uint64_t pitch_blocks = m.pitch >> bw_log2;
+        const uint32_t* const pat_x = pattern_[0].data();
+        const uint32_t* const pat_y = pattern_[1].data();
+
+        constexpr size_t kStackRuns = 128;
+        Run stack_runs[kStackRuns];
+        std::vector<Run> heap_runs;
+        size_t run_count = 0;
+        const auto push_run = [&](size_t t_off, size_t l_off, size_t len) {
+            if (run_count < kStackRuns) {
+                stack_runs[run_count++] = {t_off, l_off, len};
+            } else {
+                if (heap_runs.empty()) {
+                    heap_runs.reserve(std::max<size_t>(kStackRuns * 2, size_t{m.width} / 2 + 1));
+                    heap_runs.assign(stack_runs, stack_runs + kStackRuns);
+                }
+                heap_runs.push_back({t_off, l_off, len});
+                ++run_count;
+            }
+        };
+
+        auto col_offset = [&](uint32_t x) -> size_t {
+            const uint32_t xx = x + x_tail;
+            return static_cast<size_t>((uint64_t{xx >> bw_log2} << align_log2) + pat_x[xx & bw_mask]);
+        };
+        size_t first_linear = 0, first_tiled = col_offset(0);
+        for (uint32_t x = 1; x < m.width; ++x) {
+            const size_t off = col_offset(x);
+            const size_t at = size_t{x} * n;
+            if (off != first_tiled + (at - first_linear)) {
+                push_run(first_tiled, first_linear, at - first_linear);
+                first_tiled = off;
+                first_linear = at;
+            }
+        }
+        push_run(first_tiled, first_linear, bytes - first_linear);
+
+        const Run* const runs = heap_runs.empty() ? stack_runs : heap_runs.data();
+        size_t body_count = run_count;
+        const size_t uniform_len = runs[0].len;
+        bool uniform = true;
+        for (size_t i = 1; i + 1 < run_count; ++i) {
+            if (runs[i].len != uniform_len) {
+                uniform = false;
+                break;
+            }
+        }
+        bool has_tail = false;
+        if (uniform && run_count > 1 && runs[run_count - 1].len != uniform_len) {
+            body_count = run_count - 1;
+            has_tail = true;
+        }
+        const size_t dispatch_len = uniform ? uniform_len : 0;
+
         for (uint32_t z = 0; z < depth; ++z) {
             const auto [s, inner] = split(first + z);
             const uint64_t base = uint64_t{s} * slice_size + m.offset;
-            for (uint32_t y = 0; y < m.height; ++y) {
-                const size_t linear_row = z * depth_pitch + y * row_pitch;
-                if (is_linear) {
-                    copy(static_cast<size_t>(base + uint64_t{y} * m.pitch * n), linear_row, bytes);
-                } else {
-                    const size_t tiled_row = static_cast<size_t>(base + row(m, y, inner));
-                    for (const Run& r : runs) copy(tiled_row + r.tiled, linear_row + r.linear, r.len);
-                }
+            const size_t linear_slice = size_t{z} * depth_pitch;
+            const uint32_t pat_z_inner = pattern_[2][inner];
+            switch (dispatch_len) {
+            case 1:
+                copy_rows_fixed<ToLinear, 1>(tiled, linear, m.height, y_tail, bh_log2, bh_mask, pitch_blocks,
+                                             align_log2, pat_y, pat_z_inner, base, linear_slice, row_pitch, runs,
+                                             body_count, has_tail);
+                break;
+            case 2:
+                copy_rows_fixed<ToLinear, 2>(tiled, linear, m.height, y_tail, bh_log2, bh_mask, pitch_blocks,
+                                             align_log2, pat_y, pat_z_inner, base, linear_slice, row_pitch, runs,
+                                             body_count, has_tail);
+                break;
+            case 4:
+                copy_rows_fixed<ToLinear, 4>(tiled, linear, m.height, y_tail, bh_log2, bh_mask, pitch_blocks,
+                                             align_log2, pat_y, pat_z_inner, base, linear_slice, row_pitch, runs,
+                                             body_count, has_tail);
+                break;
+            case 8:
+                copy_rows_fixed<ToLinear, 8>(tiled, linear, m.height, y_tail, bh_log2, bh_mask, pitch_blocks,
+                                             align_log2, pat_y, pat_z_inner, base, linear_slice, row_pitch, runs,
+                                             body_count, has_tail);
+                break;
+            case 16:
+                copy_rows_fixed<ToLinear, 16>(tiled, linear, m.height, y_tail, bh_log2, bh_mask, pitch_blocks,
+                                              align_log2, pat_y, pat_z_inner, base, linear_slice, row_pitch, runs,
+                                              body_count, has_tail);
+                break;
+            case 32:
+                copy_rows_fixed<ToLinear, 32>(tiled, linear, m.height, y_tail, bh_log2, bh_mask, pitch_blocks,
+                                              align_log2, pat_y, pat_z_inner, base, linear_slice, row_pitch, runs,
+                                              body_count, has_tail);
+                break;
+            case 64:
+                copy_rows_fixed<ToLinear, 64>(tiled, linear, m.height, y_tail, bh_log2, bh_mask, pitch_blocks,
+                                              align_log2, pat_y, pat_z_inner, base, linear_slice, row_pitch, runs,
+                                              body_count, has_tail);
+                break;
+            case 128:
+                copy_rows_fixed<ToLinear, 128>(tiled, linear, m.height, y_tail, bh_log2, bh_mask, pitch_blocks,
+                                               align_log2, pat_y, pat_z_inner, base, linear_slice, row_pitch, runs,
+                                               body_count, has_tail);
+                break;
+            case 256:
+                copy_rows_fixed<ToLinear, 256>(tiled, linear, m.height, y_tail, bh_log2, bh_mask, pitch_blocks,
+                                               align_log2, pat_y, pat_z_inner, base, linear_slice, row_pitch, runs,
+                                               body_count, has_tail);
+                break;
+            default:
+                copy_rows_fixed<ToLinear, 0>(tiled, linear, m.height, y_tail, bh_log2, bh_mask, pitch_blocks,
+                                             align_log2, pat_y, pat_z_inner, base, linear_slice, row_pitch, runs,
+                                             body_count, has_tail);
+                break;
             }
         }
         return Error::ok;
