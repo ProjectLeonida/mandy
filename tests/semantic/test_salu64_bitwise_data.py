@@ -558,9 +558,9 @@ class LaneMaskPreservationTests(unittest.TestCase):
                     "v_mov_b32 v3, 0",
                 ]
                 outs, _ = run_ps_wave(lines, wave=32)
+                want_word = sum(1 << lane for lane in range(32) if pred(lane))      # v_mov_b32 reads the mask's word
                 for lane in range(32):
-                    want_bit = MASK32 if pred(lane) else 0
-                    self.assertEqual(outs[lane], (want_cnt, want_scc, want_bit, 0), f"lane={lane}")
+                    self.assertEqual(outs[lane], (want_cnt, want_scc, want_word, 0), f"lane={lane}")
 
         # Empty mask intersection -> SCC=0 across all lanes, and null dst on lane-mask path sets SCC.
         lines = [

@@ -18,11 +18,7 @@ class Slot67OperandForms(unittest.TestCase):
         expected = {i * 4: 7 for i in (0, 1, 32, 33, 62, 63)}
         self.assertEqual(_run_cs("cs_bitreplicate_exec", lines), expected)
 
-    # The merge into main kept main's wave32 VCC_HI model (47494e725: VCC_HI that holds a compare result is a
-    # per-lane mask), not this branch's packed-word form (1f001c739). On hardware `s_mov_b32 s8, vcc_hi` copies the
-    # packed 32-bit word (0x80000004 here); main's translator gives each lane its own mask value instead, so this
-    # case fails there. Kept as the expectation the translator should meet.
-    @unittest.expectedFailure
+    # `s_mov_b32 s8, vcc_hi` then `v_mov_b32 v1, s8` is the packed 32-bit word (0x80000004 here): SHADER-MASK-AS-DATA.
     def test_wave32_compare_high_word_preserves_low_and_clears_inactive_bits(self):
         lines = [
             "v_cmp_lt_u32_e64 vcc_lo, v0, 6",
