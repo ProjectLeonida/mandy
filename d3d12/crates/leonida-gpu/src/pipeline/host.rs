@@ -582,6 +582,19 @@ fn biased_root_srvs(root_srvs: &[(u8, u32)], user_data: &[leonida_shader::emit::
         .fold(0, |mask, (at, _)| mask | 1 << at)
 }
 
+/// `D3D12-MESH-COMPUTE-FALLBACK`: how a mesh pipeline runs on a host
+/// without mesh shaders. The mesh program runs as compute (`cs`), writing
+/// its groups' outputs to a buffer bound as its root UAV `out_param`; the
+/// pipeline it belongs to then draws them as a triangle list with the
+/// pass-through vertex shader, reading the buffer as its root SRV
+/// `in_param`. `layout` is where each group's outputs lie.
+pub(crate) struct MeshCompute {
+    pub(crate) cs: HostPipeline,
+    pub(crate) out_param: u32,
+    pub(crate) in_param: u32,
+    pub(crate) layout: leonida_shader::emit::MeshOut,
+}
+
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
@@ -604,6 +617,8 @@ pub(crate) struct HostPipeline {
     /// listing (empty for compute).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(crate) state: String,
+    /// A mesh pipeline drawn without mesh shaders ([`MeshCompute`]).
+    pub(crate) mesh_compute: Option<Box<MeshCompute>>,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -640,6 +655,9 @@ impl HostPipeline {
             );
         }
         let mesh = find("mesh");
+        if mesh.is_some() && leonida_shader::emit::mesh_as_compute() {
+            return Self::mesh_compute(shaders, g);
+        }
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
@@ -717,11 +735,12 @@ impl HostPipeline {
                     // table of strides, the directory of title memory by
                     // address and its fault notes.
                     let ours = if uav {
-                        slot == leonida_shader::emit::SLOT_FAULTS
+                        slot == leonida_shader::emit::SLOT_FAULTS || slot == leonida_shader::emit::SLOT_MESH_OUT
                     } else {
                         slot == leonida_shader::emit::SLOT_STRIDES
                             || slot == leonida_shader::emit::SLOT_TABLE_STRIDES
                             || slot == leonida_shader::emit::SLOT_MEMORY
+                            || slot == leonida_shader::emit::SLOT_MESH_IN
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
                         // A one-view table: the view's size bounds the
@@ -849,6 +868,7 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
+                mesh_compute: None,
             });
         }
         let Some(g) = g else {
@@ -905,6 +925,7 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
+                mesh_compute: None,
             });
         }
 
@@ -1026,6 +1047,7 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             rects: rect_gs.is_some(),
+            mesh_compute: None,
             state: {
                 let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
@@ -1080,6 +1102,58 @@ pub(super) fn stream_pipeline<S>(
         // SAFETY: as above.
         || unsafe { device.CreatePipelineState(&desc) },
     )
+}
+
+impl HostPipeline {
+    /// A mesh pipeline on a host without mesh shaders
+    /// (`D3D12-MESH-COMPUTE-FALLBACK`): the mesh program as a compute
+    /// pipeline, and a graphics pipeline of the pass-through vertex shader
+    /// and the title's pixel shader with the title's state, drawing
+    /// triangle lists with no vertex input. The graphics one is returned,
+    /// as a mesh pipeline (the draw path takes it for mesh dispatches),
+    /// carrying the compute one.
+    fn mesh_compute(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        let ms = shaders.iter().find(|s| s.stage == "mesh")?;
+        let ps = shaders.iter().find(|s| s.stage == "pixel");
+        let Some(g) = g else {
+            return refuse("graphics state not kept (plain description)", shaders);
+        };
+        let Some((cs, vs, layout)) = ms.mesh_fallback(ps.map(|p| &**p)) else {
+            return refuse("a mesh program that does not run as compute", shaders);
+        };
+        let compute = HostPipeline::new(&[cs], None)?;
+        let out_param = compute
+            .stages
+            .first()?
+            .root_uavs
+            .iter()
+            .find(|r| r.0 == leonida_shader::emit::SLOT_MESH_OUT)?
+            .1;
+        // The title's state, drawing triangles from no vertex input.
+        let mut state = g.with_formats(&g.formats());
+        state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        state.inputs.clear();
+        state.names.clear();
+        let mut stages = vec![vs];
+        stages.extend(ps.cloned());
+        let mut graphics = HostPipeline::new(&stages, Some(&state))?;
+        let in_param = graphics
+            .stages
+            .first()?
+            .root_srvs
+            .iter()
+            .find(|r| r.0 == leonida_shader::emit::SLOT_MESH_IN)?
+            .1;
+        tracing::info!(?shaders, "host mesh pipeline as compute and a triangle list (no mesh shaders)");
+        graphics.mesh = true;
+        graphics.mesh_compute = Some(Box::new(MeshCompute {
+            cs: compute,
+            out_param,
+            in_param,
+            layout,
+        }));
+        Some(graphics)
+    }
 }
 
 /// A graphics pipeline enabling the depth bounds test: `D3D12_GRAPHICS_PIPELINE_STATE_DESC`
