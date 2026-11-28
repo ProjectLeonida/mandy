@@ -1102,6 +1102,24 @@ async function openModal(texture) {
       label.appendChild(input);
       controls.appendChild(label);
     }
+    if (info.faces && info.faces.length) {
+      const label = document.createElement('label');
+      label.textContent = currentLang === 'ru' ? 'Грань ' : 'Face ';
+      const select = document.createElement('select');
+      for (const face of info.faces) {
+        const option = document.createElement('option');
+        option.value = face;
+        option.textContent = (face[0] === 'p' ? '+' : '−') + face[1].toUpperCase();
+        select.appendChild(option);
+      }
+      indices.face = info.faces[0];
+      select.onchange = () => {
+        indices.face = select.value;
+        updatePreview();
+      };
+      label.appendChild(select);
+      controls.appendChild(label);
+    }
     if (['R16_FLOAT', 'RGBA16_FLOAT'].includes(info.format)) {
       const coords = {};
       const result = document.createElement('output');

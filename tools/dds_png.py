@@ -1649,7 +1649,7 @@ def dds_to_png_bytes(
 
 
 def read_half_texel(path: str, *, x: int, y: int, mip: int = 0, layer: int = 0,
-                    z: int = 0) -> dict[str, str]:
+                    z: int = 0, face: str | None = None) -> dict[str, str]:
     """Return exact stored channel values as text, including signed zero and nonfinite values."""
     with open(path, "rb") as source:
         info = parse_dds_header(_read_header(source))
@@ -1657,7 +1657,7 @@ def read_half_texel(path: str, *, x: int, y: int, mip: int = 0, layer: int = 0,
         if fmt not in _HALF_FLOAT_LAYOUT:
             raise DdsError(f"Expected a half-float DDS, got {fmt}")
         stride, channels = _HALF_FLOAT_LAYOUT[fmt]
-        plane = _locate_plane(info, mip=mip, layer=layer, z=z)
+        plane = _locate_plane(info, mip=mip, layer=layer, z=z, face=face)
         if (type(x) is not int or not 0 <= x < plane.width or
                 type(y) is not int or not 0 <= y < plane.height):
             raise DdsError("Texel outside the selected mip")

@@ -250,6 +250,24 @@ test('DDS inspector selects a mip and layer and clears controls for ordinary ima
     assert.equal(controls.children.length, 0);
 });
 
+test('cube inspector requests the selected face for both preview and texel', async () => {
+    const { context, elements, run } = loadStudio();
+    const info = {format: 'R16_FLOAT', width: 1, height: 1, mip_count: 1, array_size: 1, faces: ['ny', 'nz']};
+    const requests = [];
+    context.fetch = async url => {
+        requests.push(url);
+        return {ok: true, json: async () => url.endsWith('?info') ? info : {R: '0.5'}};
+    };
+    await run("openModal({name:'cube', preview:'/c.png', ddsPreview:'/api/dds/c.dds'})");
+    const select = elements.get('dds-controls').children[0].children[0];
+    assert.deepEqual(select.children.map(option => option.value), ['ny', 'nz']);
+    assert.match(elements.get('modal-img').src, /face=ny$/);
+    select.value = 'nz';
+    select.onchange();
+    assert.match(elements.get('modal-img').src, /face=nz$/);
+    assert.match(requests.at(-1), /face=nz&x=0&y=0$/);
+});
+
 test('volume slices shrink with the selected mip', async () => {
     const { context, elements, run } = loadStudio();
     const info = {dimension: '3d', width: 9, height: 3, depth: 5, mip_count: 3, array_size: 1};

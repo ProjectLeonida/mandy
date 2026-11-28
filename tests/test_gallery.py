@@ -330,6 +330,20 @@ class TestGalleryServer(unittest.TestCase):
                 get(url + "?" + query)
             self.assertEqual(caught.exception.code, 400)
 
+    def test_cube_face_preview_and_source_texel(self) -> None:
+        hdr = bytearray(_make_1x1_rgba_dds()[:128])
+        struct.pack_into("<I4s", hdr, 80, 4, b"DX10")
+        data = hdr + struct.pack("<5I", 54, 3, 4, 1, 0) + struct.pack("<6e", 0, 0, 0, 0, 0, 0.5)
+        with open(os.path.join(self.textures_dir, "cube.dds"), "wb") as f:
+            f.write(data)
+        url = "/api/dds/cube.dds?"
+        png = gallery.dds_png.encode_png(1, 1, bytes((128, 0, 0, 255)))
+        self.assertEqual(_raw_get(self.port, url + "face=nz")[2], png)
+        status, _, sample = _raw_get(self.port, url + "mip=0&layer=0&z=0&face=nz&x=0&y=0")
+        self.assertEqual((status, json.loads(sample)), (200, {"R": "0.5"}))
+        for query in ("face=bad", "face=", "face=px&face=nz"):
+            self.assertEqual(_raw_get(self.port, url + query)[0], 400)
+
     def test_volume_z_selection(self) -> None:
         # Tight R16_FLOAT rows. Each 3x2 plane has a different pixel pattern.
         hdr = bytearray(_make_1x1_rgba_dds()[:128])
