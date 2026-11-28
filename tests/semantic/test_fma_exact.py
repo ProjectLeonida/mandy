@@ -197,8 +197,14 @@ class FmaExactTests(unittest.TestCase):
         # (-1.5 2^-100)(2^-126) + 0
         triples = [(0x80800000, 0x03800000, 0x00000000), (0x00800000, 0x03800000, 0x80000000),
                    (0x0DC00000, 0xB0800000, 0x00000000), (0x8DC00000, 0x00800000, 0x00000000)]
-        self.assertEqual(fma_words(triples), [0x80000000, 0x00000000, 0x800C0000, 0x80000000])
+        self.assertEqual(fma_words(triples), [0x80000000, 0x00000000, 0x80000000, 0x80000000])
         self.assertEqual(fma_words(triples, run=run_split_flushing), [0x80000000, 0x00000000, 0x80000000, 0x80000000])
+        old_ftz = rdna2spirv.FTZ32
+        rdna2spirv.FTZ32 = False
+        try:
+            self.assertEqual(fma_words(triples), [0x80000000, 0x00000000, 0x800C0000, 0x80000000])
+        finally:
+            rdna2spirv.FTZ32 = old_ftz
         rng = random.Random(245)
         group = []
         for _ in range(64):

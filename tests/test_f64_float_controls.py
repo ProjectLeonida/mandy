@@ -44,10 +44,10 @@ class F64FloatControlsTest(unittest.TestCase):
         self.assertIn(MODE_64, spv)
         # Core since SPIR-V 1.4, as for the 32-bit mode: no SPV_KHR_float_controls at vulkan1.2.
         self.assertNotIn("SPV_KHR_float_controls", spv)
-        # DenormPreserve 16 (SHADER-526) is declared in every module and its property comes after the two widths.
+        # DenormPreserve 16 (SHADER-526) and DenormFlushToZero 32 follow the SignedZeroInfNanPreserve widths.
         self.assertEqual(meta["float_controls"],
                          ["shaderSignedZeroInfNanPreserveFloat32", "shaderSignedZeroInfNanPreserveFloat64",
-                          "shaderDenormPreserveFloat16"])
+                          "shaderDenormPreserveFloat16", "shaderDenormFlushToZeroFloat32"])
         self.assertIn("shaderFloat64", meta["features"])
 
     def test_module_without_float64_keeps_only_the_32_bit_mode(self):
@@ -56,7 +56,8 @@ class F64FloatControlsTest(unittest.TestCase):
         self.assertIn(MODE_32, spv)
         self.assertNotIn(MODE_64, spv)
         self.assertEqual(meta["float_controls"],
-                         ["shaderSignedZeroInfNanPreserveFloat32", "shaderDenormPreserveFloat16"])
+                         ["shaderSignedZeroInfNanPreserveFloat32", "shaderDenormPreserveFloat16",
+                          "shaderDenormFlushToZeroFloat32"])
 
     def test_no_float_controls_leaves_out_both_widths(self):
         saved = rdna2spirv.FLOAT_CONTROLS
@@ -68,6 +69,7 @@ class F64FloatControlsTest(unittest.TestCase):
         self.assertIn("OpCapability Float64", spv)
         self.assertNotIn("SignedZeroInfNanPreserve", spv)
         self.assertNotIn("DenormPreserve", spv)
+        self.assertNotIn("DenormFlushToZero", spv)
         self.assertNotIn("float_controls", meta)
 
 

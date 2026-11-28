@@ -345,10 +345,18 @@ class SmemTranslatorGenTests(unittest.TestCase):
                 g = rdna2spirv.Gen("ps")
                 ins = parse_line(line)
                 g.scalar_load(ins["op"], ins["args"], ins["mods"])
-                psb_chains = [ln for ln in g.body if "OpAccessChain %_ptr_PSB_uint" in ln]
-                psb_loads = [ln for ln in g.body if "OpLoad %uint" in ln and "Aligned 4" in ln]
-                self.assertEqual(len(psb_chains), single)
-                self.assertEqual(len(psb_loads), single)
+                if line.startswith("s_buffer_load_dwordx"):
+                    n = int(line.split("x", 1)[1].split()[0])
+                    self.assertIn(f"OpFunctionCall %arr_sbuf_x{n} %sbuf_slow_x{n}", "\n".join(g.body))
+                    self.assertEqual(sum("OpAccessChain %_ptr_PSB_uint" in ln for ln in g.body), 0)
+                    slow_lines = g.sbuf_slow_fns[n]
+                    self.assertEqual(sum("OpAccessChain %_ptr_PSB_uint" in ln for ln in slow_lines), single)
+                    self.assertEqual(sum("OpLoad %uint" in ln and "Aligned 4" in ln for ln in slow_lines), single)
+                else:
+                    psb_chains = [ln for ln in g.body if "OpAccessChain %_ptr_PSB_uint" in ln]
+                    psb_loads = [ln for ln in g.body if "OpLoad %uint" in ln and "Aligned 4" in ln]
+                    self.assertEqual(len(psb_chains), single)
+                    self.assertEqual(len(psb_loads), single)
                 self.assertEqual(sum("OpLoad %v2uint_sl" in ln for ln in g.body), v2)
                 self.assertEqual(sum("OpLoad %v4uint_sl" in ln for ln in g.body), v4)
 
@@ -397,20 +405,27 @@ class SmemBodyEvaluator:
     def __init__(self, gen, sgpr, memory, heap_base=0):
         self.consts = {name: value for value, name in gen.consts.items()}
         self.consts.update({name: value for value, name in gen.lconsts.items()})
+        for n in gen.sbuf_slow_fns:
+            self.consts[f"%null_sbuf_x{n}"] = [0] * n
+        self.slow_fns = {f"%sbuf_slow_x{n}": [ln.split() for ln in flines] for n, flines in gen.sbuf_slow_fns.items()}
         self.sgpr = dict(sgpr)
         self.memory = memory
         self.heap_base = heap_base
         self.ids = {}
         self.reads = []          # byte address of every PhysicalStorageBuffer dword load, in order
-        lines = [line.split() for line in gen.body]
+        self._exec([line.split() for line in gen.body], "%entry")
+
+    def _exec(self, lines, start_block):
         labels = {w[0]: i for i, w in enumerate(lines) if len(w) == 3 and w[1:] == ["=", "OpLabel"]}
-        self.block, self.came_from = "%entry", None
+        self.block, self.came_from = start_block, None
         pc = 0
         while pc < len(lines):
             words = lines[pc]
-            if words[0] == "OpSelectionMerge":
+            if words[0] in ("OpSelectionMerge", "OpFunctionEnd") or (len(words) >= 3 and words[2] in ("OpFunction", "OpFunctionParameter")):
                 pc += 1
                 continue
+            if words[0] == "OpReturnValue":
+                return self._value(words[1])
             target = None
             if words[0] == "OpBranch":
                 target = words[1]
@@ -425,13 +440,15 @@ class SmemBodyEvaluator:
                 self.came_from, pc = self.block, labels[target]
                 continue
             if len(words) == 3 and words[1:] == ["=", "OpLabel"]:
-                if self.block != words[0] and pc > 0 and lines[pc - 1][0] not in ("OpBranch", "OpBranchConditional"):
+                if self.block != words[0] and pc > 0 and lines[pc - 1][0] not in ("OpBranch", "OpBranchConditional") and not (
+                        len(lines[pc - 1]) >= 3 and lines[pc - 1][2] in ("OpFunction", "OpFunctionParameter")):
                     raise AssertionError("fall-through into " + words[0])
                 self.block = words[0]
                 pc += 1
                 continue
             self._step(words)
             pc += 1
+        return None
 
     def _value(self, name):
         if name == "%heap_base":          # built once in the entry block, outside the body run here
@@ -472,11 +489,21 @@ class SmemBodyEvaluator:
                 value = self.memory.read_dword(where)
             else:
                 raise AssertionError("unmodelled load: " + " ".join(words))
-        elif op == "OpPhi" and ty == "%uint":
+        elif op == "OpPhi" and (ty == "%uint" or ty.startswith("%arr_sbuf_x")):
             pairs = dict(zip(args[1::2], args[0::2]))
             if len(args) % 2 or self.came_from not in pairs:
                 raise AssertionError("OpPhi without the block it came from: " + " ".join(words))
             value = self._value(pairs[self.came_from])
+        elif op == "OpCompositeConstruct" and ty.startswith("%arr_sbuf_x"):
+            value = [self._value(a) for a in args]
+        elif op == "OpFunctionCall" and args[0] in self.slow_fns:
+            fn_lines = self.slow_fns[args[0]]
+            params = [w[0] for w in fn_lines if len(w) >= 3 and w[2] == "OpFunctionParameter"]
+            saved_block, saved_came = self.block, self.came_from
+            for p, arg in zip(params, args[1:]):
+                self.ids[p] = self._value(arg)
+            value = self._exec(fn_lines, params[0] if params else args[0])
+            self.block, self.came_from = saved_block, saved_came
         elif op == "OpBitwiseAnd" and ty == "%uint":
             value = self._value(args[0]) & self._value(args[1])
         elif op == "OpBitFieldUExtract" and ty == "%uint":

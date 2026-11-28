@@ -54,7 +54,8 @@ def meta(spv):
 def without_modes(spv):
     """The module text with the float-controls capability and execution modes removed."""
     return "\n".join(ln for ln in spv.splitlines()
-                     if "SignedZeroInfNanPreserve" not in ln and "DenormPreserve" not in ln)
+                     if "SignedZeroInfNanPreserve" not in ln and "DenormPreserve" not in ln
+                     and "DenormFlushToZero" not in ln)
 
 
 class F16DenormPreserveTests(unittest.TestCase):
@@ -68,12 +69,14 @@ class F16DenormPreserveTests(unittest.TestCase):
 
     def test_index_metadata_names_the_property(self):
         self.assertEqual(meta(translate(PLAIN))["float_controls"],
-                         ["shaderSignedZeroInfNanPreserveFloat32", "shaderDenormPreserveFloat16"])
+                         ["shaderSignedZeroInfNanPreserveFloat32", "shaderDenormPreserveFloat16",
+                          "shaderDenormFlushToZeroFloat32"])
 
     def test_no_float_controls_leaves_it_out(self):
         spv = translate(PLAIN, float_controls=False)
         self.assertNotIn("DenormPreserve", spv)
         self.assertNotIn("SignedZeroInfNanPreserve", spv)
+        self.assertNotIn("DenormFlushToZero", spv)
         self.assertNotIn("float_controls", meta(spv))
 
     def test_the_mode_changes_only_the_header(self):

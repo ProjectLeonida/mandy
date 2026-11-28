@@ -1844,7 +1844,8 @@ def exe_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
 WAVE64_MODES = ("auto", "on", "off")
 
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
-FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
+FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--no-ftz32", "no_ftz32"),
+                  ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
                   ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
                   ("--compact-spirv", "compact_spirv"), ("--integer-dot-fallback", "integer_dot_fallback"))
@@ -3145,9 +3146,10 @@ def main() -> int:
     ap.add_argument("--compact-spirv", action="store_true",
                     help="run the translator's compact binary pass on all shader libraries (requires spirv-opt)")
     ap.add_argument("--no-float-controls", action="store_true",
-                    help="translate without SignedZeroInfNanPreserve and DenormPreserve (Depends on: #664), for "
-                         "devices whose vk_pipeline_check skips a shader without "
-                         "shaderSignedZeroInfNanPreserveFloat32 or shaderDenormPreserveFloat16")
+                    help="translate without SignedZeroInfNanPreserve, DenormPreserve and DenormFlushToZero (Depends on: "
+                         "#664), for devices whose vk_pipeline_check skips a shader without float-control properties")
+    ap.add_argument("--no-ftz32", action="store_true",
+                    help="translate without DenormFlushToZero 32 (keep software f32 denormal flushes, e.g. llvmpipe)")
     ap.add_argument("--bary-fallback", action="store_true",
                     help="translate raw barycentric reads from an interpolated vec3 input (with a pass-through "
                          "geometry shader the runtime draws), for devices without "
