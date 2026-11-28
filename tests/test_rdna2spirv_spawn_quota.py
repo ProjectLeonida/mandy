@@ -7,6 +7,8 @@ and one tool. The job can still count a tool that has just exited when the next 
 then fails with winerror 1816. The unit tests fake that error; the Windows-only test starts real processes in such
 a job. No game data.
 """
+import ctypes
+from ctypes import wintypes
 import errno
 import json
 import os
@@ -100,14 +102,29 @@ class RunSpirvToolTests(unittest.TestCase):
 
 
 CHILD = """
-import json, sys
+import json, os, sys
 sys.path.insert(0, sys.argv[1])
 import rdna2spirv
+print(os.getpid(), flush=True)
 sys.stdin.readline()  # in the job from here on
 for _ in range(int(sys.argv[2])):
     rdna2spirv._run_spirv_tool(["cmd", "/c", "rem"], capture_output=True, check=True)
 print(json.dumps("ok"))
 """
+
+# A venv's python.exe is a launcher that runs the base interpreter as a second process, and in the worker's job that
+# pair takes both slots, so no tool could start. The base interpreter is what runs inside the job.
+PYTHON = getattr(sys, "_base_executable", None) or sys.executable
+
+
+class ProcessIds(ctypes.Structure):  # JOBOBJECT_BASIC_PROCESS_ID_LIST, room for 8 (the worker job allows 2)
+    _fields_ = [("assigned", wintypes.DWORD), ("listed", wintypes.DWORD), ("ids", ctypes.c_size_t * 8)]
+
+
+def job_processes(win, job):
+    ids = ProcessIds()
+    win.check(win.query_job(job, 3, ctypes.byref(ids), ctypes.sizeof(ids), None))
+    return sorted(ids.ids[:ids.listed])
 
 
 @unittest.skipUnless(os.name == "nt", "Windows job objects")
@@ -117,12 +134,20 @@ class TwoProcessJobTests(unittest.TestCase):
         import compute_workers_win as win
         mib = 1024
         with win.job(mib, True) as job:
-            p = subprocess.Popen([sys.executable, "-I", "-c", CHILD, str(ROOT / "tools"), "150"],
+            p = subprocess.Popen([PYTHON, "-I", "-c", CHILD, str(ROOT / "tools"), "150"],
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                  creationflags=win.LOW)
             try:
                 win.check(win.assign(job, int(p._handle)))
                 win.verify(job, int(p._handle), mib, True)
+                ready = p.stdout.readline()
+                if not ready:  # the child ended before it got going
+                    self.fail(p.stderr.read())
+                # The precondition: the interpreter that starts the tools is the job's one process, as the worker is.
+                processes = job_processes(win, job)
+                if processes != [int(ready)]:
+                    self.skipTest(f"{PYTHON} is not the worker job's only process ({processes}, runner {int(ready)}): "
+                                  "a launcher in between leaves the tools no slot")
                 out, err = p.communicate("go\n", timeout=300)
             finally:
                 if p.poll() is None:
