@@ -159,7 +159,9 @@ private:
     // owns every import of that DLL; `out` is the export, or null when the DLL lacks it. Caller holds mutex_.
     bool resolve_compat(const std::string& key, const std::string& dll, const std::string& name, uint16_t ordinal,
                         bool by_ordinal, void*& out);
-    void* resolve_forwarder(const std::string& spec, Binding& binding, int depth);
+    // `compat_miss`, when given, is set when a LEONIDA_COMPAT_DIR module owns the forwarded name and lacks the
+    // export: the caller then binds a failure thunk, as for a direct import, instead of looking further.
+    void* resolve_forwarder(const std::string& spec, Binding& binding, int depth, bool* compat_miss = nullptr);
     void parse_exports(Module& m);
     void protect_sections(Module& m);
     void register_unwind(Module& m);

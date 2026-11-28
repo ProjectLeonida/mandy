@@ -1995,7 +1995,7 @@ void Loader::parse_exports(Module& m) {
 // Follows a forwarder string to the module and export it names. Bundled modules are searched first, with or without
 // the extension, because a forwarder may point at another mapped module; system DLLs go through LoadLibraryEx, whose
 // own GetProcAddress already follows its forwarders. Errors are "not found": the caller decides what to bind.
-void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int depth) {
+void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int depth, bool* compat_miss) {
     if (depth >= 8) return nullptr;  // a longer chain is a loop between modules, not a re-export
     auto dot = spec.rfind('.');
     if (dot == std::string::npos || dot == 0 || dot + 1 >= spec.size()) return nullptr;
@@ -2015,10 +2015,20 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
     }
 
     // A drop-in DLL in LEONIDA_COMPAT_DIR owns all of its exports, forwarded ones too, as it does for a direct import
-    // in resolve(): one module is never served half by a shim or a bundled copy and half by the drop-in.
-    const std::string compat_dll = shim_key.size() == module.size() ? module : module + ".dll";
-    if (void* p = nullptr; resolve_compat(shim_key, compat_dll, symbol, static_cast<uint16_t>(ordinal), by_ordinal, p)) {
-        if (!p) return nullptr;
+    // in resolve(): one module is never served half by a shim or a bundled copy and half by the drop-in. Its file is
+    // looked up as the bundled module is below: the name as given when it has an extension of its own
+    // ("winspool.drv"), then with ".dll".
+    std::vector<std::string> compat_names;
+    if (module.find('.') != std::string::npos) compat_names.push_back(module);
+    if (module.size() < 4 || lower(module).compare(module.size() - 4, 4, ".dll") != 0) compat_names.push_back(module + ".dll");
+    for (const std::string& compat_dll : compat_names) {
+        void* p = nullptr;
+        if (!resolve_compat(lower(compat_dll), compat_dll, symbol, static_cast<uint16_t>(ordinal), by_ordinal, p))
+            continue;
+        if (!p) {
+            if (compat_miss) *compat_miss = true;
+            return nullptr;
+        }
         binding = Binding::Host;
         return p;
     }
@@ -2042,7 +2052,7 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
             return it->second;
         }
         if (auto it = dep.forwarders.find(symbol); it != dep.forwarders.end())
-            return resolve_forwarder(it->second, binding, depth + 1);
+            return resolve_forwarder(it->second, binding, depth + 1, compat_miss);
         return nullptr;  // the bundled module exists and does not export it; don't look for a host namesake
     }
 
@@ -2112,9 +2122,16 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
         }
         if (auto it = dep.forwarders.find(sym); it != dep.forwarders.end()) {
             Binding binding = Binding::Unimplemented;
-            if (void* p = resolve_forwarder(it->second, binding, 0)) {
+            bool compat_miss = false;
+            if (void* p = resolve_forwarder(it->second, binding, 0, &compat_miss)) {
                 m.imports.push_back({dll, sym, binding});
                 return p;
+            }
+            // The forwarded module is a LEONIDA_COMPAT_DIR drop-in without this export: a failure thunk, as for a
+            // direct import, not a System32 namesake of the forwarding module.
+            if (compat_miss) {
+                m.imports.push_back({dll, sym, Binding::Unimplemented});
+                return shims::make_unimplemented_thunk(dll, sym);
             }
         }
     }

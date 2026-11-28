@@ -1514,6 +1514,34 @@ void test_compat_modules() {
             else pass(plain);
         }
         {
+            // A forwarding module named like a System32 DLL, whose forwarded export the compat DLL lacks: the import
+            // gets a failure thunk, as a direct import of the compat DLL would, not the System32 namesake's export.
+            const char* what = "a compat DLL's missing forwarded export is not taken from a System32 namesake";
+            auto img = make_forwarder_image("testcompat.Missing", 0x1E0000000);
+            std::memcpy(img.data() + 0x380, "GetFileVersionInfoSizeA", 24);
+            const auto bundled = write_image_as(img, "version.dll");
+            auto r = bind_with_compat(compat, "version.dll", "GetFileVersionInfoSizeA", bound);
+            if (r.binding != rt::Binding::Unimplemented) failed(what, "the import was bound");
+            else if (bound == host_symbol("version.dll", "GetFileVersionInfoSizeA") && bound)
+                failed(what, "the import is the System32 export");
+            else pass(what);
+            std::error_code ec;
+            std::filesystem::remove(bundled, ec);
+        }
+        {
+            // A forwarder naming a module with its own extension: the compat file is that name, not name + ".dll".
+            const char* what = "a forwarder to a compat module with its own extension finds that file";
+            write_image_as(make_os_dll(0x1F0000000), "compat/testcompat.drv");
+            write_image_as(make_forwarder_image("testcompat.drv.Answer", 0x1C8000000), "fwd_drv.dll");
+            auto r = bind_with_compat(compat, "fwd_drv.dll", "fwd", bound);
+            HMODULE h = GetModuleHandleW((compat / "testcompat.drv").c_str());
+            auto expected = h ? reinterpret_cast<void*>(GetProcAddress(h, "Answer")) : nullptr;
+            if (r.binding != rt::Binding::Host) failed(what, "the forwarded import was not bound as Host");
+            else if (!expected || bound != expected) failed(what, "the IAT does not hold testcompat.drv's export");
+            else if (reinterpret_cast<int (*)()>(bound)() != 42) failed(what, "the export did not return 42");
+            else pass(what);
+        }
+        {
             const char* what = "a DLL that is not in the compat folder still binds to its shim";
             std::filesystem::path empty = g_dir / "compat_empty";
             std::filesystem::create_directories(empty);
@@ -1559,7 +1587,7 @@ void test_compat_modules() {
         failed("LEONIDA_COMPAT_DIR", e.what());
     }
     // Loaders keep compat DLLs for the process lifetime; drop the references so the work folder can be removed.
-    for (const auto& p : {dll_path, compat / "testshim.dll"})
+    for (const auto& p : {dll_path, compat / "testshim.dll", compat / "testcompat.drv"})
         while (HMODULE h = GetModuleHandleW(p.c_str())) FreeLibrary(h);
 }
 
