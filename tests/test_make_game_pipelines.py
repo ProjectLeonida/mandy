@@ -256,6 +256,44 @@ class PipelinesStageTest(unittest.TestCase):
                 calls = json.load(f)["calls"]
         return exit_code, calls, logs, stderr.getvalue()
 
+    def test_invalid_index_shape_preserves_the_previous_crash_report(self):
+        # The index is read before the old report is dropped: a stage that cannot start keeps the last one.
+        index = os.path.join(self.spirv, "index.json")
+        report = os.path.join(self.out, "pipeline_crashes.json")
+        for invalid in (["shader"], "shader", 1):
+            with self.subTest(index=invalid):
+                with open(index, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(invalid, f)
+                with open(report, "w", encoding="utf-8", newline="\n") as f:
+                    f.write("previous crash report")
+                code, calls, _, err = self.run_stage([{"exit": 0}])
+                self.assertIsNotNone(code)
+                self.assertEqual(calls, [])
+                self.assertIn("JSON object", err)
+                with open(report, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), "previous crash report")
+
+    def test_a_locked_old_crash_report_does_not_prevent_a_clean_run(self):
+        report = os.path.join(self.out, "pipeline_crashes.json")
+        old_report = '{"modules": [{"name": "old", "spv_sha256": null}]}'
+        with open(report, "w", encoding="utf-8", newline="\n") as f:
+            f.write(old_report)
+        remove = os.remove
+
+        def remove_unlocked(path):
+            if os.path.abspath(path) == os.path.abspath(report):
+                raise PermissionError("report is locked")
+            remove(path)
+
+        with mock.patch.object(make_game.os, "remove", side_effect=remove_unlocked):
+            code, calls, logs, err = self.run_stage([{"exit": 0}])
+        self.assertIsNone(code, err)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(any("cannot remove old pipeline_crashes.json" in line and "may be stale" in line
+                            for line in logs), logs)
+        with open(report, encoding="utf-8") as f:
+            self.assertEqual(f.read(), old_report)
+
     def test_args_env_progress_and_summary(self):
         plan = [{
             "stderr": [
