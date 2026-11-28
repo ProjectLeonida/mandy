@@ -9964,6 +9964,11 @@ public:
     bool deferred_stream() const { return deferred_stream_; }
 
     VkDeviceSize unbound_bytes() const { return image_backing_bytes() ? 0 : deferred_bytes_; }
+    // For the memory probe (DeviceShare::placed_*), under title_image_mutex: the title bytes this slot-133 texture
+    // spans (its console layout's size when known, else its image's) and the image memory it holds or will hold.
+    std::uint64_t probe_image_bytes() const { return image_backing_bytes_ ? image_backing_bytes_ : deferred_bytes_; }
+    std::uint64_t title_span() const { return title_span_ ? title_span_ : probe_image_bytes(); }
+    void set_title_span(std::uint64_t bytes) { title_span_ = bytes; }
 
 private:
     bool bind_placed_memory() {
@@ -10696,6 +10701,7 @@ private:
     D3D12_RESOURCE_DESC desc_;
     Resource* storage_ = nullptr;
     bool title_image_registered_ = false;
+    std::uint64_t title_span_ = 0;  // register_title_texture: the console layout's size, when it knows it
     D3D12_HEAP_PROPERTIES heap_;
     D3D12_HEAP_FLAGS heap_flags_;
     VkImage image_ = VK_NULL_HANDLE;
@@ -15423,6 +15429,25 @@ public:
                     share.empty_blocks = blocks.empty_blocks;
                     share.largest_free = blocks.largest_free;
                 }
+                {
+                    // Every live slot-133 texture: ~Resource leaves title_images under this lock first.
+                    std::vector<std::pair<std::uint64_t, std::uint64_t>> sampled, targets;
+                    std::uint64_t sampled_gpu = 0, targets_gpu = 0;
+                    std::lock_guard lock(d.title_image_mutex);
+                    for (const auto& [va, r] : d.title_images) {
+                        constexpr UINT written = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                                 D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                        const bool gpu = (r->desc().Flags & written) || r->desc().SampleDesc.Count > 1;
+                        (gpu ? targets : sampled).push_back({va, r->title_span()});
+                        (gpu ? targets_gpu : sampled_gpu) += r->probe_image_bytes();
+                    }
+                    share.title_placed = true;
+                    share.placed_sampled =
+                        leonida::memory_breakdown::measure_title_placed(std::move(sampled), sampled_gpu);
+                    share.placed_targets =
+                        leonida::memory_breakdown::measure_title_placed(std::move(targets), targets_gpu);
+                }
                 std::lock_guard lock(d.descriptor_mutex);  // the bindless set's lock (ExecuteCommandLists' flush)
                 if (const auto* bindless = d.bindless.get()) share.bindless_table_bytes = bindless->table_buffer_bytes();
                 return share;
@@ -16367,6 +16392,10 @@ public:
             }
         }
         texture->mark_title_texture();
+        if (entry->layout_known) {
+            std::lock_guard lock(state_.title_image_mutex);
+            texture->set_title_span(entry->layout.layout.size);
+        }
         {
             std::lock_guard lock(state_.title_texture_mutex);
             if (entry->gpu_written && !(address & 0xff) && texture->image_address() != address) {

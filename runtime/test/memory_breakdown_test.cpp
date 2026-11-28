@@ -72,6 +72,23 @@ int image_kinds() {
     return 0;
 }
 
+// Overlap of title-placed textures: the union of their spans against the sum, and how many share a start.
+int placed() {
+    using Spans = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    const mb::TitlePlaced none = mb::measure_title_placed({}, 0);
+    EXPECT(none.count == 0 && none.covered == 0 && none.distinct == 0);
+    // Apart: nothing claimed twice.
+    mb::TitlePlaced p = mb::measure_title_placed(Spans{{0x2000, 0x1000}, {0x0, 0x1000}}, 0x3000);
+    EXPECT(p.count == 2 && p.covered == 0x2000 && p.distinct == 0x2000 && p.shared_start == 0 && p.gpu == 0x3000);
+    // Two at one address and one inside a third: [0, 0x4000) twice, [0x8000, 0x10000) holding [0x9000, 0xa000).
+    p = mb::measure_title_placed(Spans{{0x8000, 0x8000}, {0x0, 0x4000}, {0x9000, 0x1000}, {0x0, 0x4000}}, 0);
+    EXPECT(p.count == 4 && p.covered == 0x11000 && p.distinct == 0xc000 && p.shared_start == 1);
+    // Overlapping tails: [0, 0x3000) and [0x2000, 0x5000) cover 0x5000 distinct of 0x6000.
+    p = mb::measure_title_placed(Spans{{0x2000, 0x3000}, {0x0, 0x3000}}, 0);
+    EXPECT(p.covered == 0x6000 && p.distinct == 0x5000);
+    return 0;
+}
+
 // The text: the total first, every consumer with its MiB and count, the arena's reserved/bound/in-use bytes, other
 // last, and what lies outside the total.
 int text() {
@@ -94,6 +111,9 @@ int text() {
     share.block_used = 4100 * kMiB;
     share.empty_blocks = 2;
     share.largest_free = 64 * kMiB;
+    share.title_placed = true;
+    share.placed_sampled = {3, 300 * kMiB, 200 * kMiB, 320 * kMiB, 1};
+    share.placed_targets = {2, 64 * kMiB, 64 * kMiB, 70 * kMiB, 0};
     const std::string line = mb::format(t, share, 12 * kMiB);
     std::fprintf(stderr, "%s\n", line.c_str());
     EXPECT(line.rfind("allocated 14895 MiB = arena 4095 (1) [reserved 4095, bound 4095, in use 757: buffers 500, "
@@ -107,11 +127,15 @@ int text() {
     EXPECT(contains(line, "imported 206 MiB (1)"));
     EXPECT(contains(line, "bindless tables 2 MiB"));
     EXPECT(contains(line, "shader modules 12 MiB SPIR-V"));
+    EXPECT(contains(line, "; title-placed textures 3: 300 MiB of title memory covered, 200 MiB distinct (1 start where "
+                          "another does), 320 MiB of images"));
+    EXPECT(contains(line, "; title-placed render targets 2: 64 MiB of title memory covered, 64 MiB distinct"));
     // Without an arena the bracket is left out.
     const std::string bare = mb::format(t, mb::DeviceShare{}, 0);
     EXPECT(!contains(bare, "reserved"));
     EXPECT(contains(bare, "arena 4095 (1) + geometry copies"));
     EXPECT(!contains(bare, "free inside the blocks"));
+    EXPECT(!contains(bare, "title-placed"));
     return 0;
 }
 
@@ -121,6 +145,7 @@ int main() {
     if (int r = tally()) return r;
     if (int r = owner_scopes()) return r;
     if (int r = image_kinds()) return r;
+    if (int r = placed()) return r;
     if (int r = text()) return r;
     std::fprintf(stderr, "memory_breakdown: ok\n");
     return 0;

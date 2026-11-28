@@ -15,10 +15,13 @@
 // Pure standard library (the usage bits are passed in as plain integers), so the tally and the text are tested
 // without a GPU or Windows (memory_breakdown_test).
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace leonida::memory_breakdown {
 
@@ -104,6 +107,43 @@ struct Tally {
 };
 
 // What the device knows about the arena and the tables outside the probe's wrapped allocations.
+// Textures the title placed at its own addresses (Xbox device slot 133): each has its own GPU image, while on the
+// console it IS the title's memory there. `covered` adds up the title bytes each live one spans, `distinct` is the
+// union of those spans: covered - distinct is title memory more than one live texture claims, which the layer backs
+// once per texture. `gpu` is the image memory those textures hold.
+struct TitlePlaced {
+    std::uint64_t count = 0;
+    std::uint64_t covered = 0;
+    std::uint64_t distinct = 0;
+    std::uint64_t gpu = 0;
+    std::uint64_t shared_start = 0;  // textures that start where another live one starts
+};
+
+// `spans`: [start, start + bytes) of each live texture, any order (sorted here); `gpu`: their image bytes.
+inline TitlePlaced measure_title_placed(std::vector<std::pair<std::uint64_t, std::uint64_t>> spans, std::uint64_t gpu) {
+    TitlePlaced out;
+    out.count = spans.size();
+    out.gpu = gpu;
+    std::sort(spans.begin(), spans.end());
+    std::uint64_t end = 0;
+    bool open = false;
+    for (std::size_t i = 0; i < spans.size(); ++i) {
+        const auto [start, bytes] = spans[i];
+        const std::uint64_t stop = bytes > UINT64_MAX - start ? UINT64_MAX : start + bytes;
+        out.covered += bytes;
+        if (i && spans[i - 1].first == start) ++out.shared_start;
+        if (!open || start >= end) {
+            out.distinct += stop - start;
+            end = stop;
+            open = true;
+        } else if (stop > end) {
+            out.distinct += stop - end;
+            end = stop;
+        }
+    }
+    return out;
+}
+
 struct DeviceShare {
     bool arena = false;
     std::uint64_t arena_reserved = 0;  // the arena's size: the address range shaders may name
@@ -120,6 +160,11 @@ struct DeviceShare {
     std::uint64_t block_used = 0;
     std::uint64_t empty_blocks = 0;
     std::uint64_t largest_free = 0;
+    // Title-placed textures (measure_title_placed): ones only the title or the CPU fills, and GPU-written ones (render
+    // targets, depth, unordered access).
+    bool title_placed = false;
+    TitlePlaced placed_sampled;
+    TitlePlaced placed_targets;
 };
 
 inline double mib(std::uint64_t bytes) { return double(bytes) / 1048576.0; }
@@ -163,6 +208,17 @@ inline std::string format(const Tally& tally, const DeviceShare& device, std::ui
                   mib(tally.imported_bytes), (unsigned long long)tally.imported_count,
                   mib(device.bindless_table_bytes), mib(module_bytes));
     out += item;
+    if (device.title_placed) {
+        for (const auto& [name, p] : {std::pair{"textures", device.placed_sampled},
+                                      std::pair{"render targets", device.placed_targets}}) {
+            std::snprintf(item, sizeof item,
+                          "; title-placed %s %llu: %.0f MiB of title memory covered, %.0f MiB distinct (%llu start "
+                          "where another does), %.0f MiB of images",
+                          name, (unsigned long long)p.count, mib(p.covered), mib(p.distinct),
+                          (unsigned long long)p.shared_start, mib(p.gpu));
+            out += item;
+        }
+    }
     return out;
 }
 
