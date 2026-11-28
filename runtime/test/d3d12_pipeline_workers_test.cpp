@@ -15,12 +15,15 @@
 // With LEONIDA_LAZY_PIPELINES=0 and LEONIDA_LAZY_COMPUTE=0 the pipelines are compiled when they are created and only the
 // variants are left to the submission; the cases that need more than that are then left out.
 // The calls that create pipelines and read the cache are watched, and held back, through the device's vkGetDeviceProcAddr.
+// --async-graphics-zero and --async-graphics-unset: LEONIDA_ASYNC_PIPELINES=1 with LEONIDA_ASYNC_MIN_BYTES over every
+// module, and LEONIDA_ASYNC_MIN_BYTES_GRAPHICS 0 or unset, with the compile worker held (async_thresholds below).
 // Self-contained: builds its SPIR-V in memory. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "../shims/d3d12_pipeline_compile.h"
 #include "../src/shader_library.h"
 
 #include <algorithm>
@@ -45,6 +48,7 @@
 namespace {
 
 using namespace std::chrono_literals;
+using Clock = std::chrono::steady_clock;
 using d3d12test::Ref;
 using leonida::ReplayResult;
 using Words = std::vector<std::uint32_t>;
@@ -934,6 +938,83 @@ bool prewarm_from_recorded_order(const Setup& setup) {
     return true;
 }
 
+// ---- LEONIDA_ASYNC_MIN_BYTES_GRAPHICS (src/async_pipeline_size.h), with LEONIDA_ASYNC_PIPELINES=1. ----
+
+// --async-graphics-zero: LEONIDA_ASYNC_MIN_BYTES over every module and LEONIDA_ASYNC_MIN_BYTES_GRAPHICS=0, with every
+// job of the compile worker held. The first submission builds each compute pipeline where its dispatch needs it (every
+// buffer word is written) and no graphics one: their draws are skipped, so the image stays as cleared, and their
+// builds wait on the worker. Once the worker is let go, a later submission draws every cell.
+// --async-graphics-unset: the same with LEONIDA_ASYNC_MIN_BYTES_GRAPHICS unset. Graphics pipelines then take
+// LEONIDA_ASYNC_MIN_BYTES and are built in place too: the first submission draws everything and the worker gets nothing.
+bool async_thresholds(const Setup& setup, bool graphics_async) {
+    CHECK(first_use);  // lazy pipelines: nothing is built at creation
+    CHECK(rt::d3d12::async_replay_compile());
+    CHECK(rt::d3d12::async_min_bytes().compute == 1073741824);
+    CHECK(rt::d3d12::async_min_bytes().graphics == (graphics_async ? 0u : 1073741824u));
+    Ref<ID3D12Device> dev;
+    CHECK(setup.device("0", dev));
+    Pipelines pipelines;
+    Frame frame;
+    // Declared after the device and the pipelines, so it lets the worker go before they are released, also when a
+    // check fails.
+    std::atomic<unsigned> worker_jobs{0};
+    struct HeldWorker {
+        HANDLE release = nullptr;
+        void let_go() {
+            if (!release) return;
+            SetEvent(release);
+            rt::d3d12::PipelineCompiler::instance().set_job_probe(nullptr);
+        }
+        ~HeldWorker() {
+            let_go();
+            if (release) CloseHandle(release);
+        }
+    } held;
+    held.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    CHECK(held.release != nullptr);
+    rt::d3d12::PipelineCompiler::instance().set_job_probe([&worker_jobs, release = held.release](const void*) {
+        worker_jobs.fetch_add(1);
+        WaitForSingleObject(release, INFINITE);
+    });
+    hooks.reset();
+    CHECK(pipelines.create(dev.p) && frame.create(dev.p, pipelines));
+    CHECK(hooks.creates == 0);
+    CHECK(frame.submit() == ReplayResult::success);
+    std::vector<std::uint8_t> bytes = frame.read();
+    CHECK(bytes.size() == 4 * kExtent * kExtent + 4 * kCompute);
+    if (!graphics_async) {
+        CHECK(expected(bytes));
+        CHECK(hooks.graphics == int(kGraphics) && hooks.compute == int(kCompute));
+        CHECK(worker_jobs == 0);
+        return true;
+    }
+    // Every compute pipeline was built in place (the worker is held), no graphics one reached the driver.
+    for (unsigned n = 0; n < kCompute; ++n) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, &bytes[4 * kExtent * kExtent + 4 * n], 4);
+        CHECK(value == 1000 + n);
+    }
+    CHECK(std::all_of(bytes.begin(), bytes.begin() + 4 * kExtent * kExtent, [](std::uint8_t b) { return b == 0; }));
+    CHECK(hooks.compute == int(kCompute) && hooks.graphics == 0);
+    CHECK(worker_jobs >= 1);
+    // The worker let go: it builds the graphics pipelines (and variants), and a later submission draws them.
+    held.let_go();
+    const auto deadline = Clock::now() + 60s;
+    const auto drawn = [&] {
+        for (unsigned n = 0; n < kGraphics; ++n)
+            if (bytes[4 * ((n / 8 * 2) * kExtent + n % 8 * 2) + 3] != 255) return false;
+        return true;
+    };
+    do {
+        std::this_thread::sleep_for(20ms);
+        CHECK(frame.submit() == ReplayResult::success);
+        bytes = frame.read();
+    } while (!drawn() && Clock::now() < deadline);
+    CHECK(expected(bytes));
+    CHECK(hooks.graphics == int(kGraphics) && hooks.compute == int(kCompute));  // compute was not built again
+    return true;
+}
+
 bool run(const Setup& setup) {
     if (!same_image(setup)) return false;
     return !first_use || (refused_graphics(setup) && refused_compute(setup) && two_queues(setup) &&
@@ -943,7 +1024,19 @@ bool run(const Setup& setup) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool graphics_zero = argc == 2 && std::strcmp(argv[1], "--async-graphics-zero") == 0;
+    const bool graphics_unset = argc == 2 && std::strcmp(argv[1], "--async-graphics-unset") == 0;
+    if (argc != 1 && !graphics_zero && !graphics_unset) {
+        std::fprintf(stderr, "usage: d3d12_pipeline_workers_test [--async-graphics-zero | --async-graphics-unset]\n");
+        return 2;
+    }
+    if (graphics_zero || graphics_unset) {  // before the first pipeline state: the runtime reads these once
+        _putenv_s("LEONIDA_ASYNC_PIPELINES", "1");
+        _putenv_s("LEONIDA_STRICT_REPLAY", "0");
+        _putenv_s("LEONIDA_ASYNC_MIN_BYTES", "1073741824");  // 1 GiB: over any module
+        _putenv_s("LEONIDA_ASYNC_MIN_BYTES_GRAPHICS", graphics_zero ? "0" : "");  // "" removes it
+    }
     vktest::Device vk;
     vk.request_buffer_device_address = true;
     const auto status = vk.initialize();
@@ -964,7 +1057,8 @@ int main() {
     _putenv_s("LEONIDA_COMPUTE_WARMUP", "0");        // every compile is a submission's
     const testfiles::ScratchDir library("leonida_pipeline_workers_test");
     if (!write_library(library.path())) return 1;
-    if (!run({&vk, library.path().string()})) return 1;
+    const Setup setup{&vk, library.path().string()};
+    if (graphics_zero || graphics_unset ? !async_thresholds(setup, graphics_zero) : !run(setup)) return 1;
     if (vk.validation_errors()) {
         std::fprintf(stderr, "FAIL: %u validation errors\n", vk.validation_errors());
         return 1;
