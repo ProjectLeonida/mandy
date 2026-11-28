@@ -23,7 +23,8 @@ SEED = "LEONIDA_PIPELINE_JOURNAL_SEED_DIR"
 @unittest.skipUnless(sys.platform == "win32" and POWERSHELL, "boot.ps1 is a Windows PowerShell script")
 class BootJournalSeedTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="leonida_boot_seed_"))
+        # Its final spelling: boot.ps1 prints the long names, and the temp folder can be an 8.3 alias (RUNNER~1 on CI).
+        self.tmp = Path(os.path.realpath(tempfile.mkdtemp(prefix="leonida_boot_seed_")))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.runtime = self.tmp / "port"
         self.runtime.mkdir()
