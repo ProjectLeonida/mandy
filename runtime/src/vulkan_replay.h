@@ -4109,6 +4109,21 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 p.source = *cnt;
             }
             if (ind->kind != IndirectKind::dispatch && !vk.external_graphics_scope) continue;
+            // A DISPATCH's pipeline first: one that is dropped (skipped, or still building) leaves the command here,
+            // before its clamp is prepared. A clamp prepared for it would be emitted with no dispatch after it, and
+            // when it was the list's first clamp it owns the list's work budget (share_list_budget), so the budget
+            // word every later clamp of the list reads would be set up by a pass that never runs.
+            if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
+                if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return unsupported_at(__LINE__);
+                const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
+                if (!pipeline) return unresolved_at(__LINE__);
+                p.pipeline = *pipeline;
+                const bool found = detail::first_use(*pipeline, PipelineCompiles::User::indirect_dispatch, vk, p);
+                if (!found && p.pipeline.skipped) continue;  // dropped on request, strict or not
+                if (!found && p.pipeline.async_build && !strict_replay()) continue;
+                if (!found) return unresolved_at(__LINE__);
+                if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
+            }
             // The clamp pass (vulkan_indirect_clamp.h): the arguments are copied on the GPU into scratch with their
             // values bounded before the indirect command reads them, so a stale or garbage record left by a skipped or
             // mistranslated compute pass cannot run for seconds and reset the display driver. A counted call has its
@@ -4156,20 +4171,6 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     // around the replay, as the tests do); without vkCmdDrawIndirect[Count] there is nothing to emit.
                     return unsupported_at(__LINE__);
                 }
-            }
-            // Legacy graphics IR carries no graphics state of its own: the recorded, stateful graphics indirects are
-            // Draw commands (IndirectRasterDraw) and open their own rendering scope. A legacy one is emitted as it is
-            // - the clamp pass above is what keeps its arguments safe - and its dispatch-side work ends here.
-            if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
-                if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return unsupported_at(__LINE__);
-                const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
-                if (!pipeline) return unresolved_at(__LINE__);
-                p.pipeline = *pipeline;
-                const bool found = detail::first_use(*pipeline, PipelineCompiles::User::indirect_dispatch, vk, p);
-                if (!found && p.pipeline.skipped) continue;  // dropped on request, strict or not
-                if (!found && p.pipeline.async_build && !strict_replay()) continue;
-                if (!found) return unresolved_at(__LINE__);
-                if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;

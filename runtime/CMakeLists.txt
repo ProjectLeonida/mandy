@@ -4701,6 +4701,13 @@ if(TARGET Vulkan::Headers)
     add_test(NAME replay_pipeline_compiles COMMAND replay_pipeline_compiles_test)
     add_test(NAME replay_pipeline_compiles_strict COMMAND replay_pipeline_compiles_test)
     set_tests_properties(replay_pipeline_compiles_strict PROPERTIES ENVIRONMENT "LEONIDA_STRICT_REPLAY=1")
+    # A dropped ExecuteIndirect(DISPATCH) prepares and emits no clamp pass, and owns no list budget (no GPU).
+    add_executable(replay_dropped_indirect_clamp_test test/replay_dropped_indirect_clamp_test.cpp)
+    target_link_libraries(replay_dropped_indirect_clamp_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_dropped_indirect_clamp_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_dropped_indirect_clamp COMMAND replay_dropped_indirect_clamp_test)
     # The request hook of ComputePipeline / GraphicsPipeline that pipeline_order.h's recorder hangs on (no GPU).
     add_executable(replay_pipeline_order_hook_test test/replay_pipeline_order_hook_test.cpp)
     target_link_libraries(replay_pipeline_order_hook_test PRIVATE Vulkan::Headers)
