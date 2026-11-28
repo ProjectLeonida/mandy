@@ -12126,6 +12126,7 @@ struct DeviceState {
         std::uint32_t slice_first = 0;
         std::uint32_t slice_count = 0;
         std::uint32_t mirror_layer = 0;
+        std::uint64_t api_owner_address = 0;  // distinguishes D3D12 API views on shared deferred/placeholder images
         bool sampled_only = false;
         bool sampled = false;
         bool storage = false;
@@ -12139,6 +12140,7 @@ struct DeviceState {
                 return h;
             };
             std::uint64_t h = static_cast<std::uint64_t>(std::hash<VkImage>{}(k.vk_image));
+            h = mix(h, k.api_owner_address);
             h = mix(h, (std::uint64_t(k.dimension) << 32) | std::uint64_t(k.view_type));
             h = mix(h, (std::uint64_t(k.view_format) << 32) | std::uint64_t(k.storage_format));
             h = mix(h, (std::uint64_t(k.sampled_class) << 32) | std::uint64_t(k.aspect_mask));
@@ -12629,6 +12631,7 @@ struct DeviceState {
         vk_key.slice_first = storage ? slices.first : 0u;
         vk_key.slice_count = storage ? slices.count : 0u;
         vk_key.mirror_layer = dimension == leonida::ImageDimension::dim_2d_array ? image.first_layer : 0u;
+        vk_key.api_owner_address = binding_from_title_heap ? 0u : image.address;
         vk_key.sampled_only = sampled_only;
         vk_key.sampled = sampled;
         vk_key.storage = storage;
