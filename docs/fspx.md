@@ -428,3 +428,35 @@ it is now refused (`fall-through into undecodable words`): programs 04, 05, 06, 
 - The exact layout of the kind-7 records.
 - What the prologue does on the GPU.
 - Whether the game itself ships FSPX programs. Its shaders measured so far are `FSSM`.
+
+## The ffx_api entry points (measured)
+
+Both shipped FidelityFX modules export the same five functions (`llvm-readobj --coff-exports` on 1.0.2.1):
+`ffxConfigure`, `ffxCreateContext`, `ffxDestroyContext`, `ffxDispatch` and `ffxQuery`. The executable imports
+`ffxCreateContext`, `ffxDestroyContext`, `ffxDispatch` and `ffxQuery`, all from `amd_fidelityfx_loader_xbox.dll`;
+`ffxConfigure` is unused. The loader is a dispatcher: it reads the descriptor's module bits, picks a backend and
+forwards.
+
+Measured with Ghidra 12.2 through REA, RVAs into `amd_fidelityfx_loader_xbox.dll` (image base `0x180000000`):
+
+| Entry | RVA | Behaviour |
+|---|---|---|
+| `ffxCreateContext` | `0x1170` | Null `context*` or `desc*` returns 6. Walks the descriptor's linked list (`type` at `+0x00`, `next` at `+0x08`): `type == 4` reads the value at `+0x18`; `0x10009` and `0x1000002` read `+0x10`. The module comes from the low dword masked with `0x00ff0000`: `0x10000` selects the first backend, `0x20000`/`0x30000` the second, anything else returns 2. On success the context is a 16-byte `{ backend vtable, backend context }` taken from the caller's allocator (vtable `+0x08`) or `calloc`. |
+| `ffxQuery` | `0x1420` | Null `desc` returns 6. With a context it forwards to the backend's vtable `+0x18`. Without one it repeats the module selection; `type == 4` is special (the query type is at `+0x10`, and `+0x20` is zeroed on failure). |
+| `ffxDispatch` | `0x1520` | Null context or desc returns 6; forwards to the backend's vtable `+0x20`. |
+| `ffxDestroyContext` | `0x1290` | Not decompiled in this pass. |
+
+`amd_fidelityfx_upscaler_xbox.dll` (image base `0x180000000`):
+
+| Entry | RVA | Behaviour |
+|---|---|---|
+| `ffxCreateContext` | `0x11d0` | Same list walk (`4` → `+0x18`, `0x10009`/`0x1000002` → `+0x10`). A static table of two backends is matched by device type and version through vtable `+0x08`/`+0x10`; the chosen one creates through `+0x18`. No match returns 4; a failed create frees through the allocator's `+0x18`. |
+| `ffxDispatch` | `0x19f0` | Null arguments return 6; forwards to the backend's vtable `+0x38`. |
+
+The record types (`4`, `5`, `0x10009`, `0x1000002`), the module mask (`0x00ff0000`) and the two backend selectors
+are raw values read from the DLL; the header names behind them are not in the package.
+
+The AV reported at `amd_fidelityfx_upscaler_xbox.dll+0x65ff` before #1862 is inside `FUN_1800059a0` (`0x59a0`),
+the upscaler's dispatch encoder: it takes a queue-ring entry at `0x1078 + 0x60 * index` and begins a command buffer
+through the command-list vtable (`+0x108`, then `+0x100`). The two FSPX programs it dispatches are the ones #1862
+translates.
