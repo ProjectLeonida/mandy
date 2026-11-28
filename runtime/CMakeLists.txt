@@ -854,16 +854,6 @@ if(BUILD_TESTING)
     endif()
     target_link_libraries(title_window_test PRIVATE user32)
     add_test(NAME title_window COMMAND title_window_test)
-
-    # LEONIDA_TITLE_HUD's counters in the title bar of another thread's window (shims/title_hud.h): user32 and DXGI.
-    add_executable(title_hud_test test/title_hud_test.cpp)
-    target_include_directories(title_hud_test PRIVATE shims)
-    target_compile_definitions(title_hud_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-    if(MSVC)
-      target_compile_options(title_hud_test PRIVATE /W4 /permissive- /utf-8)
-    endif()
-    target_link_libraries(title_hud_test PRIVATE Vulkan::Headers user32 psapi)
-    add_test(NAME title_hud COMMAND title_hud_test)
   endif()
 
   # LEONIDA_DEV_OVERLAY's text and the phase bookkeeping behind it (src/dev_overlay.h): no window, GPU or game file.
@@ -2023,6 +2013,18 @@ if(TARGET Vulkan::Headers)
     endif()
     add_test(NAME submit_mutex COMMAND submit_mutex_test)
     set_tests_properties(submit_mutex PROPERTIES TIMEOUT 60)
+  endif()
+
+  # The title HUD reads the memory probe header, which includes Vulkan types.
+  if(WIN32 AND BUILD_TESTING)
+    add_executable(title_hud_test test/title_hud_test.cpp)
+    target_include_directories(title_hud_test PRIVATE shims)
+    target_compile_definitions(title_hud_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    if(MSVC)
+      target_compile_options(title_hud_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    target_link_libraries(title_hud_test PRIVATE Vulkan::Headers user32 psapi)
+    add_test(NAME title_hud COMMAND title_hud_test)
   endif()
 
   foreach(tool vk_harness vk_ps_sweep vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
