@@ -741,6 +741,14 @@ void test_copy_page_mappings_cpu_view(const PhysicalApi& api) {
     check(readable(other) && page_holds(other, 0x7300u),
           "a GPU-only source page unmapped there is looked up at its CPU range");
 
+    api.map(other, 1, nullptr);
+    const rt::xmem::PageRange cpu_source{0, 2, 1};
+    const rt::xmem::PageBatch batch{reinterpret_cast<uintptr_t>(other), 1, &cpu_source};
+    check(rt::xmem::copy_page_mappings(1, &batch, reinterpret_cast<uintptr_t>(gpu), kPair, 0),
+          "a batch copies from a GPU-only range whose source page is mapped at its CPU view");
+    check(readable(other) && page_holds(other, 0x7300u),
+          "a batch source at the paired CPU view leaves its destination mapped with the source bytes");
+
     // A CPU page the title mapped itself is the title's: a copy onto its GPU-only page, or an unmap of it, changes the
     // GPU-only page alone (the console's CopyPageMappingsBatchX edits only that range's page table).
     check(copy(gpu + 2 * kPage64k, pool + kPage64k, 1, false), "a copy onto a GPU-only page whose CPU page is the title's");
