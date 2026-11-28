@@ -3287,17 +3287,30 @@ void note_list_state(ListProxy* self, std::uint64_t a1, std::uint64_t a2, std::u
     (void)self, (void)a1, (void)a2, (void)a3, (void)a4;
 }
 
+// A closed real list of the last recording becomes a spare. Nothing executes it again before a cut resets it: a
+// submission names the proxy's parts and `real`, and the title's Reset ended the recording they were. So it drops
+// that recording now: an idle spare would otherwise keep its commands and the pipeline states, root signatures and
+// scratch they hold, and its command-list epoch would hold back every title window retired after that recording
+// began (src/command_list_epochs.h) until a cut reset it, which never comes for a spare past the cuts later
+// recordings make (cut_list takes the newest spare first).
+void keep_spare(ListProxy* self, ID3D12GraphicsCommandList* list) {
+#ifdef LEONIDA_VULKAN_DEVICE
+    rt::d3d12::drop_recording(list);
+#endif
+    self->spares.push_back(list);
+}
+
 // A new recording (Reset): the primary list records again; the other real lists of the last recording are closed and
 // wait with the spares for later cuts.
 void restart_recording(ListProxy* self) {
     for (const ListProxy::Part& part : self->parts)
-        if (part.list != self->primary) self->spares.push_back(part.list);
+        if (part.list != self->primary) keep_spare(self, part.list);
     self->parts.clear();
     if (self->real != self->primary) {
         // A title resets a list it closed; one still open (a D3D12 error, which the real Reset reports) is closed
         // here so that a later cut can Reset it.
         if (!self->real_closed) self->real->Close();
-        self->spares.push_back(self->real);
+        keep_spare(self, self->real);
         self->real = self->primary;
     }
     self->pre_writes.clear();

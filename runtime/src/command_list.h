@@ -988,6 +988,17 @@ public:
         return true;
     }
 
+    // The recording is dropped and no new one begins, for a closed list its owner will not execute again before its
+    // next Reset (a list-value cut's spare, d3d12_xs_device.cpp restart_recording): it keeps no commands and no
+    // stamp, so it holds back no copy the layer retires (command_list_epochs.h). Executed anyway, it replays nothing.
+    bool drop_recording() {
+        if (!closed_) return false;
+        commands_.clear();
+        active_.clear();
+        stamp_.drop();
+        return true;
+    }
+
     bool closed() const { return closed_; }
     std::span<const Command> commands() const { return commands_; }
 

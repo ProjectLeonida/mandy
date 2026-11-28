@@ -672,6 +672,13 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
 // lists or `object` is null.
 bool hold_until_reset(ID3D12GraphicsCommandList* list, IUnknown* object);
 
+// Drops what a closed `list` recorded, as its next Reset would, without beginning a new recording: for a list its
+// owner will not execute again before that Reset (a list-value cut's spare, d3d12_xs_device.cpp restart_recording).
+// It then keeps no commands and no reference to what they used (the pipeline states, root signatures and objects
+// hold_until_reset gave it), and holds back no retired title window (src/command_list_epochs.h). Executed anyway, it
+// replays nothing. False when `list` is not one of this module's command lists or is still recording.
+bool drop_recording(ID3D12GraphicsCommandList* list);
+
 // A copy of the commands `list` has recorded so far, for tests of what a bundle puts into its parent. False when
 // `list` is not one of this module's command lists.
 bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Command>& commands);
