@@ -3499,6 +3499,37 @@ int check_committed_resource_leases() {
     EXPECT(hr_of(raw10(device, 127, words127)) == S_OK && resource);
     EXPECT(g_heap_hook.alloc_calls == 2 && g_heap_hook.last_alloc_size == 3 * 65536);
     EXPECT(release(resource) == 0 && g_heap_hook.free_calls == 2);
+
+    // Two UHD RGBA8 targets must fit in the 64 MiB pool with at most 0x1FFFFF bytes left.
+    D3D12_RESOURCE_DESC1 target{};
+    target.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    target.Width = 3840;
+    target.Height = 2160;
+    target.DepthOrArraySize = 1;
+    target.MipLevels = 1;
+    target.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    target.SampleDesc.Count = 1;
+    target.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    constexpr std::size_t kPoolBytes = 64 * 1024 * 1024;
+    constexpr std::size_t kTargetBytes = 30 * 17 * 65536;
+    static std::uint8_t target_memory[2];
+    void* targets[2]{};
+    std::size_t used = 0;
+    words127[2] = word(&target);
+    for (int i = 0; i < 2; ++i) {
+        g_heap_hook.next_ptr = &target_memory[i];
+        words127[9] = word(&targets[i]);
+        EXPECT(hr_of(raw10(device, 127, words127)) == S_OK && targets[i]);
+        EXPECT(g_heap_hook.alloc_calls == 3 + i && g_heap_hook.last_alloc_size == kTargetBytes);
+        used += g_heap_hook.last_alloc_size;
+    }
+    EXPECT(used <= kPoolBytes && kPoolBytes - used == 262144);
+    EXPECT(g_heap_hook.free_calls == 2);
+    for (int i = 0; i < 2; ++i) {
+        EXPECT(release(targets[i]) == 0 && g_heap_hook.free_calls == 3 + i);
+        EXPECT(g_heap_hook.last_free_ptr == &target_memory[i] && g_heap_hook.last_free_attr == kLeaseAttributes);
+    }
 #endif
 
     // A driver whose PC answer is above the console tiles (AMD's Windows driver: 513 x 64 KiB for a 3840 x 2160 RGBA8
