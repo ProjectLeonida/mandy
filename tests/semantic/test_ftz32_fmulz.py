@@ -6,8 +6,10 @@ Verifies:
     in shader_meta()["float_controls"] (core since SPIR-V 1.4, no SPV_KHR_float_controls extension at vulkan1.2).
   * Software flush_f32() wrappers (OpFOrdLessThan against 2^-126) are elided on f32 MAD/MAC/legacy/fma_mix/dot2 ops
     under hardware FTZ32 and restored under --no-ftz32.
-  * DenormFlushToZero 32 is gated off when the shader contains v_div_scale_f32, v_div_fmas_f32, s_setreg* on
-    HW_REG_MODE, s_denorm_mode, or under --no-ftz32 / --no-float-controls.
+  * DenormFlushToZero 32 is gated off when the shader contains v_div_scale_f32, v_div_fmas_f32, s_setreg*
+    writing non-zero/non-constant bits into HW_REG_MODE[5:4] (FP_DENORM.fp32), s_denorm_mode, or under
+    --no-ftz32 / --no-float-controls; writes to disjoint MODE bit ranges (e.g. FP_ROUND.fp64_fp16 in bits [3:2])
+    or immediate writes setting [5:4] to 0 keep FTZ32 enabled.
   * v_mul_legacy_f32 emits the canonical Mesa NIR fmulz pattern (OpSelect %float (OpLogicalOr (OpFOrdEqual x %f0)
     (OpFOrdEqual y %f0)) %f0 (OpFMul x y)) and preserves exact edge-case semantics (0*NaN=+0, 0*Inf=+0, (-0)*1=+0,
     subnormal inputs -> +0, signed subnormal underflow, normal products) in both FTZ32 and --no-ftz32 modes.
@@ -102,22 +104,26 @@ class Ftz32AndFmulzTests(unittest.TestCase):
         _validate(spv_sw)
 
     def test_gated_off_on_div_fmas_div_scale_and_setreg_mode(self):
-        # 1. s_setreg_imm32_b32 on HW_REG_MODE disables FTZ32 and restores software flushes.
-        setreg_lines = [
-            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3",
-            "v_mov_b32 v0, 0x00000001",
-            "v_mov_b32 v1, 0x7fc00000",
-            "v_mul_legacy_f32 v2, v0, v1",
-            "exp mrt0 v2, v2, v2, v2 done vm",
-            "s_endpgm",
-        ]
-        spv_sr, meta_sr = _translate(setreg_lines, ftz32=True)
-        self.assertNotIn("DenormFlushToZero", spv_sr)
-        self.assertIn("OpExecutionMode %main DenormPreserve 16", spv_sr)
-        self.assertNotIn("shaderDenormFlushToZeroFloat32", meta_sr["float_controls"])
-        self.assertGreaterEqual(spv_sr.count("OpFOrdLessThan %bool"), 3)
-        self.assertEqual(support.mrt0_words(spv_sr), [0] * 4)
-        _validate(spv_sr)
+        # 1. s_setreg_imm32_b32 on HW_REG_MODE bits [3:2] (FP_ROUND.fp64_fp16) does NOT touch FP_DENORM.fp32 [5:4],
+        #    so hardware DenormFlushToZero 32 stays enabled for both value 3 and value 0.
+        for imm in (3, 0):
+            with self.subTest(mode_round_imm=imm):
+                setreg_lines = [
+                    f"s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), {imm}",
+                    "v_mov_b32 v0, 0x00000001",
+                    "v_mov_b32 v1, 0x7fc00000",
+                    "v_mul_legacy_f32 v2, v0, v1",
+                    "exp mrt0 v2, v2, v2, v2 done vm",
+                    "s_endpgm",
+                ]
+                spv_sr, meta_sr = _translate(setreg_lines, ftz32=True)
+                self.assertIn("OpCapability DenormFlushToZero", spv_sr)
+                self.assertIn("OpExecutionMode %main DenormFlushToZero 32", spv_sr)
+                self.assertIn("OpExecutionMode %main DenormPreserve 16", spv_sr)
+                self.assertIn("shaderDenormFlushToZeroFloat32", meta_sr["float_controls"])
+                self.assertEqual(spv_sr.count("OpFOrdLessThan %bool"), 0)
+                self.assertEqual(support.mrt0_words(spv_sr), [0] * 4)
+                _validate(spv_sr)
 
         # 2. v_div_fmas_f32 disables FTZ32 (keeps subnormal inputs/intermediates on RDNA2 even under denorm32=0).
         div_fmas_lines = [
@@ -135,12 +141,54 @@ class Ftz32AndFmulzTests(unittest.TestCase):
         self.assertEqual(support.mrt0_words(spv_df)[0], 0x26800000)
         _validate(spv_df)
 
-        # 3. Direct predicate check for v_div_scale_f32, s_denorm_mode, and s_setreg on HW_REG_MODE vs non-MODE.
-        self.assertTrue(rdna2spirv._disables_ftz32([parse_line("v_div_scale_f32 v0, vcc_lo, v1, v2, v1")]))
-        self.assertTrue(rdna2spirv._disables_ftz32([parse_line("s_denorm_mode 0")]))
-        self.assertTrue(rdna2spirv._disables_ftz32([parse_line("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 4, 4), 0")]))
-        self.assertFalse(rdna2spirv._disables_ftz32([parse_line("s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0")]))
-        self.assertFalse(rdna2spirv._disables_ftz32([parse_line("v_mul_legacy_f32 v0, v1, v2")]))
+        # 3. Direct predicate check for HW_REG_MODE bit-range overlap against [5:4] (FP_DENORM.fp32),
+        #    plus v_div_scale_f32, s_denorm_mode, and non-MODE registers.
+        keep_ftz = [
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0",
+            "s_setreg_imm32_b32 hwreg(0x1, 2, 2), 3",
+            "s_setreg_imm32_b32 0x0881, 3",  # simm16: id=1 (HW_REG_MODE), offset=2, size=2
+            "s_setreg_imm32_b32 0x0901, 0",  # simm16: id=1 (HW_REG_MODE), offset=4, size=2, val=0
+            "s_setreg_imm32_b32 0x0902, 3",  # simm16: id=2 (non-MODE), offset=4, size=2
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 4), 0xf",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 6, 4), 0xf",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 4, 2), 0",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 4, 4), 0",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 32), 0x0c",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE), 0",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 3, 2), 1",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 5, 2), 2",
+            "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s0",
+            "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0",
+            "v_mul_legacy_f32 v0, v1, v2",
+        ]
+        disable_ftz = [
+            "v_div_scale_f32 v0, vcc_lo, v1, v2, v1",
+            "s_denorm_mode 0",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 4, 2), 3",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 4, 2), 1",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 4, 2), 2",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 32), 0x30",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE), 0x10",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 3, 2), 2",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 5, 2), 1",
+            "s_setreg_imm32_b32 hwreg(1, 4, 2), 3",
+            "s_setreg_imm32_b32 hwreg(0x1, 4, 2), 3",
+            "s_setreg_b32 hwreg(0x1, 4, 2), s0",
+            "s_setreg_imm32_b32 0x0901, 3",  # simm16: id=1 (HW_REG_MODE), offset=4, size=2, val=3
+            "s_setreg_b32 0x0901, s0",       # simm16: id=1 (HW_REG_MODE), offset=4, size=2, reg
+            "s_setreg_b32 hwreg(HW_REG_MODE, 4, 2), s0",
+            "s_setreg_b32 hwreg(HW_REG_MODE), s0",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, bad, 2), 0",
+            "s_setreg_imm32_b32 hwreg(1, bad, 2), 3",
+            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 33), 0",
+        ]
+        for line in keep_ftz:
+            with self.subTest(keep_ftz=line):
+                self.assertFalse(rdna2spirv._disables_ftz32([parse_line(line)]))
+        for line in disable_ftz:
+            with self.subTest(disable_ftz=line):
+                self.assertTrue(rdna2spirv._disables_ftz32([parse_line(line)]))
 
     def test_v_mul_legacy_f32_edge_cases_both_modes(self):
         cases = [

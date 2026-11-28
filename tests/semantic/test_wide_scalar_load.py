@@ -65,12 +65,12 @@ class WideScalarLoad(unittest.TestCase):
 
     def test_the_loads_are_wide(self):
         text, _ = self.run_fixture()
-        # x16: 4, x8: 2, x4: 1, s_load x8: 2 uvec4 loads; x2: 1 uvec2 load. Each s_buffer_load also keeps its
-        # per-dword path for a partly out-of-range load (16 + 8 + 4 + 2 dword loads, which run only then); the
-        # s_load has none.
+        # x16: 4, x8: 2, x4: 1, s_load x8: 2 uvec4 loads; x2: 1 uvec2 load. Each s_buffer_load width also emits
+        # ONE compact counted-loop fallback helper (%sbuf_slow_ro_x{2,4,8,16}) with a single OpLoad in its loop body
+        # (4 dword loads total, running only when partly out of range); the s_load has none.
         self.assertEqual(text.count("OpLoad %v4uint_sl"), 9)
         self.assertEqual(text.count("OpLoad %v2uint_sl"), 1)
-        self.assertEqual(sum("OpLoad %uint" in ln and "Aligned 4" in ln for ln in text.splitlines()), 16 + 8 + 4 + 2)
+        self.assertEqual(sum("OpLoad %uint" in ln and "Aligned 4" in ln for ln in text.splitlines()), 4)
 
     def test_a_destination_that_is_its_own_vsharp(self):
         # cs_wide_scalar_load_overlap.asm: s_buffer_load_dwordx4 s[20:23], s[20:23] with its V# from memory, under

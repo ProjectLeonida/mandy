@@ -510,7 +510,7 @@ class Gen:
         self.uses_psb_scalar_ro = False  # scalar_load's read-only single-dword loads: uint NonWritable Block pointers
         self.ftz32 = bool(FLOAT_CONTROLS and FTZ32)  # DenormFlushToZero 32 active for this module
         self.scalar_load_ro = None     # None (unanalysed), True (all RO), or frozenset of id(ins) safe for NonWritable
-        self.sbuf_slow_fns: dict[int, list[str]] = {}  # width -> outlined %sbuf_slow_x{n} partial-OOB helper lines
+        self.sbuf_slow_fns: dict[tuple[int, bool], list[str]] = {}  # (width, ro) -> %sbuf_slow_{ro|rw}_x{n} helper lines
         self.uses_int_dot = False      # packed_dot4 emitted OpSDot/OpUDot(AccSat): SPV_KHR_integer_dot_product
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
         self.uses_fma_khr32 = False    # ... on f32 (feature shaderFmaFloat32)
@@ -13384,59 +13384,86 @@ class Gen:
         self.emit(f"{r} = OpIAdd %uint {acc} {du}")
         return r
 
-    def sbuf_slow_function(self, n):
-        """Build (once per width n in {2, 4, 8, 16}) the shared partial-OOB helper %sbuf_slow_x{n}(host, off, lim).
+    def sbuf_slow_function(self, n, ro=False):
+        """Build (once per (width, ro) with n in {2, 4, 8, 16}) the partial-OOB helper %sbuf_slow_{ro|rw}_x{n}.
 
         Called from the cold lbl_slow branch of wide s_buffer_load_dwordxN when the last dword is past limit.
-        Returns %arr_sbuf_x{n} (OpTypeArray %uint %c{n}): each dword i with off + 4*i + 4 <= lim is loaded at
-        host + 4*i (Aligned 4); out-of-range dwords return 0 without reading past limit (dword 0 is checked first,
-        and in-bounds partial loads re-read index 0 for out-of-range lanes, matching the inline rule)."""
-        fn = f"%sbuf_slow_x{n}"
-        if n not in self.sbuf_slow_fns:
-            p = f"%sbs{n}_"
+        Uses a compact counted loop (DontUnroll) with ONE OpLoad in the loop body, storing into a zero-initialized
+        Function-scope %arr_sbuf_x{n} and returning OpLoad %arr_sbuf_x{n}: each dword i with off + 4*i + 4 <= lim
+        is loaded at host + 4*i (Aligned 4); out-of-range dwords stay 0 without reading past limit.
+        When ro=True, loads through NonWritable %_ptr_PSB_sl_blk1 so RADV/ACO keeps SMEM s_load_dword even inside
+        the slow path; when ro=False, loads through mutable %_ptr_PSB_arr."""
+        ro = bool(ro)
+        key = (n, ro)
+        tag = "ro" if ro else "rw"
+        fn = f"%sbuf_slow_{tag}_x{n}"
+        if key not in self.sbuf_slow_fns:
+            p = f"%sbs_{tag}{n}_"
             arr = f"%arr_sbuf_x{n}"
+            ptr_arr = f"%_ptr_Function_arr_sbuf_x{n}"
             null_arr = f"%null_sbuf_x{n}"
+            c0 = self.cu(0)
+            c1 = self.cu(1)
             self.cu(n)
-            self.cu(0)
+            cl2 = self.cl(2)
+            cln = self.cl(n)
+            if ro:
+                self.uses_psb_scalar_ro = True
             lines = [
                 f"{fn} = OpFunction {arr} None %fn_sbuf_slow_x{n}",
                 f"{p}host = OpFunctionParameter %ulong",
                 f"{p}off = OpFunctionParameter %ulong",
                 f"{p}lim = OpFunctionParameter %ulong",
                 f"{p}entry = OpLabel",
-                f"{p}ptr = OpConvertUToPtr %_ptr_PSB_arr {p}host",
+                f"{p}out = OpVariable {ptr_arr} Function {null_arr}",
+                # Overflow-safe exact in-range dword count:
+                # off + 4*i + 4 <= lim  <=>  lim >= off and i < min((lim - off) >> 2, n).
+                f"{p}ge = OpUGreaterThanEqual %bool {p}lim {p}off",
+                f"{p}diff = OpISub %ulong {p}lim {p}off",
+                f"{p}avail = OpShiftRightLogical %ulong {p}diff {cl2}",
+                f"{p}lt_n = OpULessThan %bool {p}avail {cln}",
+                f"{p}cnt64 = OpSelect %ulong {p}lt_n {p}avail {cln}",
+                f"{p}cnt_u = OpUConvert %uint {p}cnt64",
+                f"{p}cnt = OpSelect %uint {p}ge {p}cnt_u {c0}",
             ]
-            for i in range(n):
-                lines.append(f"{p}end{i} = OpIAdd %ulong {p}off {self.cl(4 * i + 4)}")
-                lines.append(f"{p}ok{i} = OpUGreaterThanEqual %bool {p}lim {p}end{i}")
+            if not ro:
+                lines.append(f"{p}ptr = OpConvertUToPtr %_ptr_PSB_arr {p}host")
             lines += [
-                f"OpSelectionMerge {p}end None",
-                f"OpBranchConditional {p}ok0 {p}do {p}end",
-                f"{p}do = OpLabel",
+                f"OpBranch {p}head",
+                f"{p}head = OpLabel",
+                f"{p}i = OpPhi %uint {c0} {p}entry {p}next {p}cont",
+                f"{p}cond = OpULessThan %bool {p}i {p}cnt",
+                f"OpLoopMerge {p}exit {p}cont DontUnroll",
+                f"OpBranchConditional {p}cond {p}body {p}exit",
+                f"{p}body = OpLabel",
             ]
-            vals = []
-            for i in range(n):
-                if i == 0:
-                    idx = self.cu(0)
-                else:
-                    idx = f"{p}idx{i}"
-                    lines.append(f"{idx} = OpSelect %uint {p}ok{i} {self.cu(i)} {self.cu(0)}")
-                lines.append(f"{p}p{i} = OpAccessChain %_ptr_PSB_uint {p}ptr {idx}")
-                lines.append(f"{p}got{i} = OpLoad %uint {p}p{i} Aligned 4")
-                if i == 0:
-                    vals.append(f"{p}got0")
-                else:
-                    lines.append(f"{p}val{i} = OpSelect %uint {p}ok{i} {p}got{i} {self.cu(0)}")
-                    vals.append(f"{p}val{i}")
+            if ro:
+                lines += [
+                    f"{p}i64 = OpUConvert %ulong {p}i",
+                    f"{p}boff = OpShiftLeftLogical %ulong {p}i64 {cl2}",
+                    f"{p}addr = OpIAdd %ulong {p}host {p}boff",
+                    f"{p}bptr = OpConvertUToPtr %_ptr_PSB_sl_blk1 {p}addr",
+                    f"{p}qptr = OpAccessChain %_ptr_PSB_uint {p}bptr {c0}",
+                    f"{p}val = OpLoad %uint {p}qptr Aligned 4",
+                ]
+            else:
+                lines += [
+                    f"{p}qptr = OpAccessChain %_ptr_PSB_uint {p}ptr {p}i",
+                    f"{p}val = OpLoad %uint {p}qptr Aligned 4",
+                ]
             lines += [
-                f"{p}in = OpCompositeConstruct {arr} " + " ".join(vals),
-                f"OpBranch {p}end",
-                f"{p}end = OpLabel",
-                f"{p}res = OpPhi {arr} {p}in {p}do {null_arr} {p}entry",
+                f"{p}slot = OpAccessChain %_ptr_Function_uint {p}out {p}i",
+                f"OpStore {p}slot {p}val",
+                f"OpBranch {p}cont",
+                f"{p}cont = OpLabel",
+                f"{p}next = OpIAdd %uint {p}i {c1}",
+                f"OpBranch {p}head",
+                f"{p}exit = OpLabel",
+                f"{p}res = OpLoad {arr} {p}out",
                 f"OpReturnValue {p}res",
                 "OpFunctionEnd",
             ]
-            self.sbuf_slow_fns[n] = lines
+            self.sbuf_slow_fns[key] = lines
         return fn
 
     def scalar_load(self, op, a, mods):
@@ -13641,7 +13668,7 @@ class Gen:
         guarded = {}
         if lim is not None and not (lim_val is not None and reg is None) and n > 1:
             # Every dword in range (the last one is, so all are): one wide load, the common case. Otherwise call
-            # the shared per-width partial-OOB helper %sbuf_slow_x{n}, keeping cold fallback code out of line.
+            # the shared per-width partial-OOB loop helper %sbuf_slow_{ro|rw}_x{n}.
             last_end, all_ok = self.tmp(), self.tmp()
             if reg is not None:
                 self.emit(f"{last_end} = OpIAdd %ulong {o64} {self.cl(4 * n)}")
@@ -13659,7 +13686,7 @@ class Gen:
             self.emit(f"OpBranch {lbl_join}")
             self.emit(f"{lbl_slow} = OpLabel")
             if not coherent:
-                slow_fn = self.sbuf_slow_function(n)
+                slow_fn = self.sbuf_slow_function(n, ro=ro)
                 slow_arr = self.tmp()
                 self.emit(f"{slow_arr} = OpFunctionCall %arr_sbuf_x{n} {slow_fn} {host} {o64} {lim}")
                 slow_vals = []
@@ -17476,8 +17503,9 @@ def assemble(gen):
         # --address-guard: (heap_base, on, limit, table, offset, delta, sink) -> host address; no other function
         # type of the module has this signature.
         types.append("%fn_guard = OpTypeFunction %ulong %ulong %bool %ulong %ulong %ulong %ulong %ulong")
-    for n in sorted(gen.sbuf_slow_fns):
+    for n in sorted({k[0] for k in gen.sbuf_slow_fns}):
         types += [f"%arr_sbuf_x{n} = OpTypeArray %uint {gen.cu(n)}",
+                  f"%_ptr_Function_arr_sbuf_x{n} = OpTypePointer Function %arr_sbuf_x{n}",
                   f"%null_sbuf_x{n} = OpConstantNull %arr_sbuf_x{n}",
                   f"%fn_sbuf_slow_x{n} = OpTypeFunction %arr_sbuf_x{n} %ulong %ulong %ulong"]
     if gen.fmt_fn or gen.fmt_enc_fn:
@@ -17926,8 +17954,8 @@ def assemble(gen):
         helpers.extend(function)
     for function in gen.x_round_fns.values():
         helpers.extend(function)
-    for n in sorted(gen.sbuf_slow_fns):
-        helpers.extend(gen.sbuf_slow_fns[n])
+    for key in sorted(gen.sbuf_slow_fns):
+        helpers.extend(gen.sbuf_slow_fns[key])
     tree, nesting = (capped_tree(gen.succ, gen.out_pcs) if gen.blocks and not gen.emulate and not gen.bar_rounds
                      else (None, None))
     if nesting is not None:
@@ -18215,7 +18243,7 @@ _MEMORY_WRITE = re.compile(r"(?m)^\s*(?:(?:%[\w.]+ = )?(OpStore|OpAtomic\w+|OpCo
 
 
 def scalar_loads_read_only(text):
-    """Keep scalar_load's NonWritable wide loads (%sl_blk2 / %sl_blk4) only in a module that writes no memory.
+    """Keep scalar_load's NonWritable loads (%sl_blk1 / %sl_blk2 / %sl_blk4) only in a module that writes no memory.
 
     NonWritable lets the driver read them as SMEM (RADV: one s_load_b512 for an s_buffer_load_dwordx16), but also
     lets it order them freely against the module's own stores, and an s_load / s_buffer_load sees what the same
@@ -18236,7 +18264,7 @@ def scalar_loads_read_only(text):
             break
     else:
         return text
-    return re.sub(r"(?m)^\s*OpMemberDecorate %sl_blk[24] 0 NonWritable\n", "", text)
+    return re.sub(r"(?m)^\s*OpMemberDecorate %sl_blk[124] 0 NonWritable\n", "", text)
 
 
 # SPIR-V caps an instruction at 65,535 words. The dispatch loop's OpSwitch has one (literal, label) pair per block,
@@ -19658,19 +19686,61 @@ def barriers_under_control_flow(text):
 
 
 _FTZ32_DISABLE_OPS = frozenset({"v_div_scale_f32", "v_div_fmas_f32", "s_denorm_mode"})
+_HWREG_MODE_RE = re.compile(
+    r"^hwreg\(\s*(\w+)(?:\s*,\s*(0x[0-9a-fA-F]+|\d+)(?:\s*,\s*(0x[0-9a-fA-F]+|\d+))?)?\s*\)$"
+)
 
 
 def _disables_ftz32(insns):
     """Whether any instruction in `insns` requires disabling hardware DenormFlushToZero 32.
 
     v_div_scale_f32 and v_div_fmas_f32 preserve subnormal f32 inputs/intermediates on RDNA2 even under denorm32=0,
-    and s_setreg* on HW_REG_MODE / s_denorm_mode modifies the shader's MODE register."""
+    and s_denorm_mode / s_setreg* writing HW_REG_MODE bits [5:4] (FP_DENORM.fp32) to a non-zero or non-constant
+    value may disable f32 denormal flushing. Writes to disjoint MODE bit ranges (such as FP_ROUND.fp64_fp16 in
+    bits [3:2]) or immediate writes that set the overlapped [5:4] bits to 0 keep FTZ32 enabled."""
     for ins in insns:
         op = base_op(ins["op"])
         if op in _FTZ32_DISABLE_OPS:
             return True
-        if op.startswith("s_setreg") and ins["args"] and "HW_REG_MODE" in ins["args"][0].get("t", ""):
+        if not op.startswith("s_setreg"):
+            continue
+        if not ins["args"]:
             return True
+        a0 = ins["args"][0]
+        if a0.get("k") == "imm":
+            simm16 = a0["v"] & 0xFFFF
+            if (simm16 & 0x3F) != 1:
+                continue
+            offset = (simm16 >> 6) & 0x1F
+            size = ((simm16 >> 11) & 0x1F) + 1
+        else:
+            t = a0.get("t", "")
+            m = _HWREG_MODE_RE.match(t)
+            if not m:
+                return True
+            reg_id = m.group(1)
+            if reg_id != "HW_REG_MODE":
+                try:
+                    if int(reg_id, 0) != 1:
+                        continue
+                except ValueError:
+                    continue
+            offset = int(m.group(2), 0) if m.group(2) is not None else 0
+            size = int(m.group(3), 0) if m.group(3) is not None else 32
+            if offset < 0 or offset >= 32 or size <= 0 or size > 32:
+                return True
+        lo = max(offset, 4)
+        hi = min(offset + size, 6)
+        if lo >= hi:
+            continue
+        if op == "s_setreg_imm32_b32" and len(ins["args"]) >= 2 and ins["args"][1].get("k") == "imm" \
+                and not ins["args"][1].get("abs"):
+            val = ins["args"][1]["v"] & 0xFFFFFFFF
+            mask = (1 << (hi - lo)) - 1
+            if ((val >> (lo - offset)) & mask) != 0:
+                return True
+            continue
+        return True
     return False
 
 

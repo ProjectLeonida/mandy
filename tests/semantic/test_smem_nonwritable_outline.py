@@ -34,6 +34,7 @@ if TOOLS_DIR not in sys.path:
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import check_absent_lane_ub  # noqa: E402
 import rdna2spirv  # noqa: E402
 from shader_ir import parse_line  # noqa: E402
 import support  # noqa: E402
@@ -69,17 +70,23 @@ class SmemNonWritableAndOutlineTests(unittest.TestCase):
 
         # Part A: disjoint CBV s[4:7] and descriptor-table s[8:9] keep NonWritable despite buffer_store to s[0:3].
         self.assertIn("OpMemberDecorate %sl_blk4 0 NonWritable", spv)
+        self.assertIn("OpMemberDecorate %sl_blk1 0 NonWritable", spv)
         self.assertNotIn("%sl_rw_blk", spv)
+        self.assertEqual(check_absent_lane_ub.check_absent_lane_ub(spv), [])
 
-        # Part B: two x4 + two x16 loads share ONE %sbuf_slow_x4 and ONE %sbuf_slow_x16 (no unused x2/x8).
-        self.assertEqual(spv.count("%sbuf_slow_x4 = OpFunction "), 1)
-        self.assertEqual(spv.count("%sbuf_slow_x16 = OpFunction "), 1)
-        self.assertNotIn("%sbuf_slow_x2", spv)
-        self.assertNotIn("%sbuf_slow_x8", spv)
-        self.assertEqual(spv.count("OpFunctionCall %arr_sbuf_x4 %sbuf_slow_x4"), 2)
-        self.assertEqual(spv.count("OpFunctionCall %arr_sbuf_x16 %sbuf_slow_x16"), 2)
-        # Per-dword fallback loads exist once per width (4 + 16 = 20), not duplicated per call site (2*4 + 2*16 = 40).
-        self.assertEqual(sum("OpLoad %uint" in ln and "Aligned 4" in ln for ln in spv.splitlines()), 20)
+        # Part B: two x4 + two x16 RO loads share ONE %sbuf_slow_ro_x4 and ONE %sbuf_slow_ro_x16 loop helper
+        # (no unused x2/x8, no mutable _rw_ helpers, ONE OpLoad per helper inside OpLoopMerge ... DontUnroll).
+        self.assertEqual(spv.count("%sbuf_slow_ro_x4 = OpFunction "), 1)
+        self.assertEqual(spv.count("%sbuf_slow_ro_x16 = OpFunction "), 1)
+        self.assertNotIn("%sbuf_slow_ro_x2", spv)
+        self.assertNotIn("%sbuf_slow_ro_x8", spv)
+        self.assertNotIn("%sbuf_slow_rw_", spv)
+        self.assertEqual(spv.count("OpFunctionCall %arr_sbuf_x4 %sbuf_slow_ro_x4"), 2)
+        self.assertEqual(spv.count("OpFunctionCall %arr_sbuf_x16 %sbuf_slow_ro_x16"), 2)
+        self.assertEqual(spv.count("DontUnroll"), 2)
+        self.assertEqual(spv.count("OpConvertUToPtr %_ptr_PSB_sl_blk1"), 2)
+        # Compact loop: ONE per-dword OpLoad per width helper (1 + 1 = 2), not unrolled (4 + 16 = 20).
+        self.assertEqual(sum("OpLoad %uint" in ln and "Aligned 4" in ln for ln in spv.splitlines()), 2)
 
         # Execute with partial OOB: NUM_RECORDS = 0x18 (6 dwords: 0x00..0x14 in range, 0x18.. out of range).
         cb_bytes = 0x18
@@ -129,9 +136,13 @@ class SmemNonWritableAndOutlineTests(unittest.TestCase):
         self.assertIn("%sl_rw_blk4 = OpTypeStruct %v4uint_sl", spv)
         self.assertNotIn("OpMemberDecorate %sl_rw_blk4 0 NonWritable", spv)
         self.assertNotIn("%sl_blk4", spv)
+        self.assertIn("%sbuf_slow_rw_x4 = OpFunction ", spv)
+        self.assertNotIn("%sbuf_slow_ro_x4", spv)
+        self.assertNotIn("%sl_blk1", spv)
 
     def test_mixed_ro_and_rw_loads_in_same_shader(self):
-        # Disjoint CBV s[4:7] gets NonWritable (%sl_blk4); same-V# s[0:3] after store gets mutable (%sl_rw_blk4).
+        # Disjoint CBV s[4:7] gets NonWritable (%sl_blk4 + %sbuf_slow_ro_x4);
+        # same-V# s[0:3] after store gets mutable (%sl_rw_blk4 + %sbuf_slow_rw_x4), sharing ONE %fn_sbuf_slow_x4.
         lines = [
             "s_buffer_load_dwordx4 s[16:19], s[4:7], 0x0",
             "buffer_store_dword v0, v1, s[0:3], 0 offen",
@@ -142,11 +153,58 @@ class SmemNonWritableAndOutlineTests(unittest.TestCase):
         ]
         spv = support.translate_lines("cs_mixed_ro_rw", lines, fssm=FSSM_12)
         _validate(spv)
+        self.assertEqual(check_absent_lane_ub.check_absent_lane_ub(spv), [])
         self.assertIn("OpMemberDecorate %sl_blk4 0 NonWritable", spv)
+        self.assertIn("OpMemberDecorate %sl_blk1 0 NonWritable", spv)
         self.assertIn("%sl_rw_blk4 = OpTypeStruct %v4uint_sl", spv)
         self.assertNotIn("OpMemberDecorate %sl_rw_blk4 0 NonWritable", spv)
         self.assertIn("OpConvertUToPtr %_ptr_PSB_sl_blk4", spv)
         self.assertIn("OpConvertUToPtr %_ptr_PSB_sl_rw_blk4", spv)
+        self.assertEqual(spv.count("%sbuf_slow_ro_x4 = OpFunction "), 1)
+        self.assertEqual(spv.count("%sbuf_slow_rw_x4 = OpFunction "), 1)
+        self.assertEqual(spv.count("%fn_sbuf_slow_x4 = OpTypeFunction "), 1)
+        self.assertEqual(spv.count("OpFunctionCall %arr_sbuf_x4 %sbuf_slow_ro_x4"), 1)
+        self.assertEqual(spv.count("OpFunctionCall %arr_sbuf_x4 %sbuf_slow_rw_x4"), 1)
+        # 1 OpLoad in %sbuf_slow_ro_x4 + 1 OpLoad in %sbuf_slow_rw_x4 = 2.
+        self.assertEqual(sum("OpLoad %uint" in ln and "Aligned 4" in ln for ln in spv.splitlines()), 2)
+
+    def test_rw_slow_loop_partial_oob_and_all_oob_execution(self):
+        # Exercises %sbuf_slow_rw_x4 after a store to the same V# root s[0:3]: verifies exact partial-OOB
+        # values, store visibility, zero reads past NUM_RECORDS, and off > lim (zero reads, all zeros).
+        lines = [
+            "v_mov_b32 v0, 0x11223344",
+            "v_mov_b32 v1, 0",
+            "buffer_store_dword v0, v1, s[0:3], 0 offen",
+            "s_waitcnt vmcnt(0)",
+            "s_buffer_load_dwordx4 s[16:19], s[0:3], 0x4",
+            "s_buffer_load_dwordx4 s[20:23], s[0:3], 0x20",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32 v2, s16",
+            "v_mov_b32 v3, s17",
+            "v_mov_b32 v4, s18",
+            "v_mov_b32 v5, s19",
+            "v_mov_b32 v6, s20",
+            "buffer_store_dword v2, v1, s[4:7], 0 offen offset:0",
+            "buffer_store_dword v3, v1, s[4:7], 0 offen offset:4",
+            "buffer_store_dword v4, v1, s[4:7], 0 offen offset:8",
+            "buffer_store_dword v5, v1, s[4:7], 0 offen offset:12",
+            "buffer_store_dword v6, v1, s[4:7], 0 offen offset:16",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_rw_slow_exec", lines, fssm=FSSM_12)
+        _validate(spv)
+        self.assertEqual(spv.count("%sbuf_slow_rw_x4 = OpFunction "), 1)
+        self.assertNotIn("%sbuf_slow_ro_x4", spv)
+        # NUM_RECORDS = 15 (0x0f): at offset 0x4, dword 0 (4..7) and dword 1 (8..11) fit; dword 2 (12..15) is OOB!
+        # At offset 0x20, off > lim -> 0 dwords fit, zero reads.
+        mem = tv.ReadLog({CB + 4 * i: 0xD0000000 | (4 * i) for i in range(16)})
+        support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                             push_constants=[CB, 0, 15, OUT_V, OUT, 0, 0x100, OUT_V] + [0] * 24,
+                             memory=mem)
+        self.assertEqual([dict.get(mem, OUT + 4 * i) for i in range(5)],
+                         [0xD0000004, 0xD0000008, 0, 0, 0])
+        cb_reads = sorted({a for a in mem.reads if CB <= a < CB + 0x40})
+        self.assertEqual(cb_reads, [CB + 4, CB + 8])
 
     def test_descriptor_heap_load_stays_nonwritable_with_global_store(self):
         # 32-bit descriptor-table pointer in user SGPR s8 with hi=0 whose loaded dwords are consumed solely
@@ -264,6 +322,23 @@ class SmemNonWritableAndOutlineTests(unittest.TestCase):
         ]
         ro = rdna2spirv.analyse_scalar_load_ro([insns], [[]], user_limit=12)
         self.assertEqual(ro, frozenset())
+
+    def test_unanalysed_scalar_load_ro_none_strips_sl_blk1_nonwritable(self):
+        # When Gen() is assembled directly with scalar_load_ro=None alongside a PSB write,
+        # scalar_loads_read_only() must strip NonWritable from %sl_blk1 as well as %sl_blk2/%sl_blk4.
+        g = rdna2spirv.Gen("ps")
+        self.assertIsNone(g.scalar_load_ro)
+        for line in (
+            "buffer_store_dword v0, v1, s[0:3], 0 offen",
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+        ):
+            ins = parse_line(line)
+            g.insn(ins)
+        spv = rdna2spirv.assemble(g)
+        _validate(spv)
+        self.assertIn("%sl_blk1 = OpTypeStruct %uint", spv)
+        self.assertNotIn("OpMemberDecorate %sl_blk1 0 NonWritable", spv)
+        self.assertNotIn("OpMemberDecorate %sl_blk4 0 NonWritable", spv)
 
 
 if __name__ == "__main__":
