@@ -39,6 +39,7 @@ on:
       - "tools/gen_d3d12_stubs.py"
       - "tools/gfx10_formats.json"
       - "tools/lane_masks.py"
+      - "tools/lod_bias_probe.py"
       - "tools/mc_command.py"
       - "tools/mesh_compute_vs.py"
       - "tools/native_pso_hashes.py"
@@ -59,6 +60,7 @@ on:
       - "tools/spirv_loop_guard.py"
       - "tools/spirv_opt.py"
       - "tools/spirv_stubs.py"
+      - "tools/vk_lod_bias.py"
       - "tools/vk_subgroup_info.py"
       - "tools/wave64_emulate_opt.py"
       - "tools/wave64_halves.py"
@@ -91,6 +93,7 @@ on:
       - "tools/gen_d3d12_stubs.py"
       - "tools/gfx10_formats.json"
       - "tools/lane_masks.py"
+      - "tools/lod_bias_probe.py"
       - "tools/mc_command.py"
       - "tools/mesh_compute_vs.py"
       - "tools/native_pso_hashes.py"
@@ -111,6 +114,7 @@ on:
       - "tools/spirv_loop_guard.py"
       - "tools/spirv_opt.py"
       - "tools/spirv_stubs.py"
+      - "tools/vk_lod_bias.py"
       - "tools/vk_subgroup_info.py"
       - "tools/wave64_emulate_opt.py"
       - "tools/wave64_halves.py"
@@ -596,9 +600,9 @@ jobs:
         if: ${{ !cancelled() && steps.macos-build.outcome == 'success' }}  # also after a runtime test failure
         shell: bash
         env:
-          # ps_ssharp: #1845 (the S#'s LOD bias, which a Metal sampler can't take).
-          EXPECTED_FAILURES: >-
-            ps_ssharp
+          # Nothing expected to fail: ps_ssharp (#1845) passes since --explicit-lod-bias, and main
+          # dropped cs_fma_fused.
+          EXPECTED_FAILURES: ""
         run: |
           set +e
           python3 -I scripts/run_gpu_tests.py --build runtime/build --llvm-mc "$LLVM_MC" --work "$RUNNER_TEMP/gpu" 2>&1 |

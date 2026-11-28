@@ -261,8 +261,10 @@ def device_rank(device_type: int, vendor_id: int) -> int:
     return (0 if vendor_id == MICROSOFT_VENDOR_ID else 10) + type_rank
 
 
-def query(*, stage_caps=False) -> dict:
-    """The answer for the device the runtime would pick; raises RuntimeError with the reason when there is none."""
+def query(*, stage_caps=False, lod_bias=False) -> dict:
+    """The answer for the device the runtime would pick; raises RuntimeError with the reason when there is none.
+    lod_bias adds "explicit_lod_bias" (and its reason), which tools/vk_lod_bias.py measures on that device with one
+    small compute dispatch: True where the sampler drops mipLodBias, False where it applies it, None when unknown."""
     if sys.maxsize <= 2**32:
         # the struct sizes below are the 64-bit ones, and 32-bit Windows Vulkan is stdcall, not CDLL's cdecl
         raise RuntimeError("needs a 64-bit Python")
@@ -413,14 +415,25 @@ def query(*, stage_caps=False) -> dict:
             result.update(supported_subgroup_stages=supported_stages,
                           required_subgroup_size_stages=required_stages,
                           max_compute_workgroup_subgroups=max_workgroup_subgroups)
+        if lod_bias:
+            try:
+                here = os.path.dirname(os.path.abspath(__file__))
+                if here not in sys.path:   # python -I leaves the script's folder off sys.path
+                    sys.path.insert(0, here)
+                import vk_lod_bias  # noqa: E402
+                answer, reason = vk_lod_bias.measure(
+                    vk, chosen_d, device_extensions(vk, chosen_d) if chosen_extensions is None else chosen_extensions)
+            except Exception as e:   # a measurement that can't run is "unknown", never a guess
+                answer, reason = None, f"{type(e).__name__}: {e}"
+            result.update(explicit_lod_bias=answer, explicit_lod_bias_reason=reason)
         return result
     finally:
         vk.vkDestroyInstance(inst, None)
 
 
-def main(*, stage_caps=False) -> int:
+def main(*, stage_caps=False, lod_bias=False) -> int:
     try:
-        print(json.dumps(query(stage_caps=stage_caps)))
+        print(json.dumps(query(stage_caps=stage_caps, lod_bias=lod_bias)))
         return 0
     except Exception as e:      # any failure means "unknown": the caller falls back to emulation
         print(json.dumps({"error": f"{type(e).__name__}: {e}"}))
@@ -434,4 +447,7 @@ if __name__ == "__main__":
         pass
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--stage-caps", action="store_true", help="include raw subgroup stage masks and limits")
-    sys.exit(main(stage_caps=parser.parse_args().stage_caps))
+    parser.add_argument("--lod-bias", action="store_true",
+                        help="measure whether the sampler applies mipLodBias (one compute dispatch; explicit_lod_bias)")
+    args = parser.parse_args()
+    sys.exit(main(stage_caps=args.stage_caps, lod_bias=args.lod_bias))

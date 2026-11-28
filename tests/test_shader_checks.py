@@ -38,8 +38,9 @@ TOTAL = (len(check.COMPUTE) + 8 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 20)  # three mesh fixtures, ps_tex, ps_imgatomic, ps_table_fetch, six compute fixtures,
-         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case), cs_fmt_all,
+         + len(check.TEXTURE_CONSTANTS) + len(check.SAMPLER_FIXTURES)
+         + 19)  # three mesh fixtures, ps_tex, ps_imgatomic, ps_table_fetch, six compute fixtures,
+         # vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case), cs_fmt_all,
          # cs_w32_shift64, cs_w32_cmp_f64, cs_w32_round_f64 and cs_w32_frexp_ldexp
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
@@ -1070,7 +1071,7 @@ class SamplerMipChecks(unittest.TestCase):
 
     def test_levels_follow_the_s_and_t_fields(self):
         want = {"point": (0, 1), "point max_lod 0": (0, 0), "point min_lod 1": (1, 1), "point bias +1": (1, 1),
-                "point bias -1": (0, 0), "none": (0, 0), "none min_lod 1": (0, 0), "point base 1": (1, 1)}
+                "point bias -1": (0, 0), "point bias +0.3": (0, 1), "point bias -0.3": (0, 1), "none": (0, 0), "none min_lod 1": (0, 0), "point base 1": (1, 1)}
         self.assertEqual({name for name, _, _ in check.SAMPLER_CASES}, set(want))
         for name, words, view in check.SAMPLER_CASES:
             with self.subTest(name=name):

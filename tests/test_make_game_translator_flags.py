@@ -198,7 +198,7 @@ class MainWiringTest(unittest.TestCase):
     """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
     def run_main(self, *extra_argv, per_vertex=None, barycentric_fallback=None, max_push_constants=None,
-                 mesh_crash=False):
+                 mesh_crash=False, drops_lod_bias=False):
         # An empty --out: main() reads the flags an existing translation was made with, and the default folder
         # is the user's own.
         out = tempfile.TemporaryDirectory()
@@ -211,6 +211,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=barycentric_fallback), \
+                mock.patch("make_game.runtime_gpu_explicit_lod_bias", return_value=drops_lod_bias), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.runtime_gpu_mesh_draws_crash", return_value=mesh_crash), \
                 mock.patch("make_game.preflight") as preflight, \
@@ -228,6 +229,12 @@ class MainWiringTest(unittest.TestCase):
         pre, sh = self.run_main()
         self.assertEqual(pre, ())
         self.assertEqual(sh, ())
+
+    def test_explicit_lod_bias_follows_the_moltenvk_probe(self):
+        """MoltenVK drops the sampler's mipLodBias: the shaders take the S# bias themselves there, nowhere else."""
+        self.assertEqual(self.run_main(drops_lod_bias=True), (("--explicit-lod-bias",),) * 2)
+        self.assertEqual(self.run_main(drops_lod_bias=False), ((), ()))
+        self.assertEqual(self.run_main("--explicit-lod-bias", drops_lod_bias=False), (("--explicit-lod-bias",),) * 2)
 
     def test_mesh_serial_waves_is_opt_in_and_forwarded(self):
         # #2435's translator switch: nothing passes it unless asked, and asking forwards it like the other flags.
@@ -362,6 +369,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=None), \
+                mock.patch("make_game.runtime_gpu_explicit_lod_bias", return_value=False), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.runtime_gpu_mesh_draws_crash", return_value=mesh_crash), \
                 mock.patch("make_game.preflight"), \

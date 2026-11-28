@@ -92,6 +92,14 @@ FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from si
 # maintenance8 outside gather. Implicit-LOD samples become Grad samples with the derivatives of the original
 # coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
 TEXEL_OFFSET_FALLBACK = False
+# --explicit-lod-bias: MoltenVK 1.4.2 on an Apple M3 drops VkSamplerCreateInfo::mipLodBias (ps_ssharp: neither
+# image_sample_lz with a +1 S# LOD_BIAS nor the derivative-LOD image_sample with -1 moves a level); on an Apple M5 Pro
+# the same MoltenVK applies it, so tools/lod_bias_probe.py measures it per device. With this flag the shader applies the
+# S#'s signed 5.8 LOD_BIAS (word 2 [13:0]) itself: added to the Lod of explicit-LOD samples and to the bias of
+# _b / _c_b, as a Bias operand on implicit samples, and as a 2^bias scale of Grad derivatives (lambda = log2 of
+# their length). The sampler still clamps the result to MIN_LOD..MAX_LOD. Only for a driver that drops the
+# sampler's bias: elsewhere it would count twice.
+EXPLICIT_LOD_BIAS = False
 FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPreserve, for drivers without the property
 # --mesh-compute: mesh shaders become compute shaders (same workgroup size and code) for devices without
 # VK_EXT_mesh_shader. Instead of SetMeshOutputs and the mesh outputs, the epilogue writes the vertex and primitive
@@ -13513,6 +13521,47 @@ class Gen:
         self.emit(f"{one} = OpLogicalOr %bool {white} {black}")
         return one
 
+    def ssharp_lod_bias(self, word_reg: int):
+        """--explicit-lod-bias: the S#'s LOD_BIAS (word 2 [13:0], signed 5.8 fixed point, -32..31 in steps of 1/256)
+        as a float id, or None when a literal S# has a zero bias."""
+        literal = self.sgpr_imm.get(word_reg)
+        if literal is not None:
+            bias = ((literal & 0x3fff) ^ 0x2000) - 0x2000
+            return self.fconst(bias / 256.0) if bias else None
+        word = self.load_reg("sgpr", word_reg)
+        raw, signed, value, scaled = (self.tmp() for _ in range(4))
+        self.emit(f"{raw} = OpBitFieldSExtract %uint {word} {self.cu(0)} {self.cu(14)}")
+        self.emit(f"{signed} = OpBitcast %int {raw}")
+        self.emit(f"{value} = OpConvertSToF %float {signed}")
+        self.emit(f"{scaled} = OpFMul %float {value} {self.fconst(1.0 / 256.0)}")
+        return scaled
+
+    def add_ssharp_lod_bias(self, lod: str, word_reg: int) -> str:
+        """--explicit-lod-bias: lod + the S#'s LOD_BIAS."""
+        b = self.ssharp_lod_bias(word_reg)
+        if b is None:
+            return lod
+        out = self.tmp()
+        self.emit(f"{out} = OpFAdd %float {lod} {b}")
+        return out
+
+    def scale_grads_by_ssharp_bias(self, grads, width: int, word_reg: int):
+        """--explicit-lod-bias: (dx, dy) * 2^LOD_BIAS, which adds the bias to the LOD the derivatives give."""
+        b = self.ssharp_lod_bias(word_reg)
+        if b is None:
+            return grads
+        k = self.tmp()
+        self.emit(f"{k} = OpExtInst %float %glsl Exp2 {b}")
+        out = []
+        for g in grads:
+            t = self.tmp()
+            if width == 1:
+                self.emit(f"{t} = OpFMul %float {g} {k}")
+            else:
+                self.emit(f"{t} = OpVectorTimesScalar %v{width}float {g} {k}")
+            out.append(t)
+        return tuple(out)
+
     def clamp_gather_lod(self, lod: str, word_reg: int) -> str:
         """Clamp to S# word 1's unsigned 4.8 MIN_LOD and MAX_LOD before choosing the fetch mip.
 
@@ -14407,6 +14456,8 @@ class Gen:
             bias = None
             if kind in ("_b", "_c_b"):
                 bias, f = f[0], f[1:]
+                if EXPLICIT_LOD_BIAS:
+                    bias = self.add_ssharp_lod_bias(bias, a[3]["r"] + 2)
             ref = None
             if kind.startswith("_c"):
                 ref, f = f[0], f[1:]
@@ -14422,6 +14473,8 @@ class Gen:
                     self.emit(f"{gx} = OpCompositeConstruct %v{grad_width}float {' '.join(f[:grad_width])}")
                     self.emit(f"{gy} = OpCompositeConstruct %v{grad_width}float {' '.join(f[grad_width:2 * grad_width])}")
                     grads = (gx, gy)
+                if EXPLICIT_LOD_BIAS:
+                    grads = self.scale_grads_by_ssharp_bias(grads, grad_width, a[3]["r"] + 2)
                 f = f[2 * grad_width:]
             if clamp:
                 # The clamp is the component right after the coordinates. Under a16 an f16 pad may follow it, so
@@ -14443,6 +14496,8 @@ class Gen:
                 uv = self.tmp()
                 self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
             lod = f[ncoord] if kind == "_l" and len(f) > ncoord else "%f0"
+            if EXPLICIT_LOD_BIAS and kind in ("_lz", "_l"):
+                lod = self.add_ssharp_lod_bias(lod, a[3]["r"] + 2)
             if typed_sample:
                 # The aliases image_read_typed declares are indexed by the dimension it reads: a cube samples its
                 # 6-layer 2D-array view, which is what `img` was loaded from above.
@@ -14453,6 +14508,8 @@ class Gen:
                     dx, dy = self.tmp(), self.tmp()
                     self.emit(f"{dx} = OpDPdx %v2float {uv}")
                     self.emit(f"{dy} = OpDPdy %v2float {uv}")
+                    if EXPLICIT_LOD_BIAS:
+                        dx, dy = self.scale_grads_by_ssharp_bias((dx, dy), 2, a[3]["r"] + 2)
                     operands = f"Grad {dx} {dy}"
 
                 def sample(image, cls, ty):
@@ -14473,19 +14530,31 @@ class Gen:
             # PS) the base LOD is 0 (or bias for _b / _c_b) and the clamp raises it, so the explicit LOD is
             # max(base, clamp) and no MinLod operand.
             lod_zero = "%f0"
+            if EXPLICIT_LOD_BIAS and not implicit and kind in ("", "_c_lz", "_c"):
+                # Outside the PS these forms are explicit-LOD samples at lod_zero (_b / _c_b carry it in their bias).
+                # The bias goes in before the _cl clamp below: Vulkan clamps the biased LOD, max(bias, minlod).
+                lod_zero = self.add_ssharp_lod_bias(lod_zero, a[3]["r"] + 2)
             if minlod is not None and not implicit and kind not in ("_d", "_b", "_c_b"):
+                base = lod_zero
                 lod_zero = self.tmp()
-                self.emit(f"{lod_zero} = OpExtInst %float %glsl FMax %f0 {minlod}")
+                self.emit(f"{lod_zero} = OpExtInst %float %glsl FMax {base} {minlod}")
             bias_lod = bias
             if kind in ("_b", "_c_b") and not implicit and minlod is not None:
                 bias_lod = self.tmp()
                 self.emit(f"{bias_lod} = OpExtInst %float %glsl FMax {bias} {minlod}")
+            # Implicit samples without a bias of their own take the S# bias as a Bias operand.
+            sbias = (self.ssharp_lod_bias(a[3]["r"] + 2)
+                     if EXPLICIT_LOD_BIAS and implicit and kind in ("", "_c") else None)
             grads_fb = None
             if off is not None and TEXEL_OFFSET_FALLBACK:
                 fb_lod = bias_lod if (not implicit and kind in ("_b", "_c_b")) else lod
                 uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit, fb_lod, bias,
                                                        a[3])
                 off = None
+                if grads_fb is not None and sbias is not None:
+                    # Grad, not Bias, carries these samples now: scale the derivatives instead.
+                    grads_fb = self.scale_grads_by_ssharp_bias(grads_fb, 3 if is3d else ncoord, a[3]["r"] + 2)
+                    sbias = None
 
             def opnd(mask, args):
                 """Image operands in SPIR-V mask order: Bias / Lod, Offset (0x10), MinLod (0x80, implicit forms)."""
@@ -14506,7 +14575,7 @@ class Gen:
                 self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad{'|MinLod' if minlod else ''} "
                           f"{grads_fb[0]} {grads_fb[1]}{' ' + minlod if minlod else ''}")
             elif kind == "":
-                self.emit(f"{res} = OpImageSampleImplicitLod %v4float {si} {uv}{opnd('', '')}" if self.stage == "ps" else
+                self.emit(f"{res} = OpImageSampleImplicitLod %v4float {si} {uv}{opnd('Bias', sbias) if sbias else opnd('', '')}" if self.stage == "ps" else
                           f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', lod_zero)}")
             elif kind in ("_lz", "_l"):
                 self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', lod)}")
@@ -14518,6 +14587,8 @@ class Gen:
                 if kind in ("_c_lz", "_c_l") or (self.stage != "ps" and kind in ("_c", "_c_b")):
                     # _c / _c_b outside the PS have no derivatives (base LOD 0, or bias / max(bias, minlod) for _c_b)
                     d_lod = f[ncoord] if kind == "_c_l" else (bias_lod if kind == "_c_b" else lod_zero)
+                    if EXPLICIT_LOD_BIAS and kind == "_c_l":
+                        d_lod = self.add_ssharp_lod_bias(d_lod, a[3]["r"] + 2)
                     self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref}{opnd('Lod', d_lod)}")
                 elif grads_fb is not None:
                     self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref} Grad{'|MinLod' if minlod else ''} "
@@ -14525,7 +14596,7 @@ class Gen:
                 elif kind == "_c_b":
                     self.emit(f"{d} = OpImageSampleDrefImplicitLod %float {si} {uv} {ref}{opnd('Bias', bias)}")
                 else:
-                    self.emit(f"{d} = OpImageSampleDrefImplicitLod %float {si} {uv} {ref}{opnd('', '')}")
+                    self.emit(f"{d} = OpImageSampleDrefImplicitLod %float {si} {uv} {ref}{opnd('Bias', sbias) if sbias else opnd('', '')}")
                 if d16:
                     # d16: the compare result is an f16 in the low half, as in the other d16 paths below. Until
                     # 2026-11-21 it was written as f32 bits, whose low half is 0 for every result (1.0 = 0x3f800000).
@@ -20553,6 +20624,9 @@ def main():
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="image_sample*_o without VK_KHR_maintenance8 (e.g. NVIDIA Pascal): fold the texel offset into "
                          "the coordinate instead of the Offset operand")
+    ap.add_argument("--explicit-lod-bias", action="store_true",
+                    help="apply the S# LOD_BIAS in the shader, for a driver whose sampler drops mipLodBias (measured by "
+                         "tools/lod_bias_probe.py); elsewhere the bias would count twice")
     ap.add_argument("--mesh-compute", action="store_true",
                     help="mesh shaders become compute shaders that write their vertices and primitives to a buffer "
                          "(metadata: mesh_compute), drawn by tools/mesh_compute_vs.py, for devices without "
@@ -20626,7 +20700,7 @@ def main():
     DESCRIPTOR_TABLE = a.descriptor_table
     LOOP_LIMIT = a.loop_limit
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
-    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
+    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, EXPLICIT_LOD_BIAS, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
     global MESH_SERIAL_WAVES
     global PC_TAIL_UBO, ADDRESS_GUARD
     PC_TAIL_UBO = a.pc_tail_ubo
@@ -20642,6 +20716,7 @@ def main():
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
+    EXPLICIT_LOD_BIAS = a.explicit_lod_bias
     MESH_COMPUTE = a.mesh_compute
     MESH_SERIAL_WAVES = a.mesh_serial_waves
     F16_HALVES = a.f16_interp_fallback

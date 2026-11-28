@@ -28,7 +28,7 @@ from build import CLIP_CASES, clip_container, shader_source
 from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test,
                    fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test, compute_unsupported)
 from compute_fixture import compute_header
-from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
+from check import SAMPLER_CASES, SAMPLER_FIXTURES, sampler_test   # ps_ssharp*: the S#/T# mip fields (vk_sampler_test)
 from check import (CS_SMEM_VCC, CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, PK_MUL_LO_ENV, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, table_fetch_test, texture_gradient_a16_test, texture_mip_test)
@@ -371,6 +371,7 @@ def f16_interp_fallback() -> bool:
 
 _PER_VERTEX = []
 _BARYCENTRIC_FALLBACK = []
+_EXPLICIT_LOD_BIAS = []
 
 
 def _device_per_vertex():
@@ -404,6 +405,33 @@ def _device_barycentric_fallback():
             pass
         _BARYCENTRIC_FALLBACK.append(answer)
     return _BARYCENTRIC_FALLBACK[0]
+
+
+def _device_explicit_lod_bias(build: str | None):
+    """tools/lod_bias_probe.py's answer for the device the tests run on (cached per suite), or None: vk_subgroup_info.py
+    --lod-bias's compute measurement, else (with the test programs) ps_ssharp drawn without the flag."""
+    if not _EXPLICIT_LOD_BIAS:
+        answer = None
+        try:
+            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "lod_bias_probe.py"),
+                                *(["--build", build] if build else [])], capture_output=True, text=True, timeout=300)
+            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("explicit_lod_bias")
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            pass
+        _EXPLICIT_LOD_BIAS.append(answer)
+    return _EXPLICIT_LOD_BIAS[0]
+
+
+def explicit_lod_bias(build: str | None) -> bool:
+    """LEONIDA_EXPLICIT_LOD_BIAS=1 (or 0): translate with --explicit-lod-bias, so samples take the S# LOD_BIAS in the
+    shader. Unset, it is on where tools/lod_bias_probe.py measures that the sampler drops mipLodBias (MoltenVK on an
+    Apple M3, not on an M5 Pro: a driver ID can't tell); a probe without an answer leaves it off."""
+    v = (os.environ.get("LEONIDA_EXPLICIT_LOD_BIAS") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return _device_explicit_lod_bias(build) is True
 
 
 def w64_emulated() -> bool:
@@ -714,7 +742,7 @@ OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "ps_m15_dual": "d3d12_t
 DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_persp_bary": "vs_persp.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
               "ps_table_fetch": "vs_ids.asm", "ps_sample_c": "vs_ids.asm", "ps_sample_c_b": "vs_ids.asm",
-              **{name: "vs_ids.asm" for name in TEXTURE_CONSTANTS}, "ps_ssharp": "vs_ids.asm", "ps_imgatomic": "vs_ids.asm",
+              **{name: "vs_ids.asm" for name in TEXTURE_CONSTANTS}, **{name: "vs_ids.asm" for name in SAMPLER_FIXTURES}, "ps_imgatomic": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
@@ -967,6 +995,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--f16-interp-fallback")
         if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
+        if explicit_lod_bias(getattr(a, "build", None)):   # the S# LOD bias in the shader, where the sampler drops it (measured)
+            cmd.append("--explicit-lod-bias")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
         if os.environ.get("LEONIDA_MESH_SERIAL_WAVES") == "1":   # with --wave64-emulate: one pass per wave
@@ -1475,9 +1505,9 @@ def run_suite(a, work: str) -> int:
                 results.append((name, None, f"SKIP ({reason})"))
             else:
                 results.append((name, rc == 0, verdict_line(rc, msg)))
-        elif name == "ps_ssharp":
+        elif name in SAMPLER_FIXTURES:
             # The S#/T# mip fields through vulkan_sampler() and the view range (check.py's SAMPLER_CASES).
-            problem = sampler_test(a.build, spirv_dir)
+            problem = sampler_test(a.build, spirv_dir, name)
             results.append((name, None if isinstance(problem, Skip) else not problem,
                             problem or f"{len(SAMPLER_CASES)} S#/T# cases, 4096 pixels each exact"))
         elif name in ("ps_texoff", "ps_texoff_implicit", "ps_texoff_forms"):
