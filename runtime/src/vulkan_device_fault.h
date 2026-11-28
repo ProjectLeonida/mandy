@@ -177,6 +177,11 @@ struct CheckpointSubmission {
     std::vector<CheckpointDispatch> dispatches;
     std::size_t dispatch_count = 0;
     static constexpr std::size_t dispatch_limit = 64;
+    // With LEONIDA_DEVICE_FAULT_ROOTS a submission keeps up to this many of its own dispatches, so a checkpoint the
+    // driver reports early in a long compute submission still finds its dispatch. Diagnostic mode only: 64 recent
+    // submissions at about 250 bytes a dispatch is at most 16 MiB.
+    static constexpr std::size_t roots_dispatch_limit = 1024;
+    std::size_t keep = dispatch_limit;  // how many of its most recent dispatches this submission keeps
     // Numbers every recorded dispatch, across queues and submissions (the report's seq). Null: no numbers.
     std::atomic<std::uint64_t>* dispatch_seq = nullptr;
     // LEONIDA_DEVICE_MARKERS=1: this queue's marker slot, every dispatch recorded for the marker history and the seq
@@ -186,8 +191,8 @@ struct CheckpointSubmission {
     std::uint64_t open_marker = 0;
 
     void append_dispatch(CheckpointDispatch d) {
-        if (dispatches.size() < dispatch_limit) dispatches.push_back(d);
-        else dispatches[dispatch_count % dispatch_limit] = d;
+        if (dispatches.size() < keep) dispatches.push_back(d);
+        else dispatches[dispatch_count % keep] = d;
         ++dispatch_count;
     }
 };
@@ -1344,6 +1349,7 @@ public:
         CheckpointSubmission submission{sequence_, call, queue, kind, lists,
                 std::vector<CheckpointList>(std::min(lists, std::size_t{CheckpointMarker::max_list} + 1))};
         submission.dispatch_seq = &dispatch_seq_;
+        if (include_roots_) submission.keep = CheckpointSubmission::roots_dispatch_limit;
         if (markers_) {
             std::lock_guard lock(mutex_);
             submission.markers = markers_->target(queue);
@@ -1353,9 +1359,13 @@ public:
 
     void publish(CheckpointSubmission&& submission) {
         std::lock_guard lock(mutex_);
-        for (std::size_t i = submission.dispatch_count - submission.dispatches.size(); i < submission.dispatch_count; ++i)
-            dispatches_[dispatch_count_++ % dispatches_.size()] = submission.dispatches[i % submission.dispatch_limit];
-        submission.dispatches.clear();
+        // The global history keeps the last 64 across submissions, so only a submission's last 64 can stay in it.
+        const std::size_t copied = std::min(submission.dispatches.size(), dispatches_.size());
+        for (std::size_t i = submission.dispatch_count - copied; i < submission.dispatch_count; ++i)
+            dispatches_[dispatch_count_++ % dispatches_.size()] = submission.dispatches[i % submission.keep];
+        // With LEONIDA_DEVICE_FAULT_ROOTS each recent submission keeps its own dispatches: a later submission can
+        // push every one of them out of the global history before the driver reports a checkpoint in it.
+        if (!include_roots_) submission.dispatches.clear();
         if (history_)
             for (const auto& d : submission.marked) history_->push(d);
         submission.marked.clear();
@@ -1480,25 +1490,34 @@ private:
         const auto n = std::min(dispatch_count_, dispatches_.size());
         for (std::size_t i = dispatch_count_ - n; i < dispatch_count_; ++i) {
             const auto& d = dispatches_[i % dispatches_.size()];
-            std::fprintf(stderr, "[rt] device-fault: submitted dispatch seq=%" PRIu64 " execute=%" PRIu64
-                         " queue=%p (%s) list=%zu command=%zu shader=%s ", d.seq, d.execute_call,
-                         static_cast<void*>(d.queue), d.queue_kind, d.list, d.command, d.shader ? d.shader : "-");
-            if (d.indirect)
-                std::fprintf(stderr, "indirect args=0x%" PRIxPTR "+0x%" PRIx64 " count=0x%" PRIxPTR
-                             "+0x%" PRIx64 " max=%u stride=%u", d.argument_buffer, d.argument_offset,
-                             d.count_buffer, d.count_offset, d.max_count, d.stride);
-            else std::fprintf(stderr, "groups=%u,%u,%u", d.groups[0], d.groups[1], d.groups[2]);
-            if (include_roots_) {
-                std::fputs(" roots=", stderr);
-                for (auto word : d.roots) std::fprintf(stderr, "%08x ", word);
-            }
-            if (d.seq && std::find(hangs.begin(), hangs.end(), d.seq) != hangs.end())
-                std::fputs(" <- likely hang (device-markers)", stderr);
-            std::fputc('\n', stderr);
+            const bool likely_hang = d.seq && std::find(hangs.begin(), hangs.end(), d.seq) != hangs.end();
+            std::fprintf(stderr, "[rt] device-fault: submitted dispatch seq=%" PRIu64, d.seq);
+            print_dispatch(d, likely_hang);
         }
     }
 
+    // The rest of a dispatch line: where it was submitted, its shader, its groups or indirect arguments, and with
+    // LEONIDA_DEVICE_FAULT_ROOTS its 32 root words.
+    void print_dispatch(const CheckpointDispatch& d, bool likely_hang = false) const {
+        std::fprintf(stderr, " execute=%" PRIu64 " queue=%p (%s) list=%zu command=%zu shader=%s ", d.execute_call,
+                     static_cast<void*>(d.queue), d.queue_kind, d.list, d.command, d.shader ? d.shader : "-");
+        if (d.indirect)
+            std::fprintf(stderr, "indirect args=0x%" PRIxPTR "+0x%" PRIx64 " count=0x%" PRIxPTR
+                         "+0x%" PRIx64 " max=%u stride=%u", d.argument_buffer, d.argument_offset,
+                         d.count_buffer, d.count_offset, d.max_count, d.stride);
+        else std::fprintf(stderr, "groups=%u,%u,%u", d.groups[0], d.groups[1], d.groups[2]);
+        if (include_roots_) {
+            std::fputs(" roots=", stderr);
+            for (auto word : d.roots) std::fprintf(stderr, "%08x ", word);
+        }
+        if (likely_hang) std::fputs(" <- likely hang (device-markers)", stderr);
+        std::fputc('\n', stderr);
+    }
+
 public:
+    // Checkpoints whose dispatch the report found in its submission's history (LEONIDA_DEVICE_FAULT_ROOTS); tests.
+    std::size_t checkpoint_dispatches_found() const { return checkpoint_dispatches_found_; }
+
     // LOCAL DIAGNOSTIC: run once after a loss is reported (the compute input probe rechecks the descriptors it saw).
     void set_lost_hook(std::function<void()> hook) {
         std::lock_guard lock(mutex_);
@@ -1621,6 +1640,22 @@ private:
                              pipeline.shaders[1] ? pipeline.shaders[1] : "-",
                              pipeline.shaders[2] ? pipeline.shaders[2] : "-");
             }
+            // The dispatch at the checkpoint, from the submission's own history (LEONIDA_DEVICE_FAULT_ROOTS).
+            if (include_roots_ && marker.kind == CheckpointKind::dispatch) {
+                bool found = false;
+                for (const auto& dispatch : entry.dispatches) {
+                    if (dispatch.list != marker.list || dispatch.command != marker.command) continue;
+                    std::fputs("[rt] device-fault: checkpoint dispatch", stderr);
+                    print_dispatch(dispatch);
+                    found = true;
+                }
+                if (found) ++checkpoint_dispatches_found_;
+                else if (entry.dispatch_count > entry.dispatches.size())
+                    std::fprintf(stderr, "[rt] device-fault: checkpoint dispatch not in its submission's history (it "
+                                 "recorded %zu dispatches and keeps the last %zu)\n", entry.dispatch_count,
+                                 entry.dispatches.size());
+                else std::fputs("[rt] device-fault: checkpoint dispatch not in its submission's history\n", stderr);
+            }
         }
         // LOCAL DIAGNOSTIC (post-load GPU faults): the work in flight is between the bottom-of-pipe checkpoint (last
         // command finished) and the top-of-pipe one (last command started) of the same list. Every pipeline bound in
@@ -1674,6 +1709,7 @@ private:
     std::uint64_t stalled_ticket_ = 0;
     std::atomic<bool> reported_{false};
     std::atomic<std::uint64_t> execute_calls_{0};
+    mutable std::size_t checkpoint_dispatches_found_ = 0;
     std::uint32_t sequence_ = 0;
     // Held while a report reads the counters of the semaphores in the ring, and by forget before one is destroyed.
     // Before mutex_; the submit path never takes it.

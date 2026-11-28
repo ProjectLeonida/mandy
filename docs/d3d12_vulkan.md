@@ -4920,7 +4920,12 @@ in that list when available. A checkpoint shows progress at a reported pipeline 
 the faulting work. The loss report also lists the last 64 compute dispatches submitted across queues, including
 direct group dimensions or indirect argument-buffer locations, even without driver checkpoints. These entries show
 submission order. Set `LEONIDA_DEVICE_FAULT_ROOTS=1` to include each dispatch's 32 recorded root words in the local
-diagnostic log. While this mode is enabled, a host thread samples the submission timelines once a second. If the
+diagnostic log. In this mode each of the 64 recent submissions also keeps its own dispatches. A dispatch checkpoint the driver
+reports is then followed by `checkpoint dispatch` with that exact dispatch: groups or indirect arguments, and the
+root words. This works even when later submissions have pushed it out of the global history of 64, which is what a
+busy compute queue does by the time a loss is reported. Each submission keeps up to its last 1,024 dispatches, so
+a checkpoint early in a long compute submission is found as well; past that, the report says how many dispatches the
+submission recorded and how many it kept. At about 250 bytes a dispatch this is at most 16 MiB, in this mode only. While this mode is enabled, a host thread samples the submission timelines once a second. If the
 retired ticket stays behind submitted work for 15 seconds, it prints the CPU dispatch history. It also reports
 when it cannot sample the submission lock for that long. A progress warning leaves D3D12 fence values and the
 device state intact. The driver checkpoint and fault-info queries run after Vulkan reports device loss. This mode

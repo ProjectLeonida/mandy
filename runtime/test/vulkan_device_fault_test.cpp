@@ -123,13 +123,29 @@ int main() {
     for (unsigned i = 0; i < 70; ++i)
         cpu.dispatch(VK_NULL_HANDLE, i, VK_NULL_HANDLE, 4, roots, {i, 2, 3});
     cpu.dispatch(VK_NULL_HANDLE, 70, VK_NULL_HANDLE, 4, roots, {}, true, 17, 32, 19, 64, 4, 12);
-    const auto& oldest = submission.dispatches[submission.dispatch_count % submission.dispatch_limit];
-    const auto& latest = submission.dispatches[(submission.dispatch_count - 1) % submission.dispatch_limit];
-    if (submission.dispatches.size() != 64 || oldest.command != 7 || oldest.groups[0] != 7 ||
+    // The driver will report the checkpoint at an early dispatch (list 1, command 3): one of the 71 that the last 64
+    // no longer hold, as in a long compute submission whose loss is reported well after its start.
+    last_marker = reinterpret_cast<void*>(CheckpointMarker::encode(submission.sequence, 1, 3, CheckpointKind::dispatch));
+    const char* roots_env = std::getenv("LEONIDA_DEVICE_FAULT_ROOTS");
+    const bool roots_on = roots_env && !std::strcmp(roots_env, "1");
+    // Without LEONIDA_DEVICE_FAULT_ROOTS a submission keeps its last 64; with it, up to roots_dispatch_limit.
+    const std::size_t kept = roots_on ? 71 : 64, first_kept = 71 - kept;
+    if (submission.keep != (roots_on ? CheckpointSubmission::roots_dispatch_limit : CheckpointSubmission::dispatch_limit))
+        return 11;
+    const auto& oldest = submission.dispatches[(submission.dispatch_count - kept) % submission.keep];
+    const auto& latest = submission.dispatches[(submission.dispatch_count - 1) % submission.keep];
+    if (submission.dispatches.size() != kept || oldest.command != first_kept || oldest.groups[0] != first_kept ||
         oldest.roots[5] != 42 || std::strcmp(oldest.shader, "test_shader") ||
         latest.list != 1 || !latest.indirect || latest.argument_buffer != 17 || latest.count_offset != 64 ||
         latest.stride != 12 || latest.queue != queue) return 7;
     diagnostics.publish(std::move(submission));
+    // A later submission can push every dispatch of that one out of the global history before the driver reports
+    // the checkpoint in it; with LEONIDA_DEVICE_FAULT_ROOTS the report still finds it in the submission's own.
+    auto later = diagnostics.begin_submission(diagnostics.next_execute_call(), queue, "direct", 1);
+    const CheckpointRecorder later_cpu{nullptr, later, diagnostics.pipeline_names, 0};
+    for (unsigned i = 0; i < 64; ++i)
+        later_cpu.dispatch(VK_NULL_HANDLE, i, VK_NULL_HANDLE, 4, {}, {i, 1, 1});
+    diagnostics.publish(std::move(later));
     // A stopped timeline emits the CPU history once. Idle time and new completions reset the clock.
     using Watch = SubmissionProgressWatch;
     using namespace std::chrono_literals;
@@ -150,4 +166,5 @@ int main() {
         DeviceFaultDiagnostics::observe(&diagnostics, VK_ERROR_DEVICE_LOST, "test repeat") != VK_ERROR_DEVICE_LOST ||
         fault_queries != 2 || !fault_data_written || checkpoint_queries != 2)
         return 6;
+    if (diagnostics.checkpoint_dispatches_found() != (roots_on ? 1u : 0u)) return 10;
 }
