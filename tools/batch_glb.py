@@ -123,19 +123,30 @@ def _load_png_bytes(tex_path: str, max_size: int = 0) -> tuple[bytes | None, str
     return None, "not a .png or .dds"
 
 
+class _TextureEntry:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.result: tuple[bytes | None, str] | None = None
+
+
 class TextureCache:
     """Thread-safe (bytes, reason) per texture path, so the batch decodes a broken DDS once even when two
     worker threads reach the same file at the same time (the pool runs one model per thread)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._entries: dict[str, tuple[bytes | None, str]] = {}
+        self._entries: dict[tuple[str, int], _TextureEntry] = {}
 
     def get_or_load(self, path: str, max_size: int = 0) -> tuple[bytes | None, str]:
+        key = (path, max_size)
         with self._lock:
-            if path not in self._entries:
-                self._entries[path] = _load_png_bytes(path, max_size=max_size)
-            return self._entries[path]
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = self._entries[key] = _TextureEntry()
+        with entry.lock:
+            if entry.result is None:
+                entry.result = _load_png_bytes(path, max_size=max_size)
+            return entry.result
 
 
 def convert_single(

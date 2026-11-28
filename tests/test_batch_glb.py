@@ -363,6 +363,35 @@ class TestBatchGlb(unittest.TestCase):
             with open(os.path.join(out_dir, "car_body.glb"), "rb") as f:
                 self.assertNotIn(b"image/png", f.read())     # no texture, and it says so
 
+    def test_distinct_texture_decodes_can_overlap(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest import mock
+
+        cache = batch_glb.TextureCache()
+        rendezvous = threading.Barrier(2, timeout=5)
+
+        def load(path, max_size):
+            rendezvous.wait()
+            return path.encode(), ""
+
+        with mock.patch.object(batch_glb, "_load_png_bytes", side_effect=load):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                self.assertEqual(list(pool.map(cache.get_or_load, ["a.dds", "b.dds"])),
+                                 [(b"a.dds", ""), (b"b.dds", "")])
+
+    def test_cached_decode_uses_the_requested_size_and_retries_exceptions(self) -> None:
+        from unittest import mock
+
+        cache = batch_glb.TextureCache()
+        with mock.patch.object(batch_glb, "_load_png_bytes",
+                               side_effect=[RuntimeError("interrupted"), (b"full", ""), (b"small", "")]) as load:
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                cache.get_or_load("a.dds")
+            self.assertEqual(cache.get_or_load("a.dds"), (b"full", ""))
+            self.assertEqual(cache.get_or_load("a.dds", 64), (b"small", ""))
+            self.assertEqual(cache.get_or_load("a.dds"), (b"full", ""))
+            self.assertEqual(load.call_count, 3)
+
     def test_broken_dds_shared_by_two_models_is_decoded_once_across_workers(self) -> None:
         with tempfile.TemporaryDirectory() as in_dir, \
              tempfile.TemporaryDirectory() as out_dir, \
