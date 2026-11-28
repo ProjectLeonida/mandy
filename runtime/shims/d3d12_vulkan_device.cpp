@@ -7527,7 +7527,7 @@ struct DeviceState {
                 cache = fallback.get();
             }
             cache->reset();
-            cache->signed_vsharp = dev.signed_vsharp_offsets();
+            cache->signed_vsharp = signed_vsharp_offsets();
             cache->has_mirror = dev.page_mirror.mirror != nullptr;
             cache->has_geometry = dev.geometry.cap() != 0;
             cache->arena_size = dev.arena.size;
@@ -8456,7 +8456,8 @@ struct DeviceState {
             apply_in_place_changes(heap);
             const std::uint64_t room_gen = geometry.free_generation();
             if (!heap.deferred.empty()) {
-                FilterPageCache reach_cache = make_filter_page_cache_locked();
+                FilterCacheScope reach_scope(*this);
+                FilterPageCache& reach_cache = *reach_scope.cache;
                 jobs.reserve(heap.deferred.size());
                 for (const std::uint32_t slot : heap.deferred) {
                     heap.deferred_mark[slot] = 0;
