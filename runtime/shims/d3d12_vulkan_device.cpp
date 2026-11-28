@@ -14459,8 +14459,15 @@ void DeviceState::drain_titles_gone() {
     if (!titles_gone_pending.load(std::memory_order_acquire)) return;
     std::lock_guard lock(title_texture_mutex);
     for (const auto& [resource, address] : titles_gone) {
+        // As title_texture_gone outside the registry: LEONIDA_TEXTURE_REFRESH_ASYNC's range index and mapped list
+        // name the entry too. A texture made at the address since has a resource and keeps all three.
         const auto it = title_textures.find(address);
-        if (it != title_textures.end() && !it->second->resource) title_textures.erase(it);
+        if (it != title_textures.end() && !it->second->resource) {
+            texture_ranges.erase(address);
+            title_textures.erase(it);
+        }
+        const auto mapped = mapped_title_textures.find(address);
+        if (mapped != mapped_title_textures.end() && !mapped->second->resource) mapped_title_textures.erase(mapped);
     }
     titles_gone.clear();
     titles_gone_pending.store(false, std::memory_order_release);
@@ -16561,7 +16568,10 @@ public:
                 const auto apply = [&](const auto& ranges, bool write) {
                     for (const auto& [from, to] : ranges)
                         state_.texture_ranges.overlapping(from, to, [&](auto key) {
-                            auto& t = *state_.title_textures.at(key);
+                            // A key without an entry is skipped: an exception here would end the process.
+                            const auto it = state_.title_textures.find(key);
+                            if (it == state_.title_textures.end()) return;
+                            auto& t = *it->second;
                             invalidate(t, write, !write);
                             if (t.stale) queue_title_fill(key);
                         });
@@ -23938,6 +23948,35 @@ TitleImage test_bind_title_image(ID3D12Device* device, const std::array<std::uin
     leonida::gfx10::ImageWords w;
     std::memcpy(w.data(), words.data(), sizeof(w));
     return bind_title_image(d->state(), w, why);
+}
+
+TitleTextureRegistry title_texture_registry(ID3D12Device* device) {
+    TitleTextureRegistry registry;
+    if (!device) return registry;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return registry;
+    DeviceState& state = d->state();
+    std::lock_guard lock(state.title_texture_mutex);
+    registry.textures = state.title_textures.size();
+    registry.ranges = state.texture_ranges.size();
+    registry.mapped = state.mapped_title_textures.size();
+    return registry;
+}
+
+bool release_in_title_registry(ID3D12Device* device, ID3D12Resource* resource) {
+    if (!device || !resource) return false;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return false;
+    DeviceState& state = d->state();
+    {
+        std::lock_guard lock(state.title_texture_mutex);
+        const InTitleTextures inside;
+        resource->Release();
+    }
+    state.drain_titles_gone();
+    return true;
 }
 
 std::uint64_t resource_image_address(ID3D12Resource* resource) {

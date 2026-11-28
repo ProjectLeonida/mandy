@@ -460,6 +460,18 @@ void note_refused_tsharp_for_test(std::uint64_t heap_va, std::size_t offset,
 // or TitleImage::unknown / TitleImage::not_tsharp.
 TitleImage test_bind_title_image(ID3D12Device* device, const std::array<std::uint32_t, 8>& words,
                                  const char** why = nullptr);
+// The title texture registry of `device` (the slot-133 textures and the images made for slot-70 views): its entries,
+// the keys of the async refresh's range index and the mapped textures that refresh visits every pass. Read under the
+// registry's lock, so a refresh pass on the worker (LEONIDA_TEXTURE_REFRESH_ASYNC=1) is over when it returns. For
+// tests.
+struct TitleTextureRegistry {
+    std::uint64_t textures = 0, ranges = 0, mapped = 0;
+};
+TitleTextureRegistry title_texture_registry(ID3D12Device* device);
+// Releases the caller's reference to `resource` with the registry's lock held on this thread, as a slot-70 view that
+// overwrites the descriptor holding a texture's last reference does (title_texture_gone inside the registry), then
+// lets drain_titles_gone remove what went. False when `device` is not a Vulkan device of this module. For tests.
+bool release_in_title_registry(ID3D12Device* device, ID3D12Resource* resource);
 
 // Returns the internal image address registered for a resource in the device's image table.
 std::uint64_t resource_image_address(ID3D12Resource* resource);

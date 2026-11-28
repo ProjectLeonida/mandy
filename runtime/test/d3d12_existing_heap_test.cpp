@@ -1753,6 +1753,73 @@ int check_mapped_plane_first_use(ID3D12Device* device) {
     return 0;
 }
 
+// The refresh worker's pass after the texel writes noted so far (LEONIDA_TEXTURE_REFRESH_ASYNC=1): submissions wake the
+// worker (a busy one can miss a request) until a pass has taken the writes, and title_texture_registry, read under the
+// registry's lock, returns once that pass is over.
+int wait_async_refresh(ID3D12Device* device, GpuReader& gpu) {
+    const char* who = "async texture refresh";
+    auto& writes = leonida::title_texel_writes::state();
+    ID3D12CommandList* lists[]{gpu.list.p};
+    for (int i = 0; i < 2000 && writes.pending.load(std::memory_order_acquire); ++i) {
+        gpu.queue->ExecuteCommandLists(1, lists);
+        EXPECT_HR(gpu.queue->Signal(gpu.fence.p, ++gpu.fence_value), S_OK);
+        EXPECT_HR(gpu.fence->SetEventOnCompletion(gpu.fence_value, gpu.done), S_OK);
+        EXPECT(WaitForSingleObject(gpu.done, 30000) == WAIT_OBJECT_0);
+        Sleep(1);
+    }
+    EXPECT(!writes.pending.load(std::memory_order_acquire));
+    rt::d3d12::title_texture_registry(device);
+    return 0;
+}
+
+// LEONIDA_TEXTURE_REFRESH_ASYNC=1 (the d3d12_mapped_plane_async test): a mapped slot-133 texture destroyed while its
+// thread held the registry's lock (a slot-70 view overwrote the descriptor that held its last reference) leaves
+// nothing in the async refresh's range index or mapped list once drain_titles_gone removes its entry. A key left in
+// the index made the next pass that saw a write over the texture's memory look the gone entry up with
+// title_textures.at(), and the std::out_of_range ended the process on the refresh worker
+// (RT-TITLE-TEXTURE-GONE-RANGES).
+int check_mapped_plane_gone_in_registry(ID3D12Device* device) {
+    const char* who = "mapped slot-133 plane destroyed inside the registry";
+    constexpr UINT width = 256, height = 8, size = width * height;
+    void* pages = VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    EXPECT(pages);
+    std::memset(pages, 29, size);
+    GpuReader gpu;
+    EXPECT(!gpu.init(device, size));
+    const auto before = rt::d3d12::title_texture_registry(device);
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.SampleDesc.Count = desc.DepthOrArraySize = desc.MipLevels = 1;
+    leonida::title_xg_layouts::note({UINT(desc.Dimension), UINT(desc.Format), height, 1, 1, width}, 1);
+    ID3D12Resource* texture = nullptr;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&texture)), S_OK);
+    void* mapped = nullptr;
+    EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    EXPECT(mapped == pages);
+    const auto registered = rt::d3d12::title_texture_registry(device);
+    EXPECT(registered.textures == before.textures + 1 && registered.ranges == before.ranges + 1 &&
+           registered.mapped == before.mapped + 1);
+    // One pass first: the worker's first pass looks at every texture, a later one only at those a write overlaps.
+    leonida::title_texel_writes::note(pages, size);
+    EXPECT(!wait_async_refresh(device, gpu));
+    EXPECT(rt::d3d12::release_in_title_registry(device, texture));
+    // The title writes those pages again, and submits.
+    std::memset(pages, 41, size);
+    leonida::title_texel_writes::note(pages, size);
+    EXPECT(!wait_async_refresh(device, gpu));
+    const auto after = rt::d3d12::title_texture_registry(device);
+    std::printf("%s: %llu textures, %llu range keys, %llu mapped after it went (%llu, %llu, %llu before it)\n", who,
+                static_cast<unsigned long long>(after.textures), static_cast<unsigned long long>(after.ranges),
+                static_cast<unsigned long long>(after.mapped), static_cast<unsigned long long>(before.textures),
+                static_cast<unsigned long long>(before.ranges), static_cast<unsigned long long>(before.mapped));
+    EXPECT(after.textures == before.textures && after.ranges == before.ranges && after.mapped == before.mapped);
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return 0;
+}
+
 // Several threads write the same watched pages while submissions keep making them read-only again. Two threads that
 // fault on one page race: the first fault reopens it, a submission can protect it again before the second fault is
 // handled, and the second write must still be retried, not refused (refused, the process ends: seen natively). After
@@ -2423,6 +2490,7 @@ int main(int argc, char** argv) {
         }
         if (async_plane) {
             int result = vk.host_image_copy ? check_mapped_plane_first_use(ours.p) : 0;
+            result += check_mapped_plane_gone_in_registry(ours.p);
             auto no_host_copy = info;  // the staged upload too
             no_host_copy.host_image_copy = false;
             Ref<ID3D12Device> staged;
