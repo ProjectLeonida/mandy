@@ -104,6 +104,22 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool che
                                              IID_PPV_ARGS(&list.p))));
     CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
     const auto execute = [&](ID3D12CommandList* commands) { queue->ExecuteCommandLists(1, &commands); };
+    // The edge draw's samples, pinned to the D3D standard 4x pattern where the device has programmable positions: a
+    // driver setting can move the default ones. Measured on an RTX 4070 SUPER (621.24) with NVIDIA's MFAA ("sample
+    // interleaving") on in the global profile: the four samples of a pixel coincide until the first Present and two
+    // other patterns alternate after each one, so no edge resolve matched WARP or the layer. Set before the clears
+    // and kept through the resolve, as depth data needs. The layer and WARP have no programmable positions.
+    const auto pin_samples = [&](ID3D12GraphicsCommandList* commands) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS2 options{};
+        Ref<ID3D12GraphicsCommandList1> positions;
+        if (!c.edge || FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &options, sizeof options)) ||
+            options.ProgrammableSamplePositionsTier == D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED ||
+            FAILED(commands->QueryInterface(IID_PPV_ARGS(&positions.p))))
+            return;
+        D3D12_SAMPLE_POSITION standard[4] = {{-2, -6}, {6, -2}, {-6, 2}, {2, 6}};  // 1/16 pixel from the centre
+        positions->SetSamplePositions(4, 1, standard);
+    };
+    pin_samples(list.p);
 
     D3D12_HEAP_PROPERTIES heap_properties{};
     heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -203,6 +219,7 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool che
         CHECK(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
         CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                                  IID_PPV_ARGS(&list1.p))));
+        pin_samples(list1.p);
     } else {
         CHECK(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list1.p))));
     }
