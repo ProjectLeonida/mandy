@@ -588,6 +588,26 @@ class CliTest(unittest.TestCase):
                     with open(source, "rb") as handle:
                         self.assertEqual(handle.read(), original)
 
+    def test_oserror_prints_plain_path_without_repr(self):
+        import errno
+        from unittest import mock
+
+        bad_path = r"C:\tmp\sub\dict.json"
+        for err_obj, expect_path in (
+            (OSError(errno.EACCES, "Permission denied", bad_path), True),
+            (OSError(errno.EACCES, "Permission denied"), False),
+        ):
+            err_buf = io.StringIO()
+            with mock.patch("builtins.open", side_effect=err_obj), \
+                    contextlib.redirect_stderr(err_buf):
+                rc = WN.main(["resolve", "--dict", bad_path])
+            self.assertEqual(rc, 1)
+            msg = err_buf.getvalue()
+            if expect_path:
+                self.assertIn(bad_path, msg)
+            self.assertIn("Permission denied", msg)
+            self.assertNotIn("\\\\", msg)
+
 
 if __name__ == "__main__":
     unittest.main()

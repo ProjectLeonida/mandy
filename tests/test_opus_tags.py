@@ -481,6 +481,28 @@ class TestFolder(unittest.TestCase):
         self.assertEqual(result.stdout, baseline.stdout)
         self.assertEqual([path.read_bytes() for path in streams], expected)
 
+    def test_oserror_prints_plain_path_without_repr(self):
+        import contextlib
+        import errno
+        import io
+        from unittest import mock
+
+        sys.path.insert(0, os.path.dirname(TOOL))
+        import opus_tags as opus_tags_mod
+
+        bad_path = r"C:\tmp\sub\names.csv"
+        for target in ("load_names", "tag_folder"):
+            err_buf = io.StringIO()
+            with mock.patch.object(opus_tags_mod, "load_names", return_value=({}, set())), \
+                    mock.patch.object(opus_tags_mod, target, side_effect=OSError(errno.EACCES, "Permission denied", bad_path)), \
+                    contextlib.redirect_stderr(err_buf):
+                rc = opus_tags_mod.main([self.opus, "--names", self.names])
+            self.assertEqual(rc, 2)
+            msg = err_buf.getvalue()
+            self.assertIn(bad_path, msg)
+            self.assertIn("Permission denied", msg)
+            self.assertNotIn("\\\\", msg)
+
 
 if __name__ == "__main__":
     unittest.main()

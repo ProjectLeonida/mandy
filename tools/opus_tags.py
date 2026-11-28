@@ -270,12 +270,16 @@ def main(argv=None) -> int:
         names, ambiguous = load_names(a.names, a.source)
         dialogue, langs = load_dialogue(a.dialogue) if a.dialogue else ({}, [])
     except (OSError, KeyError, ValueError) as e:
-        print(f"opus_tags: error: cannot read a CSV: {e}", file=sys.stderr)
+        if isinstance(e, OSError):
+            where = f"{e.filename}: " if e.filename else ""
+            print(f"opus_tags: error: cannot read a CSV: {where}{e.strerror or e}", file=sys.stderr)
+        else:
+            print(f"opus_tags: error: cannot read a CSV: {e}", file=sys.stderr)
         return 2
     try:
         stats = tag_folder(a.opus, names, dialogue, langs, a.dry_run, ambiguous)
     except OSError as e:
-        print(f"opus_tags: error: {e}", file=sys.stderr)
+        print(f"opus_tags: error: {e.filename or a.opus}: {e.strerror or e}", file=sys.stderr)
         return 2
     for k, v in stats.items():
         print(f"{k:32} {v:,}")

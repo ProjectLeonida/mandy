@@ -698,6 +698,58 @@ class TestReportErrors(unittest.TestCase):
                     self.assertIn("row 2", err)
                     self.assertFalse(os.path.exists(out))
 
+    def test_oserror_prints_plain_path_without_repr(self):
+        import contextlib
+        import errno
+        import io
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mount_path = os.path.join(tmp, "m.xml")
+            src_path = os.path.join(tmp, "index.json")
+            out_path = os.path.join(tmp, "out.json")
+            with open(src_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}")
+            with open(mount_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("<Mount/>")
+
+            # read_mount_lists: both with error.filename set and with filename=None (a.mount is a list).
+            for err_obj in (
+                OSError(errno.EACCES, "Permission denied", mount_path),
+                OSError(errno.EACCES, "Permission denied"),
+            ):
+                err_buf = io.StringIO()
+                with mock.patch.object(names_mod, "read_mount_lists", side_effect=err_obj), \
+                        contextlib.redirect_stderr(err_buf):
+                    rc = names_mod.main([src_path, "--mount", mount_path])
+                self.assertEqual(rc, 1)
+                msg = err_buf.getvalue()
+                self.assertIn(mount_path, msg)
+                self.assertIn("Permission denied", msg)
+                self.assertNotIn("\\\\", msg)
+                self.assertNotIn("['", msg)
+
+            # load_streams, load_pins, and write.
+            for target, argv, expected_rc, expected_path in (
+                ("load_streams", [src_path, "--mount", mount_path], 1, src_path),
+                ("load_pins", [src_path, "--mount", mount_path, "--pins", src_path], 1, src_path),
+                ("write", [src_path, "--mount", mount_path, "--out", out_path], 2, out_path),
+            ):
+                err_buf = io.StringIO()
+                with mock.patch.object(names_mod, "read_mount_lists", return_value=[]), \
+                        mock.patch.object(names_mod, "load_streams", return_value=[]), \
+                        mock.patch.object(names_mod, "load_pins", return_value=[]), \
+                        mock.patch.object(names_mod, "name_streams", return_value=([], [])), \
+                        mock.patch.object(names_mod, target, side_effect=OSError(errno.EACCES, "Permission denied", expected_path)), \
+                        contextlib.redirect_stderr(err_buf):
+                    rc = names_mod.main(argv)
+                self.assertEqual(rc, expected_rc)
+                msg = err_buf.getvalue()
+                self.assertIn(expected_path, msg)
+                self.assertIn("Permission denied", msg)
+                self.assertNotIn("\\\\", msg)
+
 
 if __name__ == "__main__":
     unittest.main()

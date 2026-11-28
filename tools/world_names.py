@@ -667,7 +667,13 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except OSError as exc:
+        if exc.filename:
+            print(f"ERROR: {exc.filename}: {exc.strerror or exc}", file=sys.stderr)
+        else:
+            print(f"ERROR: {exc.strerror or exc}", file=sys.stderr)
+        return 1
+    except (ValueError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
