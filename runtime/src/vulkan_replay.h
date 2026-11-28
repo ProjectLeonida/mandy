@@ -3297,6 +3297,15 @@ inline void plan_statistics_segments(PreparedList& out) {
 // while one runs, because its helper dispatch would be counted — closes the one open physical query and opens
 // a new one, so each logical query keeps a contiguous slot range and its result is the sum of that range
 // (statistics_sum.comp). A Begin or End of another query kind leaves the segments alone.
+// The draw kind of every statistics segment of a batch, list after list, as the batch's segment pool numbers them
+// (OcclusionSegmentPool::mesh). `lists` is this batch's lists only: a caller that keeps PreparedLists from a larger
+// batch past its end (VulkanQueue::execute) passes the first lists.size() of them.
+inline std::vector<std::uint8_t> batch_statistics_mesh(std::span<const PreparedList> lists) {
+    std::vector<std::uint8_t> out;
+    for (const PreparedList& list : lists) out.insert(out.end(), list.statistics_mesh.begin(), list.statistics_mesh.end());
+    return out;
+}
+
 inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
     std::map<std::pair<QueryHeapId, std::uint32_t>, std::uint32_t> active;
     std::uint32_t current = detail::PreparedQuery::no_segment;
@@ -3326,9 +3335,8 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
                 p.statistics_end = current;
                 current = open();
                 p.statistics_begin = current;
-                // A clamped draw is also the first vertex draw of this segment.
-                if (draw_command(commands[i]).state) kind = 0;
-                continue;
+                // The clamped call is the first command of the new segment: a draw sets its kind below (vertex or
+                // mesh, as any draw does), a dispatch leaves it unset.
             }
             // A draw of the other kind than the open segment's starts a segment in its own pool (D3D-291).
             int draw = -1;

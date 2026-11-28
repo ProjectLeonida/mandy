@@ -760,6 +760,81 @@ int main() {
         expect(q[3].statistics_first == 1 && q[3].statistics_count == 3, "overlap-mesh: query 1 sums segments 1-3");
     }
 
+    // 16b. kevincommits' finding (#1608, item 2): a clamped indirect draw under overlapping statistics queries opens a
+    //      segment of its own (the clamp is a helper dispatch), and that segment takes the draw's kind like any other:
+    //      mesh for a clamped indirect mesh draw, so it runs in the mesh pool. A mesh draw after it stays in the same
+    //      segment; a vertex draw after it splits. The non-overlapping planner marks the same draw mesh too.
+    {
+        const auto draw = [](bool mesh) {
+            Draw d{};
+            d.pipeline = 1;
+            d.count = d.instances = d.first = 1;
+            d.mesh = mesh;
+            return d;
+        };
+        CommandList list;
+        expect(list.begin_query({6, d3d12_query::pipeline_statistics, 0}), "record clamped-mesh begin 0");  // 0
+        expect(list.begin_query({6, d3d12_query::pipeline_statistics, 1}), "record clamped-mesh begin 1");  // 1
+        expect(list.draw(draw(true)), "record clamped mesh draw");                                           // 2
+        expect(list.draw(draw(true)), "record mesh draw after it");                                          // 3
+        expect(list.draw(draw(false)), "record vertex draw after them");                                     // 4
+        expect(list.end_query({6, d3d12_query::pipeline_statistics, 0}), "record clamped-mesh end 0");      // 5
+        expect(list.end_query({6, d3d12_query::pipeline_statistics, 1}), "record clamped-mesh end 1");      // 6
+        expect(list.close(), "close clamped-mesh list");
+        const auto plan = [&](bool overlapping) {
+            PreparedList prepared;
+            prepared.list = &list;
+            prepared.commands.assign(list.commands().size(), {});
+            prepared.commands[2].indirect_clamp.buffer = handle<VkBuffer>(30);  // as prepare() leaves a clamped draw
+            for (std::size_t i : {0, 1, 5, 6}) {
+                const bool begin = std::holds_alternative<BeginQuery>(list.commands()[i]);
+                prepared.queries.push_back({i, &statistics_heap, begin});
+            }
+            if (overlapping) expect(plan_overlapping_statistics_segments(prepared) == ReplayResult::success,
+                                    "plan clamped-mesh list");
+            else plan_statistics_segments(prepared);
+            return prepared;
+        };
+        const PreparedList prepared = plan(true);
+        const auto& c = prepared.commands;
+        constexpr auto none = detail::PreparedQuery::no_segment;
+        const auto mesh_of = [&](std::uint32_t segment) {
+            return segment < prepared.statistics_mesh.size() ? int(prepared.statistics_mesh[segment]) : -1;
+        };
+        expect(c[2].statistics_begin != none && mesh_of(c[2].statistics_begin) == 1,
+               "clamped-mesh: the clamped mesh draw's segment is a mesh segment");
+        expect(c[3].statistics_begin == none, "clamped-mesh: a mesh draw after it stays in its segment");
+        expect(c[4].statistics_begin != none && mesh_of(c[4].statistics_begin) == 0,
+               "clamped-mesh: the vertex draw after them splits into a vertex segment");
+        // The same draw under one query at a time (plan_statistics_segments) is marked mesh as well.
+        CommandList single;
+        single.begin_query({6, d3d12_query::pipeline_statistics, 0});  // 0
+        single.draw(draw(true));                                        // 1
+        single.end_query({6, d3d12_query::pipeline_statistics, 0});    // 2
+        single.close();
+        PreparedList one;
+        one.list = &single;
+        one.commands.assign(single.commands().size(), {});
+        one.commands[1].indirect_clamp.buffer = handle<VkBuffer>(30);
+        for (std::size_t i : {0, 2})
+            one.queries.push_back({i, &statistics_heap, std::holds_alternative<BeginQuery>(single.commands()[i])});
+        plan_statistics_segments(one);
+        expect(std::find(one.statistics_mesh.begin(), one.statistics_mesh.end(), std::uint8_t(1)) !=
+                   one.statistics_mesh.end(),
+               "clamped-mesh: one query at a time, the clamped mesh draw's segment is a mesh segment too");
+
+        // kevincommits' item 2, second part: VulkanQueue::execute keeps the PreparedLists of its largest batch. A
+        // later, smaller batch gathers the segment kinds of its own lists only (batch_statistics_mesh over the first
+        // lists.size()), so a stale mesh segment past its end does not ask for the mesh pools.
+        std::vector<PreparedList> kept(2);
+        kept[0].statistics_mesh = {0, 0};
+        kept[1].statistics_mesh = {1};  // from an earlier batch of two lists
+        expect(batch_statistics_mesh(std::span<const PreparedList>(kept).first(1)) == std::vector<std::uint8_t>({0, 0}),
+               "batch kinds: a batch of one list sees only its own segments");
+        expect(batch_statistics_mesh(kept) == std::vector<std::uint8_t>({0, 0, 1}),
+               "batch kinds: a batch of two lists sees both, in list order");
+    }
+
     // 17. D3D-291: the pool a mesh draw runs in must not enable a counter
     //     VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076 forbids, or the validation layer reports the VUID on
     //     every DispatchMesh inside a statistics query. The VUID leaves the fragment and compute invocations
