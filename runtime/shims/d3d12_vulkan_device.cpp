@@ -17269,7 +17269,7 @@ private:
         ++title_stats_.retired;
     }
 
-    // LEONIDA_TITLE_IMAGE_RETIRE (on by default; 0: as before). An image made for slot-70 views was retired only when
+    // LEONIDA_TITLE_IMAGE_RETIRE=1 (off by default). An image made for slot-70 views was retired only when
     // its own address got another description or a slot-133 texture, and a title that streams places its textures at
     // ever new addresses: each kept its image (in VRAM, then in system memory), its bindless index and its turn in the
     // refresh passes for the device's life. Now one is also retired once a texture made or registered after the last
@@ -17285,14 +17285,14 @@ private:
     static bool owned_image_retirement_on() {
         static const bool on = [] {
             const char* v = std::getenv("LEONIDA_TITLE_IMAGE_RETIRE");
-            return !v || std::strcmp(v, "0");
+            return v && *v && std::strcmp(v, "0") != 0;
         }();
         return on;
     }
     static std::chrono::milliseconds owned_image_idle() {
         static const std::chrono::milliseconds idle([] {
             const char* v = std::getenv("LEONIDA_TITLE_IMAGE_IDLE_MS");
-            return v && *v ? std::strtoll(v, nullptr, 10) : 2000ll;
+            return v && *v ? (std::max)(0ll, std::strtoll(v, nullptr, 10)) : 2000ll;
         }());
         return idle;
     }
