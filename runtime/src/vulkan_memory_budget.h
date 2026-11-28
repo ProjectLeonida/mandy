@@ -19,12 +19,15 @@ namespace leonida {
 inline VramBudget sum_vram_budget(const VkPhysicalDeviceMemoryProperties& memory,
                                   const VkPhysicalDeviceMemoryBudgetPropertiesEXT& budget) {
     VramBudget out;
+    const auto add_sat = [](std::uint64_t& dst, std::uint64_t add) {
+        dst = add > UINT64_MAX - dst ? UINT64_MAX : dst + add;
+    };
     for (std::uint32_t i = 0; i < memory.memoryHeapCount && i < VK_MAX_MEMORY_HEAPS; ++i) {
         if (memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-            out.local_usage += budget.heapUsage[i];
-            out.local_budget += budget.heapBudget[i];
+            add_sat(out.local_usage, budget.heapUsage[i]);
+            add_sat(out.local_budget, budget.heapBudget[i]);
         } else {
-            out.shared_usage += budget.heapUsage[i];
+            add_sat(out.shared_usage, budget.heapUsage[i]);
         }
     }
     out.available = out.local_budget != 0;
