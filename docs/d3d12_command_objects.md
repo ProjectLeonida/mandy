@@ -746,7 +746,9 @@ surface, not the command objects:
 
 - device slots 1/14/15/16/18/19/27/38 in desktop order; slot 14 is `CreateDescriptorHeap`;
 - device slot 62 is called as `CreateComputePipelineState` (the PC interface's slot 62 is
-  `CreateStateObject`), and slot 76 is Xbox texture creation;
+  `CreateStateObject`), and slot 76 is Xbox texture creation. In the retail executable slot 62 measures five
+  parameters, `(desc, 0, 0, &riid, &out)`, which the three-argument PC method loses, and the executable itself
+  never calls slot 76 (the callers in this bullet are the package DLLs);
 - descriptor-heap `GetCPU/GPUDescriptorHandleForHeapStart` (heap slots 9/10) return the 8-byte
   handle in RAX;
 - Xbox root-signature descriptors carry flags `0x03000000`, masked on a copy;
