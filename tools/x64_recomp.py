@@ -638,6 +638,10 @@ def decode_one(buf, pos, end, addr):
         ins.mnem, ins.kind, ins.error = "invalid", "invalid", "invalid opcode"
         ins.size = pos - start
         return ins
+    if mnem == "xchg" and opspec in ("Oq Oq", "Oq Rq"):
+        opspec = "Ov Av"
+    elif mnem == "movnti":
+        opspec = "Eq Gq" if rexw else "Ed Gd"
     return _finish(buf, pos, end, ins, start, mnem, opspec, state, addr, opcode_byte)
 
 
@@ -1832,6 +1836,11 @@ class FunctionTranslator:
         elif m == "movsxd":
             self._load(ins, src, T0)
             a.sxtw(T0, T0)
+            self._store(ins, dst, T0)
+        elif m == "movnti":
+            if dst[0] != "m":
+                raise UnhandledInsn(ins, "movnti non-memory")
+            self._load(ins, src, T0)
             self._store(ins, dst, T0)
         else:
             raise UnhandledInsn(ins, m)
