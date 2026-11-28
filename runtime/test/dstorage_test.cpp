@@ -235,6 +235,29 @@ void test_staging_budget() {
     check(entered, "waiting publisher wakes when exclusive buffers are released");
     StagingPool::Lease reclaimed(pool);
     check(reclaimed.try_pair(limit), "pool is entirely reusable after the last publisher");
+    check(!reclaimed.try_pair(1), "a held lease refuses duplicate try_pair without leaking helper count");
+    reclaimed.acquire(0);  // releases prior try_pair cleanly
+    check(reclaimed.try_pair(limit), "acquire(0) released prior reservation back to pool");
+    reclaimed.acquire(limit / 2);  // re-acquire replaces prior reservation without leaking used_
+    {
+        StagingPool::Lease companion(pool);
+        check(companion.try_pair(limit / 2), "re-acquired lease kept exact remaining pool budget");
+    }
+    reclaimed.release();
+    check(reclaimed.try_pair(limit), "explicit release returns full pool budget");
+
+    // Overflow-safe staging_bytes saturation for huge page-backed or combined transform sizes.
+    DSTORAGE_REQUEST big_pages{};
+    big_pages.Options.AsUINT64 = options::kSourceMemory | options::kSourcePages;
+    big_pages.SourceSize = UINT32_MAX;
+    big_pages.SourcePageOffset = 65535;
+    check(staging_bytes(big_pages) > big_pages.SourceSize, "large page-backed source does not wrap");
+
+    DSTORAGE_REQUEST big_pair{};
+    big_pair.Options.AsUINT64 = options::kZlib;
+    big_pair.SourceSize = UINT32_MAX;
+    big_pair.DestinationSize = UINT32_MAX;
+    check(staging_bytes(big_pair) == uint64_t(UINT32_MAX) * 2, "large transform sum stays in 64-bit range");
 }
 
 void test_layout_and_options() {
