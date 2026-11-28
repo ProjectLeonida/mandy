@@ -177,6 +177,87 @@ class PlainLogicTest(unittest.TestCase):
             self.assertEqual(recs[0]["name"], "watersystemheightmap")
 
 
+class ValidationHardeningTest(unittest.TestCase):
+    """Stdlib-only regression tests for geometry, cell_box, fill_by_order, align, linear_fit, manifests, and JSON."""
+
+    def test_geometry_rejects_nonpositive_bool_nonfinite_and_negative_z(self):
+        bad_docs = (
+            {**DOC, "width": 0},
+            {**DOC, "height": -512},
+            {**DOC, "tileSize": True},
+            {**DOC, "width": False},
+            {**DOC, "zInflation": -1.0},
+            {**DOC, "zInflation": float("nan")},
+            {**DOC, "zInflation": True},
+            {**DOC, "origin": (0.0, float("inf"), 0.0)},
+            {**DOC, "origin": (0.0, 0.0)},
+        )
+        for doc in bad_docs:
+            with self.subTest(doc=doc), self.assertRaises(ValueError):
+                wga.geometry(doc)
+
+    def test_cell_box_rejects_bool_float_and_degenerate_grid(self):
+        g = wga.geometry(DOC)
+        for bad in (True, False, 1.5, -1):
+            with self.subTest(cell=bad), self.assertRaises(ValueError):
+                wga.cell_box(g, bad)
+        with self.assertRaises(ValueError):
+            wga.cell_box({**g, "columns": 0}, 0)
+
+    def test_fill_by_order_validates_tiles_anchors_and_order(self):
+        with self.assertRaises(ValueError):
+            wga.fill_by_order(-1, {}, [0, 1])
+        with self.assertRaises(ValueError):
+            wga.fill_by_order(True, {}, [0, 1])
+        with self.assertRaises(ValueError):
+            wga.fill_by_order(2, {0: 99}, [0, 1])
+        with self.assertRaises(ValueError):
+            wga.fill_by_order(2, {-1: 0}, [0, 1])
+        with self.assertRaises(ValueError):
+            wga.fill_by_order(2, {2: 0}, [0, 1])
+        with self.assertRaises(ValueError):
+            wga.fill_by_order(2, {0: 0}, [0, 0, 1])
+
+    def test_align_rejects_ragged_nonfinite_and_unalignable_scores(self):
+        bad_matrices = (
+            [[1.0, 2.0], [3.0]],
+            [[1.0, 2.0], [3.0, 4.0, 5.0]],
+            [[float("-inf"), 1.0], [1.0, 2.0]],
+            [[float("nan"), 1.0], [1.0, 2.0]],
+            [[float("inf"), 1.0], [1.0, 2.0]],
+            [[True, 1.0], [1.0, 2.0]],
+        )
+        for scores in bad_matrices:
+            with self.subTest(scores=scores), self.assertRaises(ValueError):
+                wga.align(scores)
+
+    def test_linear_fit_rejects_length_mismatch_and_nonfinite_values(self):
+        with self.assertRaises(ValueError):
+            wga.linear_fit([1.0, 2.0, 3.0], [1.0, 2.0])
+        with self.assertRaises(ValueError):
+            wga.linear_fit([1.0, float("nan")], [1.0, 2.0])
+        with self.assertRaises(ValueError):
+            wga.linear_fit([1.0, 2.0], [1.0, float("inf")])
+        with self.assertRaises(ValueError):
+            wga.linear_fit([True, 2.0], [1.0, 2.0])
+
+    def test_load_manifests_rejects_non_object_manifest_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            tex_dir = os.path.join(td, "assets", "levels", "textures")
+            os.makedirs(tex_dir)
+            with open(os.path.join(tex_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("[1, 2, 3]\n")
+            with self.assertRaises(ValueError):
+                wga.load_manifests(td)
+
+    def test_write_json_rejects_nan_and_leaves_no_temp_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "grid.json")
+            with self.assertRaises(ValueError):
+                wga.write_json(out, {"bad": float("nan")})
+            self.assertEqual(os.listdir(td), [])
+
+
 # ---- synthetic work folder and carve ---------------------------------------------------------------------------
 
 def dds(width, height, dxgi, payload, bpp):
@@ -621,6 +702,41 @@ class ForwardCheckTest(unittest.TestCase):
         p, _ = self.run_tool()
         self.assertEqual(p.returncode, 2)
         self.assertIn("mosaic", p.stderr)
+
+    def test_read_image_rejects_truncated_dx10_r16_header_as_value_error(self):
+        path = os.path.join(self.root, "short.dds")
+        short = bytearray(100)
+        short[:4] = b"DDS "
+        short[84:88] = b"DX10"
+        with open(path, "wb") as f:
+            f.write(short)
+        with self.assertRaisesRegex(ValueError, "truncated"):
+            wga.read_image({"path": path, "format": "R16_UNORM", "width": 4, "height": 4})
+
+    def test_water_fit_skips_degenerate_zero_span_mhiu_bounds(self):
+        import warnings
+        fb = np.full((8, 8), 40000.0)
+        geom = wga.geometry(DOC)
+        bad_payload = {
+            "type": "MHIU",
+            "offset_hex": "0x1000",
+            "header": {"width": 4, "height": 4, "bounds": {"min": [0.0, 0.0, 0.0], "max": [0.0, 100.0, 10.0]}},
+            "_grid": bytes(16),
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            rows, metres = wga.water_fit(fb, geom, [bad_payload])
+        self.assertEqual(rows, [{"heightmap": "MHIU 0x1000", "north_up": None, "south_up": None}])
+        self.assertIsNone(metres)
+
+    def test_split_cells_and_tile_step_reject_zero_dimensions(self):
+        arr = np.zeros((4, 4))
+        with self.assertRaises(ValueError):
+            wga.split_cells(arr, {"rows": 0, "columns": 2})
+        with self.assertRaises(ValueError):
+            wga.split_cells(arr, {"rows": 2, "columns": 0})
+        with self.assertRaises(ValueError):
+            wga.tile_step(arr, 0)
 
 
 if __name__ == "__main__":

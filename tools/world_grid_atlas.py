@@ -70,16 +70,38 @@ ORDER_KEYS = {
 
 # ---- plain Python: geometry, order, alignment, fit ------------------------------------------------------------
 
+def _finite_float(value, label: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a number, not bool")
+    num = float(value)
+    if not math.isfinite(num):
+        raise ValueError(f"{label} must be finite")
+    return num
+
+
+def _whole_number(value, label: str) -> int:
+    num = _finite_float(value, label)
+    if not num.is_integer():
+        raise ValueError(f"{label} ({value}) is not a whole number")
+    return int(num)
+
+
 def geometry(doc: dict) -> dict:
     """Columns, rows and world box of a grid document; origin is the grid centre (docs/gamedata.md)."""
     tile, width, height = (doc[k] for k in ("tileSize", "width", "height"))
-    if any(not float(v).is_integer() for v in (tile, width, height)):
+    if any(isinstance(v, bool) or not math.isfinite(float(v)) or not float(v).is_integer()
+           for v in (tile, width, height)):
         raise ValueError(f"grid size {width}x{height} or tile {tile} is not a whole number")
     tile, width, height = int(tile), int(width), int(height)
-    if tile <= 0 or width % tile or height % tile:
+    if tile <= 0 or width <= 0 or height <= 0 or width % tile or height % tile:
         raise ValueError(f"grid {width}x{height} is not a whole number of {tile}-unit tiles")
-    ox, oy, oz = (float(v) for v in doc["origin"])
-    z = float(doc.get("zInflation", 0.0))
+    origin = doc["origin"]
+    if not isinstance(origin, (list, tuple)) or len(origin) != 3:
+        raise ValueError("origin must have three coordinates")
+    ox, oy, oz = (_finite_float(v, "origin") for v in origin)
+    z = _finite_float(doc.get("zInflation", 0.0), "zInflation")
+    if z < 0:
+        raise ValueError(f"zInflation must be non-negative (got {z})")
     return {"columns": width // tile, "rows": height // tile, "tile": tile,
             "x_min": ox - width / 2, "x_max": ox + width / 2,
             "y_min": oy - height / 2, "y_max": oy + height / 2,
@@ -88,9 +110,14 @@ def geometry(doc: dict) -> dict:
 
 def cell_box(geom: dict, cell: int) -> tuple:
     """World x/y box of a cell; row 0 is the north edge (largest y)."""
-    row, col = divmod(cell, geom["columns"])
-    if not 0 <= row < geom["rows"]:
-        raise ValueError(f"cell {cell} is outside the {geom['columns']}x{geom['rows']} grid")
+    if isinstance(cell, bool) or not isinstance(cell, int):
+        raise ValueError(f"cell must be an integer (got {cell!r})")
+    cols, rows = geom["columns"], geom["rows"]
+    if cols <= 0 or rows <= 0:
+        raise ValueError(f"invalid {cols}x{rows} grid")
+    row, col = divmod(cell, cols)
+    if not 0 <= row < rows:
+        raise ValueError(f"cell {cell} is outside the {cols}x{rows} grid")
     t = geom["tile"]
     x0 = geom["x_min"] + col * t
     y1 = geom["y_max"] - row * t
@@ -140,8 +167,22 @@ def fill_by_order(n_tiles: int, anchors: dict, order: list) -> tuple:
     between them only when there are exactly k free cells. Returns (placement dict tile -> cell, dropped anchors,
     tiles left unplaced).
     """
-    pos = {c: i for i, c in enumerate(order)}
-    kept = longest_increasing([(i, pos[anchors[i]]) for i in sorted(anchors)])
+    if isinstance(n_tiles, bool) or not isinstance(n_tiles, int) or n_tiles < 0:
+        raise ValueError(f"n_tiles must be a non-negative integer (got {n_tiles!r})")
+    pos = {}
+    for i, c in enumerate(order):
+        if c in pos:
+            raise ValueError(f"duplicate cell {c!r} in order")
+        pos[c] = i
+    pairs = []
+    for i in sorted(anchors):
+        if isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < n_tiles:
+            raise ValueError(f"anchor tile index {i!r} is outside 0..{n_tiles - 1}")
+        cell = anchors[i]
+        if cell not in pos:
+            raise ValueError(f"anchor cell {cell!r} is not in order")
+        pairs.append((i, pos[cell]))
+    kept = longest_increasing(pairs)
     dropped = len(anchors) - len(kept)
     placed = {i: order[p] for i, p in kept}
     left = 0
@@ -169,11 +210,16 @@ def align(scores: list) -> list:
     m = len(scores[0])
     if m < n:
         raise ValueError(f"{n} tiles do not fit {m} slots in order")
+    validated = []
+    for row in scores:
+        if len(row) != m:
+            raise ValueError("score matrix rows must have equal length")
+        validated.append([_finite_float(v, "alignment score") for v in row])
     neg = float("-inf")
-    best = list(scores[0])
+    best = list(validated[0])
     back = []
     for i in range(1, n):
-        row = scores[i]
+        row = validated[i]
         cur = [neg] * m
         arg = [-1] * m
         run, run_at = neg, -1
@@ -186,26 +232,34 @@ def align(scores: list) -> list:
         back.append(arg)
         best = cur
     j = max(range(m), key=lambda k: best[k])
+    if not math.isfinite(best[j]):
+        raise ValueError("no valid order-constrained alignment")
     path = [j]
     for arg in reversed(back):
         j = arg[j]
+        if j < 0:
+            raise ValueError("no valid order-constrained alignment")
         path.append(j)
     return path[::-1]
 
 
 def linear_fit(xs: list, ys: list) -> dict:
     """Least-squares y = slope * x + intercept, with Pearson r."""
+    if len(xs) != len(ys):
+        raise ValueError(f"xs and ys length mismatch ({len(xs)} != {len(ys)})")
     n = len(xs)
     if n < 2:
         raise ValueError("a fit needs at least two points")
-    mx, my = math.fsum(xs) / n, math.fsum(ys) / n
-    sxx = math.fsum((x - mx) ** 2 for x in xs)
-    syy = math.fsum((y - my) ** 2 for y in ys)
-    sxy = math.fsum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    fx = [_finite_float(x, "x") for x in xs]
+    fy = [_finite_float(y, "y") for y in ys]
+    mx, my = math.fsum(fx) / n, math.fsum(fy) / n
+    sxx = math.fsum((x - mx) ** 2 for x in fx)
+    syy = math.fsum((y - my) ** 2 for y in fy)
+    sxy = math.fsum((x - mx) * (y - my) for x, y in zip(fx, fy))
     if sxx == 0:
         raise ValueError("all x values are equal")
     slope = sxy / sxx
-    r = sxy / math.sqrt(sxx * syy) if syy else 0.0
+    r = max(-1.0, min(1.0, sxy / math.sqrt(sxx * syy))) if syy else 0.0
     return {"slope": slope, "intercept": my - slope * mx, "r": r, "n": n}
 
 
@@ -228,12 +282,25 @@ def load_manifests(work: str) -> list:
             continue
         with open(path, encoding="utf-8-sig") as f:
             manifest = json.load(f)
-        for item in manifest.get("Items", []):
-            for t in item.get("Textures", []):
-                out.append({"archive": archive, "offset": int(item["Offset"]), "dir": item["Dir"],
-                            "index": int(t["Index"]), "name": t["Name"], "width": int(t["Width"]),
-                            "height": int(t["Height"]), "format": t["Format"],
-                            "path": os.path.join(root, item["Dir"], "%03d_%s.dds" % (t["Index"], t["Name"])),
+        if not isinstance(manifest, dict):
+            raise ValueError(f"{path}: expected JSON object")
+        items = manifest.get("Items", [])
+        if not isinstance(items, list):
+            raise ValueError(f"{path}: Items must be a list")
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError(f"{path}: manifest item must be an object")
+            textures = item.get("Textures", [])
+            if not isinstance(textures, list):
+                raise ValueError(f"{path}: Textures must be a list")
+            for t in textures:
+                if not isinstance(t, dict):
+                    raise ValueError(f"{path}: texture record must be an object")
+                out.append({"archive": archive, "offset": _whole_number(item["Offset"], "Offset"), "dir": item["Dir"],
+                            "index": _whole_number(t["Index"], "Index"), "name": t["Name"],
+                            "width": _whole_number(t["Width"], "Width"), "height": _whole_number(t["Height"], "Height"),
+                            "format": t["Format"],
+                            "path": os.path.join(root, item["Dir"], "%03d_%s.dds" % (int(t["Index"]), t["Name"])),
                             "manifest": path})
     if not out:
         raise ValueError(f"no texture manifest under {assets}")
@@ -265,6 +332,10 @@ def read_image(rec: dict):
         data = f.read()
     fmt = rec["format"]
     if fmt == "R16_UNORM":
+        if rec["width"] <= 0 or rec["height"] <= 0:
+            raise ValueError(f"{rec['path']} has invalid dimensions {rec['width']}x{rec['height']}")
+        if len(data) < DX10_HEADER:
+            raise ValueError(f"{rec['path']} is truncated")
         if data[:4] != b"DDS " or data[84:88] != b"DX10" or struct.unpack_from("<I", data, 128)[0] != DXGI_R16_UNORM:
             raise ValueError(f"{rec['path']} is not a DX10 R16_UNORM DDS")
         count = rec["width"] * rec["height"]
@@ -284,8 +355,10 @@ def read_image(rec: dict):
 def split_cells(fallback, geom: dict):
     """Fallback mosaic -> array (cells, p, p[, c]) with cell = row * columns + column, row 0 at the top."""
     rows, cols = geom["rows"], geom["columns"]
+    if rows <= 0 or cols <= 0:
+        raise ValueError(f"invalid {cols}x{rows} grid")
     h, w = fallback.shape[:2]
-    if w % cols or h != rows * (w // cols):
+    if w <= 0 or h <= 0 or w % cols or h != rows * (w // cols):
         raise ValueError(f"fallback {w}x{h} is not a {cols}x{rows} mosaic of square cells")
     p = w // cols
     rest = fallback.shape[2:]
@@ -301,7 +374,7 @@ def point_sample(tile, p: int):
 def tile_step(tile, p: int) -> int:
     """Tile pixels per fallback pixel; the tile must be square and a whole multiple of the fallback cell."""
     h, w = tile.shape[:2]
-    if h != w or w < p or w % p:
+    if p <= 0 or h != w or w < p or w % p:
         raise ValueError(f"a {w}x{h} tile does not fit a fallback cell of {p}x{p} pixels")
     return w // p
 
@@ -387,6 +460,8 @@ def water_fit(fallback, geom: dict, payloads: list) -> tuple:
     """
     import numpy as np
     rows, cols = fallback.shape
+    if rows <= 0 or cols <= 0:
+        return [], None
     px = (geom["x_max"] - geom["x_min"]) / cols
     r, c = np.mgrid[0:rows, 0:cols]
     x = geom["x_min"] + (c + 0.5) * px
@@ -396,12 +471,18 @@ def water_fit(fallback, geom: dict, payloads: list) -> tuple:
             continue
         b = pl["header"]["bounds"]
         w, h = pl["header"]["width"], pl["header"]["height"]
-        z = np.frombuffer(pl["_grid"], np.uint8).reshape(h, w).astype(float)
+        row = {"heightmap": "MHIU " + pl.get("offset_hex", ""), "north_up": None, "south_up": None}
+        span_x = b["max"][0] - b["min"][0]
+        span_y = b["max"][1] - b["min"][1]
+        if (w <= 0 or h <= 0 or len(pl["_grid"]) < w * h
+                or not math.isfinite(span_x) or not math.isfinite(span_y) or span_x <= 0 or span_y <= 0):
+            out.append(row)
+            continue
+        z = np.frombuffer(pl["_grid"], np.uint8, count=w * h).reshape(h, w).astype(float)
         z = b["min"][2] + z / 255.0 * (b["max"][2] - b["min"][2])
-        row = {"heightmap": "MHIU " + pl.get("offset_hex", "")}
         for label, y in (("north_up", geom["y_max"] - (r + 0.5) * px), ("south_up", geom["y_min"] + (r + 0.5) * px)):
-            i = np.floor((x - b["min"][0]) / (b["max"][0] - b["min"][0]) * w).astype(int)
-            j = np.floor((y - b["min"][1]) / (b["max"][1] - b["min"][1]) * h).astype(int)
+            i = np.floor((x - b["min"][0]) / span_x * w).astype(int)
+            j = np.floor((y - b["min"][1]) / span_y * h).astype(int)
             ok = (i >= 0) & (i < w) & (j >= 0) & (j < h) & (fallback > FIT_MIN_VALUE)
             row[label] = None
             if ok.sum() < 2:
@@ -522,7 +603,7 @@ def run(textures: list, carve: str) -> dict:
                  "sector_fallbacks": {o.get("sectorOverrideGlobalFallbackName"):
                                       archive_counts(by_name.get(o.get("sectorOverrideGlobalFallbackName"), []))
                                       for o in doc.get("sectorOverrides") or []}}
-            if is_height and fmt == "R16_UNORM":
+            if doc.get("clientSystemName") == HEIGHT_GRID and fmt == "R16_UNORM":
                 g["water_fit"], g["water_metres"] = water_fit(fb, geom, payloads)
             summary["grids"].append(g)
             summary["placements"][doc["tileTextureNameSuffix"]] = [
@@ -648,7 +729,7 @@ def write_json(path, data):
             os.close(fd)
             raise
         with f:
-            json.dump(data, f, indent=1)
+            json.dump(data, f, indent=1, allow_nan=False)
         os.chmod(tmp, published_mode(path))   # mkstemp creates 0600
         os.replace(tmp, path)
     except BaseException:
