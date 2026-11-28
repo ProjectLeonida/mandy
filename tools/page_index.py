@@ -305,6 +305,16 @@ def index_streams(streams, progress=None):
             progress(streams_seen, len(pages))
         if waiting is not None:
             page, base, cont = waiting
+            if is_page(data):
+                # A directory stream opens a resource of its own and is never a continuation, even when its
+                # bytes would cover what the previous page still needs. That page ended before its declared
+                # table/entries did: report it as parsed with the continuations it had (waiting holds that
+                # parse), then index this stream as the new directory page.
+                page["complete"] = False
+                page["error"] = page["error"] or "resource ended before q38 was complete"
+                add(page)
+                waiting = start(offset, stored, data)
+                continue
             cont.append((offset, stored, data))
             page, complete = parse_page(base, cont)
             page["offset"] = waiting[0]["offset"]
@@ -312,16 +322,6 @@ def index_streams(streams, progress=None):
             if complete:
                 add(page)
                 waiting = None
-                continue
-            if is_page(data):
-                # The previous resource ended before its declared table/entries did. Report it, then
-                # treat this stream as the new directory page instead of swallowing it as a continuation.
-                # Report the page re-parsed with this stream: waiting[0] is the parse before the last
-                # continuation was appended and would lose it from the reported continuations/records.
-                page["complete"] = False
-                page["error"] = page["error"] or "resource ended before q38 was complete"
-                add(page)
-                waiting = start(offset, stored, data)
                 continue
             if len(cont) >= MAX_CONTINUATIONS:
                 page["complete"] = False

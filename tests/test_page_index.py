@@ -267,9 +267,9 @@ class PageIndexTest(unittest.TestCase):
                              [(0x1111, 0x10, 0x60, 0), (0x2222, 0x20, 0x120, 1)])
             self.assertEqual(page_doc["span"], 0x140)
 
-    def test_new_page_after_a_continuation_is_reported_with_both_streams(self):
-        # The first page's q38 target stays out of reach even after both following streams, so the
-        # second page is consumed as a continuation before it is recognised as a new directory page.
+    def test_new_page_after_a_continuation_ends_the_previous_resource(self):
+        # The first page's q38 target stays out of reach after its continuation. The second page opens a
+        # resource of its own: the first is reported with its one continuation, not with the new page.
         first = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
         put_q38(first, 0xC0, [(0x1234, 0x10, 0x10000)])
         cont = b"\xbb" * 0x100
@@ -284,13 +284,38 @@ class PageIndexTest(unittest.TestCase):
                 doc = json.load(f)
         self.assertEqual(doc["summary"]["pages"], 2)
         reported, fresh = doc["pages"]
-        self.assertEqual([c["offset"] for c in reported["continuations"]], [offsets[1], offsets[2]])
+        self.assertEqual([c["offset"] for c in reported["continuations"]], [offsets[1]])
+        self.assertEqual([s["offset"] for s in reported["resource"]["streams"]], offsets[:2])
         self.assertFalse(reported["complete"])
         self.assertEqual(reported["error"], "resource ended before q38 was complete")
         self.assertEqual(reported["q38_records"], [])
         self.assertEqual(reported["offset"], offsets[0])
         self.assertTrue(fresh["complete"])
         self.assertEqual(fresh["offset"], offsets[2])
+        self.assertEqual([(r["hash"], r["target"]) for r in fresh["q38_records"]], [(0x5678, 0x60)])
+
+    def test_a_directory_page_is_not_taken_as_a_continuation_even_when_it_would_complete_one(self):
+        # The first page's last record runs 0x10 bytes past its stream; the very next stream is a complete
+        # directory page whose bytes would cover them. It is indexed as a page, and the first page stays
+        # incomplete instead of reporting the second page's header as its record's payload.
+        first = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
+        put_q38(first, 0xC0, [(0x1234, 0x10, 0x100)])
+        second = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
+        put_q38(second, 0xC0, [(0x5678, 0x10, 0x60)])
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "adjacent.rpf")
+            out = os.path.join(tmp, "pages.json")
+            offsets = make_rpf(arc, [first, second])
+            run_tool(arc, out)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+        self.assertEqual(doc["summary"]["pages"], 2)
+        reported, fresh = doc["pages"]
+        self.assertEqual(reported["offset"], offsets[0])
+        self.assertFalse(reported["complete"])
+        self.assertEqual(reported["error"], "resource ended before q38 was complete")
+        self.assertEqual(reported["continuations"], [])
+        self.assertEqual((fresh["offset"], fresh["complete"]), (offsets[1], True))
         self.assertEqual([(r["hash"], r["target"]) for r in fresh["q38_records"]], [(0x5678, 0x60)])
 
     def test_carve_directory_mode(self):
