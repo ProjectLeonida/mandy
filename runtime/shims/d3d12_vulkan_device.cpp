@@ -22469,12 +22469,15 @@ private:
             if (!t.hashed || t.stale) queue_title_fill(t.address);
             return;
         }
-        // If a deferred pending_stream image's pages have now arrived, back its VkImage immediately so existing and
-        // new slot-70 descriptors get their bindless indices, while still deferring the texel upload to the batched
-        // refresh_title_textures() pass before GPU submission.
-        if (t.unbound_bytes && title_texture_readable(t)) {
+        // If a deferred pending_stream image's pages have now arrived, back its VkImage and publish its views
+        // immediately so existing and new slot-70 descriptors get their bindless indices, while still deferring the
+        // texel upload to the batched refresh_title_textures() pass before GPU submission.
+        if ((t.unbound_bytes || (t.resource && t.resource->deferred_stream())) && title_texture_readable(t)) {
             const unsigned from = fill_from(t);
-            if (!from || title_partial_bytes_ + t.unbound_bytes <= partial_mips_budget()) back_title_texture(t);
+            if ((!from || !t.unbound_bytes || title_partial_bytes_ + t.unbound_bytes <= partial_mips_budget()) &&
+                back_title_texture(t)) {
+                if (t.resource && t.resource->deferred_stream()) t.resource->publish_streamed_texture(from);
+            }
         }
         if (!t.hashed || t.stale) {
             t.stale = true;
