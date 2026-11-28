@@ -2970,7 +2970,8 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_host_prefix COMMAND d3d12_existing_heap_test --host-prefix-only)
     set_tests_properties(d3d12_host_prefix PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(d3d12_existing_heap PROPERTIES SKIP_RETURN_CODE 77)
-    # LEONIDA_TEXTURE_REFRESH_ASYNC=1 (set by the test itself): a mapped plane's first submission reads its bytes.
+    # LEONIDA_TEXTURE_REFRESH_ASYNC=1 (set by the test itself): a mapped plane's first submission reads its bytes, and
+    # a mapped plane destroyed inside the registry leaves nothing for the refresh worker (RT-TITLE-TEXTURE-GONE-RANGES).
     add_test(NAME d3d12_mapped_plane_async COMMAND d3d12_existing_heap_test --mapped-plane-async)
     set_tests_properties(d3d12_mapped_plane_async PROPERTIES SKIP_RETURN_CODE 77)
     # The same with write watching off: the guarded cases only, the concurrent writers among them.
