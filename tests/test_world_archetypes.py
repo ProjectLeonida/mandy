@@ -310,6 +310,24 @@ class CliTest(unittest.TestCase):
                 f.write(data)
         self.check(self.run_cli(folder))
 
+    def test_folder_joins_a_continuation_file_as_world_index_does(self):
+        # rpf9_carve writes each stream as <offset>.bin plus index.json, and world_index.scan_path joins a resource
+        # whose block runs past its stream with the file of the stream that followed it. The archetypes stored in
+        # that continuation are read too, as in an RPF9 window.
+        defs, m = scene()
+        cut = len(defs) - 0x20                      # the last archetype's tail lands in the continuation
+        folder = os.path.join(self.tmp.name, "carved")
+        os.makedirs(folder)
+        streams = [(0x1000, defs[:cut], 0x1000), (0x2000, defs[cut:], 0x100), (0x3000, m, 0x100)]
+        for off, data, _ in streams:
+            with open(os.path.join(folder, "%012x.bin" % off), "wb") as f:
+                f.write(data)
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"files": [{"off": off, "stored": stored} for off, _, stored in streams]}, f)
+        self.assertEqual([r["size"] for r in WA.WI.scan_path(folder)[0] if r["file"] == "%012x.bin" % 0x1000],
+                         [len(defs)])
+        self.check(self.run_cli(folder))
+
     def test_rpf9_window(self):
         defs, m = scene()
         path = os.path.join(self.tmp.name, "levels.rpf")
