@@ -7988,9 +7988,11 @@ class Gen:
             const = (src["v"] & 0xFFFFFFFF) if src["k"] == "imm" else None
             if src["k"] == "fimm":
                 const = struct.unpack("<I", struct.pack("<f", src["v"]))[0]
-            # an SGPR that isn't a mask (a constant, say) gives each lane its own bit, as a constant does (mask_src)
-            val = None if const is not None else (self.mask_src(src, wide=False) if src["k"] == "sgpr"
-                                                  else self.src_u(src))
+            # Any non-mask source (plain SGPR, m0, scc/src_scc, plain-data vcc_lo/vcc_hi, null) gives each lane
+            # its own bit via exec_bit; a lane-mask source already holds 0/~0 per lane in src_u.
+            val = None if const is not None else (
+                self.src_u(src) if self.holds_lane_mask(src) else self.exec_bit(self.src_u(src))
+            )
             self.exec_half_write(0 if a[0]["t"] == "exec_lo" else 1, val, const)
         elif op == "v_mov_b32" or op == "s_mov_b32":
             lit_val = None
