@@ -29,10 +29,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
-#include <map>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -63,52 +62,77 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
         return {};
     }
     // What the vertex stage declares: types, Output variables, and the decorations that name them.
-    struct Type { std::uint32_t op = 0, component = 0, count = 0, width = 0; };
-    std::map<std::uint32_t, Type> types;
-    std::map<std::uint32_t, std::uint32_t> variable_type;  // Output variable -> its pointer type
-    std::map<std::uint32_t, std::uint32_t> location, builtin;       // variable id -> value
-    std::set<std::uint32_t> outputs;
+    // All of these live before the first OpFunction (SPIR-V logical layout §2.4).
+    struct TypeEntry { std::uint32_t id = 0, op = 0, component = 0, count = 0, width = 0; };
+    struct KvEntry { std::uint32_t key = 0, value = 0; };
+    std::vector<TypeEntry> types;
+    std::vector<KvEntry> outputs;   // Output variable id -> pointer type id
+    std::vector<KvEntry> location;  // variable id -> Location literal
+    std::vector<KvEntry> builtin;   // variable id -> BuiltIn literal
     for (std::size_t i = 5; i < vertex_words.size();) {
         const std::uint32_t op = vertex_words[i] & 0xffffu, n = vertex_words[i] >> 16;
-        if (!n || i + n > vertex_words.size()) {
+        if (!n || n > vertex_words.size() - i) {
             why = "the vertex shader's SPIR-V is cut short";
             return {};
         }
+        if (op == op_function) break;
         const std::uint32_t* w = &vertex_words[i];
-        if (op == op_type_float && n >= 3) types[w[1]] = {op, 0, 0, w[2]};
-        else if (op == op_type_vector && n >= 4) types[w[1]] = {op, w[2], w[3], 0};
-        else if (op == op_type_pointer && n >= 4) types[w[1]] = {op, w[3], w[2], 0};
-        else if (op == op_variable && n >= 4 && w[3] == storage_output) outputs.insert(w[2]), variable_type[w[2]] = w[1];
-        else if (op == op_decorate && n >= 4 && w[2] == deco_location) location[w[1]] = w[3];
-        else if (op == op_decorate && n >= 4 && w[2] == deco_builtin) builtin[w[1]] = w[3];
+        if (op == op_type_float && n >= 3) types.push_back({w[1], op, 0, 0, w[2]});
+        else if (op == op_type_vector && n >= 4) types.push_back({w[1], op, w[2], w[3], 0});
+        else if (op == op_type_pointer && n >= 4) types.push_back({w[1], op, w[3], w[2], 0});
+        else if (op == op_variable && n >= 4 && w[3] == storage_output) outputs.push_back({w[2], w[1]});
+        else if (op == op_decorate && n >= 4 && w[2] == deco_location) location.push_back({w[1], w[3]});
+        else if (op == op_decorate && n >= 4 && w[2] == deco_builtin) builtin.push_back({w[1], w[3]});
         i += n;
     }
+    std::stable_sort(types.begin(), types.end(), [](const TypeEntry& a, const TypeEntry& b) { return a.id < b.id; });
+    const auto sort_kv = [](std::vector<KvEntry>& v) {
+        std::stable_sort(v.begin(), v.end(), [](const KvEntry& a, const KvEntry& b) { return a.key < b.key; });
+    };
+    sort_kv(outputs);
+    sort_kv(location);
+    sort_kv(builtin);
+    const auto find_type = [&](std::uint32_t id) -> const TypeEntry* {
+        const auto it = std::upper_bound(types.begin(), types.end(), id,
+                                         [](std::uint32_t k, const TypeEntry& e) { return k < e.id; });
+        return (it != types.begin() && (it - 1)->id == id) ? &*(it - 1) : nullptr;
+    };
+    const auto find_kv = [](const std::vector<KvEntry>& v, std::uint32_t key) -> const KvEntry* {
+        const auto it = std::upper_bound(v.begin(), v.end(), key,
+                                         [](std::uint32_t k, const KvEntry& e) { return k < e.key; });
+        return (it != v.begin() && (it - 1)->key == key) ? &*(it - 1) : nullptr;
+    };
+
     std::uint32_t position = 0;
     std::vector<std::uint32_t> params;  // Location values, ascending
-    for (std::uint32_t id : outputs) {
-        const auto b = builtin.find(id);
-        if (b != builtin.end()) {
-            if (b->second == builtin_position) position = id;
-            else if (b->second != builtin_point_size) {
+    params.reserve(outputs.size());
+    for (std::size_t idx = 0; idx < outputs.size(); ++idx) {
+        // Keep last-wins semantics if an output variable id ever appeared twice.
+        if (idx + 1 < outputs.size() && outputs[idx + 1].key == outputs[idx].key) continue;
+        const std::uint32_t id = outputs[idx].key;
+        if (const KvEntry* b = find_kv(builtin, id)) {
+            if (b->value == builtin_position) position = id;
+            else if (b->value != builtin_point_size) {
                 why = "the vertex shader writes ClipDistance, CullDistance, Layer or ViewportIndex";
                 return {};
             }
             continue;
         }
-        const auto l = location.find(id);
-        if (l == location.end()) continue;
-        const Type& ptr = types[variable_type[id]];
-        const Type& vec = types[ptr.component];
-        const Type& scalar = types[vec.component];
+        const KvEntry* l = find_kv(location, id);
+        if (!l) continue;
+        const TypeEntry* ptr = find_type(outputs[idx].value);
+        const TypeEntry* vec = ptr ? find_type(ptr->component) : nullptr;
+        const TypeEntry* scalar = vec ? find_type(vec->component) : nullptr;
         // Known limit: every vec4 float output gets the plain a + b - p corner. The translator can export an attribute
         // as the register's raw bits with two packed f16 halves (only the pixel shader knows, through per_vertex in
         // tools/rdna2spirv.py), and nothing on the vertex side tells those apart, so such an output would get a wrong
         // fourth corner. Fixing it needs the pixel shader's words here and a per-channel marker from the translator.
-        if (vec.op != op_type_vector || vec.count != 4 || scalar.op != op_type_float || scalar.width != 32) {
+        if (!vec || !scalar || vec->op != op_type_vector || vec->count != 4 || scalar->op != op_type_float ||
+            scalar->width != 32) {
             why = "a vertex output is not a vec4 float";
             return {};
         }
-        params.push_back(l->second);
+        params.push_back(l->value);
     }
     if (!position) {
         why = "the vertex shader writes no Position";
@@ -120,7 +144,11 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
     // The module: a fixed prelude, then per variable ids, then the body. Ids count up from 1.
     std::uint32_t next = 1;
     const auto id = [&] { return next++; };
-    std::vector<std::uint32_t> head, annotations, globals, body;
+    const std::size_t var_count = params.size() + 1;
+    std::vector<std::uint32_t> annotations, globals, body;
+    annotations.reserve(var_count * 8);
+    globals.reserve(56 + var_count * 8);
+    body.reserve(128 + var_count * 96);
     const auto emit = [](std::vector<std::uint32_t>& to, std::uint32_t op, std::initializer_list<std::uint32_t> args) {
         to.push_back((std::uint32_t(args.size()) + 1) << 16 | op);
         to.insert(to.end(), args.begin(), args.end());
@@ -144,9 +172,11 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
 
     struct Var { std::uint32_t in, out; bool is_position; };
     std::vector<Var> vars;
+    vars.reserve(var_count);
     vars.push_back({id(), id(), true});
     for (std::size_t i = 0; i < params.size(); ++i) vars.push_back({id(), id(), false});
     std::vector<std::uint32_t> io_vars;
+    io_vars.reserve(var_count * 2);
     emit(annotations, op_decorate, {vars[0].in, deco_builtin, builtin_position});
     emit(annotations, op_decorate, {vars[0].out, deco_builtin, builtin_position});
     for (std::size_t i = 0; i < params.size(); ++i) {
@@ -166,6 +196,7 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
     // Per variable: the three corners.
     struct Corners { std::uint32_t v[3]; };
     std::vector<Corners> corners;
+    corners.reserve(var_count);
     const std::uint32_t cs[3] = {c0, c1, c2};
     for (const Var& v : vars) {
         Corners c{};
@@ -223,6 +254,7 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
     };
     // Per variable: the fourth corner, v1 + v2 + v3 - 2 * corner, and the six vertices of the two triangles.
     std::vector<std::array<std::uint32_t, 6>> emitted;
+    emitted.reserve(var_count);
     for (const Corners& c : corners) {
         const std::uint32_t corner = pick(c_v1, c.v[0], pick(c_v2, c.v[1], c.v[2]));
         const std::uint32_t s12 = id(), s123 = id(), less = id(), fourth = id();
@@ -243,13 +275,14 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
     emit(body, op_return, {});
     emit(body, op_function_end, {});
 
-    std::vector<std::uint32_t> out{0x07230203u, 0x00010000u, 0, next, 0};
+    std::vector<std::uint32_t> out;
+    out.reserve(5 + 2 + 3 + 5 + io_vars.size() + 14 + annotations.size() + globals.size() + body.size());
+    out.insert(out.end(), {0x07230203u, 0x00010000u, 0, next, 0});
     emit(out, op_capability, {2});  // Geometry
     emit(out, op_memory_model, {0, 1});  // Logical, GLSL450
-    std::vector<std::uint32_t> entry{3, main_fn, 0x6e69616du, 0};  // Geometry, %main, "main"
-    entry.insert(entry.end(), io_vars.begin(), io_vars.end());
-    out.push_back((std::uint32_t(entry.size()) + 1) << 16 | op_entry_point);
-    out.insert(out.end(), entry.begin(), entry.end());
+    out.push_back((std::uint32_t(4 + io_vars.size()) + 1) << 16 | op_entry_point);
+    out.insert(out.end(), {3, main_fn, 0x6e69616du, 0});  // Geometry, %main, "main"
+    out.insert(out.end(), io_vars.begin(), io_vars.end());
     emit(out, op_execution_mode, {main_fn, 22});         // Triangles
     emit(out, op_execution_mode, {main_fn, 0, 1});       // Invocations 1
     emit(out, op_execution_mode, {main_fn, 29});         // OutputTriangleStrip

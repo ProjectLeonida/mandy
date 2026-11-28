@@ -841,6 +841,9 @@ if(BUILD_TESTING)
   target_link_libraries(image_memory_test PRIVATE Threads::Threads)
   add_test(NAME image_memory COMMAND image_memory_test)
 
+  add_executable(rect_list_geometry_test test/rect_list_geometry_test.cpp)
+  add_test(NAME rect_list_geometry COMMAND rect_list_geometry_test)
+
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
 
