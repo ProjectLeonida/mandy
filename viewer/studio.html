@@ -418,7 +418,7 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
         <button class="tool-btn" id="btn-shade-normals" onclick="setShadingMode('normals')">Нормали</button>
         <button class="tool-btn" id="btn-wireframe" onclick="toggleWireframe()">Сетка</button>
         <button class="tool-btn" id="btn-autorotate" onclick="toggleAutoRotate()">Вращение</button>
-        <button class="tool-btn" onclick="resetCamera()">Сброс камеры</button>
+        <button class="tool-btn" id="btn-reset-camera" onclick="resetCamera()">Сброс камеры</button>
       </div>
       <div id="stats-overlay">
         <div>Модель: <b id="stat-name">—</b></div>
@@ -434,7 +434,7 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
   <section id="textures-view" class="view-panel">
     <div class="tex-controls">
       <div>
-        <h2 style="font-size: 16px; font-weight: 700; color: var(--accent-pink);">Галерея текстур (DDS & PNG)</h2>
+        <h2 id="tex-heading" style="font-size: 16px; font-weight: 700; color: var(--accent-pink);">Галерея текстур (DDS & PNG)</h2>
         <span id="tex-count" style="font-size: 12px; color: var(--text-muted);">Загрузка...</span>
       </div>
       <div class="tex-search">
@@ -485,6 +485,8 @@ const I18N = {
     texSearchPlaceholder: "Фильтр текстур...",
     texCountSuffix: "текстур найдено",
     texNotFound: "Текстуры не найдены",
+    texLoadError: "Ошибка загрузки текстур",
+    showAllTextures: "Показать все ({n} ещё)",
     modelsNotFound: "Ничего не найдено",
     previousModelPage: "Назад",
     nextModelPage: "Далее",
@@ -520,6 +522,8 @@ const I18N = {
     texSearchPlaceholder: "Filter textures...",
     texCountSuffix: "textures found",
     texNotFound: "No textures found",
+    texLoadError: "Could not load the textures",
+    showAllTextures: "Show all ({n} more)",
     modelsNotFound: "No models found",
     previousModelPage: "Previous",
     nextModelPage: "Next",
@@ -557,6 +561,17 @@ function applyTranslations() {
   document.getElementById('btn-autorotate').innerText = t.autoRotate;
   document.getElementById('tex-search-input').placeholder = t.texSearchPlaceholder;
   document.getElementById('modal-title').innerText = t.modalTitle;
+  document.getElementById('btn-reset-camera').innerText = t.resetCamera;
+  document.getElementById('tex-heading').innerText = t.texHeading;
+  const allChip = document.getElementById('chip-all');
+  if (allChip) allChip.innerText = `${t.allCategories} (${allModels.length})`;
+  if (texturesLoaded) document.getElementById('tex-count').innerText = `${allTextures.length} ${t.texCountSuffix}`;
+  // Each stats label is the text node in front of its value (<div>Модель: <b id="stat-name">).
+  for (const [id, key] of [['stat-name', 'statModel'], ['stat-category', 'statCategory'],
+      ['stat-triangles', 'statTriangles'], ['stat-vertices', 'statVertices'], ['stat-size', 'statSize']]) {
+    const label = document.getElementById(id).previousSibling;
+    if (label) label.nodeValue = t[key] + ' ';
+  }
 
   renderAccordionList();
   renderTexturesGrid();
@@ -566,6 +581,7 @@ let allModels = [];
 let selectedModel = null;
 const modelPages = new Map();
 let allTextures = [];
+let texturesLoaded = false;
 let activeCategory = 'ALL';
 let modelSearchQuery = '';
 let texSearchQuery = '';
@@ -816,7 +832,8 @@ function renderCategoryChips(categories) {
 
   const allChip = document.createElement('div');
   allChip.className = 'filter-chip active';
-  allChip.innerText = `Все (${allModels.length})`;
+  allChip.id = 'chip-all';
+  allChip.innerText = `${I18N[currentLang].allCategories} (${allModels.length})`;
   allChip.onclick = () => selectCategory('ALL', allChip);
   container.appendChild(allChip);
 
@@ -860,7 +877,8 @@ function renderAccordionList() {
   });
 
   if (filtered.length === 0) {
-    container.innerHTML = '<div style="padding: 16px; color: var(--text-muted); font-size: 12px; text-align: center;">Ничего не найдено</div>';
+    container.innerHTML = '<div style="padding: 16px; color: var(--text-muted); font-size: 12px; text-align: center;">' +
+      escapeHtml(I18N[currentLang].modelsNotFound) + '</div>';
     return;
   }
 
@@ -966,11 +984,12 @@ async function loadTextures() {
     const data = await res.json();
     allTextures = data.textures || [];
     document.getElementById('badge-textures').innerText = allTextures.length;
-    document.getElementById('tex-count').innerText = `${allTextures.length} текстур найдено`;
+    texturesLoaded = true;
+    document.getElementById('tex-count').innerText = `${allTextures.length} ${I18N[currentLang].texCountSuffix}`;
     renderTexturesGrid();
   } catch (e) {
     console.error('Failed to load textures:', e);
-    document.getElementById('tex-count').innerText = 'Ошибка загрузки текстур';
+    document.getElementById('tex-count').innerText = I18N[currentLang].texLoadError;
   }
 }
 
@@ -986,7 +1005,8 @@ function renderTexturesGrid() {
   const filtered = allTextures.filter(t => !texSearchQuery || t.name.toLowerCase().includes(texSearchQuery));
 
   if (filtered.length === 0) {
-    grid.innerHTML = '<div style="grid-column: 1/-1; padding: 30px; text-align: center; color: var(--text-muted);">Текстуры не найдены</div>';
+    grid.innerHTML = '<div style="grid-column: 1/-1; padding: 30px; text-align: center; color: var(--text-muted);">' +
+      escapeHtml(I18N[currentLang].texNotFound) + '</div>';
     return;
   }
 
@@ -1016,7 +1036,8 @@ function renderTexturesGrid() {
     loadMore.style.gridColumn = '1 / -1';
     loadMore.style.textAlign = 'center';
     loadMore.style.padding = '20px';
-    loadMore.innerHTML = `<button class="tab-btn" style="margin: 0 auto;">Показать все (${filtered.length - 80} ещё)</button>`;
+    loadMore.innerHTML = `<button class="tab-btn" style="margin: 0 auto;">${
+      escapeHtml(I18N[currentLang].showAllTextures.replace('{n}', filtered.length - 80))}</button>`;
     loadMore.onclick = () => {
       loadMore.remove();
       filtered.slice(80).forEach(t => {
