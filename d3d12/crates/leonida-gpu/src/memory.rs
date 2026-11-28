@@ -684,12 +684,21 @@ impl Memory {
             crate::host::copy_mapped(title.as_mut_ptr(), (page as usize * PAGE as usize + at) as *const u8, n, false);
             // SAFETY: a page of an arena of ours, under the mutex.
             let ours = unsafe { std::slice::from_raw_parts_mut((held.at + at) as *mut u8, n) };
-            let runs = merge(&title[..n], ours, false);
-            if !runs.is_empty() {
-                crate::watch::wrote(held.at + at, n);
-            }
             if shadow.side_is_memory() && !whole {
+                // Only here do the dwords that changed matter: they are what
+                // goes up. Found 32 bytes at a time, as a refresh finds them
+                // (this runs at a submission).
+                let runs = crate::shadow::word_runs_put(held.at + at, &title[..n], ours);
                 changed.extend(runs.into_iter().map(|(a, len)| (base + at + a, base + at + a + len)));
+            } else if *ours != title[..n] {
+                // Sent whole, or compared at the next refresh: what differs
+                // is not needed here.
+                ours.copy_from_slice(&title[..n]);
+                // (Nothing asks the write watch about an arena that is its
+                // copy's CPU side.)
+                if !shadow.side_is_memory() {
+                    crate::watch::wrote(held.at + at, n);
+                }
             }
             at += n;
         }
@@ -1470,6 +1479,22 @@ mod tests {
         assert_eq!(got[10], 0xb11d, "the card's own dword stayed");
         assert_eq!(&got[..10], &words[..10], "the page went up whole the first time");
         assert_eq!(&got[21..], &words[21..]);
+        // The same of a page taken at a submission (`land`, of a page not
+        // in a packed structure): dword 11 on the card's side alone, dword
+        // 30 changed by the title.
+        // SAFETY: the mapping, which no copy uses now.
+        unsafe { data.cast::<u32>().write(0xb11e) };
+        // SAFETY: as above.
+        run(&m, &|list| unsafe { list.CopyBufferRegion(&shadow.buffer, offset + 44, &aside, 0, 4) });
+        words[30] = 0x7172;
+        m.take(page, 0, PAGE as usize, false);
+        // SAFETY: as above.
+        run(&m, &|list| unsafe { list.CopyBufferRegion(&aside, 0, &shadow.buffer, offset, PAGE) });
+        // SAFETY: as above.
+        let got = unsafe { std::slice::from_raw_parts(data.cast::<u32>().cast_const(), PAGE as usize / 4) };
+        assert_eq!(got[30], 0x7172, "the dword the title changed went up from `take`");
+        assert_eq!((got[10], got[11]), (0xb11d, 0xb11e), "the card's own dwords stayed");
+        assert_eq!(got[20], 0x7171);
     }
 
     #[test]

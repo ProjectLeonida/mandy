@@ -2957,7 +2957,7 @@ unsafe fn word_runs_avx2_in<const PUT: bool>(at: usize, title: &[u8], held: *mut
 }
 
 /// [`word_runs`] of `title` and `held`, and `held` is `title` afterwards.
-fn word_runs_put(at: usize, title: &[u8], held: &mut [u8]) -> Vec<(usize, usize)> {
+pub(crate) fn word_runs_put(at: usize, title: &[u8], held: &mut [u8]) -> Vec<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
     if title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: the processor has AVX2, and the lengths are the same; `held`
