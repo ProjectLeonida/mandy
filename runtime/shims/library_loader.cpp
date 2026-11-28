@@ -86,7 +86,8 @@ bool is_ascii(const wchar_t* w) {
 std::wstring module_name_w(std::wstring path) {
     const size_t slash = path.find_last_of(L"\\/");
     if (slash != std::wstring::npos) path.erase(0, slash + 1);
-    if (!path.empty() && path.back() == L'.') path.pop_back();
+    if (path.empty()) return {};  // "" or a path ending in a slash: no module, not ".dll"
+    if (path.back() == L'.') path.pop_back();
     else if (path.find(L'.') == std::wstring::npos) path += L".dll";
     return path;
 }
@@ -103,25 +104,22 @@ std::string module_name(std::string path) {
     const size_t slash = path.find_last_of("\\/");
     if (slash != std::string::npos) path.erase(0, slash + 1);
     path = lower_ascii(path);
-    if (!path.empty() && path.back() == '.') path.pop_back();
+    if (path.empty()) return {};  // "" or a path ending in a slash: no module, not ".dll"
+    if (path.back() == '.') path.pop_back();
     else if (path.find('.') == std::string::npos) path += ".dll";
     return path;
 }
 
+// The module name of a host module, asked of Windows on every call. Not cached by HMODULE: a handle names a module
+// only while it is loaded, and once FreeLibrary unloads it another DLL can be mapped at the same base, possibly by
+// another thread before any cache entry could be dropped. Windows' own answer always belongs to the module mapped
+// there now.
 std::string host_module_name(HMODULE module) {
-    std::lock_guard lock(loader_mutex());
-    static auto* names = new std::map<HMODULE, std::string>;
-    if (auto it = names->find(module); it != names->end()) return it->second;
-
     std::vector<wchar_t> path(MAX_PATH);
     for (;;) {
         const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
         if (!length) return {};
-        if (length < path.size()) {
-            const std::string name = module_name(narrow(path.data()));
-            names->emplace(module, name);
-            return name;
-        }
+        if (length < path.size()) return module_name(narrow(path.data()));
         if (path.size() == 32768) return {};
         path.resize(path.size() > 16384 ? 32768 : path.size() * 2);
     }
