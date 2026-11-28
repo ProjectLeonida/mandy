@@ -4850,6 +4850,17 @@ if(TARGET Vulkan::Headers)
       target_compile_options(memory_breakdown_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME memory_breakdown COMMAND memory_breakdown_test)
+    # The mem probe's vmmap line, its reading of the process on native Windows (src/mem_probe.h): the classifier over
+    # synthetic regions and ranges, and walks of this process around memory it commits and maps.
+    if(WIN32)
+      add_executable(mem_probe_vmmap_test test/mem_probe_vmmap_test.cpp)
+      target_link_libraries(mem_probe_vmmap_test PRIVATE Vulkan::Headers psapi)
+      target_compile_definitions(mem_probe_vmmap_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      if(MSVC)
+        target_compile_options(mem_probe_vmmap_test PRIVATE /W4 /permissive- /utf-8)
+      endif()
+      add_test(NAME mem_probe_vmmap COMMAND mem_probe_vmmap_test)
+    endif()
     # The address guard's page table (src/address_guard.h; docs/d3d12_vulkan.md, "Address guard").
     add_executable(address_guard_test test/address_guard_test.cpp)
     if(WIN32 AND MSVC)
