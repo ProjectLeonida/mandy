@@ -334,7 +334,8 @@ def _copy(v):
 
 
 class _Wave:
-    def __init__(self, mod, wave, push_constants, max_steps, builtins=None, inputs=None, memory=None):
+    def __init__(self, mod, wave, push_constants, max_steps, builtins=None, inputs=None, memory=None,
+                 active_lanes=None, strict_subgroup_ub=False, fault_on_unmapped=False):
         self.m = mod
         self.wave = wave
         self.pcw = list(push_constants or [])
@@ -344,6 +345,11 @@ class _Wave:
         self.killed = set()
         self.returned = set()
         self.memory = memory if memory is not None else {}
+        self.active_lanes = set(range(wave)) if active_lanes is None else set(active_lanes)
+        if not self.active_lanes or any(not 0 <= i < wave for i in self.active_lanes):
+            raise ValueError(f"active_lanes must be a non-empty subset of 0..{wave - 1}")
+        self.strict_subgroup_ub = strict_subgroup_ub
+        self.fault_on_unmapped = fault_on_unmapped
         for lane in self.lanes:
             for vid, cls, pointee, init in mod.globals:
                 if cls == "PushConstant":
@@ -404,13 +410,13 @@ class _Wave:
 
     # -- structured execution ------------------------------------------------------------------------------------
     def run(self):
-        group = set(range(self.wave))
+        group = set(self.active_lanes)
         rest = self.region(group, self.m.entry, frozenset())
         if rest:
             raise UnsupportedConstruct(f"invocations left the function through {sorted(rest)}")
         out = []
         for lane in self.lanes:
-            if lane.index in self.killed:
+            if lane.index not in self.active_lanes or lane.index in self.killed:
                 out.append(None)
                 continue
             words = {}
@@ -576,7 +582,7 @@ class _Wave:
                         v = self.eval(self.lanes[i], res, op, a)
                     except _UsedPoison as p:
                         # OpSelect reads its arms without inspecting them, so only its condition gets here.
-                        if op in ("OpAccessChain", "OpSelect"):
+                        if op in ("OpAccessChain", "OpSelect", "OpConvertUToPtr"):
                             raise UnsupportedConstruct(f"{op} {res} depends on an undefined value "
                                                        f"({p.poison.why})") from None
                         v = p.poison
@@ -659,9 +665,19 @@ class _Wave:
             src_vals = {i: self.raw(L[i], a[2]) for i in members}
             for i in members:
                 idx = self.int_of(L[i], a[3])
-                L[i].values[res] = src_vals[idx] if idx in src_vals else \
-                    _Poison(f"{op[17:]} from invocation {idx}, which is not running")
+                if idx in src_vals:
+                    L[i].values[res] = src_vals[idx]
+                else:
+                    msg = f"{op[17:]} from invocation {idx}, which is not running"
+                    if self.strict_subgroup_ub:
+                        raise UnsupportedConstruct(msg)
+                    L[i].values[res] = _Poison(msg)
         elif op == "OpGroupNonUniformBroadcastFirst":
+            if not members:
+                msg = "BroadcastFirst with no running invocation"
+                if self.strict_subgroup_ub:
+                    raise UnsupportedConstruct(msg)
+                return
             first = self.raw(L[members[0]], a[2])
             for i in members:
                 L[i].values[res] = first
@@ -675,7 +691,13 @@ class _Wave:
                 if d not in (0, 1, 2):
                     raise UnsupportedConstruct(f"OpGroupNonUniformQuadSwap direction {d}")
                 partner = i ^ (d + 1)
-                L[i].values[res] = src_vals[partner] if partner in src_vals else                     _Poison(f"QuadSwap from invocation {partner}, which is not running")
+                if partner in src_vals:
+                    L[i].values[res] = src_vals[partner]
+                else:
+                    msg = f"QuadSwap from invocation {partner}, which is not running"
+                    if self.strict_subgroup_ub:
+                        raise UnsupportedConstruct(msg)
+                    L[i].values[res] = _Poison(msg)
         elif op == "OpGroupNonUniformQuadBroadcast":
             src_vals = {i: self.raw(L[i], a[2]) for i in members}
             for i in members:
@@ -683,7 +705,13 @@ class _Wave:
                 if not 0 <= idx < 4:
                     raise UnsupportedConstruct(f"OpGroupNonUniformQuadBroadcast index {idx}")
                 partner = (i & ~3) | idx
-                L[i].values[res] = src_vals[partner] if partner in src_vals else                     _Poison(f"QuadBroadcast from invocation {partner}, which is not running")
+                if partner in src_vals:
+                    L[i].values[res] = src_vals[partner]
+                else:
+                    msg = f"QuadBroadcast from invocation {partner}, which is not running"
+                    if self.strict_subgroup_ub:
+                        raise UnsupportedConstruct(msg)
+                    L[i].values[res] = _Poison(msg)
         else:
             raise UnsupportedConstruct(op)
 
@@ -716,11 +744,6 @@ class _Wave:
                         raise UnsupportedConstruct(f"psb access chain into {k[0]}")
                 lane.pointers[res] = ("psb", addr, ty)
                 return None
-            if p[0] == "psb":
-                if m.size(p[2]) != 4:
-                    raise UnsupportedConstruct("psb load wider than one word")
-                v = self.memory.get(p[1], 0)
-                return F(v) if m.types[p[2]][0] == "float" else v & MASK
             if p[0] == "pc":
                 off, ty = p[1], p[2]
                 for x in a[2:]:
@@ -755,6 +778,26 @@ class _Wave:
             p = lane.pointers.get(a[1])
             if p is None:
                 raise UnsupportedConstruct(f"OpLoad from {a[1]}, which is not a pointer")
+            if p[0] == "psb":
+                k = m.types[p[2]]
+                if k[0] == "vec":
+                    elem_k = m.types[k[1]]
+                    if m.size(k[1]) != 4:
+                        raise UnsupportedConstruct("psb vector load with non-32-bit element")
+                    out_v = []
+                    for wi in range(k[2]):
+                        ea = p[1] + 4 * wi
+                        if self.fault_on_unmapped and ea not in self.memory:
+                            raise UnsupportedConstruct(f"psb load from unmapped address {ea:#x}")
+                        w = self.memory.get(ea, 0) & MASK
+                        out_v.append(F(w) if elem_k[0] == "float" else w)
+                    return tuple(out_v)
+                if m.size(p[2]) != 4:
+                    raise UnsupportedConstruct("psb load wider than one word")
+                if self.fault_on_unmapped and p[1] not in self.memory:
+                    raise UnsupportedConstruct(f"psb load from unmapped address {p[1]:#x}")
+                v = self.memory.get(p[1], 0) & MASK
+                return F(v) if k[0] == "float" else v
             if p[0] == "pc":
                 if m.size(p[2]) != 4:
                     raise UnsupportedConstruct("push-constant load wider than one word")
@@ -1043,9 +1086,12 @@ class _BuiltinNotModelled:
         self.name = name
 
 
-def run_wave(text, wave=32, push_constants=None, max_steps=2_000_000, builtins=None, inputs=None, memory=None):
+def run_wave(text, wave=32, push_constants=None, max_steps=2_000_000, builtins=None, inputs=None, memory=None,
+             active_lanes=None, strict_subgroup_ub=False, fault_on_unmapped=False):
     if wave not in (32, 64):
         raise ValueError("wave must be 32 or 64")
-    w = _Wave(_Module(text), wave, push_constants, max_steps, builtins, inputs=inputs, memory=memory)
+    w = _Wave(_Module(text), wave, push_constants, max_steps, builtins, inputs=inputs, memory=memory,
+              active_lanes=active_lanes, strict_subgroup_ub=strict_subgroup_ub,
+              fault_on_unmapped=fault_on_unmapped)
     outputs = w.run()
     return {"outputs": outputs, "steps": w.steps, "memory": w.memory}
