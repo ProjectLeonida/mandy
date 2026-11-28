@@ -598,8 +598,19 @@ int main() {
         for (int i = 0; host_loopback && host->h_addr_list[i]; ++i)
             host_loopback = static_cast<uint8_t>(host->h_addr_list[i][0]) == 127;
         check(host_loopback, "gethostbyname(LOCALHOST) answers loopback only");
+        // Under AI_NUMERICHOST "localhost" is not a numeric host: refused as the host refuses it, not rewritten.
+        ADDRINFOA numeric{};
+        numeric.ai_flags = AI_NUMERICHOST;
+        res = nullptr;
+        check(sh_getaddrinfo("localhost", "80", &numeric, &res) == EAI_NONAME && res == nullptr,
+              "getaddrinfo(localhost, AI_NUMERICHOST) is EAI_NONAME, as on the host");
+        check(sh_getaddrinfo("127.0.0.1", "80", &numeric, &res) == 0 && res != nullptr,
+              "getaddrinfo(127.0.0.1, AI_NUMERICHOST) is answered");
+        if (res) freeaddrinfo(res);
 
-        // An overlapped SIO_GET_EXTENSION_FUNCTION_POINTER: answered at once, reported through the OVERLAPPED.
+        // An overlapped SIO_GET_EXTENSION_FUNCTION_POINTER: answered at once, and its completion reported as the host
+        // reports it. Windows 11 (measured): the event set, the routine run once, a port packet posted, with 0 bytes
+        // in the OVERLAPPED and the completion (lpcbBytesReturned is 8).
         const SOCKET tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         GUID connect_ex_guid = WSAID_CONNECTEX;
         LPFN_CONNECTEX direct = nullptr, overlapped_ex = nullptr;
@@ -613,9 +624,8 @@ int main() {
                                     &overlapped_ex, sizeof(overlapped_ex), &returned, &ov, nullptr);
         check(rc == 0 && overlapped_ex && overlapped_ex == direct && returned == sizeof(overlapped_ex),
               "an overlapped WSAIoctl returns the same wrapped ConnectEx at once");
-        check(WaitForSingleObject(ov.hEvent, 0) == WAIT_OBJECT_0 && ov.Internal == 0 &&
-                  ov.InternalHigh == sizeof(overlapped_ex),
-              "an overlapped WSAIoctl sets its event and its OVERLAPPED's status and byte count");
+        check(WaitForSingleObject(ov.hEvent, 0) == WAIT_OBJECT_0 && ov.Internal == 0,
+              "an overlapped WSAIoctl sets its event and a success status");
         WSACloseEvent(ov.hEvent);
 
         static int routine_calls = 0;
@@ -631,9 +641,54 @@ int main() {
         const int rc2 = sh_wsa_ioctl(tcp, SIO_GET_EXTENSION_FUNCTION_POINTER, &send_msg_guid, sizeof(send_msg_guid),
                                      &send_msg, sizeof(send_msg), &returned, &ov2, routine);
         SleepEx(0, TRUE);  // an alertable wait runs the queued routine
-        check(rc2 == 0 && send_msg && routine_calls == 1 && routine_bytes == sizeof(send_msg),
+        check(rc2 == 0 && send_msg && routine_calls == 1,
               "an overlapped WSAIoctl with a completion routine runs it once at the next alertable wait");
         closesocket(tcp);
+
+        // A socket on an I/O completion port, an OVERLAPPED with no event and no routine: the completion is a port
+        // packet, and the caller's buffer already holds the wrapper when it is dequeued (timbot103's review).
+        const SOCKET on_port = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
+        const HANDLE port = CreateIoCompletionPort(reinterpret_cast<HANDLE>(on_port), nullptr, 0x5a, 0);
+        WSAOVERLAPPED ov3{};
+        LPFN_CONNECTEX port_ex = nullptr;
+        returned = 0;
+        const int rc3 = sh_wsa_ioctl(on_port, SIO_GET_EXTENSION_FUNCTION_POINTER, &connect_ex_guid,
+                                     sizeof(connect_ex_guid), &port_ex, sizeof(port_ex), &returned, &ov3, nullptr);
+        const bool pending3 = rc3 == SOCKET_ERROR && WSAGetLastError() == WSA_IO_PENDING;
+        DWORD port_bytes = 0;
+        ULONG_PTR key = 0;
+        LPOVERLAPPED dequeued = nullptr;
+        const BOOL got = port ? GetQueuedCompletionStatus(port, &port_bytes, &key, &dequeued, 2000) : FALSE;
+        check(port && (rc3 == 0 || pending3) && got && key == 0x5a && dequeued == &ov3 && port_ex == direct,
+              "an overlapped WSAIoctl on a completion-port socket posts its packet, with the wrapped ConnectEx");
+        if (port) CloseHandle(port);
+        closesocket(on_port);
+
+        // A socket without WSA_FLAG_OVERLAPPED ignores the overlapped and the routine: the shim's answer leaves them
+        // as the host's own WSAIoctl does on the same socket.
+        const SOCKET blocking = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, 0);
+        using HostIoctl = int(WSAAPI*)(SOCKET, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPWSAOVERLAPPED,
+                                       LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+        const auto host_ioctl = reinterpret_cast<HostIoctl>(GetProcAddress(GetModuleHandleW(L"ws2_32.dll"), "WSAIoctl"));
+        WSAOVERLAPPED ov_shim{}, ov_host{};
+        ov_shim.hEvent = WSACreateEvent();
+        ov_host.hEvent = WSACreateEvent();
+        LPFN_CONNECTEX blocking_ex = nullptr, host_ex = nullptr;
+        DWORD host_returned = 0;
+        const int rc_shim = sh_wsa_ioctl(blocking, SIO_GET_EXTENSION_FUNCTION_POINTER, &connect_ex_guid,
+                                         sizeof(connect_ex_guid), &blocking_ex, sizeof(blocking_ex), &returned,
+                                         &ov_shim, nullptr);
+        const int rc_host = host_ioctl(blocking, SIO_GET_EXTENSION_FUNCTION_POINTER, &connect_ex_guid,
+                                       sizeof(connect_ex_guid), &host_ex, sizeof(host_ex), &host_returned, &ov_host,
+                                       nullptr);
+        const bool shim_set = WaitForSingleObject(ov_shim.hEvent, 0) == WAIT_OBJECT_0;
+        const bool host_set = WaitForSingleObject(ov_host.hEvent, 0) == WAIT_OBJECT_0;
+        check(rc_shim == 0 && rc_host == 0 && blocking_ex == direct && host_ex != direct && shim_set == host_set &&
+                  ov_shim.Internal == ov_host.Internal && ov_shim.InternalHigh == ov_host.InternalHigh,
+              "on a socket without WSA_FLAG_OVERLAPPED the overlapped is left as the host leaves it");
+        WSACloseEvent(ov_shim.hEvent);
+        WSACloseEvent(ov_host.hEvent);
+        closesocket(blocking);
     }
 
     WSACleanup();

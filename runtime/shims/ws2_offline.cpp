@@ -29,8 +29,9 @@
 //     NI_NAMEREQD is set), avoiding reverse DNS lookups.
 //   - WSAIoctl wraps WSAID_CONNECTEX and WSAID_WSASENDMSG and refuses SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER
 //     with WSAEINVAL so extension functions cannot bypass the checks. The wrappers ask the host for the native
-//     pointer of the socket they are called on, since each Winsock provider has its own. The lookup itself is
-//     synchronous; an overlapped request is reported as completed at once (its event set, its routine queued).
+//     pointer of the socket they are called on, since each Winsock provider has its own. The host answers the
+//     lookup with the caller's overlapped and completion routine (so a completion port, event or routine is told as
+//     Winsock tells it), but writes its own pointer into storage of the shim's, never into the caller's buffer.
 //
 // Every host ws2_32.dll call is resolved dynamically from System32 so gta6rt needs no static ws2_32.lib link
 // dependency. Each refused destination is logged once ("[rt] ws2: offline, refused <op> <target>") with no payload.
@@ -262,13 +263,14 @@ bool is_localhost_name_a(const char* node) {
 }
 
 // What a lookup hands the host for `node`: "localhost" becomes a loopback literal, so the host's hosts file is never
-// read for it (it could map the name off loopback); IPv6 for an AF_INET6 lookup, else IPv4. Any other node as is.
-const char* lookup_node_a(const char* node, int family) {
-    if (!node || !is_localhost_name_a(node)) return node;
+// read for it (it could map the name off loopback); IPv6 for an AF_INET6 lookup, else IPv4. Any other node as is, and
+// "localhost" too under AI_NUMERICHOST, where the host refuses it (EAI_NONAME) without a lookup, as it should.
+const char* lookup_node_a(const char* node, int family, int flags = 0) {
+    if (!node || (flags & AI_NUMERICHOST) || !is_localhost_name_a(node)) return node;
     return family == AF_INET6 ? "::1" : "127.0.0.1";
 }
-const wchar_t* lookup_node_w(const wchar_t* node, int family) {
-    if (!node || !is_localhost_name_a(narrow_ascii(node).c_str())) return node;
+const wchar_t* lookup_node_w(const wchar_t* node, int family, int flags = 0) {
+    if (!node || (flags & AI_NUMERICHOST) || !is_localhost_name_a(narrow_ascii(node).c_str())) return node;
     return family == AF_INET6 ? L"::1" : L"127.0.0.1";
 }
 
@@ -609,7 +611,7 @@ INT WSAAPI getaddrinfo_offline(PCSTR node, PCSTR service, const ADDRINFOA* hints
         set_wsa_error(WSAHOST_NOT_FOUND);
         return WSAHOST_NOT_FOUND;
     }
-    return real_fn(lookup_node_a(node, hints ? hints->ai_family : AF_UNSPEC), service, hints, result);
+    return real_fn(lookup_node_a(node, hints ? hints->ai_family : AF_UNSPEC, hints ? hints->ai_flags : 0), service, hints, result);
 }
 
 INT WSAAPI get_addr_info_w_offline(PCWSTR node, PCWSTR service, const ADDRINFOW* hints, PADDRINFOW* result) {
@@ -625,7 +627,7 @@ INT WSAAPI get_addr_info_w_offline(PCWSTR node, PCWSTR service, const ADDRINFOW*
         set_wsa_error(WSAHOST_NOT_FOUND);
         return WSAHOST_NOT_FOUND;
     }
-    return real_fn(lookup_node_w(node, hints ? hints->ai_family : AF_UNSPEC), service, hints, result);
+    return real_fn(lookup_node_w(node, hints ? hints->ai_family : AF_UNSPEC, hints ? hints->ai_flags : 0), service, hints, result);
 }
 
 INT WSAAPI get_addr_info_ex_a_offline(PCSTR name, PCSTR service, DWORD ns, LPGUID nsp_id, const ADDRINFOEXA* hints,
@@ -645,7 +647,7 @@ INT WSAAPI get_addr_info_ex_a_offline(PCSTR name, PCSTR service, DWORD ns, LPGUI
         set_wsa_error(WSAHOST_NOT_FOUND);
         return WSAHOST_NOT_FOUND;
     }
-    return real_fn(lookup_node_a(name, hints ? hints->ai_family : AF_UNSPEC), service, ns, nsp_id, hints, result, timeout, overlapped, completion, cancel_handle);
+    return real_fn(lookup_node_a(name, hints ? hints->ai_family : AF_UNSPEC, hints ? hints->ai_flags : 0), service, ns, nsp_id, hints, result, timeout, overlapped, completion, cancel_handle);
 }
 
 INT WSAAPI get_addr_info_ex_w_offline(PCWSTR name, PCWSTR service, DWORD ns, LPGUID nsp_id, const ADDRINFOEXW* hints,
@@ -665,7 +667,7 @@ INT WSAAPI get_addr_info_ex_w_offline(PCWSTR name, PCWSTR service, DWORD ns, LPG
         set_wsa_error(WSAHOST_NOT_FOUND);
         return WSAHOST_NOT_FOUND;
     }
-    return real_fn(const_cast<PWSTR>(lookup_node_w(name, hints ? hints->ai_family : AF_UNSPEC)), service, ns, nsp_id, hints, result, timeout, overlapped, completion, cancel_handle);
+    return real_fn(const_cast<PWSTR>(lookup_node_w(name, hints ? hints->ai_family : AF_UNSPEC, hints ? hints->ai_flags : 0)), service, ns, nsp_id, hints, result, timeout, overlapped, completion, cancel_handle);
 }
 
 hostent* WSAAPI gethostbyname_offline(const char* name) {
@@ -848,29 +850,43 @@ int PASCAL wsa_send_msg_ext_offline(SOCKET s, LPWSAMSG msg, DWORD flags, LPDWORD
     return real_fn(s, msg, flags, bytes_sent, overlapped, completion);
 }
 
-// An overlapped extension-pointer lookup that the shim answered synchronously: report it the way Winsock reports an
-// overlapped call that completed at once (status and byte count in the OVERLAPPED, its event set, its completion
-// routine queued to this thread for its next alertable wait).
-void complete_now(LPWSAOVERLAPPED overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE completion, DWORD bytes) {
-    if (!overlapped) return;
-    overlapped->Internal = 0;
-    overlapped->InternalHigh = bytes;
-    if (completion) {
-        struct Call {
-            LPWSAOVERLAPPED_COMPLETION_ROUTINE routine;
-            LPWSAOVERLAPPED overlapped;
-            DWORD bytes;
-        };
-        auto* call = new Call{completion, overlapped, bytes};
-        const auto run = [](ULONG_PTR p) {
-            auto* c = reinterpret_cast<Call*>(p);
-            c->routine(0, c->bytes, c->overlapped, 0);
-            delete c;
-        };
-        if (!QueueUserAPC(run, GetCurrentThread(), reinterpret_cast<ULONG_PTR>(call))) delete call;
-    } else if (overlapped->hEvent) {
-        SetEvent(overlapped->hEvent);
+// SIO_GET_EXTENSION_FUNCTION_POINTER for an extension the shim wraps: the caller gets `wrapped`, never the host's
+// pointer. The host still answers the call itself, with the caller's overlapped and completion routine, so the
+// completion is reported the way Winsock reports it for this socket: an I/O completion port packet, the event, the
+// routine, or nothing for a socket without WSA_FLAG_OVERLAPPED. What the host writes (its own pointer and byte
+// count) goes to storage of the shim's own, never to the caller's buffer or to this frame: it is freed when the call
+// completed here, and kept when the host reports the call pending, since the host may write it later (a few bytes;
+// this lookup completes at once in practice). `wrapped` is in the caller's buffer before the host is called, so a
+// completion another thread dequeues already finds it there; on failure the buffer gets its old contents back.
+template <typename Wrapped, typename Fn>
+int wrap_extension_lookup(Fn real_fn, SOCKET s, DWORD io_control_code, LPVOID in_buf, DWORD in_len, LPVOID out_buf,
+                          LPDWORD bytes_returned, LPWSAOVERLAPPED overlapped,
+                          LPWSAOVERLAPPED_COMPLETION_ROUTINE completion, Wrapped wrapped) {
+    struct HostAnswer {
+        Wrapped pointer = nullptr;
+        DWORD returned = 0;
+    };
+    auto* answer = new (std::nothrow) HostAnswer;
+    if (!answer) {
+        set_wsa_error(WSA_NOT_ENOUGH_MEMORY);
+        return SOCKET_ERROR;
     }
+    Wrapped previous = nullptr;
+    std::memcpy(&previous, out_buf, sizeof(previous));
+    std::memcpy(out_buf, &wrapped, sizeof(wrapped));
+    const int rc = real_fn(s, io_control_code, in_buf, in_len, &answer->pointer, sizeof(answer->pointer),
+                           &answer->returned, overlapped, completion);
+    const int error = rc == 0 ? 0 : WSAGetLastError();
+    if (rc == 0) {
+        *bytes_returned = sizeof(wrapped);
+        delete answer;
+        return 0;
+    }
+    if (error == WSA_IO_PENDING) return rc;  // the host still owns `answer`; `wrapped` stays in the caller's buffer
+    std::memcpy(out_buf, &previous, sizeof(previous));
+    delete answer;
+    set_wsa_error(error);
+    return rc;
 }
 
 int WSAAPI wsa_ioctl_offline(SOCKET s, DWORD io_control_code, LPVOID in_buf, DWORD in_len, LPVOID out_buf,
@@ -900,34 +916,17 @@ int WSAAPI wsa_ioctl_offline(SOCKET s, DWORD io_control_code, LPVOID in_buf, DWO
                 set_wsa_error(WSAEFAULT);
                 return SOCKET_ERROR;
             }
-            // Synchronous, as host_extension asks: an overlapped host call could finish after this frame is gone,
-            // writing through &real_ext and &returned. The caller's overlapped is completed here instead.
-            LPFN_CONNECTEX real_ext = nullptr;
-            DWORD returned = 0;
-            const int rc = real_fn(s, io_control_code, in_buf, in_len, &real_ext, sizeof(real_ext), &returned,
-                                   nullptr, nullptr);
-            if (rc != 0) return rc;
-            LPFN_CONNECTEX wrapped = &connect_ex_offline;
-            std::memcpy(out_buf, &wrapped, sizeof(wrapped));
-            *bytes_returned = sizeof(wrapped);
-            complete_now(overlapped, completion, sizeof(wrapped));
-            return 0;
+            return wrap_extension_lookup<LPFN_CONNECTEX>(real_fn, s, io_control_code, in_buf, in_len, out_buf,
+                                                         bytes_returned, overlapped, completion, &connect_ex_offline);
         }
         if (std::memcmp(&requested, &kSendMsgGuid, sizeof(GUID)) == 0) {
             if (!out_buf || out_len < sizeof(void*) || !bytes_returned) {
                 set_wsa_error(WSAEFAULT);
                 return SOCKET_ERROR;
             }
-            LPFN_WSASENDMSG real_ext = nullptr;
-            DWORD returned = 0;
-            const int rc = real_fn(s, io_control_code, in_buf, in_len, &real_ext, sizeof(real_ext), &returned,
-                                   nullptr, nullptr);  // synchronous: see ConnectEx above
-            if (rc != 0) return rc;
-            LPFN_WSASENDMSG wrapped = &wsa_send_msg_ext_offline;
-            std::memcpy(out_buf, &wrapped, sizeof(wrapped));
-            *bytes_returned = sizeof(wrapped);
-            complete_now(overlapped, completion, sizeof(wrapped));
-            return 0;
+            return wrap_extension_lookup<LPFN_WSASENDMSG>(real_fn, s, io_control_code, in_buf, in_len, out_buf,
+                                                          bytes_returned, overlapped, completion,
+                                                          &wsa_send_msg_ext_offline);
         }
     }
 
