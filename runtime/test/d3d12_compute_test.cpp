@@ -439,6 +439,45 @@ int main() {
             EXPECT(attempt(resealed(blob_bytes, 4)) == E_INVALIDARG);  // version
         }
 
+        // ID3D12Device2::CreatePipelineState gives a stream's PSO the same cache key as the description path: the same
+        // root signature and CS make the same GetCachedBlob bytes, and the blob is accepted back (#2477's review: the
+        // public stream path left the key empty).
+        {
+            struct alignas(void*) RootSubobject {
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+                ID3D12RootSignature* value;
+            };
+            struct alignas(void*) ShaderSubobject {
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+                D3D12_SHADER_BYTECODE value;
+            };
+            struct {
+                RootSubobject root;
+                ShaderSubobject cs;
+            } stream{{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, pso_desc.pRootSignature},
+                     {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, pso_desc.CS}};
+            const D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
+            Ref<ID3D12Device2> device2;
+            EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device2.p))) && device2.p);
+            Ref<ID3D12PipelineState> from_desc, from_stream;
+            EXPECT(SUCCEEDED(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&from_desc.p))));
+            if (device2.p) EXPECT(SUCCEEDED(device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&from_stream.p))));
+            Ref<ID3DBlob> desc_blob, stream_blob;
+            if (from_desc.p && from_stream.p) {
+                EXPECT(from_desc->GetCachedBlob(&desc_blob.p) == S_OK && desc_blob.p);
+                EXPECT(from_stream->GetCachedBlob(&stream_blob.p) == S_OK && stream_blob.p);
+            }
+            if (desc_blob.p && stream_blob.p) {
+                EXPECT(desc_blob->GetBufferSize() == stream_blob->GetBufferSize() &&
+                       std::memcmp(desc_blob->GetBufferPointer(), stream_blob->GetBufferPointer(),
+                                   desc_blob->GetBufferSize()) == 0);
+                D3D12_COMPUTE_PIPELINE_STATE_DESC d = pso_desc;
+                d.CachedPSO = {stream_blob->GetBufferPointer(), stream_blob->GetBufferSize()};
+                Ref<ID3D12PipelineState> made;
+                EXPECT(device->CreateComputePipelineState(&d, IID_PPV_ARGS(&made.p)) == S_OK);
+            }
+        }
+
         // A device whose maxPushConstantsSize is the Vulkan minimum (128 bytes) cannot hold the 144-byte block, so
         // its PSOs are refused instead of creating a pipeline layout the spec forbids (#224's fallback flag).
         {

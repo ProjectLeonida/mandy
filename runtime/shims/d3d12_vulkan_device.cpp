@@ -17955,6 +17955,9 @@ public:
         if (FAILED(parsed)) return finish(parsed);
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
+        // The same cache key the description paths and a console stream (prepare_console_stream) give: GetCachedBlob
+        // and a later CachedPSO check name this stream's state, its depth bounds and back-face stencil masks with it.
+        pipeline->set_cache_key(stream.has_cs ? pipeline_key(stream.compute) : stream_graphics_key(stream));
         if (state_.order_log || state_.prewarm_plan) pipeline->set_order_key(order_key(stream));
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
                                          : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as,
