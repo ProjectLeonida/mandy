@@ -418,9 +418,42 @@ int test() {
     EXPECT(mirror->counters().homes_freed == freed + 1);
     EXPECT(dispatch(4, r) && r[0] == b[0x10] && r[1] == 0);
 
+    // 4. Parallel batch upload (>= kParallelThreshold): 64 distinct pages mapped, mutated, uploaded via internal
+    //    worker pool into mapped Vulkan unit memory, and verified on the GPU through title-written V#s.
+    constexpr std::size_t kBatchPages = 64;
+    std::vector<std::uint32_t> batch_frames(kBatchPages * (kPage / 4));
+    for (std::size_t p = 0; p < kBatchPages; ++p) {
+        std::uint32_t* page_words = batch_frames.data() + p * (kPage / 4);
+        for (std::size_t i = 0; i < kPage / 4; ++i)
+            page_words[i] = 0xC0000000u | (std::uint32_t(p) << 16) | std::uint32_t(i);
+        mirror->map(t0 + (4 + p) * kPage, reinterpret_cast<std::uint8_t*>(page_words), nullptr, ++ticket);
+    }
+    EXPECT(mirror->flush(5));
+    // Mutate word 0x10 of every page in the 64-page batch and upload in parallel.
+    for (std::size_t p = 0; p < kBatchPages; ++p) {
+        batch_frames[p * (kPage / 4) + 0x10] = 0xD0000000u | (std::uint32_t(p) << 16) | 0x10u;
+        EXPECT(mirror->dirty(t0 + (4 + p) * kPage));
+    }
+    const std::uint64_t batch_uploads_before = mirror->counters().uploads;
+    EXPECT(mirror->upload() == kBatchPages);
+    EXPECT(mirror->counters().uploads == batch_uploads_before + kBatchPages);
+    EXPECT(mirror->last_upload_bytes() == kBatchPages * 256);
+    // Point the 4 V#s at 4 pages spanning the parallel batch (0, 17, 41, 63) and verify GPU reads.
+    const std::size_t sample_pages[kViews] = {0, 17, 41, 63};
+    for (std::uint32_t i = 0; i < kViews; ++i) {
+        const std::uint64_t va = t0 + (4 + sample_pages[i]) * kPage;
+        w[i * 4 + 0] = std::uint32_t(va);
+        w[i * 4 + 1] = std::uint32_t(va >> 32) & 0xffffu;
+    }
+    EXPECT(dispatch(5, r));
+    for (std::uint32_t i = 0; i < kViews; ++i) {
+        const std::uint32_t expected = 0xD0000000u | (std::uint32_t(sample_pages[i]) << 16) | 0x10u;
+        EXPECT(r[i] == expected);
+    }
+
     std::printf("title mirror: a title-written V# read through a buffer reaches its page at heap_base + its address, "
                 "its alias the same home, an unbound page zero; a remap, a write and an unmap reach the next dispatch "
-                "that waits for the bind (%zu chunk, %zu unit)\n",
+                "that waits for the bind; 64-page parallel upload verified on GPU (%zu chunk, %zu unit)\n",
                 chunks.size(), units.size());
     return 0;
 #endif

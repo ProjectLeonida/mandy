@@ -10,17 +10,166 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#elif defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
 
 namespace leonida::shadow_keep {
 
 inline constexpr std::size_t kPiece = 256;
 
 // The sum of `n` bytes, never 0 (0 is "not known": the piece is copied at its next look).
-// Four independent lanes over 32 bytes a step, so the multiplies do not wait on each other: about the speed of a
-// copy (one chained lane read about 3.6 GB/s on an RTX 5080 machine's CPU, a copy about 18 GB/s).
+// On AVX2 (x86-64-v3): 4 x 256-bit accumulators (128 bytes/step, XXH3-style vpmuludq + vpaddq with distinct evolving
+// per-lane keys — 2 iterations per 256-byte piece).
+// On baseline x86-64 (SSE2): 4 x 128-bit accumulators (64 bytes/step).
+// Portable fallback: four independent 64-bit lanes over 32 bytes a step.
 inline std::uint64_t sum_of(const std::uint8_t* bytes, std::size_t n) {
     constexpr std::uint64_t k = 0xff51afd7ed558ccdull;
     const auto rotl = [](std::uint64_t x, int r) { return (x << r) | (x >> (64 - r)); };
+#if defined(__AVX2__)
+    const __m256i k_step = _mm256_set_epi32(
+        static_cast<int>(0x9e3779b1u), static_cast<int>(0x85ebca77u), static_cast<int>(0xc2b2ae3du),
+        static_cast<int>(0x27d4eb2fu), static_cast<int>(0x165667b1u), static_cast<int>(0x9e3779f9u),
+        static_cast<int>(0x85ebca87u), static_cast<int>(0xc2b2ae63u));
+    __m256i k0 = _mm256_set_epi32(
+        static_cast<int>(0x165667b1u), static_cast<int>(0x9e3779f9u), static_cast<int>(0x85ebca87u),
+        static_cast<int>(0xc2b2ae63u), static_cast<int>(0x27d4eb4fu), static_cast<int>(0x165667c5u),
+        static_cast<int>(0xff51afd7u), static_cast<int>(0xed558ccdu));
+    __m256i k1 = _mm256_set_epi32(
+        static_cast<int>(0xc4ceb9feu), static_cast<int>(0x1a85ec53u), static_cast<int>(0x94d049bbu),
+        static_cast<int>(0x133111ebu), static_cast<int>(0xbf58476du), static_cast<int>(0x1ce4e5b9u),
+        static_cast<int>(0x9e3779b9u), static_cast<int>(0x7f4a7c15u));
+    __m256i k2 = _mm256_set_epi32(
+        static_cast<int>(0xa0761d65u), static_cast<int>(0xe7037ed1u), static_cast<int>(0x8ebc6af1u),
+        static_cast<int>(0x589965cbu), static_cast<int>(0x1d8e4e27u), static_cast<int>(0xeb44accbu),
+        static_cast<int>(0x2d358dcdu), static_cast<int>(0x75567b7bu));
+    __m256i k3 = _mm256_set_epi32(
+        static_cast<int>(0xd6e8feb9u), static_cast<int>(0x6659fd93u), static_cast<int>(0xb492b66fu),
+        static_cast<int>(0x3c79ac49u), static_cast<int>(0xf1357aeau), static_cast<int>(0x60642e2bu),
+        static_cast<int>(0x49d4f7b3u), static_cast<int>(0xc8b86a9du));
+
+    __m256i s0 = _mm256_set_epi64x(
+        static_cast<long long>(0x27d4eb2f165667c5ull), static_cast<long long>(0x165667b19e3779f9ull),
+        static_cast<long long>(0xc2b2ae3d27d4eb4full), static_cast<long long>(0x9e3779b97f4a7c15ull ^ n));
+    __m256i s1 = _mm256_set_epi64x(
+        static_cast<long long>(0x94d049bb133111ebull), static_cast<long long>(0xc4ceb9fe1a85ec53ull),
+        static_cast<long long>(0xff51afd7ed558ccdull), static_cast<long long>(0x85ebca77c2b2ae63ull));
+    __m256i s2 = _mm256_set_epi64x(
+        static_cast<long long>(0xbf58476d1ce4e5b9ull), static_cast<long long>(0xa0761d6478bd642full),
+        static_cast<long long>(0xe7037ed1a0b428dbull), static_cast<long long>(0x8ebc6af09c88c6e3ull));
+    __m256i s3 = _mm256_set_epi64x(
+        static_cast<long long>(0x589965cc75374cc3ull), static_cast<long long>(0x1d8e4e27c47d124full),
+        static_cast<long long>(0xeb44accab455d165ull), static_cast<long long>(0xd6e8feb86659fd93ull));
+
+    const auto lane = [](__m256i acc, __m256i data, __m256i key) -> __m256i {
+        const __m256i x = _mm256_xor_si256(data, key);
+        const __m256i x_hi = _mm256_srli_epi64(x, 32);
+        const __m256i prod = _mm256_mul_epu32(x, x_hi);
+        const __m256i d_swap = _mm256_shuffle_epi32(data, _MM_SHUFFLE(1, 0, 3, 2));
+        return _mm256_add_epi64(_mm256_add_epi64(acc, d_swap), prod);
+    };
+
+    std::size_t i = 0;
+    for (; i + 128 <= n; i += 128) {
+        const auto* p = reinterpret_cast<const __m256i*>(bytes + i);
+        s0 = lane(s0, _mm256_loadu_si256(p + 0), k0);
+        s1 = lane(s1, _mm256_loadu_si256(p + 1), k1);
+        s2 = lane(s2, _mm256_loadu_si256(p + 2), k2);
+        s3 = lane(s3, _mm256_loadu_si256(p + 3), k3);
+        k0 = _mm256_add_epi32(k0, k_step);
+        k1 = _mm256_add_epi32(k1, k_step);
+        k2 = _mm256_add_epi32(k2, k_step);
+        k3 = _mm256_add_epi32(k3, k_step);
+    }
+
+    const __m256i m0 = _mm256_xor_si256(s0, _mm256_shuffle_epi32(s2, _MM_SHUFFLE(1, 0, 3, 2)));
+    const __m256i m1 = _mm256_xor_si256(s1, _mm256_shuffle_epi32(s3, _MM_SHUFFLE(1, 0, 3, 2)));
+    const __m128i f0 = _mm_xor_si128(_mm256_castsi256_si128(m0),
+                                     _mm_shuffle_epi32(_mm256_extracti128_si256(m0, 1), _MM_SHUFFLE(1, 0, 3, 2)));
+    const __m128i f1 = _mm_xor_si128(_mm256_castsi256_si128(m1),
+                                     _mm_shuffle_epi32(_mm256_extracti128_si256(m1, 1), _MM_SHUFFLE(1, 0, 3, 2)));
+    std::uint64_t a[4];
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(a), f0);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(a + 2), f1);
+
+    for (; i < n; i += 8) {
+        std::uint64_t v = 0;
+        std::memcpy(&v, bytes + i, n - i < 8 ? n - i : 8);
+        a[0] = rotl(a[0] ^ v, 31) * k;
+    }
+    std::uint64_t h = (a[0] * k) ^ rotl(a[1] * 0xc4ceb9fe1a85ec53ull, 17) ^
+                      rotl(a[2] * 0x94d049bb133111ebull, 29) ^ rotl(a[3] * 0xbf58476d1ce4e5b9ull, 47);
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ull;
+    h ^= h >> 29;
+    return h | 1;  // 0: not known
+#elif defined(__x86_64__) || defined(_M_X64)
+    const __m128i k_step =
+        _mm_set_epi32(static_cast<int>(0x9e3779b1u), static_cast<int>(0x85ebca77u), static_cast<int>(0xc2b2ae3du),
+                      static_cast<int>(0x27d4eb2fu));
+    __m128i k0 =
+        _mm_set_epi32(static_cast<int>(0x165667b1u), static_cast<int>(0x9e3779f9u), static_cast<int>(0x85ebca87u),
+                      static_cast<int>(0xc2b2ae63u));
+    __m128i k1 =
+        _mm_set_epi32(static_cast<int>(0x27d4eb4fu), static_cast<int>(0x165667c5u), static_cast<int>(0xff51afd7u),
+                      static_cast<int>(0xed558ccdu));
+    __m128i k2 =
+        _mm_set_epi32(static_cast<int>(0xc4ceb9feu), static_cast<int>(0x1a85ec53u), static_cast<int>(0x94d049bbu),
+                      static_cast<int>(0x133111ebu));
+    __m128i k3 =
+        _mm_set_epi32(static_cast<int>(0xbf58476du), static_cast<int>(0x1ce4e5b9u), static_cast<int>(0x9e3779b9u),
+                      static_cast<int>(0x7f4a7c15u));
+
+    __m128i s0 = _mm_set_epi64x(static_cast<long long>(0xc2b2ae3d27d4eb4full),
+                                static_cast<long long>(0x9e3779b97f4a7c15ull ^ n));
+    __m128i s1 = _mm_set_epi64x(static_cast<long long>(0x165667b19e3779f9ull),
+                                static_cast<long long>(0x27d4eb2f165667c5ull));
+    __m128i s2 = _mm_set_epi64x(static_cast<long long>(0x85ebca77c2b2ae63ull),
+                                static_cast<long long>(0xff51afd7ed558ccdull));
+    __m128i s3 = _mm_set_epi64x(static_cast<long long>(0xc4ceb9fe1a85ec53ull),
+                                static_cast<long long>(0x94d049bb133111ebull));
+
+    const auto lane = [](__m128i acc, __m128i data, __m128i key) -> __m128i {
+        const __m128i x = _mm_xor_si128(data, key);
+        const __m128i x_hi = _mm_srli_epi64(x, 32);
+        const __m128i prod = _mm_mul_epu32(x, x_hi);
+        const __m128i d_swap = _mm_shuffle_epi32(data, _MM_SHUFFLE(1, 0, 3, 2));
+        return _mm_add_epi64(_mm_add_epi64(acc, d_swap), prod);
+    };
+
+    std::size_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        const auto* p = reinterpret_cast<const __m128i*>(bytes + i);
+        s0 = lane(s0, _mm_loadu_si128(p + 0), k0);
+        s1 = lane(s1, _mm_loadu_si128(p + 1), k1);
+        s2 = lane(s2, _mm_loadu_si128(p + 2), k2);
+        s3 = lane(s3, _mm_loadu_si128(p + 3), k3);
+        k0 = _mm_add_epi32(k0, k_step);
+        k1 = _mm_add_epi32(k1, k_step);
+        k2 = _mm_add_epi32(k2, k_step);
+        k3 = _mm_add_epi32(k3, k_step);
+    }
+
+    const __m128i m0 = _mm_xor_si128(s0, _mm_shuffle_epi32(s2, _MM_SHUFFLE(1, 0, 3, 2)));
+    const __m128i m1 = _mm_xor_si128(s1, _mm_shuffle_epi32(s3, _MM_SHUFFLE(1, 0, 3, 2)));
+    std::uint64_t a[4];
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(a), m0);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(a + 2), m1);
+
+    for (; i < n; i += 8) {
+        std::uint64_t v = 0;
+        std::memcpy(&v, bytes + i, n - i < 8 ? n - i : 8);
+        a[0] = rotl(a[0] ^ v, 31) * k;
+    }
+    std::uint64_t h = (a[0] * k) ^ rotl(a[1] * 0xc4ceb9fe1a85ec53ull, 17) ^
+                      rotl(a[2] * 0x94d049bb133111ebull, 29) ^ rotl(a[3] * 0xbf58476d1ce4e5b9ull, 47);
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ull;
+    h ^= h >> 29;
+    return h | 1;  // 0: not known
+#else
     std::uint64_t a0 = 0x9e3779b97f4a7c15ull ^ n, a1 = 0xc2b2ae3d27d4eb4full, a2 = 0x165667b19e3779f9ull,
                   a3 = 0x27d4eb2f165667c5ull;
     std::size_t i = 0;
@@ -42,6 +191,7 @@ inline std::uint64_t sum_of(const std::uint8_t* bytes, std::size_t n) {
     h *= 0xc4ceb9fe1a85ec53ull;
     h ^= h >> 29;
     return h | 1;  // 0: not known
+#endif
 }
 
 // `bytes` holds the title's bytes [va, va + n) as read now. sums[k] is the sum of the piece at base + k * kPiece
@@ -51,7 +201,7 @@ template <class Copy>
 void copy_changed(const std::uint8_t* bytes, std::uintptr_t va, std::size_t n, std::uint64_t* sums,
                   std::uintptr_t base, Copy&& copy) {
     for (std::size_t off = 0; off < n;) {
-        const std::size_t piece = std::min<std::size_t>(n - off, kPiece - ((va + off) & (kPiece - 1)));
+        const std::size_t piece = (std::min)(n - off, std::size_t(kPiece - ((va + off) & (kPiece - 1))));
         std::uint64_t& known = sums[(va + off - base) / kPiece];
         const std::uint64_t sum = sum_of(bytes + off, piece);
         if (sum != known) {

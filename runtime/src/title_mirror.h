@@ -33,12 +33,15 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -54,6 +57,7 @@ struct TitleMirrorHooks {
     // The binds in one batch (per chunk: VkSparseMemoryBind with resourceOffset inside it); signals `value`.
     std::function<bool(const std::vector<VkSparseBufferMemoryBindInfo>& binds, std::uint64_t value)> bind;
     // Copies a physical page's 64 KiB into its home; false when its bytes cannot be read (the home keeps zeros).
+    // May be called concurrently from internal worker threads during batched upload(); must be thread-safe.
     std::function<bool(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes)> copy;
     // Fills the filtered copy of a page in an aliased range (alias): the title's bytes at `from` (the page shown at
     // title address `va`) in, what the GPU reads at the alias into `to`. Called after the page's own home took the
@@ -77,6 +81,8 @@ public:
     static constexpr std::uint64_t kChunk = std::uint64_t(2) << 30;
     static constexpr std::uint64_t kUnitBytes = std::uint64_t(32) << 20;
     static constexpr std::uint32_t kUnitPages = std::uint32_t(kUnitBytes / kPage);
+    static constexpr std::size_t kParallelThreshold = 16;
+    static constexpr std::size_t kMaxWorkers = 6;
     // Sentinel ticket for freed homes waiting for flush() + note_mirror_bind() to publish the sparse unbind before
     // stamping their retire ticket via stamp_freed().
     static constexpr std::uint64_t kUnstamped = UINT64_MAX;
@@ -93,11 +99,17 @@ public:
 
     explicit TitleMirror(TitleMirrorHooks hooks) : hooks_(std::move(hooks)) {}
     ~TitleMirror() {
+        pool_.reset();
         for (const Unit& u : units_)
             if (u.memory && hooks_.free_unit) hooks_.free_unit(u.memory);
     }
     TitleMirror(const TitleMirror&) = delete;
     TitleMirror& operator=(const TitleMirror&) = delete;
+
+    // Enables or disables internal worker-pool parallelisation for large batches (enabled by default; tests toggle it
+    // to compare single-threaded vs parallel output and timings directly).
+    void set_parallel(bool enabled) noexcept { parallel_enabled_ = enabled; }
+    bool parallel_enabled() const noexcept { return parallel_enabled_; }
 
     // The chunks over [base, end) of the title's address space (a reservation xmem placed). False when one could not
     // be placed: its pages stay unmirrored (a title address there reads what heap_base + it names: the caller logs).
@@ -255,18 +267,89 @@ public:
         return true;
     }
     // Fills the homes dirty() named. Returns how many.
+    // For batches >= kParallelThreshold, fans out per-page guarded copy + 256-byte piece hashing + coalesced home
+    // writes across the internal worker pool (each worker owns disjoint homes and scratch slots), then accumulates
+    // counters and runs filtered-heap callbacks sequentially on the calling thread in dirty_ order.
     std::size_t upload() {
         const std::uint64_t uploaded_before = counters_.uploaded_bytes;
-        std::size_t n = 0;
-        for (std::uint8_t* frame : dirty_) {
-            const auto home = homes_.find(frame);
-            if (home == homes_.end() || !home->second.dirty) continue;
-            home->second.dirty = false;
-            fill(home->second, frame, false);
-            ++n;
+        if (dirty_.empty()) {
+            last_upload_bytes_ = 0;
+            return 0;
         }
-        dirty_.clear();
+        std::vector<std::uint8_t*> batch_frames;
+        batch_frames.swap(dirty_);
         dirty_count_.store(0, std::memory_order_release);
+
+        std::size_t n = 0;
+        if (!parallel_enabled_ || batch_frames.size() < kParallelThreshold) {
+            for (std::uint8_t* frame : batch_frames) {
+                const auto home = homes_.find(frame);
+                if (home == homes_.end() || !home->second.dirty) continue;
+                home->second.dirty = false;
+                fill(home->second, frame, false);
+                ++n;
+            }
+        } else {
+            upload_jobs_.clear();
+            upload_jobs_.reserve(batch_frames.size());
+            std::size_t aliased_count = 0;
+            for (std::uint8_t* frame : batch_frames) {
+                const auto home = homes_.find(frame);
+                if (home == homes_.end() || !home->second.dirty) continue;
+                home->second.dirty = false;
+                UploadJob job;
+                job.frame = frame;
+                job.to = units_[home->second.unit].host + std::size_t(home->second.slot) * kPage;
+                job.sums = home->second.sums.get();
+                if (home->second.copy) job.aliased_slot = aliased_count++;
+                upload_jobs_.push_back(job);
+            }
+            n = upload_jobs_.size();
+            if (n < kParallelThreshold || !ensure_pool()) {
+                for (const UploadJob& job : upload_jobs_) {
+                    const auto it = homes_.find(job.frame);
+                    if (it == homes_.end()) continue;
+                    fill(it->second, job.frame, false);
+                }
+            } else {
+                if (aliased_count > 0) {
+                    const std::size_t need_bytes = aliased_count * kPage;
+                    if (aliased_scratch_.size() < need_bytes) aliased_scratch_.resize(need_bytes);
+                }
+                const std::size_t workers = pool_->worker_count();
+                const std::size_t chunk = (std::max)(std::size_t(1), (std::min)(std::size_t(4), n / (workers * 2)));
+                pool_->run(n, chunk, [this](std::size_t b, std::size_t e, std::size_t tid) {
+                    std::uint8_t* const worker_scratch = pool_->scratch(tid);
+                    for (std::size_t i = b; i < e; ++i) {
+                        UploadJob& job = upload_jobs_[i];
+                        std::uint8_t* const scratch =
+                            (job.aliased_slot != kNoAliasedSlot)
+                                ? (aliased_scratch_.data() + job.aliased_slot * kPage)
+                                : worker_scratch;
+                        job.failed = sync_page_into_scratch(job.to, scratch, job.sums, job.frame, false,
+                                                            job.changed_pieces, job.changed);
+                    }
+                });
+                for (const UploadJob& job : upload_jobs_) {
+                    counters_.uploaded_bytes += std::uint64_t(job.changed) * kPiece;
+                    if (job.failed) ++counters_.upload_failures;
+                    ++counters_.uploads;
+                    if (job.aliased_slot != kNoAliasedSlot) {
+                        // Re-lookup by frame key: filter_pieces may re-entrantly map() and rehash homes_.
+                        const auto it = homes_.find(job.frame);
+                        if (it != homes_.end() && it->second.copy &&
+                            (job.changed || it->second.fresh || it->second.refilter)) {
+                            fill_copy(it->second, aliased_scratch_.data() + job.aliased_slot * kPage, false,
+                                      &job.changed_pieces);
+                        }
+                    }
+                }
+            }
+        }
+        if (dirty_.empty()) {
+            batch_frames.clear();
+            dirty_.swap(batch_frames);  // keep vector capacity for the next refresh
+        }
         last_upload_bytes_ = counters_.uploaded_bytes - uploaded_before;
         return n;
     }
@@ -359,8 +442,8 @@ public:
                     const auto found = homes_.find(mapped->second);
                     if (found != homes_.end()) {
                         if (const std::uint8_t* gpu = staged(page)) {
-                            const std::size_t k0 = std::size_t((std::max(begin, page) - page) / kPiece);
-                            const std::size_t k1 = std::size_t((std::min(end, page + kPage) - page + kPiece - 1) / kPiece);
+                            const std::size_t k0 = std::size_t(((std::max)(begin, page) - page) / kPiece);
+                            const std::size_t k1 = std::size_t(((std::min)(end, page + kPage) - page + kPiece - 1) / kPiece);
                             written += write_back_pieces(found->second, mapped->second, gpu, k0, k1, write,
                                                          refilter_frames);
                         }
@@ -376,6 +459,9 @@ public:
     // Batched multi-range write-back over `count` snapshotted HomeRefs whose GPU copies lie contiguously at
     // `staged + i * kPage`. Skips any page that now has a pending bind or was remapped to a different physical frame
     // since `homes_in_ranges()` snapshotted it.
+    // For batches >= kParallelThreshold, scans 256-byte piece hashes read-only across the internal worker pool, then
+    // applies only changed pieces (conflict checks, write() callbacks, stats, and refilters) sequentially in exact
+    // batch order on the calling thread.
     template <class Write>
     std::uint64_t write_back_batch(const HomeRef* batch, std::size_t count,
                                    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges,
@@ -385,6 +471,40 @@ public:
         if (merged.empty()) return 0;
         std::uint64_t written = 0;
         std::vector<std::uint8_t*> refilter_frames;
+        if (!parallel_enabled_ || count < kParallelThreshold) {
+            std::size_t cursor = 0;
+            for (std::size_t i = 0; i < count; ++i) {
+                const HomeRef& ref = batch[i];
+                if (i > 0 && ref.page < batch[i - 1].page) cursor = 0;
+                while (cursor < merged.size() && merged[cursor].second <= ref.page) ++cursor;
+                if (cursor >= merged.size()) break;
+                if (merged[cursor].first >= ref.page + kPage) continue;
+                if (has_pending(ref.page)) continue;
+                const auto mapped = pages_.find(ref.page);
+                if (mapped == pages_.end() || mapped->second != ref.frame) continue;
+                const auto found = homes_.find(mapped->second);
+                if (found == homes_.end()) continue;
+                const std::uint8_t* gpu = staged + i * kPage;
+                std::size_t next_k = 0;
+                for (std::size_t r = cursor; r < merged.size() && merged[r].first < ref.page + kPage; ++r) {
+                    const std::uint64_t lo = (std::max)(merged[r].first, ref.page);
+                    const std::uint64_t hi = (std::min)(merged[r].second, ref.page + kPage);
+                    if (lo >= hi) continue;
+                    const std::size_t k0 = (std::max)(next_k, std::size_t((lo - ref.page) / kPiece));
+                    const std::size_t k1 = std::size_t((hi - ref.page + kPiece - 1) / kPiece);
+                    if (k0 < k1) {
+                        written += write_back_pieces(found->second, mapped->second, gpu, k0, k1, write, refilter_frames);
+                        next_k = k1;
+                    }
+                }
+            }
+            finish_write_back(written, refilter_frames);
+            return written;
+        }
+
+        wb_jobs_.clear();
+        wb_jobs_.reserve(count);
+        bool any_shared_home = false;
         std::size_t cursor = 0;
         for (std::size_t i = 0; i < count; ++i) {
             const HomeRef& ref = batch[i];
@@ -397,18 +517,96 @@ public:
             if (mapped == pages_.end() || mapped->second != ref.frame) continue;
             const auto found = homes_.find(mapped->second);
             if (found == homes_.end()) continue;
-            const std::uint8_t* gpu = staged + i * kPage;
+
+            WriteBackJob job;
+            job.home = &found->second;
+            job.frame = mapped->second;
+            job.gpu = staged + i * kPage;
+            job.sums = found->second.sums.get();
+            if (found->second.refs > 1) any_shared_home = true;
+
             std::size_t next_k = 0;
+            std::size_t piece_count = 0;
             for (std::size_t r = cursor; r < merged.size() && merged[r].first < ref.page + kPage; ++r) {
-                const std::uint64_t lo = std::max(merged[r].first, ref.page);
-                const std::uint64_t hi = std::min(merged[r].second, ref.page + kPage);
+                const std::uint64_t lo = (std::max)(merged[r].first, ref.page);
+                const std::uint64_t hi = (std::min)(merged[r].second, ref.page + kPage);
                 if (lo >= hi) continue;
-                const std::size_t k0 = std::max(next_k, std::size_t((lo - ref.page) / kPiece));
+                const std::size_t k0 = (std::max)(next_k, std::size_t((lo - ref.page) / kPiece));
                 const std::size_t k1 = std::size_t((hi - ref.page + kPiece - 1) / kPiece);
                 if (k0 < k1) {
-                    written += write_back_pieces(found->second, mapped->second, gpu, k0, k1, write, refilter_frames);
+                    set_piece_range(job.scan_mask, k0, k1);
+                    piece_count += k1 - k0;
                     next_k = k1;
                 }
+            }
+            if (!piece_count) continue;
+            job.full_page = (piece_count == kPieces);
+            wb_jobs_.push_back(job);
+        }
+
+        const std::size_t n_jobs = wb_jobs_.size();
+        if (!n_jobs) return 0;
+
+        if (n_jobs < kParallelThreshold || !ensure_pool()) {
+            for (const WriteBackJob& job : wb_jobs_) {
+                written += write_back_masked(*job.home, job.frame, job.gpu, job.scan_mask, job.full_page, write,
+                                             refilter_frames);
+            }
+            finish_write_back(written, refilter_frames);
+            return written;
+        }
+
+        // Phase 1 (parallel, read-only over staged and home.sums[]): compute 256-bit diff_mask per page.
+        const std::size_t workers = pool_->worker_count();
+        const std::size_t chunk = (std::max)(std::size_t(1), (std::min)(std::size_t(4), n_jobs / (workers * 2)));
+        pool_->run(n_jobs, chunk, [this](std::size_t b, std::size_t e, std::size_t) {
+            for (std::size_t i = b; i < e; ++i) {
+                WriteBackJob& job = wb_jobs_[i];
+                std::uint16_t diffs = 0;
+                if (job.full_page) {
+                    for (std::size_t k = 0; k < kPieces; ++k) {
+                        if (shadow_keep::sum_of(job.gpu + k * kPiece, kPiece) != job.sums[k]) {
+                            job.diff_mask[k >> 6] |= std::uint64_t(1) << (k & 63);
+                            ++diffs;
+                        }
+                    }
+                } else {
+                    for (std::size_t w = 0; w < 4; ++w) {
+                        std::uint64_t m = job.scan_mask[w];
+                        while (m) {
+                            const unsigned bit = static_cast<unsigned>(std::countr_zero(m));
+                            m &= m - 1;
+                            const std::size_t k = w * 64 + bit;
+                            if (shadow_keep::sum_of(job.gpu + k * kPiece, kPiece) != job.sums[k]) {
+                                job.diff_mask[w] |= std::uint64_t(1) << bit;
+                                ++diffs;
+                            }
+                        }
+                    }
+                }
+                job.diff_count = diffs;
+            }
+        });
+
+        // Phase 2 (sequential on calling thread in exact batch order): apply only changed pieces.
+        // If two HomeRefs in the batch alias the same physical frame and an earlier one updated home.sums[], fall back
+        // to scanning the later alias's scan_mask sequentially so conflict resolution matches single-threaded order.
+        std::vector<std::uint8_t*> modified_shared_frames;
+        for (const WriteBackJob& job : wb_jobs_) {
+            const bool frame_modified_earlier =
+                any_shared_home && !modified_shared_frames.empty() &&
+                std::find(modified_shared_frames.begin(), modified_shared_frames.end(), job.frame) !=
+                    modified_shared_frames.end();
+            if (!job.diff_count && !frame_modified_earlier) continue;
+            const std::uint64_t page_written =
+                frame_modified_earlier
+                    ? write_back_masked(*job.home, job.frame, job.gpu, job.scan_mask, job.full_page, write,
+                                        refilter_frames)
+                    : write_back_masked(*job.home, job.frame, job.gpu, job.diff_mask, false, write, refilter_frames);
+            if (page_written) {
+                written += page_written;
+                if (any_shared_home && job.home->refs > 1 && !frame_modified_earlier)
+                    modified_shared_frames.push_back(job.frame);
             }
         }
         finish_write_back(written, refilter_frames);
@@ -516,8 +714,8 @@ public:
             const auto found = homes_.find(mapped->second);
             if (found == homes_.end()) return false;
             const std::uint64_t page_end = (page <= UINT64_MAX - kPage) ? (page + kPage) : UINT64_MAX;
-            const std::uint64_t lo = std::max(va, page);
-            const std::uint64_t hi = std::min(end, page_end);
+            const std::uint64_t lo = (std::max)(va, page);
+            const std::uint64_t hi = (std::min)(end, page_end);
             const std::size_t k0 = std::size_t((lo - page) / kPiece);
             const std::size_t k1 = std::size_t((hi - page + kPiece - 1) / kPiece);
             const std::uint64_t* const sums = found->second.sums.get();
@@ -604,29 +802,68 @@ private:
         return merged;
     }
 
+    static void set_piece_range(std::array<std::uint64_t, 4>& mask, std::size_t k0, std::size_t k1) noexcept {
+        if (k0 >= k1) return;
+        const std::size_t w0 = k0 >> 6;
+        const std::size_t w1 = (k1 - 1) >> 6;
+        const std::uint64_t lo_mask = ~std::uint64_t(0) << (k0 & 63);
+        const std::size_t hi_bits = k1 & 63;
+        const std::uint64_t hi_mask = hi_bits ? ((std::uint64_t(1) << hi_bits) - 1) : ~std::uint64_t(0);
+        if (w0 == w1) {
+            mask[w0] |= lo_mask & hi_mask;
+        } else {
+            mask[w0] |= lo_mask;
+            for (std::size_t w = w0 + 1; w < w1; ++w) mask[w] = ~std::uint64_t(0);
+            mask[w1] |= hi_mask;
+        }
+    }
+
+    template <class Write>
+    std::uint64_t write_back_piece(Home& home, std::uint8_t* frame, const std::uint8_t* gpu, std::size_t k,
+                                   std::uint8_t* title, Write&& write, std::vector<std::uint8_t*>& refilter_frames) {
+        const std::uint64_t agreed = home.sums[k];
+        const std::uint64_t now = shadow_keep::sum_of(gpu + k * kPiece, kPiece);
+        if (now == agreed) return 0;  // the GPU did not change it
+        const std::uint8_t* from = frame + k * kPiece;
+        if (!(hooks_.copy ? hooks_.copy(title, from, kPiece) : (std::memcpy(title, from, kPiece), true)))
+            return 0;  // the title's page went away
+        if (shadow_keep::sum_of(title, kPiece) != agreed) {
+            ++counters_.conflicts;  // both changed it: the title's bytes win at the next upload
+            return 0;
+        }
+        const auto frame_base = reinterpret_cast<std::uintptr_t>(frame);
+        if (!write(static_cast<std::uint64_t>(frame_base + k * kPiece), gpu + k * kPiece, kPiece)) return 0;
+        home.sums[k] = now;
+        if (home.copy && !home.refilter) {
+            home.refilter = true;  // the title's bytes changed: its filtered copy follows
+            refilter_frames.push_back(frame);
+        }
+        return kPiece;
+    }
+
     template <class Write>
     std::uint64_t write_back_pieces(Home& home, std::uint8_t* frame, const std::uint8_t* gpu, std::size_t k0,
                                     std::size_t k1, Write&& write, std::vector<std::uint8_t*>& refilter_frames) {
         std::uint64_t written = 0;
         alignas(64) std::uint8_t title[kPiece];
-        const auto frame_base = reinterpret_cast<std::uintptr_t>(frame);
-        for (std::size_t k = k0; k < k1; ++k) {
-            const std::uint64_t agreed = home.sums[k];
-            const std::uint64_t now = shadow_keep::sum_of(gpu + k * kPiece, kPiece);
-            if (now == agreed) continue;  // the GPU did not change it
-            const std::uint8_t* from = frame + k * kPiece;
-            if (!(hooks_.copy ? hooks_.copy(title, from, kPiece) : (std::memcpy(title, from, kPiece), true)))
-                continue;  // the title's page went away
-            if (shadow_keep::sum_of(title, kPiece) != agreed) {
-                ++counters_.conflicts;  // both changed it: the title's bytes win at the next upload
-                continue;
-            }
-            if (!write(static_cast<std::uint64_t>(frame_base + k * kPiece), gpu + k * kPiece, kPiece)) continue;
-            home.sums[k] = now;
-            written += kPiece;
-            if (home.copy && !home.refilter) {
-                home.refilter = true;  // the title's bytes changed: its filtered copy follows
-                refilter_frames.push_back(frame);
+        for (std::size_t k = k0; k < k1; ++k)
+            written += write_back_piece(home, frame, gpu, k, title, write, refilter_frames);
+        return written;
+    }
+
+    template <class Write>
+    std::uint64_t write_back_masked(Home& home, std::uint8_t* frame, const std::uint8_t* gpu,
+                                    const std::array<std::uint64_t, 4>& mask, bool full_page, Write&& write,
+                                    std::vector<std::uint8_t*>& refilter_frames) {
+        if (full_page) return write_back_pieces(home, frame, gpu, 0, kPieces, write, refilter_frames);
+        std::uint64_t written = 0;
+        alignas(64) std::uint8_t title[kPiece];
+        for (std::size_t w = 0; w < 4; ++w) {
+            std::uint64_t m = mask[w];
+            while (m) {
+                const unsigned bit = static_cast<unsigned>(std::countr_zero(m));
+                m &= m - 1;
+                written += write_back_piece(home, frame, gpu, w * 64 + bit, title, write, refilter_frames);
             }
         }
         return written;
@@ -640,18 +877,67 @@ private:
         }
     }
 
-    // Brings the home up to date with the title's page, piece by piece, into `fill_scratch_`: `whole` (a new home)
-    // copies every piece, and otherwise only a piece the title changed since both sides last agreed, so a piece only
-    // the GPU wrote keeps the GPU's bytes (and goes back with write_back). A piece both changed takes the title's
-    // bytes. Copies the whole 64 KiB page in one hooks_.copy call, falling back to per-piece copies only when the
-    // whole-page copy fails, then updates home.sums in a tight pass and flushes changed pieces to `to` in coalesced
-    // contiguous runs (optimal for write-combined device-local homes). Never reads from `to`. Returns whether any
-    // piece copy failed.
-    bool sync_home_from_frame(Home& home, const std::uint8_t* frame, bool whole,
-                              std::array<std::uint64_t, 4>& changed_pieces, std::size_t& changed) {
-        std::uint8_t* const to = units_[home.unit].host + std::size_t(home.slot) * kPage;
-        std::uint8_t* const scratch = fill_scratch_.data();
-        std::uint64_t* const sums = home.sums.get();
+    // Coalesces contiguous changed pieces across the 4 x 64-bit mask words into single memcpy bursts (optimal for
+    // write-combined device-local homes). Never reads from `to`.
+    static void flush_changed_runs(std::uint8_t* to, const std::uint8_t* scratch,
+                                   const std::array<std::uint64_t, 4>& changed_pieces, std::size_t changed) noexcept {
+        if (changed == kPieces) {
+            std::memcpy(to, scratch, kPage);
+            return;
+        }
+        std::size_t run_start = kPieces;
+        for (std::size_t w = 0; w < 4; ++w) {
+            const std::uint64_t word = changed_pieces[w];
+            if (!word) {
+                if (run_start < kPieces) {
+                    const std::size_t run_end = w * 64;
+                    std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece,
+                                (run_end - run_start) * kPiece);
+                    run_start = kPieces;
+                }
+                continue;
+            }
+            if (word == ~std::uint64_t(0)) {
+                if (run_start == kPieces) run_start = w * 64;
+                continue;
+            }
+            std::size_t bit = 0;
+            while (bit < 64) {
+                const std::uint64_t rem = word >> bit;
+                if (!rem) {
+                    if (run_start < kPieces) {
+                        const std::size_t run_end = w * 64 + bit;
+                        std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece,
+                                    (run_end - run_start) * kPiece);
+                        run_start = kPieces;
+                    }
+                    break;
+                }
+                const std::size_t zeros = std::size_t(std::countr_zero(rem));
+                if (zeros > 0) {
+                    if (run_start < kPieces) {
+                        const std::size_t run_end = w * 64 + bit;
+                        std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece,
+                                    (run_end - run_start) * kPiece);
+                        run_start = kPieces;
+                    }
+                    bit += zeros;
+                }
+                const std::size_t ones = std::size_t(std::countr_one(word >> bit));
+                if (run_start == kPieces) run_start = w * 64 + bit;
+                bit += ones;
+            }
+        }
+        if (run_start < kPieces) {
+            std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece, (kPieces - run_start) * kPiece);
+        }
+    }
+
+    // Stateless per-page copy + 256-byte piece hash + coalesced WC home flush (safe to run across worker threads on
+    // disjoint homes and scratch buffers).
+    bool sync_page_into_scratch(std::uint8_t* to, std::uint8_t* scratch, std::uint64_t* sums,
+                                const std::uint8_t* frame, bool whole,
+                                std::array<std::uint64_t, 4>& changed_pieces, std::size_t& changed) const {
         bool failed = false;
         const bool whole_ok = hooks_.copy ? hooks_.copy(scratch, frame, kPage)
                                           : (std::memcpy(scratch, frame, kPage), true);
@@ -672,7 +958,6 @@ private:
             std::memcpy(to, scratch, kPage);
             changed = kPieces;
             changed_pieces = kAllPieces;
-            counters_.uploaded_bytes += kPage;
         } else {
             for (std::size_t k = 0; k < kPieces; ++k) {
                 const std::uint64_t sum = shadow_keep::sum_of(scratch + k * kPiece, kPiece);
@@ -681,61 +966,24 @@ private:
                 changed_pieces[k >> 6] |= std::uint64_t(1) << (k & 63);
                 ++changed;
             }
-            if (changed == kPieces) {
-                std::memcpy(to, scratch, kPage);
-                counters_.uploaded_bytes += kPage;
-            } else if (changed) {
-                // Coalesce contiguous changed pieces across the 4 x 64-bit mask words into single memcpy bursts.
-                std::size_t run_start = kPieces;
-                for (std::size_t w = 0; w < 4; ++w) {
-                    const std::uint64_t word = changed_pieces[w];
-                    if (!word) {
-                        if (run_start < kPieces) {
-                            const std::size_t run_end = w * 64;
-                            std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece,
-                                        (run_end - run_start) * kPiece);
-                            run_start = kPieces;
-                        }
-                        continue;
-                    }
-                    if (word == ~std::uint64_t(0)) {
-                        if (run_start == kPieces) run_start = w * 64;
-                        continue;
-                    }
-                    std::size_t bit = 0;
-                    while (bit < 64) {
-                        const std::uint64_t rem = word >> bit;
-                        if (!rem) {
-                            if (run_start < kPieces) {
-                                const std::size_t run_end = w * 64 + bit;
-                                std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece,
-                                            (run_end - run_start) * kPiece);
-                                run_start = kPieces;
-                            }
-                            break;
-                        }
-                        const std::size_t zeros = std::size_t(std::countr_zero(rem));
-                        if (zeros > 0) {
-                            if (run_start < kPieces) {
-                                const std::size_t run_end = w * 64 + bit;
-                                std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece,
-                                            (run_end - run_start) * kPiece);
-                                run_start = kPieces;
-                            }
-                            bit += zeros;
-                        }
-                        const std::size_t ones = std::size_t(std::countr_one(word >> bit));
-                        if (run_start == kPieces) run_start = w * 64 + bit;
-                        bit += ones;
-                    }
-                }
-                if (run_start < kPieces) {
-                    std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece,
-                                (kPieces - run_start) * kPiece);
-                }
-                counters_.uploaded_bytes += changed * kPiece;
-            }
+            if (changed) flush_changed_runs(to, scratch, changed_pieces, changed);
         }
+        return failed;
+    }
+
+    // Brings the home up to date with the title's page, piece by piece, into `fill_scratch_`: `whole` (a new home)
+    // copies every piece, and otherwise only a piece the title changed since both sides last agreed, so a piece only
+    // the GPU wrote keeps the GPU's bytes (and goes back with write_back). A piece both changed takes the title's
+    // bytes. Copies the whole 64 KiB page in one hooks_.copy call, falling back to per-piece copies only when the
+    // whole-page copy fails, then updates home.sums in a tight pass and flushes changed pieces to `to` in coalesced
+    // contiguous runs (optimal for write-combined device-local homes). Never reads from `to`. Returns whether any
+    // piece copy failed.
+    bool sync_home_from_frame(Home& home, const std::uint8_t* frame, bool whole,
+                              std::array<std::uint64_t, 4>& changed_pieces, std::size_t& changed) {
+        std::uint8_t* const to = units_[home.unit].host + std::size_t(home.slot) * kPage;
+        const bool failed =
+            sync_page_into_scratch(to, fill_scratch_.data(), home.sums.get(), frame, whole, changed_pieces, changed);
+        counters_.uploaded_bytes += std::uint64_t(changed) * kPiece;
         return failed;
     }
 
@@ -898,6 +1146,168 @@ private:
         freed_count_.store(freed_.size(), std::memory_order_release);
     }
 
+    // Reusable internal thread pool for batched upload() and write_back_batch(). Lazily created on the first batch
+    // >= kParallelThreshold and joined cleanly in ~TitleMirror(). Synchronous barrier: every worker finishes before
+    // run() returns, so TitleMirror maps remain strictly single-owner with zero lock-order issues.
+    class WorkerPool {
+    public:
+        explicit WorkerPool(std::size_t bg_threads) : scratches_(bg_threads + 1) {
+            threads_.reserve(bg_threads);
+            try {
+                for (std::size_t t = 0; t < bg_threads; ++t) {
+                    threads_.emplace_back([this, tid = t + 1] { worker_loop(tid); });
+                }
+            } catch (...) {
+                shutdown();
+                throw;
+            }
+        }
+        ~WorkerPool() { shutdown(); }
+        WorkerPool(const WorkerPool&) = delete;
+        WorkerPool& operator=(const WorkerPool&) = delete;
+
+        std::size_t worker_count() const noexcept { return threads_.size() + 1; }
+        std::uint8_t* scratch(std::size_t worker_id) noexcept { return scratches_[worker_id].bytes.data(); }
+
+        template <class Fn>
+        void run(std::size_t count, std::size_t chunk_size, Fn&& fn) {
+            if (!count) return;
+            if (threads_.empty()) {
+                fn(0, count, 0);
+                return;
+            }
+            auto thunk = [](void* ctx, std::size_t b, std::size_t e, std::size_t tid) {
+                (*static_cast<Fn*>(ctx))(b, e, tid);
+            };
+            {
+                std::lock_guard lock(mutex_);
+                task_fn_ = thunk;
+                task_ctx_ = &fn;
+                task_count_ = count;
+                task_chunk_ = chunk_size;
+                next_index_.store(0, std::memory_order_relaxed);
+                remaining_workers_ = threads_.size();
+                ++generation_;
+            }
+            work_cv_.notify_all();
+            struct JoinGuard {
+                WorkerPool& pool;
+                ~JoinGuard() {
+                    std::unique_lock lock(pool.mutex_);
+                    pool.done_cv_.wait(lock, [this] { return pool.remaining_workers_ == 0; });
+                    pool.task_fn_ = nullptr;
+                    pool.task_ctx_ = nullptr;
+                }
+            } join_guard{*this};
+            drain_work(thunk, &fn, count, chunk_size, 0);
+        }
+
+    private:
+        struct alignas(64) Scratch {
+            std::array<std::uint8_t, kPage> bytes{};
+        };
+        using Thunk = void (*)(void*, std::size_t, std::size_t, std::size_t);
+
+        void shutdown() noexcept {
+            {
+                std::lock_guard lock(mutex_);
+                stop_ = true;
+                ++generation_;
+            }
+            work_cv_.notify_all();
+            for (std::thread& t : threads_)
+                if (t.joinable()) t.join();
+            threads_.clear();
+        }
+
+        void drain_work(Thunk fn, void* ctx, std::size_t count, std::size_t chunk, std::size_t tid) {
+            for (;;) {
+                const std::size_t b = next_index_.fetch_add(chunk, std::memory_order_relaxed);
+                if (b >= count) break;
+                const std::size_t e = (std::min)(b + chunk, count);
+                fn(ctx, b, e, tid);
+            }
+        }
+
+        void worker_loop(std::size_t tid) {
+            std::uint64_t seen = 0;
+            for (;;) {
+                Thunk fn = nullptr;
+                void* ctx = nullptr;
+                std::size_t count = 0;
+                std::size_t chunk = 0;
+                {
+                    std::unique_lock lock(mutex_);
+                    work_cv_.wait(lock, [this, seen] { return generation_ != seen; });
+                    seen = generation_;
+                    if (stop_) return;
+                    fn = task_fn_;
+                    ctx = task_ctx_;
+                    count = task_count_;
+                    chunk = task_chunk_;
+                }
+                struct DoneGuard {
+                    WorkerPool& pool;
+                    ~DoneGuard() {
+                        std::lock_guard lock(pool.mutex_);
+                        if (--pool.remaining_workers_ == 0) pool.done_cv_.notify_one();
+                    }
+                } done_guard{*this};
+                drain_work(fn, ctx, count, chunk, tid);
+            }
+        }
+
+        std::vector<Scratch> scratches_;
+        std::vector<std::thread> threads_;
+        std::mutex mutex_;
+        std::condition_variable work_cv_;
+        std::condition_variable done_cv_;
+        Thunk task_fn_ = nullptr;
+        void* task_ctx_ = nullptr;
+        std::size_t task_count_ = 0;
+        std::size_t task_chunk_ = 1;
+        std::size_t remaining_workers_ = 0;
+        std::uint64_t generation_ = 0;
+        bool stop_ = false;
+        alignas(64) std::atomic<std::size_t> next_index_{0};
+    };
+
+    static constexpr std::size_t kNoAliasedSlot = ~std::size_t(0);
+    struct UploadJob {
+        std::uint8_t* frame = nullptr;
+        std::uint8_t* to = nullptr;
+        std::uint64_t* sums = nullptr;
+        std::size_t aliased_slot = kNoAliasedSlot;
+        std::array<std::uint64_t, 4> changed_pieces{};
+        std::size_t changed = 0;
+        bool failed = false;
+    };
+    struct WriteBackJob {
+        Home* home = nullptr;
+        std::uint8_t* frame = nullptr;
+        const std::uint8_t* gpu = nullptr;
+        const std::uint64_t* sums = nullptr;
+        std::array<std::uint64_t, 4> scan_mask{};
+        std::array<std::uint64_t, 4> diff_mask{};
+        std::uint16_t diff_count = 0;
+        bool full_page = false;
+    };
+
+    bool ensure_pool() {
+        if (pool_) return true;
+        const unsigned hw = std::thread::hardware_concurrency();
+        const std::size_t total = (hw >= 4) ? (std::min)(std::size_t(hw / 2), kMaxWorkers)
+                                            : ((hw >= 2) ? std::size_t(hw) : std::size_t(1));
+        if (total <= 1) return false;
+        try {
+            pool_ = std::make_unique<WorkerPool>(total - 1);
+            return true;
+        } catch (...) {
+            pool_.reset();
+            return false;
+        }
+    }
+
     TitleMirrorHooks hooks_;
     std::map<std::uint64_t, VkBuffer> chunks_;                 // chunk index -> buffer (null: could not be placed)
     std::unordered_map<std::uint64_t, std::uint8_t*> pages_;   // mirrored page -> its physical page's bytes
@@ -917,6 +1327,11 @@ private:
     std::atomic<std::size_t> freed_count_{0};
     std::atomic<std::uint64_t> oldest_freed_ticket_{UINT64_MAX};
     alignas(64) std::array<std::uint8_t, kPage> fill_scratch_{};
+    std::vector<UploadJob> upload_jobs_;
+    std::vector<std::uint8_t> aliased_scratch_;
+    std::vector<WriteBackJob> wb_jobs_;
+    std::unique_ptr<WorkerPool> pool_;
+    bool parallel_enabled_ = true;
 
 public:
     std::size_t last_batch() const { return last_batch_; }  // binds in the last flush()

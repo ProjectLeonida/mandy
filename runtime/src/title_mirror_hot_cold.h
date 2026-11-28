@@ -292,7 +292,8 @@ private:
     }
 
     struct CellGuard {
-        static constexpr std::size_t kMaxBatchRunPages = 64;  // up to 4 MiB per VirtualProtect run
+        static constexpr std::size_t kMaxBatchRunPages = 1024;  // up to 64 MiB per contiguous VirtualProtect run
+        static constexpr std::size_t kMaxLockBatchPages = 128;  // pages per pin check + geometry_writes lock hold
 
         std::unordered_map<std::uint64_t, geometry_writes::Cell*> cells;
         std::unordered_map<std::uint64_t, std::uint64_t> armed;  // page -> its cell's version when last armed
@@ -312,35 +313,48 @@ private:
             return true;
         }
 
-        // Batched arming of sorted 64 KiB pages: merges contiguous runs into one pin check, one geometry_writes lock
-        // acquisition, and one VirtualQuery/VirtualProtect per uniform region (cutting Wine server round-trips 4-8x).
+        // Batched arming of sorted 64 KiB pages: coalesces both contiguous runs (up to 64 MiB in one VirtualProtect)
+        // and scattered pages into shared pin checks, shared geometry_writes lock holds, and a short-lived
+        // VirtualQuery region cache (invalidated by title_memory_map::generation() or any VirtualProtect failure).
         void arm_batch(const std::uintptr_t* pages, std::uint8_t* results, std::size_t count) {
             using geometry_writes::Cell;
             constexpr std::uintptr_t kTile = geometry_writes::tile_size;
             constexpr std::uintptr_t kHostPage = geometry_writes::page_size;
 
-            for (std::size_t i = 0; i < count;) {
-                // Single isolated page: reuse direct path.
-                if (i + 1 == count || pages[i + 1] != pages[i] + kTile) {
-                    results[i] = arm(pages[i]) ? 1 : 0;
-                    ++i;
-                    continue;
-                }
-                std::size_t j = i + 1;
-                while (j < count && j - i < kMaxBatchRunPages && pages[j] == pages[j - 1] + kTile) ++j;
-                const std::size_t run_n = j - i;
-                const std::uintptr_t run_lo = pages[i];
-                const std::uintptr_t run_hi = run_lo + run_n * kTile;
+            if (!count) return;
+            if (count == 1) {
+                results[0] = arm(pages[0]) ? 1 : 0;
+                return;
+            }
 
-                run_cells_.resize(run_n);
-                run_versions_.resize(run_n);
-                run_pinned_.assign(run_n, 0);
-                run_eligible_.assign(run_n, 0);
-                run_failed_.assign(run_n, 0);
+            for (std::size_t i = 0; i < count;) {
+                // Extend chunk up to kMaxLockBatchPages, or further across one contiguous run up to kMaxBatchRunPages.
+                std::size_t j = i + 1;
+                while (j < count) {
+                    const bool contiguous = (pages[j] == pages[j - 1] + kTile);
+                    const std::size_t len = j - i;
+                    if (len < kMaxLockBatchPages) {
+                        ++j;
+                    } else if (contiguous && len < kMaxBatchRunPages) {
+                        ++j;
+                    } else {
+                        break;
+                    }
+                }
+                const std::size_t batch_n = j - i;
+                const std::uintptr_t* const batch_pages = pages + i;
+
+                run_cells_.resize(batch_n);
+                run_versions_.resize(batch_n);
+                run_pinned_.assign(batch_n, 0);
+                run_eligible_.assign(batch_n, 0);
+                run_failed_.assign(batch_n, 0);
 
                 // Clear hot flags and snapshot versions BEFORE querying kernel pins or taking geometry_writes::mutex.
-                for (std::size_t k = 0; k < run_n; ++k) {
-                    const std::uintptr_t page = pages[i + k];
+                std::uintptr_t pin_lo = UINTPTR_MAX;
+                std::uintptr_t pin_hi = 0;
+                for (std::size_t k = 0; k < batch_n; ++k) {
+                    const std::uintptr_t page = batch_pages[k];
                     const auto it = cells.find(page);
                     if (it == cells.end()) {
                         run_cells_[k] = nullptr;
@@ -350,80 +364,135 @@ private:
                     if (hot.erase(page)) geometry_writes::set_hot(page, false);
                     run_cells_[k] = it->second;
                     run_versions_[k] = it->second->version.load(std::memory_order_acquire);
+                    if (page < pin_lo) pin_lo = page;
+                    const std::uintptr_t page_hi = (page <= UINTPTR_MAX - kTile) ? (page + kTile) : UINTPTR_MAX;
+                    if (page_hi > pin_hi) pin_hi = page_hi;
                 }
 
-                // One pin check for the entire contiguous run (never under geometry_writes::state().mutex).
-                kernel_writes::for_each_pin(run_lo, run_hi, [&](std::uintptr_t p_lo, std::uintptr_t p_hi) {
-                    const std::size_t a = std::size_t((p_lo - run_lo) / kTile);
-                    const std::size_t b = std::size_t(((p_hi - run_lo) + kTile - 1) / kTile);
-                    for (std::size_t k = a; k < b && k < run_n; ++k) run_pinned_[k] = 1;
-                });
+                // One pin check for the entire batch (never under geometry_writes::state().mutex).
+                if (pin_lo < pin_hi) {
+                    kernel_writes::for_each_pin(pin_lo, pin_hi, [&](std::uintptr_t p_lo, std::uintptr_t p_hi) {
+                        const std::uintptr_t first_tile = p_lo & ~(kTile - 1);
+                        const std::uintptr_t* it =
+                            std::lower_bound(batch_pages, batch_pages + batch_n, first_tile);
+                        for (; it < batch_pages + batch_n && *it < p_hi; ++it) {
+                            run_pinned_[std::size_t(it - batch_pages)] = 1;
+                        }
+                    });
+                }
 
                 auto& s = geometry_writes::state();
                 {
                     std::lock_guard lock(s.mutex);
-                    for (std::size_t k = 0; k < run_n; ++k) {
+                    for (std::size_t k = 0; k < batch_n; ++k) {
                         Cell* c = run_cells_[k];
                         if (!c) continue;
                         if (c->hot) {
                             results[i + k] = 1;
-                            armed[pages[i + k]] = run_versions_[k];
+                            armed[batch_pages[k]] = run_versions_[k];
                             continue;
                         }
                         if (run_pinned_[k] || run_versions_[k] != c->version.load(std::memory_order_relaxed)) {
                             results[i + k] = 0;
-                            armed.erase(pages[i + k]);
+                            armed.erase(batch_pages[k]);
                             continue;
                         }
                         run_eligible_[k] = 1;
                     }
 
+                    // Short-lived VirtualQuery cache within this lock hold: if a uniform writable MEM_COMMIT region
+                    // extends past the current sub-run into subsequent pages in the same batch and no title map change
+                    // occurred, reuse its protection instead of issuing a redundant VirtualQuery syscall.
+                    std::uintptr_t cached_lo = 0;
+                    std::uintptr_t cached_hi = 0;
+                    DWORD cached_protect = 0;
+                    DWORD cached_guarded = 0;
+                    std::uint64_t cached_gen = 0;
+
                     // Protect each contiguous sub-run of eligible cells with batched VirtualQuery + VirtualProtect.
-                    for (std::size_t sub_start = 0; sub_start < run_n;) {
+                    for (std::size_t sub_start = 0; sub_start < batch_n;) {
                         if (!run_eligible_[sub_start]) {
                             ++sub_start;
                             continue;
                         }
                         std::size_t sub_end = sub_start + 1;
-                        while (sub_end < run_n && run_eligible_[sub_end]) ++sub_end;
-                        const std::uintptr_t sub_lo = run_lo + sub_start * kTile;
-                        const std::uintptr_t sub_hi = run_lo + sub_end * kTile;
+                        while (sub_end < batch_n && run_eligible_[sub_end] &&
+                               batch_pages[sub_end] == batch_pages[sub_end - 1] + kTile) {
+                            ++sub_end;
+                        }
+                        const std::uintptr_t sub_lo = batch_pages[sub_start];
+                        const std::uintptr_t sub_hi = sub_lo + (sub_end - sub_start) * kTile;
 
                         for (std::uintptr_t p = sub_lo; p < sub_hi;) {
-                            MEMORY_BASIC_INFORMATION m{};
-                            if (!VirtualQuery(reinterpret_cast<void*>(p), &m, sizeof m)) {
-                                const std::size_t tile_k = sub_start + std::size_t((p - sub_lo) / kTile);
-                                run_failed_[tile_k] = 1;
-                                p = (p & ~(kTile - 1)) + kTile;
-                                continue;
+                            std::uintptr_t region_end = 0;
+                            DWORD state = 0;
+                            DWORD protect = 0;
+                            DWORD guarded = 0;
+                            bool from_cache = false;
+
+                            if (p >= cached_lo && p < cached_hi &&
+                                title_memory_map::generation() == cached_gen) {
+                                region_end = cached_hi;
+                                state = MEM_COMMIT;
+                                protect = cached_protect;
+                                guarded = cached_guarded;
+                                from_cache = true;
+                            } else {
+                                const std::uint64_t gen_before = title_memory_map::generation();
+                                MEMORY_BASIC_INFORMATION m{};
+                                if (!VirtualQuery(reinterpret_cast<void*>(p), &m, sizeof m)) {
+                                    const std::size_t tile_k = sub_start + std::size_t((p - sub_lo) / kTile);
+                                    run_failed_[tile_k] = 1;
+                                    p = (p & ~(kTile - 1)) + kTile;
+                                    continue;
+                                }
+                                region_end = reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize;
+                                state = m.State;
+                                protect = m.Protect;
+                                guarded = geometry_writes::read_only(m.Protect);
+                                if (state == MEM_COMMIT && !(protect & PAGE_GUARD) && guarded &&
+                                    region_end > sub_hi) {
+                                    cached_lo = p;
+                                    cached_hi = region_end;
+                                    cached_protect = protect;
+                                    cached_guarded = guarded;
+                                    cached_gen = gen_before;
+                                } else {
+                                    cached_hi = 0;
+                                }
                             }
-                            const std::uintptr_t region_end =
-                                reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize;
+
                             const std::uintptr_t end = (std::min)(sub_hi, region_end);
                             if (end <= p) {
                                 const std::size_t tile_k = sub_start + std::size_t((p - sub_lo) / kTile);
                                 run_failed_[tile_k] = 1;
+                                cached_hi = 0;
                                 p = (p & ~(kTile - 1)) + kTile;
                                 continue;
                             }
-                            const DWORD guarded = geometry_writes::read_only(m.Protect);
-                            if (m.State == MEM_COMMIT && !(m.Protect & PAGE_GUARD) && guarded) {
+                            if (state == MEM_COMMIT && !(protect & PAGE_GUARD) && guarded) {
                                 DWORD old{};
                                 if (VirtualProtect(reinterpret_cast<void*>(p), end - p, guarded, &old)) {
                                     for (std::uintptr_t q = p; q < end; q += kHostPage) {
                                         const std::size_t tile_k = sub_start + std::size_t((q - sub_lo) / kTile);
                                         const std::size_t sub_p = std::size_t((q & (kTile - 1)) / kHostPage);
-                                        run_cells_[tile_k]->restore[sub_p] = m.Protect;
+                                        run_cells_[tile_k]->restore[sub_p] = protect;
                                     }
+                                    if (cached_hi) cached_lo = end;
+                                } else if (from_cache) {
+                                    // Cached region is stale: invalidate and retry this address with a fresh query.
+                                    cached_hi = 0;
+                                    continue;
                                 } else {
                                     // Multi-tile VirtualProtect failed: fall back per-tile so healthy neighbors arm.
+                                    cached_hi = 0;
                                     for (std::uintptr_t t = p; t < end;) {
                                         const std::uintptr_t t_end = (std::min)(end, (t & ~(kTile - 1)) + kTile);
                                         const std::size_t tile_k = sub_start + std::size_t((t - sub_lo) / kTile);
                                         if (VirtualProtect(reinterpret_cast<void*>(t), t_end - t, guarded, &old)) {
                                             for (std::uintptr_t q = t; q < t_end; q += kHostPage) {
                                                 const std::size_t sub_p = std::size_t((q & (kTile - 1)) / kHostPage);
-                                                run_cells_[tile_k]->restore[sub_p] = m.Protect;
+                                                run_cells_[tile_k]->restore[sub_p] = protect;
                                             }
                                         } else {
                                             run_failed_[tile_k] = 1;
@@ -438,10 +507,10 @@ private:
                         for (std::size_t k = sub_start; k < sub_end; ++k) {
                             if (!run_failed_[k]) {
                                 results[i + k] = 1;
-                                armed[pages[i + k]] = run_versions_[k];
+                                armed[batch_pages[k]] = run_versions_[k];
                             } else {
                                 results[i + k] = 0;
-                                armed.erase(pages[i + k]);
+                                armed.erase(batch_pages[k]);
                             }
                         }
                         sub_start = sub_end;

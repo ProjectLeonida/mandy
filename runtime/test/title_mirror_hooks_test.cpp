@@ -881,6 +881,369 @@ int unstamped_freed_homes_wait_for_flush() {
     return 0;
 }
 
+int parallel_upload_matches_serial() {
+    constexpr std::size_t kPages = 96;
+    constexpr std::size_t kFilteredPages = 16;
+    constexpr std::size_t kFailPage = 90;
+    constexpr std::size_t kFailPiece = 17;
+    const VkBuffer arena = fake<VkBuffer>(0xC1);
+
+    struct FilterLog {
+        std::uint64_t va;
+        bool fresh;
+        std::array<std::uint64_t, 4> mask;
+        bool operator==(const FilterLog& o) const = default;
+    };
+
+    struct RunResult {
+        std::size_t uploaded_count = 0;
+        std::uint64_t last_upload_bytes = 0;
+        TitleMirror::Counters counters{};
+        std::vector<std::uint8_t> all_homes;
+        std::vector<std::uint8_t> all_copies;
+        std::vector<std::uint64_t> page_hashes;
+        std::vector<FilterLog> filter_logs;
+        std::uint64_t reentrant_hash = 0;
+    };
+
+    const auto run_once = [&](bool parallel, RunResult& out) -> int {
+        Fixture f;
+        auto h = f.hooks();
+        std::vector<std::uint8_t> frames(kPages * kPage);
+        for (std::size_t i = 0; i < frames.size(); ++i)
+            frames[i] = std::uint8_t((i * 37 + (i / kPage) * 13 + 5) & 0xff);
+        const std::uint8_t* const fail_frame = frames.data() + kFailPage * kPage;
+        bool enable_copy_fail = false;
+        h.copy = [fail_frame, &enable_copy_fail](std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
+            if (enable_copy_fail && from == fail_frame && bytes == kPage) return false;
+            if (enable_copy_fail && bytes == 256 && from == fail_frame + kFailPiece * 256) return false;
+            std::memcpy(to, from, bytes);
+            return true;
+        };
+
+        TitleMirror* mirror_ptr = nullptr;
+        std::vector<std::uint8_t> reentrant_frames(64 * kPage, 0x6D);
+        bool trigger_rehash = false;
+        h.filter_pieces = [&](std::uint64_t va, std::uint8_t* to, const std::uint8_t* scratch, std::size_t bytes,
+                              bool fresh, const std::array<std::uint64_t, 4>& mask) {
+            out.filter_logs.push_back({va, fresh, mask});
+            for (std::size_t k = 0; k < bytes / 256; ++k) {
+                if (!fresh && !(mask[k >> 6] & (std::uint64_t(1) << (k & 63)))) continue;
+                for (std::size_t j = 0; j < 256; ++j) {
+                    const std::uint8_t b = scratch[k * 256 + j];
+                    to[k * 256 + j] = (b == 0xA5) ? 0x5A : b;
+                }
+            }
+            if (trigger_rehash && va == kBase + 4 * kPage && mirror_ptr) {
+                trigger_rehash = false;
+                for (std::size_t r = 0; r < 64; ++r) {
+                    mirror_ptr->map(kBase + (200 + r) * kPage, reentrant_frames.data() + r * kPage, nullptr, 9);
+                }
+            }
+            return true;
+        };
+
+        TitleMirror mirror(std::move(h));
+        mirror_ptr = &mirror;
+        mirror.set_parallel(parallel);
+        EXPECT(mirror.cover(kBase, kBase + 300 * kPage));
+        mirror.alias(kBase, kBase + kFilteredPages * kPage, arena, 0);
+
+        for (std::size_t p = 0; p < kPages; ++p) {
+            // Pages 20..23 alias physical frames 16..19 (physical-page aliasing).
+            const std::size_t frame_idx = (p >= 20 && p < 24) ? (p - 4) : p;
+            mirror.map(kBase + p * kPage, frames.data() + frame_idx * kPage, nullptr, 1);
+        }
+        EXPECT(mirror.flush(1));
+
+        // Inject GPU-only writes into untouched piece 10 of several homes to verify parallel upload preserves them.
+        for (std::size_t p = 24; p < 40; ++p) mirror.home_bytes(kBase + p * kPage)[10 * 256 + 3] = 0xEE;
+
+        // Mutate a diverse mix: filtered pages (with 0xA5), aliased frames, word-boundary pieces, full pages,
+        // untouched pages (40..55), and the failing-copy page 90.
+        for (std::size_t p = 0; p < kPages; ++p) {
+            if (p >= 20 && p < 24) continue;  // shared with 16..19
+            if (p >= 40 && p < 56) continue;  // intentionally unchanged dirty pages
+            std::uint8_t* const fptr = frames.data() + p * kPage;
+            if (p < kFilteredPages) {
+                fptr[0 * 256 + 1] = 0xA5;
+                fptr[63 * 256 + 2] = std::uint8_t(0x20 + p);
+                fptr[64 * 256 + 3] = 0xA5;
+                fptr[255 * 256 + 4] = std::uint8_t(0x80 + p);
+            } else if (p < 40) {
+                const std::size_t pcs[] = {0, 1, 62, 63, 64, 65, 127, 128, 254, 255};
+                for (std::size_t pc : pcs) fptr[pc * 256 + (p & 31)] ^= 0x5A;
+            } else if (p < 72) {
+                for (std::size_t pc = 0; pc < 256; ++pc) fptr[pc * 256] ^= std::uint8_t(0xA0 + (pc & 15));
+            } else {
+                fptr[5 * 256 + 9] ^= 0x33;
+                fptr[kFailPiece * 256 + 7] = 0xCC;
+                fptr[200 * 256 + 11] ^= 0x77;
+            }
+        }
+        enable_copy_fail = true;
+        trigger_rehash = true;
+        for (std::size_t p = 0; p < kPages; ++p) EXPECT(mirror.dirty(kBase + p * kPage));
+
+        out.uploaded_count = mirror.upload();
+        out.last_upload_bytes = mirror.last_upload_bytes();
+        out.counters = mirror.counters();
+        out.all_homes.resize(kPages * kPage);
+        for (std::size_t p = 0; p < kPages; ++p) {
+            std::memcpy(out.all_homes.data() + p * kPage, mirror.home_bytes(kBase + p * kPage), kPage);
+        }
+        out.all_copies.resize(kFilteredPages * kPage);
+        for (std::size_t p = 0; p < kFilteredPages; ++p) {
+            std::memcpy(out.all_copies.data() + p * kPage, mirror.copy_bytes(kBase + p * kPage), kPage);
+        }
+        out.page_hashes.resize(kPages);
+        for (std::size_t p = 0; p < kPages; ++p) {
+            EXPECT(mirror.range_sum(kBase + p * kPage, kPage, out.page_hashes[p]));
+        }
+        EXPECT(mirror.range_sum(kBase + 200 * kPage, 64 * kPage, out.reentrant_hash));
+        // Verify GPU-only writes survived and failing piece 17 was zeroed.
+        for (std::size_t p = 24; p < 40; ++p) EXPECT(mirror.home_bytes(kBase + p * kPage)[10 * 256 + 3] == 0xEE);
+        EXPECT(mirror.home_bytes(kBase + kFailPage * kPage)[kFailPiece * 256 + 7] == 0);
+        EXPECT(mirror.counters().upload_failures == 1);
+        return 0;
+    };
+
+    RunResult serial{}, par{};
+    if (run_once(false, serial)) return 1;
+    if (run_once(true, par)) return 1;
+
+    EXPECT(par.uploaded_count == serial.uploaded_count);
+    EXPECT(par.uploaded_count == kPages - 4);  // 4 aliased VAs deduplicated
+    EXPECT(par.last_upload_bytes == serial.last_upload_bytes);
+    EXPECT(par.counters.uploads == serial.counters.uploads);
+    EXPECT(par.counters.uploaded_bytes == serial.counters.uploaded_bytes);
+    EXPECT(par.counters.upload_failures == serial.counters.upload_failures);
+    EXPECT(par.counters.filtered == serial.counters.filtered);
+    EXPECT(par.counters.homes == serial.counters.homes);
+    EXPECT(par.counters.pages == serial.counters.pages);
+    EXPECT(par.all_homes == serial.all_homes);
+    EXPECT(par.all_copies == serial.all_copies);
+    EXPECT(par.page_hashes == serial.page_hashes);
+    EXPECT(par.filter_logs == serial.filter_logs);
+    EXPECT(par.reentrant_hash == serial.reentrant_hash);
+
+    std::printf("parallel_upload_matches_serial: 96 dirty pages (filtered, aliased, partial, fallback, rehash) 100%% "
+                "identical\n");
+    return 0;
+}
+
+int parallel_write_back_batch_matches_serial() {
+    constexpr std::size_t kPages = 80;
+    constexpr std::size_t kFilteredPages = 8;
+    const VkBuffer arena = fake<VkBuffer>(0xC2);
+
+    struct WriteEvent {
+        std::size_t frame_offset;
+        std::array<std::uint8_t, 256> bytes;
+        bool operator==(const WriteEvent& o) const = default;
+    };
+
+    struct RunResult {
+        std::uint64_t written = 0;
+        TitleMirror::Counters counters{};
+        std::vector<std::uint8_t> frames;
+        std::vector<std::uint8_t> copies;
+        std::vector<std::uint64_t> page_hashes;
+        std::vector<WriteEvent> writes;
+    };
+
+    const auto run_once = [&](bool parallel, RunResult& out) -> int {
+        Fixture f;
+        TitleMirror mirror(f.hooks());
+        mirror.set_parallel(parallel);
+        EXPECT(mirror.cover(kBase, kBase + (kPages + 8) * kPage));
+        mirror.alias(kBase, kBase + kFilteredPages * kPage, arena, 0);
+
+        out.frames.resize(kPages * kPage);
+        for (std::size_t i = 0; i < out.frames.size(); ++i)
+            out.frames[i] = std::uint8_t((i * 53 + (i / kPage) * 19 + 11) & 0xff);
+
+        for (std::size_t p = 0; p < kPages; ++p) {
+            // Pages 12 and 13 share physical frames 10 and 11 (physical-page aliasing).
+            const std::size_t frame_idx = (p == 12 || p == 13) ? (p - 2) : p;
+            mirror.map(kBase + p * kPage, out.frames.data() + frame_idx * kPage, nullptr, 1);
+        }
+        EXPECT(mirror.flush(1));
+
+        // Mix of full-page ranges, partial sub-ranges, overlapping ranges, and out-of-order ranges.
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges = {
+            {kBase + 40 * kPage, kBase + kPages * kPage},
+            {kBase + 0 * kPage, kBase + 24 * kPage},
+            {kBase + 24 * kPage + 256, kBase + 24 * kPage + 1024},       // partial pieces [1..4)
+            {kBase + 25 * kPage + 63 * 256, kBase + 25 * kPage + 66 * 256},  // word boundary [63..66)
+            {kBase + 26 * kPage, kBase + 41 * kPage},                    // overlaps 40..41
+        };
+        const auto refs = mirror.homes_in_ranges(ranges);
+        EXPECT(refs.size() == kPages);
+
+        std::vector<std::uint8_t> staged(refs.size() * kPage);
+        for (std::size_t i = 0; i < refs.size(); ++i) {
+            std::memcpy(staged.data() + i * kPage, refs[i].frame, kPage);
+        }
+
+        // Apply GPU-only writes, CPU-only writes, and both-sides conflicts across the 80 pages.
+        // 1. Filtered aliased pages 2 and 5: GPU-only writes -> must write back AND refilter!
+        staged[2 * kPage + 3 * 256 + 7] = 0xA5;  // filtered to 0x5A in copy_bytes
+        staged[5 * kPage + 128 * 256 + 15] = 0x91;
+        // 2. Shared physical frames 10/12 and 11/13: GPU writes on alias 10, conflict on alias 11.
+        staged[10 * kPage + 4 * 256 + 1] = 0xE1;
+        staged[12 * kPage + 4 * 256 + 1] = 0xE1;
+        staged[11 * kPage + 8 * 256 + 2] = 0xE2;
+        out.frames[11 * kPage + 8 * 256 + 2] = 0xC2;  // CPU also modified -> conflict
+        // 3. Partial-range page 24: GPU modifies piece 0 (outside [1..4) -> ignored!) and piece 2 (inside -> written!).
+        staged[24 * kPage + 0 * 256 + 5] = 0xDD;
+        staged[24 * kPage + 2 * 256 + 5] = 0x72;
+        // 4. Word-boundary partial page 25: GPU modifies pieces 63, 64, 65 (64 also CPU-modified -> conflict).
+        staged[25 * kPage + 63 * 256 + 1] = 0x73;
+        staged[25 * kPage + 64 * 256 + 1] = 0x74;
+        out.frames[25 * kPage + 64 * 256 + 2] = 0x84;
+        staged[25 * kPage + 65 * 256 + 1] = 0x75;
+        // 5. High pages 30..75: mix of GPU-only, CPU-only, and conflicts.
+        for (std::size_t p = 30; p < 76; ++p) {
+            if (p % 3 == 0) {
+                // GPU-only across 3 pieces
+                staged[p * kPage + 1 * 256 + 3] ^= 0x41;
+                staged[p * kPage + 64 * 256 + 4] ^= 0x42;
+                staged[p * kPage + 255 * 256 + 5] ^= 0x43;
+            } else if (p % 3 == 1) {
+                // CPU-only write (GPU unchanged -> no write-back, CPU bytes preserved)
+                out.frames[p * kPage + 12 * 256 + 6] ^= 0x55;
+            } else {
+                // Both sides modify piece 20 -> conflict, CPU wins; GPU-only modifies piece 21 -> written!
+                staged[p * kPage + 20 * 256 + 7] ^= 0x61;
+                out.frames[p * kPage + 20 * 256 + 8] ^= 0x62;
+                staged[p * kPage + 21 * 256 + 9] ^= 0x63;
+            }
+        }
+        // 6. Remap page 77 (flushed) and make page 78 pending (unflushed) after snapshot -> both must be skipped!
+        std::vector<std::uint8_t> remap_frame(kPage, 0xFA);
+        staged[77 * kPage + 2 * 256 + 1] = 0x19;
+        staged[78 * kPage + 2 * 256 + 1] = 0x29;
+        mirror.map(kBase + 77 * kPage, remap_frame.data(), nullptr, 2);
+        EXPECT(mirror.flush(2));
+        mirror.map(kBase + 78 * kPage, remap_frame.data(), nullptr, 3);  // pending, not flushed
+
+        const auto base_ptr = reinterpret_cast<std::uintptr_t>(out.frames.data());
+        const auto write_fn = [&](std::uint64_t dst, const std::uint8_t* bytes, std::size_t n) {
+            if (n != 256) return false;
+            WriteEvent ev{};
+            ev.frame_offset = std::size_t(static_cast<std::uintptr_t>(dst) - base_ptr);
+            std::memcpy(ev.bytes.data(), bytes, 256);
+            out.writes.push_back(ev);
+            std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), bytes, n);
+            return true;
+        };
+
+        out.written = mirror.write_back_batch(refs, ranges, staged.data(), write_fn);
+        out.counters = mirror.counters();
+        out.copies.resize(kFilteredPages * kPage);
+        for (std::size_t p = 0; p < kFilteredPages; ++p)
+            std::memcpy(out.copies.data() + p * kPage, mirror.copy_bytes(kBase + p * kPage), kPage);
+        out.page_hashes.resize(kPages);
+        for (std::size_t p = 0; p < kPages; ++p)
+            EXPECT(mirror.range_sum(kBase + p * kPage, kPage, out.page_hashes[p]));
+
+        // Spot-check key semantics: filtered refilter ran, partial out-of-range piece 0 skipped, remap/pending skipped.
+        EXPECT(out.frames[2 * kPage + 3 * 256 + 7] == 0xA5);
+        EXPECT(mirror.copy_bytes(kBase + 2 * kPage)[3 * 256 + 7] == 0x5A);
+        EXPECT(out.frames[24 * kPage + 0 * 256 + 5] != 0xDD && out.frames[24 * kPage + 2 * 256 + 5] == 0x72);
+        EXPECT(out.frames[77 * kPage + 2 * 256 + 1] != 0x19 && out.frames[78 * kPage + 2 * 256 + 1] != 0x29);
+        EXPECT(out.counters.conflicts == 17);  // page 11 + page 25 + 15 pages in [30..75] with p%3==2
+        return 0;
+    };
+
+    RunResult serial{}, par{};
+    if (run_once(false, serial)) return 1;
+    if (run_once(true, par)) return 1;
+
+    EXPECT(par.written == serial.written && par.written > 0);
+    EXPECT(par.counters.written_back_bytes == serial.counters.written_back_bytes);
+    EXPECT(par.counters.conflicts == serial.counters.conflicts);
+    EXPECT(par.counters.filtered == serial.counters.filtered);
+    EXPECT(par.writes == serial.writes);
+    EXPECT(par.frames == serial.frames);
+    EXPECT(par.copies == serial.copies);
+    EXPECT(par.page_hashes == serial.page_hashes);
+
+    std::printf("parallel_write_back_batch_matches_serial: 80 pages (GPU-only, CPU-only, conflicts, filtered, aliased) "
+                "100%% identical (%llu bytes, %llu conflicts)\n",
+                static_cast<unsigned long long>(par.written),
+                static_cast<unsigned long long>(par.counters.conflicts));
+    return 0;
+}
+
+int parallel_fill_and_write_back_benchmark() {
+    constexpr std::size_t kFillPages = 400;
+    constexpr std::size_t kWbPages = 256;
+    constexpr int kIters = 8;
+
+    Fixture f;
+    TitleMirror mirror(f.hooks());
+    EXPECT(mirror.cover(kBase, kBase + kFillPages * kPage));
+
+    std::vector<std::uint8_t> frames(kFillPages * kPage);
+    for (std::size_t i = 0; i < frames.size(); ++i) frames[i] = std::uint8_t((i * 131 + 7) & 0xff);
+    for (std::size_t p = 0; p < kFillPages; ++p) mirror.map(kBase + p * kPage, frames.data() + p * kPage, nullptr, 1);
+    EXPECT(mirror.flush(1));
+
+    const auto bench_upload = [&](bool parallel) -> double {
+        mirror.set_parallel(parallel);
+        double total_ms = 0.0;
+        for (int it = 0; it < kIters; ++it) {
+            for (std::size_t p = 0; p < kFillPages; ++p) {
+                for (std::size_t k = 0; k < 256; k += 4) frames[p * kPage + k * 256] ^= std::uint8_t(it + 1);
+                mirror.dirty(kBase + p * kPage);
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            const std::size_t n = mirror.upload();
+            total_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (n != kFillPages) return -1.0;
+        }
+        return total_ms / kIters;
+    };
+
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> wb_ranges = {{kBase, kBase + kWbPages * kPage}};
+    const auto refs = mirror.homes_in_ranges(wb_ranges);
+    EXPECT(refs.size() == kWbPages);
+    std::vector<std::uint8_t> staged(kWbPages * kPage);
+    std::memcpy(staged.data(), frames.data(), staged.size());
+    const auto write_fn = [](std::uint64_t dst, const std::uint8_t* bytes, std::size_t n) {
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), bytes, n);
+        return true;
+    };
+
+    const auto bench_wb = [&](bool parallel) -> double {
+        mirror.set_parallel(parallel);
+        double total_ms = 0.0;
+        for (int it = 0; it < kIters; ++it) {
+            for (std::size_t q = 0; q < 4; ++q)
+                staged[(q * 60 + 7) * kPage + 5 * 256 + 11] ^= std::uint8_t(it + 5);
+            const auto t0 = std::chrono::steady_clock::now();
+            const std::uint64_t wb = mirror.write_back_batch(refs, wb_ranges, staged.data(), write_fn);
+            total_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (wb != 4 * 256) return -1.0;
+        }
+        return total_ms / kIters;
+    };
+
+    const double fill_serial_ms = bench_upload(false);
+    const double fill_par_ms = bench_upload(true);
+    std::memcpy(staged.data(), frames.data(), staged.size());  // sync staged after fill bench
+    const double wb_serial_ms = bench_wb(false);
+    const double wb_par_ms = bench_wb(true);
+    EXPECT(fill_serial_ms > 0.0 && fill_par_ms > 0.0 && wb_serial_ms > 0.0 && wb_par_ms > 0.0);
+    std::printf("bench (400-page upload, 25%% dirty): serial %.3f ms -> parallel %.3f ms (%.2fx)\n",
+                fill_serial_ms, fill_par_ms, fill_serial_ms / fill_par_ms);
+    std::printf("bench (256-page write_back_batch):  serial %.3f ms -> parallel %.3f ms (%.2fx)\n",
+                wb_serial_ms, wb_par_ms, wb_serial_ms / wb_par_ms);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -897,6 +1260,9 @@ int main() {
     if (lock_free_pending_fast_paths()) return 1;
     if (range_sum_piece_hashing()) return 1;
     if (unstamped_freed_homes_wait_for_flush()) return 1;
+    if (parallel_upload_matches_serial()) return 1;
+    if (parallel_write_back_batch_matches_serial()) return 1;
+    if (parallel_fill_and_write_back_benchmark()) return 1;
     std::printf("title_mirror_hooks_test: ok\n");
     return 0;
 }
