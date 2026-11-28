@@ -60,6 +60,8 @@ public:
     template<class Create>
     HRESULT create(UINT64 address, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_ALLOCATION_INFO allocation,
                    const D3D12_CLEAR_VALUE* clear, bool opaque_layout, REFIID iid, void** out, Create create_backing) {
+        if (!out) return E_POINTER;
+        *out = nullptr;
         if (!address || !allocation.Alignment || address % allocation.Alignment || !allocation.SizeInBytes ||
             allocation.SizeInBytes > UINT64_MAX - address)
             return E_INVALIDARG;
@@ -85,25 +87,36 @@ public:
                 // with it: between two opaque layouts it gets a backing of its own, since D3D12 leaves an alias's
                 // contents undefined until it is reinitialized. Only a non-opaque layout is refused there.
                 const auto limit = ranges_.lower_bound(end);
-                for (auto it = ranges_.begin(); it != limit; ++it) {
+                for (auto it = ranges_.begin(); it != limit;) {
+                    auto live = it->second.backing.lock();
+                    if (!live) {
+                        it = ranges_.erase(it);
+                        continue;
+                    }
                     const auto& range = it->second;
-                    if (range.end <= address) continue;
+                    if (range.end <= address) {
+                        ++it;
+                        continue;
+                    }
                     if (it->first != address) {
                         if (!opaque_layout || !range.opaque_layout) return E_NOTIMPL;
+                        ++it;
                         continue;
                     }
                     const bool same_shape = compatible(desc, range.desc);
                     if (range.end == end && same_shape && range.optimized == optimized) {
-                        if (auto live = range.backing.lock()) owner = std::move(live);
+                        owner = std::move(live);
                     } else if (!opaque_layout || !range.opaque_layout || same_shape) {
                         return E_NOTIMPL;
                     }
+                    ++it;
                 }
                 if (!owner) {
                     ID3D12Resource* resource = nullptr;
                     const HRESULT hr = create_backing(&resource);
                     if (FAILED(hr)) return hr;
-                    owner = {resource, [](ID3D12Resource* r) { r->Release(); }};
+                    if (!resource) return E_FAIL;
+                    owner = {resource, [](ID3D12Resource* r) { if (r) r->Release(); }};
                     ranges_.emplace(address, Range{end, desc, optimized, owner, opaque_layout});
                 }
             }

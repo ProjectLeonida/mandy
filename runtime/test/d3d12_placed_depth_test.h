@@ -69,6 +69,11 @@ inline bool check_alias_lifetime(ID3D12Device* device, ID3D12Device* xbox, bool 
     if (place(address, xbox_desc, invalid, &optimized) != E_NOTIMPL || invalid.p) return false;
     if ((!opaque && (place(address, smaller, invalid) != E_NOTIMPL || invalid.p)) ||
         place(address + 1, xbox_desc, invalid) != E_INVALIDARG || invalid.p) return false;
+    {
+        ID3D12Resource* dirty = first.p;
+        if (create(xbox, address + 1, &xbox_desc, UINT_MAX, nullptr, IID_PPV_ARGS(&dirty)) != E_INVALIDARG || dirty)
+            return false;
+    }
     // A placement that starts inside another one's PC allocation: the title's own blocks can be smaller than the
     // PC sizes them (a D16 target on RADV), so the next block starts inside the range. Opaque layouts get a backing
     // of their own there; a layout whose bytes would have to be shared is still refused.
