@@ -26,6 +26,18 @@ profile and the parameters can be left out. Defaults: `gta6rt` from `runtime\bui
 checkout, the executable from the game folder (`-Exe` or `LEONIDA_EXE` when it lives elsewhere), outputs in `$HOME\leonida-runs`.
 The script refuses an output folder inside the repository.
 
+### Private crash diagnostics
+
+Build the `gta6rt_crash_monitor` target in the same x64 Windows build as the runtime, then add
+`-CrashDump` to your usual boot command. Each invocation reserves a fresh directory under `-OutDir`.
+An unhandled exception writes `crash.dmp` and `stack.txt` for the faulting thread. An explicit nonzero
+exit captures the last thread at process exit, which may already be in shutdown. Handled exceptions,
+successful exits and the boot time limit produce no crash report.
+
+Keep matching PDBs beside the runtime for local symbol names. Frames without symbols can appear as
+addresses, and unwinding can stop at manually mapped code. Dumps can contain process memory and stacks
+can identify private inputs. Keep both on your machine. Share only the outcome, error class and counts.
+
 ## What it sets
 
 Only when your shell has not set them already (`-DryRun` prints the final list):

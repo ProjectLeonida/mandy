@@ -91,6 +91,9 @@
 .PARAMETER DryRun
     Print the environment and the command line, check the paths, launch nothing.
 
+.PARAMETER CrashDump
+    Run under the native Windows crash monitor. A crash dump and stack go into a fresh private folder under -OutDir.
+
 .PARAMETER DigestOnly
     Launch nothing; write the summary and digest again from an earlier run's files (-Name, -OutDir).
 
@@ -120,6 +123,7 @@ param(
     [string]$Stacks = "",
     [hashtable]$SetEnv = @{},
     [switch]$NoCapture,
+    [switch]$CrashDump,
     [switch]$NoInput,
     [string[]]$ExtraArgs = @(),
     [switch]$FirstRunUi,
@@ -213,6 +217,12 @@ if (Test-InsideFolder $OutDir $RepoRoot) { $problems.Add("-OutDir $OutDir is ins
 if (-not (Test-Path -LiteralPath $Runtime -PathType Leaf)) { $problems.Add("no gta6rt.exe at $Runtime (build it, or pass -Runtime / set GTA6RT)") }
 elseif (-not (Test-Path -LiteralPath (Join-Path $RuntimeDir "gta6rt_tls_host.dll") -PathType Leaf)) {
     $problems.Add("gta6rt_tls_host.dll is missing beside $Runtime (build the gta6rt target; without it the title exits at once)")
+}
+if ($CrashDump) {
+    $monitor = Join-Path $RuntimeDir "gta6rt_crash_monitor.exe"
+    if (-not (Test-Path -LiteralPath $monitor -PathType Leaf)) {
+        $problems.Add("-CrashDump needs the gta6rt_crash_monitor build target beside the runtime")
+    }
 }
 if (-not $GameDir) { $problems.Add("no game folder: pass -GameDir or set LEONIDA_GAME_DIR") }
 elseif (-not (Test-Path -LiteralPath (Join-Path $GameDir "MicrosoftGame.Config") -PathType Leaf)) {
@@ -420,11 +430,30 @@ if (-not $DigestOnly) {
 
         # ------------------------------------------------------------------------------------------- the boot
         $started = Get-Date
-        $proc = Start-Process -FilePath $Runtime -ArgumentList $argLine -WorkingDirectory $RepoRoot -NoNewWindow -PassThru `
+        $launchFile = $Runtime
+        $launchArgs = $argLine
+        if ($CrashDump) {
+            $crashDir = Join-Path $OutDir ("{0}-crash-{1}" -f $Name, [guid]::NewGuid().ToString("N"))
+            $runtimePath = (Get-Item -LiteralPath $Runtime).FullName
+            $childCommand = "$(ConvertTo-ProcessArgument $runtimePath) $argLine"
+            $launchFile = $monitor
+            $launchArgs = (@($RepoRoot, $crashDir, $Seconds, $runtimePath, $childCommand) |
+                ForEach-Object { ConvertTo-ProcessArgument ([string]$_) }) -join " "
+        }
+        $proc = Start-Process -FilePath $launchFile -ArgumentList $launchArgs -WorkingDirectory $RepoRoot -NoNewWindow -PassThru `
             -RedirectStandardError $LogFile -RedirectStandardOutput $StdoutFile
         $handle = $proc.Handle   # keeps the exit code readable after the process ends
         $stopped = $false
-        if (-not $proc.WaitForExit($Seconds * 1000)) {
+        if ($CrashDump) {
+            # The monitor owns the deadline so a dump already in progress can finish.
+            $proc.WaitForExit()
+            $stopped = Test-Path -LiteralPath (Join-Path $crashDir "timed-out")
+            if (Test-Path -LiteralPath (Join-Path $crashDir "crash.dmp")) {
+                Write-Output "[boot] private crash diagnostics: $crashDir"
+            } elseif ($proc.ExitCode -ne 0) {
+                Write-Warning "No crash dump was saved. See the monitor diagnostics in $LogFile"
+            }
+        } elseif (-not $proc.WaitForExit($Seconds * 1000)) {
             $stopped = $true
             try { Stop-Process -Id $proc.Id -Force -Confirm:$false } catch { }
             [void]$proc.WaitForExit(20000)

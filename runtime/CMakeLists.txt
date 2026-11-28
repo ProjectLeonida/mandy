@@ -256,6 +256,8 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   set_source_files_properties(shims/dstorage.cpp src/thread_stacks.cpp
     PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang>:/EHa>")
   add_dependencies(gta6rt gta6rt_tls_host bcpack_history_train)
+  add_executable(gta6rt_crash_monitor ../scripts/windows-boot/crash_monitor.cpp)
+  target_link_libraries(gta6rt_crash_monitor PRIVATE dbghelp)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
   # Static shim tables register themselves at startup; keep the linker from dropping their objects.
@@ -827,6 +829,13 @@ include(CTest)
 # LEONIDA_TRANSLATOR_DEPS: what the rules that run test/shaders/build.py depend on besides their .asm files.
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/translator_deps.cmake")
 if(BUILD_TESTING)
+  if(TARGET gta6rt_crash_monitor AND NOT CMAKE_CROSSCOMPILING)
+    add_executable(windows_crash_fixture test/windows_crash_fixture.cpp)
+    target_compile_options(windows_crash_fixture PRIVATE /Od /EHa)
+    add_test(NAME windows_crash_monitor COMMAND "${Python3_EXECUTABLE}" -I
+      "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/windows-boot/test_crash_monitor.py"
+      $<TARGET_FILE:gta6rt_crash_monitor> $<TARGET_FILE:windows_crash_fixture>)
+  endif()
   add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
   add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
 
