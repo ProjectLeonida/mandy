@@ -1709,6 +1709,9 @@ void test_split_under_reader(const PhysicalApi& api) {
             ++reads;
         }
     });
+    // On a loaded host (ctest -j) the 2,046 splits can finish before the reader is first scheduled: reads stayed 0
+    // and the check below failed, with nothing wrong in xmem. Split only once the reader is reading.
+    while (reads.load() == 0) Sleep(0);
     bool unmapped = true;
     for (uint64_t k = 0; k < kPages - 1; ++k) {
         if (k == 1023) continue;
@@ -1719,6 +1722,8 @@ void test_split_under_reader(const PhysicalApi& api) {
     reader.join();
     check(unmapped, "2,046 pages unmap one at a time, each splitting the view a reader is in");
     check(reads.load() > 0 && wrong.load() == 0, "the reader of the views' last pages never faults or misreads");
+    std::printf("split reader: %llu reads, %llu misread\n", static_cast<unsigned long long>(reads.load()),
+                static_cast<unsigned long long>(wrong.load()));
     // The last split was of [2046, 2048): a fault there is retried, one on another mapped page is not.
     api.map(window, kPages, nullptr);
     api.free_pages(kPages, pages.data());

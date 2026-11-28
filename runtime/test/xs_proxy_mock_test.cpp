@@ -4568,6 +4568,9 @@ int check_list_values_more() {
     VirtualFree(read_only, 0, MEM_RELEASE);
     const HANDLE reader = CreateThread(nullptr, 0, &tear_reader, nullptr, 0, nullptr);
     EXPECT(reader);
+    // On a loaded host (ctest -j) the 200,000 stores can finish before the reader is first scheduled: reads stayed 0
+    // and the check below failed with no torn write. Store only once the reader is reading.
+    while (reader && g_tear.reads.load() == 0) Sleep(0);
     for (int i = 0; i < 200000; ++i) leonida::kernel_writes::store(&g_tear.cell, (i & 1) ? ~0ull : 0, 8);
     g_tear.stop = true;
     WaitForSingleObject(reader, INFINITE);
