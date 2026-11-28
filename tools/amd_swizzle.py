@@ -216,13 +216,31 @@ def main(argv=None):
         if err:
             print(f"ERROR: {err}", file=sys.stderr)
             return 2
+    if a.width < 1 or a.height < 1:
+        print(f"ERROR: --width and --height must be at least 1 (got {a.width}x{a.height})", file=sys.stderr)
+        return 2
+    if a.offset < 0:
+        print(f"ERROR: --offset must not be negative (got {a.offset})", file=sys.stderr)
+        return 2
     try:
         with open(a.blob, "rb") as f:
-            data = f.read()[a.offset:]
+            raw = f.read()
     except OSError as e:
         print(f"ERROR: {a.blob}: {e.strerror or e}", file=sys.stderr)
         return 2
-    nibbles, tables = load()
+    if a.offset >= len(raw):
+        print(f"ERROR: --offset {a.offset} is past the end of {a.blob} ({len(raw)} bytes)", file=sys.stderr)
+        return 2
+    data = raw[a.offset:]
+    try:
+        nibbles, tables = load()
+    except OSError as e:
+        print(f"ERROR: cannot read the addrlib pattern header {HEADER!r}: {e.strerror or e}; "
+              "set AMD_SWIZZLE_HEADER to gfx10SwizzlePattern.h", file=sys.stderr)
+        return 2
+    except (AttributeError, ValueError) as e:
+        print(f"ERROR: {HEADER!r} does not look like addrlib's gfx10SwizzlePattern.h ({e})", file=sys.stderr)
+        return 2
     # BC formats cover 4x4 pixels per element; uncompressed 1/2/4 bpe formats have one pixel per element.
     block = 4 if a.bpe in (8, 16) else 1
     wb = (a.width + block - 1) // block
@@ -241,6 +259,11 @@ def main(argv=None):
                 continue
             img = feature(lin, a.bpe).reshape(hb, wb, 3)
             res.append((score(img), tname, e[5], e, bits))
+    if not res:
+        print(f"ERROR: no swizzle pattern produced an image for --bpe {a.bpe} --modes {a.modes}; "
+              f"check that {a.blob} covers {a.width}x{a.height} pixels at {a.bpe} bpe",
+              file=sys.stderr)
+        return 2
     res.sort(key=lambda r: r[0])
     seen = set()
     for s, t, c, _, _ in res:
