@@ -22,7 +22,6 @@ import os
 import struct
 import subprocess
 import sys
-import tempfile
 import unittest
 
 sys.dont_write_bytecode = True
@@ -88,13 +87,13 @@ MC = _llvm_mc()
 
 
 def assemble(cpu, text):
-    """(returncode, stdout, stderr) of llvm-mc assembling `text` for `cpu`, through a file (no BOM, no pipe)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "in.s")
-        with open(path, "w", encoding="ascii", newline="\n") as f:
-            f.write(text)
-        r = subprocess.run(MC + ["-triple=amdgcn", f"-mcpu={cpu}", "-show-encoding", path],
-                           capture_output=True, text=True, timeout=60)
+    """(returncode, stdout, stderr) of llvm-mc assembling `text` for `cpu`, read from stdin.
+
+    Not through a temporary file: LLVM_MC can be a WSL command (`wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc`, see
+    tools/mc_command.py), and llvm-mc inside WSL cannot open a Windows path. tools/shader_disasm.py feeds llvm-mc
+    the same way."""
+    r = subprocess.run(MC + ["-triple=amdgcn", f"-mcpu={cpu}", "-show-encoding"], input=text,
+                       capture_output=True, text=True, encoding="ascii", errors="replace", timeout=60)
     return r.returncode, r.stdout, r.stderr
 
 
