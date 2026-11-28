@@ -2030,6 +2030,10 @@ if(TARGET Vulkan::Headers)
   add_executable(vulkan_device_fault_test test/vulkan_device_fault_test.cpp)
   target_link_libraries(vulkan_device_fault_test PRIVATE Vulkan::Headers)
   add_test(NAME vulkan_device_fault COMMAND vulkan_device_fault_test)
+  add_executable(address_binding_test test/address_binding_test.cpp)
+  target_link_libraries(address_binding_test PRIVATE Vulkan::Headers)
+  add_test(NAME address_binding COMMAND address_binding_test)
+
   # The AMD breadcrumbs (LEONIDA_DEVICE_MARKERS): seq numbering, marker writes and the likely-hang verdict, on the CPU.
   add_executable(vulkan_device_markers_test test/vulkan_device_markers_test.cpp)
   target_link_libraries(vulkan_device_markers_test PRIVATE Vulkan::Headers)

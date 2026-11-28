@@ -1,6 +1,14 @@
 #pragma once
 
 #include <vulkan/vulkan.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>  // VirtualQuery: what the process has at a fault address
+#endif
+
+#include "address_binding.h"  // LEONIDA_ADDRESS_BINDINGS: the bound object at a fault address
 
 #include "compile_gate_policy.h"
 #include "vulkan_device_markers.h"
@@ -1578,6 +1586,19 @@ private:
             std::fprintf(stderr, "[rt] device-fault: address[%zu] type=%d address=0x%" PRIx64
                                  " precision=%" PRIu64 "\n",
                          i, int(address.addressType), address.reportedAddress, address.addressPrecision);
+#ifdef _WIN32
+            // The page in this process at the same number. A GPU address is not a CPU one, but a host import, a title
+            // range or a raw CPU pointer that reached the GPU shares it, so the region says which of those it can be.
+            MEMORY_BASIC_INFORMATION page{};
+            if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address.reportedAddress)), &page,
+                             sizeof page))
+                std::fprintf(stderr, "[rt] device-fault: address[%zu] in this process: base %p allocation %p size 0x%zx "
+                                     "state 0x%lx protect 0x%lx type 0x%lx\n",
+                             i, page.BaseAddress, page.AllocationBase, page.RegionSize,
+                             static_cast<unsigned long>(page.State), static_cast<unsigned long>(page.Protect),
+                             static_cast<unsigned long>(page.Type));
+#endif
+            leonida::address_binding::describe(address.reportedAddress, address.addressPrecision);
         }
         for (std::size_t i = 0; i < counts.vendorInfoCount; ++i) {
             const auto& vendor = vendors[i];

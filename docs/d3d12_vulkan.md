@@ -4926,6 +4926,27 @@ when it cannot sample the submission lock for that long. A progress warning leav
 device state intact. The driver checkpoint and fault-info queries run after Vulkan reports device loss. This mode
 is off by default.
 
+Each fault address is also looked up in this process (RT-FAULT-ADDRESS-OWNER). On Windows, `VirtualQuery` of the
+same number gives the region's base, allocation base, state, protection and type. A GPU address isn't a CPU one,
+but a host import, a range of the title's memory and a raw CPU pointer that reached a shader all share the
+number. With `LEONIDA_ADDRESS_BINDINGS=1` as well, the device enables `VK_EXT_device_address_binding_report`, and
+a debug messenger records the GPU virtual address range of every buffer, image and allocation the driver binds
+and unbinds (`runtime/src/address_binding.h`). The fault report then lists, for each address:
+- the live objects that contain the address ("containing"), and those that only share its reported page, whose
+  size is the fault's `addressPrecision` ("on the page");
+- the live objects that end nearest below it and start nearest above it;
+- up to 16 recently unbound objects that held it, with their type, range, handle and the times they were bound
+  and unbound.
+
+"Nothing live or recently unbound there" means that no object of this device had that GPU address. On an
+RTX 5070 Ti the world-start loss of 1.0.2.1 reported write addresses far above every bound range, at about 50,000
+binds. The record keeps the last 16,384 unbinds and costs one map entry per live binding.
+
+There is one record per process. A second Vulkan instance in the same process (a second device) is refused a
+messenger, and its device doesn't enable the extension, so the two devices' GPU addresses aren't mixed. If
+`LEONIDA_ADDRESS_BINDINGS=1` is set but no messenger records the device, the fault report says that the bindings
+were not recorded, so this can't be mistaken for "nothing live or recently unbound there".
+
 Each dispatch line carries a `seq`: a number every recorded dispatch gets, across queues and submissions, in the
 order the submissions were recorded. The list keeps the last 64, so its numbers can have gaps where a submission
 recorded more than that.

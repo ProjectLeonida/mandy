@@ -16188,7 +16188,10 @@ public:
         state_.context.reset();
         state_.image_memory.reset();  // the context's deferred queue gave its ranges back
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
-        if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);
+        if (owned_.instance) {
+            leonida::address_binding::uninstall_messenger(owned_.instance);
+            owned_.destroy_instance(owned_.instance, nullptr);
+        }
     }
 
     bool ok() const { return state_.context && state_.context->loaded(); }
@@ -22625,8 +22628,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         return E_FAIL;
     }
     owned.destroy_instance = reinterpret_cast<PFN_vkDestroyInstance>(get(owned.instance, "vkDestroyInstance"));
+    // LEONIDA_ADDRESS_BINDINGS: the device's bindings reach this messenger from vkCreateDevice on (address_binding.h).
+    if (has_debug_utils) leonida::address_binding::install_messenger(owned.instance, get);
     const auto fail = [&](const char* why) {
         std::fprintf(stderr, "[rt] d3d12: %s\n", why);
+        leonida::address_binding::uninstall_messenger(owned.instance);
         owned.destroy_instance(owned.instance, nullptr);
         return E_FAIL;
     };
@@ -23375,6 +23381,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (aftermath && !info.device_diagnostics_config)
         std::fprintf(stderr, "[rt] aftermath: VK_NV_device_diagnostics_config unavailable; the dump has no shader "
                              "debug info, resource tracking or checkpoints\n");
+    leonida::address_binding::enable_device(owned.instance, info.physical, vkGetPhysicalDeviceFeatures2, extensions,
+                                            device_extensions, device_info);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
