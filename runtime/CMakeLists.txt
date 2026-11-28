@@ -39,6 +39,17 @@ if(MSVC)
   target_link_options(root_signature_test PRIVATE /OPT:NOREF)
 endif()
 
+# The memory probe merges CPU ranges on every platform. Windows also tests the working-set query on real pages.
+add_executable(working_set_test test/working_set_test.cpp)
+if(WIN32)
+  target_compile_definitions(working_set_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_link_libraries(working_set_test PRIVATE psapi)
+endif()
+if(MSVC)
+  target_compile_options(working_set_test PRIVATE /W4 /permissive- /utf-8)
+endif()
+add_test(NAME working_set COMMAND working_set_test)
+
 option(LEONIDA_BUILD_WINDOWS_RUNTIME "Build the Windows runtime, its shims and their tests" ${WIN32})
 if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # Custom CMAKE_CXX_FLAGS can replace MSVC's default /EHsc. Require C++ stack unwinding so error
