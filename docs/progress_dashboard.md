@@ -42,7 +42,7 @@ are read directly; there is no need to re-save them as UTF-8.
 | Translator contract | the contract table in [design.md](design.md#translator-status-and-runtime-contract), each row classified by how it says it was confirmed | contract row |
 | Runtime imports | the measured tables in [runtime_imports.md](runtime_imports.md) | import |
 | Shader corpus | `--work <work>`: counts per stage from `<work>/shaders/dxbc/index.json` and `<work>/shaders/spirv/index.json` | shaders, aggregated per stage |
-| Pull requests into main | `--github`: every pull request into `main` of the main repository (`--repo`, default `ubiquitarianism/leonida`), grouped by the item ID its title names (`D3D-86: …`, `… (SHADER-339)`) | pull request |
+| Pull requests into main | `--github`: every pull request into `main` of the main repository (`--repo`, default `ProjectLeonida/mandy`), grouped by the item ID its title names (`D3D-86: …`, `… (SHADER-339)`) | pull request |
 | D3D12 layer | `--github`: the `D3D-` table of the D3D12 tracking issue, read through `gh` and checked against the merged and open pull requests. The issue is the open one whose title starts with "D3D12 → Vulkan layer", or the one `--d3d-issue N` names; when the repository has neither, the sources list says so and the panel stays empty (the number is not fixed: it was #313 in the original repository) | item |
 | CI on main | `--github`: the latest completed run of each workflow on `main` | workflow |
 
