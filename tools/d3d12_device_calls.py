@@ -17,7 +17,8 @@ How it follows the device (x86-64 images only):
    function was given, a tail jump to the creator) is reported as an out-pointer not followed.
 3. Within each function (bounds from .pdata; a byte window for code without an entry) the device is followed through
    loads of a device global, register copies, stores to and loads from the same `[reg+disp]` slot (stack slots
-   survive calls; other memory doesn't), and stores to another global, which becomes a device global too. Every
+   survive calls, except one whose address the call is given, an out-pointer; other memory doesn't; any store
+   over a slot's bytes ends it, SSE/AVX stores included), and stores to another global, which becomes a device global too. Every
    function that references a device global is walked again until no new global turns up.
    The walk is linear, with forward branches followed: a `jmp` or conditional branch to a later address in the
    walked range carries what is known at the branch to its target, where it is met with the fall-through's state
@@ -63,6 +64,12 @@ import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# SSE/AVX stores to memory (op as tools/gdk_runtime_calls.py numbers them) and the bytes they write. The decoder keeps
+# neither the prefix nor VEX.L, so each takes its widest legacy form (movups over movss, 16 bytes) and 32 bytes
+# under VEX/EVEX: a slot is better forgotten than kept after a store that may have replaced it.
+_LEGACY_STORES = {0x11: 16, 0x29: 16, 0x2B: 16, 0x7F: 16, 0xE7: 16, 0x13: 8, 0x17: 8, 0xD6: 8, 0xC3: 8}
+VECTOR_STORES = {**{0x100 | b: n for b, n in _LEGACY_STORES.items()},
+                 **{0x1100 | b: 32 for b in _LEGACY_STORES if b != 0xC3}}
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 from gdk_runtime_calls import (  # noqa: E402
@@ -228,6 +235,11 @@ class Census:
             for key in [k for k in mem if k[0] == r]:
                 mem.discard(key)
 
+        def overwrite(base: int, disp: int, width: int) -> None:
+            # Any store over a slot's 8 bytes ends what the slot held, not only one at its exact address.
+            for key in [k for k in mem if k[0] == base and disp - 8 < k[1] < disp + width]:
+                mem.discard(key)
+
         def survives_call(base: int) -> bool:
             return base == RSP or (base == RBP and frame_rbp)
 
@@ -332,9 +344,12 @@ class Census:
                 elif (creator is None and not (indirect and mod != 3 and base in vt) and i.rva not in self.unverified
                       and dev & {RCX, RDX, 8, 9}):
                     self.passed.add(i.rva)
+                # A slot whose address the call is given (an out-pointer, `lea r9,[rsp+40h]`) can hold another
+                # object afterwards: the callee may write it. A creator's out slot is added back below.
+                given = {(a[1], a[2]) for r, a in addr.items() if r in (RCX, RDX, 8, R9) and a[0] == "m"}
                 for r in VOLATILE:
                     forget(r)
-                for key in [k for k in mem if not survives_call(k[0])]:
+                for key in [k for k in mem if not survives_call(k[0]) or k in given]:
                     mem.discard(key)
                 if creator is not None and not tail and out and out[0] == "m" and (
                         survives_call(out[1]) or out[1] not in VOLATILE):
@@ -388,7 +403,9 @@ class Census:
                         if base not in (RSP, RBP):
                             self.stored.add(i.rva)
                     else:
-                        mem.discard(key)
+                        overwrite(base, i.disp, 1 if op in (0x88, 0xC6, 0x86) else 8 if wide else 4)
+            elif op in VECTOR_STORES and plain:                        # an SSE/AVX store to [m]
+                overwrite(base, i.disp, VECTOR_STORES[op])
             dests = writes(i)
             if copy_from is not None:
                 carried = (copy_from in dev, vt.get(copy_from), meth.get(copy_from), addr.get(copy_from),

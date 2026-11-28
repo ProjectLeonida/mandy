@@ -335,6 +335,46 @@ class DeviceCallsTest(unittest.TestCase):
         self.assertEqual(r["creators"][0]["out"],
                          {"global": 1, "stack slot": 1, "object member (followed until the next call)": 1})
 
+    def spilled_device(self, between):
+        """A function that spills the device to [rsp+0x40], runs `between`, reloads the slot and calls its slot 6."""
+        def emit(a):
+            a.raw(b"\x48\x83\xec\x68")                   # sub rsp,0x68
+            a.rip(b"\x48\x8b\x0d", DEVICE)               # mov rcx,[rip+DEVICE]
+            a.raw(b"\x48\x89\x4c\x24\x40")               # mov [rsp+0x40],rcx
+            between(a)
+            a.raw(b"\x48\x8b\x4c\x24\x40")               # mov rcx,[rsp+0x40]
+            a.raw(b"\x48\x8b\x01")                       # mov rax,[rcx]
+            a.raw(b"\xff\x50\x30")                       # call [rax+0x30]: slot 6 while the slot holds the device
+            a.raw(b"\x48\x83\xc4\x68\xc3")               # add rsp,0x68; ret
+        return {s["slot"] for s in self.with_code(emit)["slots"]}
+
+    def test_a_store_over_the_slot_ends_it_vector_and_partial_stores_included(self):
+        for label, store, kept in [
+            ("mov [rsp+0x40],rdx", b"\x48\x89\x54\x24\x40", False),
+            ("movups [rsp+0x40],xmm0", b"\x0f\x11\x44\x24\x40", False),
+            ("movups [rsp+0x38],xmm0: bytes 0x38-0x47", b"\x0f\x11\x44\x24\x38", False),
+            ("vmovdqu [rsp+0x30],ymm0: bytes 0x30-0x4f", b"\xc5\xfe\x7f\x44\x24\x30", False),
+            ("mov dword [rsp+0x44],0: the slot's upper half", b"\xc7\x44\x24\x44\x00\x00\x00\x00", False),
+            ("movups [rsp+0x48],xmm0: the next slot", b"\x0f\x11\x44\x24\x48", True),
+            ("mov [rsp+0x38],rdx: the slot before", b"\x48\x89\x54\x24\x38", True),
+        ]:
+            with self.subTest(label):
+                self.assertEqual(6 in self.spilled_device(lambda a, store=store: a.raw(store)), kept)
+
+    def test_a_slot_whose_address_a_call_is_given_is_forgotten(self):
+        # device->CreateCommandQueue(&desc, riid, &out): when out is the slot that held the device, the slot holds
+        # the queue afterwards, and a call through it is the queue's, not a device slot.
+        for label, out, kept in [("out-pointer to another slot", 0x48, True), ("out-pointer to the slot", 0x40, False)]:
+            def between(a, out=out):
+                a.raw(b"\x48\x8b\x01")                   # mov rax,[rcx]
+                a.raw(b"\x4c\x8d\x4c\x24" + bytes([out]))   # lea r9,[rsp+out]
+                a.raw(b"\x48\x8d\x54\x24\x50")           # lea rdx,[rsp+0x50]
+                a.raw(b"\xff\x50\x40")                   # call [rax+0x40]: slot 8
+            with self.subTest(label):
+                slots = self.spilled_device(between)
+                self.assertIn(8, slots)
+                self.assertEqual(6 in slots, kept)
+
     def test_creators_and_globals(self):
         self.assertEqual(self.r["creators"], [{"import": "d3d12_xs.dll!D3D12XboxCreateDevice", "call_sites": 2,
                                                "out": {"global": 1, "stack slot": 1}}])
