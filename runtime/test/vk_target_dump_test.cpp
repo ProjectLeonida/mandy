@@ -835,6 +835,31 @@ int test_unit_helpers() {
         EXPECT(dump.outstanding_staging_bytes() == 0);
         EXPECT(g_mock_dump.buffers_created == 1 && g_mock_dump.buffers_destroyed == 1);
         EXPECT(g_mock_dump.memories_allocated == 1 && g_mock_dump.memories_freed == 1);
+
+        dump.set_staging_limits(512, 4);
+        color_uav.mip_levels = 2;
+        color_uav.array_layers = 2;
+        g_mock_dump.copies = 0;
+        dump.begin_submission(1, queue_a);
+        dump.note_uav(10, color_uav, VK_REMAINING_MIP_LEVELS, VK_REMAINING_ARRAY_LAYERS);
+        dump.clear_uav(10, 1, 1, 1, 1);
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> captured;
+        dump.after_dispatch(fake_cb, true, [&](auto id, auto, auto mip, auto layer) {
+            if (id != 10) return false;
+            captured.emplace_back(mip, layer);
+            return true;
+        });
+        EXPECT(g_mock_dump.copies == 3 && captured.size() == 3);
+        EXPECT((captured[0] == std::pair{0u, 0u}));
+        EXPECT((captured[1] == std::pair{0u, 1u}));
+        EXPECT((captured[2] == std::pair{1u, 0u}));
+        dump.forget_resource(10);
+        dump.commit_submission(false, 0);
+
+        dump.begin_submission(1, queue_a);
+        dump.after_dispatch(fake_cb, true, [](auto, auto, auto, auto) { return true; });
+        EXPECT(g_mock_dump.copies == 3);
+        dump.commit_submission(false, 0);
     }
     EXPECT(set_target_dump_env(nullptr, nullptr));
     return 0;

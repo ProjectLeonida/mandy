@@ -1858,7 +1858,7 @@ inline void track_target_dump_transition(TargetDump& dump, ResourceId id, const 
     if (!p.binding.image) return;
     if (transition.after & d3d12_state::unordered_access) {
         if (p.binding.aspects == VK_IMAGE_ASPECT_COLOR_BIT && !p.binding.depth_uav && !p.binding.stencil_uav)
-            dump.note_uav(id, make_target_dump_uav(p.binding, p.range));
+            dump.note_uav(id, make_target_dump_uav(p.binding, p.range), p.range.levelCount, p.range.layerCount);
     } else {
         dump.clear_uav(id, p.range.baseMipLevel, p.range.levelCount, p.range.baseArrayLayer, p.range.layerCount);
     }
@@ -1870,7 +1870,7 @@ inline void track_target_dump_texture_barrier(TargetDump& dump, ResourceId id, c
     if (!release &&
         (texture_uav_layout(texture.layout_after) || (texture.access_after & d3d12_access::unordered_access))) {
         if (p.binding.aspects == VK_IMAGE_ASPECT_COLOR_BIT && !p.binding.depth_uav && !p.binding.stencil_uav)
-            dump.note_uav(id, make_target_dump_uav(p.binding, p.range));
+            dump.note_uav(id, make_target_dump_uav(p.binding, p.range), p.range.levelCount, p.range.layerCount);
     } else if (release || texture.layout_after != d3d12_layout::undefined) {
         dump.clear_uav(id, p.range.baseMipLevel, p.range.levelCount, p.range.baseArrayLayer, p.range.layerCount);
     }
@@ -1880,7 +1880,7 @@ inline void track_target_dump_uav_clear(TargetDump& dump, ResourceId id, const P
     if (!p.binding.image || p.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT || p.binding.depth_uav ||
         p.binding.stencil_uav)
         return;
-    dump.note_uav(id, make_target_dump_uav(p.binding, p.range));
+    dump.note_uav(id, make_target_dump_uav(p.binding, p.range), p.range.levelCount, p.range.layerCount);
 }
 
 inline void dump_dispatch_targets(TargetDump& dump, VkCommandBuffer command_buffer, bool writes_storage_image,

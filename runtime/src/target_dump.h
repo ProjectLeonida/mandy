@@ -20,6 +20,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -409,32 +410,44 @@ public:
         next_pass_ = committed_passes_;
     }
 
-    void note_uav(std::uint64_t id, const UavImage& image) {
+    void note_uav(std::uint64_t id, const UavImage& image, std::uint32_t mip_count = 1,
+                  std::uint32_t layer_count = 1) {
         // Depth/stencil UAVs write to separate storage-plane child images rather than the parent depth image; skip them
         // so post-dispatch capture never dumps stale pre-dispatch parent depth.
         if (!id || !image.image || image.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return;
+        if (image.mip >= image.mip_levels || image.layer >= image.array_layers) return;
+        const auto mip_end = image.mip + std::min(mip_count, image.mip_levels - image.mip);
+        const auto layer_end = image.layer + std::min(layer_count, image.array_layers - image.layer);
         std::lock_guard lock(mutex_);
-        active_uavs_[id] = {current_queue_, image};
+        for (auto mip = image.mip; mip < mip_end; ++mip) {
+            for (auto layer = image.layer; layer < layer_end; ++layer) {
+                UavImage subresource = image;
+                subresource.mip = mip;
+                subresource.layer = layer;
+                active_uavs_.insert_or_assign(UavKey{id, mip, layer}, TrackedUav{current_queue_, subresource});
+            }
+        }
     }
 
     void clear_uav(std::uint64_t id, std::uint32_t base_mip, std::uint32_t level_count, std::uint32_t base_layer,
                    std::uint32_t layer_count) {
         std::lock_guard lock(mutex_);
-        const auto it = active_uavs_.find(id);
-        if (it == active_uavs_.end()) return;
-        const UavImage& entry = it->second.image;
-        const bool mip_hit = entry.mip >= base_mip &&
-                             (level_count == VK_REMAINING_MIP_LEVELS || entry.mip - base_mip < level_count);
-        const bool layer_hit = entry.layer >= base_layer &&
-                               (layer_count == VK_REMAINING_ARRAY_LAYERS || entry.layer - base_layer < layer_count);
-        if (mip_hit && layer_hit) active_uavs_.erase(it);
+        auto it = active_uavs_.lower_bound(UavKey{id, base_mip, 0});
+        while (it != active_uavs_.end() && std::get<0>(it->first) == id) {
+            const UavImage& entry = it->second.image;
+            if (entry.mip - base_mip >= level_count) break;
+            if (entry.layer >= base_layer && entry.layer - base_layer < layer_count)
+                it = active_uavs_.erase(it);
+            else
+                ++it;
+        }
     }
 
     void forget_resource(std::uint64_t id) {
         if (!enabled() && !has_pending()) return;
         std::lock_guard lock(mutex_);
-        active_uavs_.erase(id);
-        saved_uavs_.erase(id);
+        erase_resource(active_uavs_, id);
+        erase_resource(saved_uavs_, id);
     }
 
     void after_rendering(VkCommandBuffer cb, std::span<const TargetImage> targets,
@@ -452,11 +465,11 @@ public:
             std::lock_guard lock(mutex_);
             if (active_uavs_.empty()) return;
             std::uint32_t slot_index = 0;
-            for (const auto& [id, tracked] : active_uavs_) {
+            for (const auto& [key, tracked] : active_uavs_) {
                 if (tracked.queue != current_queue_) continue;
                 const UavImage& uav = tracked.image;
                 if (!uav.image || uav.samples > 1 || uav.aspects != VK_IMAGE_ASPECT_COLOR_BIT) continue;
-                if (!is_general(id, uav.aspects, uav.mip, uav.layer)) continue;
+                if (!is_general(std::get<0>(key), uav.aspects, uav.mip, uav.layer)) continue;
                 TargetImage target{};
                 target.image = uav.image;
                 target.format = uav.format;
@@ -577,6 +590,15 @@ private:
         VkQueue queue = VK_NULL_HANDLE;
         UavImage image{};
     };
+
+    using UavKey = std::tuple<std::uint64_t, std::uint32_t, std::uint32_t>;
+    using UavMap = std::map<UavKey, TrackedUav>;
+
+    static void erase_resource(UavMap& uavs, std::uint64_t id) {
+        const auto first = uavs.lower_bound(UavKey{id, 0, 0});
+        const auto last = uavs.upper_bound(UavKey{id, UINT32_MAX, UINT32_MAX});
+        uavs.erase(first, last);
+    }
 
     struct DeviceFunctions {
         PFN_vkCreateBuffer create_buffer = nullptr;
@@ -933,8 +955,8 @@ private:
     VkPhysicalDeviceMemoryProperties memory_{};
 
     mutable std::mutex mutex_;
-    std::map<std::uint64_t, TrackedUav> active_uavs_;
-    std::map<std::uint64_t, TrackedUav> saved_uavs_;
+    UavMap active_uavs_;
+    UavMap saved_uavs_;
     std::vector<InFlightBatch> in_flight_;
     VkDeviceSize max_staging_bytes_ = default_max_staging_bytes;
     std::uint32_t max_staging_allocations_ = default_max_staging_allocations;
