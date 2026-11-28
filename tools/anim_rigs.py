@@ -124,13 +124,15 @@ def join_rbf0(dicts, rigs):
     for dictionary in dicts:
         if name := dictionary.get("name"):
             keys[name].update(entry["key"] for entry in dictionary.get("entries", ()))
+    # Index all hashes once: unresolved entries otherwise rescan every dictionary.
+    all_keys = set().union(*keys.values()) if keys else set()
     entries = [e for rs in rigs["rbf0"]["rigsets"] for e in rs["entries"]]
     c = collections.Counter()
     for e in entries:
         h = anim_index.joaat32(e["rig"].lower())
         if h in keys.get(e["source"], ()):
             c["resolved"] += 1
-        elif any(h in k for k in keys.values()):
+        elif h in all_keys:
             c["in_another_dictionary"] += 1
         elif e["source"] not in keys:
             c["no_dictionary_named_source"] += 1
