@@ -590,6 +590,190 @@ class SamplerSourceCensus(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertTrue(p.stderr.startswith("ERROR: cannot read the carve index"), p.stderr)
 
+    def test_vsharp_with_per_dword_offset_keeps_user_class(self):
+        static_v = [
+            ("s_add_u32 s4, s4, 0x100", 8),
+            ("s_addc_u32 s5, s5, 0", 4),
+            ("s_buffer_load_dwordx4 s[28:31], s[4:7], 0x10", 8),
+            SAMPLE, END,
+        ]
+        self.work.add("vs_static", "ps", static_v)
+        insns = ssc.shader_ir.parse_file(os.path.join(self.work.disasm, "vs_static.s"))["insns"]
+        uses, stats = ssc.analyse(insns, "ps", 32)
+        self.assertEqual(list(uses.values()), [("user_pointer", "static")])
+        self.assertEqual(stats["max_pointer_constant"], 0x100)
+
+        dyn_v = [
+            ("s_lshl_b32 s1, s1, 4", 4),
+            ("s_add_u32 s4, s4, s1", 4),
+            ("s_addc_u32 s5, s5, 0", 4),
+            ("s_buffer_load_dwordx4 s[28:31], s[4:7], 0x10", 8),
+            SAMPLE, END,
+        ]
+        self.assertEqual(self.classes(dyn_v), [("user_pointer", "dynamic")])
+
+    def test_pointer_high_word_unary_zero_and_offset_propagation(self):
+        unary_zero = [
+            ("s_not_b32 s9, -1", 4),
+            ("s_load_dwordx4 s[28:31], s[8:9], 0x40", 8),
+            SAMPLE, END,
+        ]
+        self.assertEqual(self.classes(unary_zero), [("user_pointer", "static")])
+
+        hi_const = [
+            ("s_add_u32 s9, s9, 0x200", 8),
+            ("s_load_dwordx4 s[28:31], s[8:9], 0x40", 8),
+            SAMPLE, END,
+        ]
+        self.work.add("hi_c", "ps", hi_const)
+        insns = ssc.shader_ir.parse_file(os.path.join(self.work.disasm, "hi_c.s"))["insns"]
+        uses, stats = ssc.analyse(insns, "ps", 32)
+        self.assertEqual(list(uses.values()), [("user_pointer", "static")])
+        self.assertEqual(stats["max_pointer_constant"], 0x200)
+
+        hi_dyn = [
+            ("s_lshl_b32 s5, s5, 4", 4),
+            ("s_add_u32 s9, s9, s5", 4),
+            ("s_load_dwordx4 s[28:31], s[8:9], 0x40", 8),
+            SAMPLE, END,
+        ]
+        self.assertEqual(self.classes(hi_dyn), [("user_pointer", "dynamic")])
+
+    def test_smem_inst_offset_modifier_counted_in_bounds(self):
+        self.work.add("dyn_mod", "ps", [
+            ("s_mov_b32 s9, 0", 4),
+            ("s_load_dwordx4 s[28:31], s[8:9], s5 offset:0x7f004000", 8),
+            SAMPLE, END,
+        ])
+        self.work.add("const_mod", "ps", [
+            ("s_mov_b32 s9, 0", 4),
+            ("s_mov_b32 s6, 0x100", 8),
+            ("s_load_dwordx4 s[28:31], s[8:9], s6 offset:0x40", 8),
+            SAMPLE, END,
+        ])
+        out = ssc.census(self.work.disasm)
+        self.assertEqual(out["total"]["classes"]["user_pointer"], 2)
+        self.assertEqual(out["total"]["max_pointer_constant"], 0x7f004000)
+        self.assertEqual(out["total"]["max_static_offset"], 0x140)
+
+    def test_v_mov_modifiers_sdwa_and_dpp_are_not_lossless_spills(self):
+        lost = [("undetermined", "a dword the dataflow does not follow")]
+        restore = "v_readfirstlane_b32 s{s}, v{v}"
+        self.assertEqual(self.classes(spilled("v_mov_b32_e32 v{v}, s{s}", restore)), [("user_pointer", "static")])
+        self.assertEqual(self.classes(spilled("v_mov_b32_e64 v{v}, -s{s}", restore)), lost)
+        self.assertEqual(self.classes(spilled("v_mov_b32_e64 v{v}, |s{s}|", restore)), lost)
+        self.assertEqual(self.classes(spilled("v_mov_b32_e64 v{v}, s{s} clamp", restore)), lost)
+        self.assertEqual(
+            self.classes(spilled("v_mov_b32_sdwa v{v}, s{s} dst_sel:DWORD src0_sel:BYTE_0", restore)),
+            lost,
+        )
+        dpp = spilled("v_mov_b32 v{v}, s{s}", restore)
+        dpp.insert(7, ("v_mov_b32_dpp v9, v9 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf", 8))
+        self.assertEqual(self.classes(dpp), lost)
+
+    def test_anchored_invalid_hex_skips_and_empty_blocks_do_not_crash(self):
+        self.assertEqual(ssc.blocks_of([]), ([], []))
+        self.assertEqual(
+            ssc.analyse([], "ps", 32),
+            ({}, {"max_pointer_constant": 0, "max_static_offset": 0, "unreachable": 0}),
+        )
+        self.work.add("badhex", "ps", USER_TABLE, blob=bytes(0x140))
+        info = {
+            "name": "badhex",
+            "code_start": 0x100,
+            "insns": [{"op": "s_endpgm", "args": [], "mods": [], "enc": "zz", "pc": 0x100}],
+        }
+        with self.assertRaises(ssc.hic.Skip):
+            ssc.anchored(os.path.join(self.work.disasm, "badhex.s"), info)
+
+    def test_census_validates_limit_and_jobs(self):
+        self.work.add("a", "ps", USER_TABLE)
+        for bad in (0, -1, True, False):
+            with self.assertRaises(ValueError):
+                ssc.census(self.work.disasm, limit=bad)
+            with self.assertRaises(ValueError):
+                ssc.census(self.work.disasm, jobs=bad)
+
+    def test_cli_json_guards_atomic_write_and_oserror(self):
+        self.work.add("a", "ps", USER_TABLE, rsrc2=16 << 1)
+        idx_path = os.path.join(self.work.root, "index.json")
+        dxbc_path = os.path.join(self.work.root, "a.dxbc")
+        fssm_path = os.path.join(self.work.root, "fssm", "a.fssm")
+        listing_path = os.path.join(self.work.disasm, "a.s")
+        with open(idx_path, "rb") as f:
+            idx_before = f.read()
+        with open(dxbc_path, "rb") as f:
+            dxbc_before = f.read()
+        with open(fssm_path, "rb") as f:
+            fssm_before = f.read()
+        with open(listing_path, "rb") as f:
+            listing_before = f.read()
+
+        hardlink = os.path.join(self.work.root, "linked_listing.json")
+        os.link(listing_path, hardlink)
+        existing_dir = os.path.join(self.work.root, "out_dir")
+        os.makedirs(existing_dir)
+
+        for bad_target in (
+            idx_path,
+            os.path.join(self.work.disasm, "census.json"),
+            os.path.join(self.work.disasm, "nested", "census.json"),
+            dxbc_path,
+            fssm_path,
+            hardlink,
+            existing_dir,
+        ):
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = ssc.main([self.work.disasm, "--json", bad_target])
+            self.assertEqual(rc, 2, bad_target)
+            self.assertTrue(err.getvalue().startswith("ERROR:"), (bad_target, err.getvalue()))
+
+        for path, before in ((idx_path, idx_before), (dxbc_path, dxbc_before),
+                             (fssm_path, fssm_before), (listing_path, listing_before)):
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), before, path)
+
+        # Atomic write failure must preserve any pre-existing report and leave no temp file behind.
+        out_dir = os.path.join(self.work.root, "atomic")
+        os.makedirs(out_dir)
+        out_path = os.path.join(out_dir, "census.json")
+        with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"keep": true}\n')
+        orig_replace = ssc.replace_retry.replace
+
+        def boom(src, dst, **kw):
+            raise OSError("disk full")
+
+        ssc.replace_retry.replace = boom
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = ssc.main([self.work.disasm, "--json", out_path])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR: cannot write", err.getvalue())
+        finally:
+            ssc.replace_retry.replace = orig_replace
+        with open(out_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"keep": true}\n')
+        self.assertEqual(os.listdir(out_dir), ["census.json"])
+
+        # OSError during census() must report ERROR and exit 2 instead of crashing.
+        orig_census = ssc.census
+
+        def bad_census(*args, **kwargs):
+            raise OSError("read failed")
+
+        ssc.census = bad_census
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = ssc.main([self.work.disasm])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR: cannot read", err.getvalue())
+        finally:
+            ssc.census = orig_census
+
 
 if __name__ == "__main__":
     unittest.main()

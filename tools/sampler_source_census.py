@@ -64,14 +64,18 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import file_mode  # noqa: E402
 import heap_index_census as hic  # noqa: E402
 import pool_workers  # noqa: E402
+import replace_retry  # noqa: E402
 import shader_ir  # noqa: E402
 import shader_meta  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 CLASSES = ("user_sgprs", "user_pointer", "literal", "other_base", "undetermined")
 ENDS = ("s_endpgm", "s_setpc_b64")           # no fall-through and no successor the listing names
@@ -100,7 +104,10 @@ def anchored(path, info):
     for ins in info["insns"]:
         if not ins["enc"]:
             raise hic.Skip("embedded data words, instruction without encoding")
-        enc = bytes.fromhex(ins["enc"])
+        try:
+            enc = bytes.fromhex(ins["enc"])
+        except ValueError:
+            raise hic.Skip("embedded data words, invalid instruction encoding") from None
         at, skipped = pos, 0
         while not rdna2spirv.same_encoding(blob[at:at + len(enc)], enc, ins["op"], len(ins["args"])):
             at += 4
@@ -138,6 +145,8 @@ def blocks_of(insns):
     def is_branch(ins):
         return shader_meta.base_op(ins["op"]) in hic.BRANCHES
 
+    if not insns:
+        return [], []
     if any(is_branch(i) and not i.get("enc") for i in insns):
         raise hic.Skip("branch without encoding")
     pcs = {i["pc"] for i in insns}
@@ -226,8 +235,14 @@ def step(sym, ins, lanes=None):
         written = [x for x in (a if op == "v_swap_b32" else a[:1]) if x["k"] == "vgpr"]
         lane = a[2]["v"] if op == "v_writelane_b32" and len(a) >= 3 and a[2]["k"] == "imm" else None
         moved = None
-        if op in ("v_mov_b32", "v_writelane_b32") and len(a) >= 2 and a[0].get("n", 1) == 1:
-            moved = sym.get(("v", a[1]["r"])) if a[1]["k"] == "vgpr" else hic._src(sym, a[1])
+        if op in ("v_mov_b32", "v_writelane_b32") and len(a) >= 2 and a[0].get("n", 1) == 1 \
+                and not ins["op"].endswith(("_sdwa", "_dpp")) and not ins.get("mods"):
+            src = a[1]
+            if src["k"] == "vgpr":
+                if src.get("n", 1) == 1 and not (src.get("neg") or src.get("abs") or src.get("sext")):
+                    moved = sym.get(("v", src["r"]))
+            elif src["k"] != "sgpr" or not (src.get("neg") or src.get("abs") or src.get("sext")):
+                moved = hic._src(sym, src)
         for x in written:
             for r in range(x["r"], x["r"] + x.get("n", 1)):
                 sym.pop(("v", r), None)
@@ -282,6 +297,17 @@ def merge(old, new):
     return out
 
 
+def _smem_inst_offset(mods):
+    """Immediate byte offset from an SMEM `offset:N` modifier, or 0."""
+    for mod in mods or ():
+        if mod.startswith("offset:"):
+            try:
+                return int(mod.split(":", 1)[1], 0)
+            except ValueError:
+                return 0
+    return 0
+
+
 def analyse(insns, stage, user_count, follow_skips=True):
     """{code offset: (class, detail)} of the reachable sampling instructions, in code order, and the shader's
     statistics. detail: the offset kind for user_pointer ("static" / "dynamic"), the form for other_base, the
@@ -289,6 +315,8 @@ def analyse(insns, stage, user_count, follow_skips=True):
     follow_skips=False leaves out the taken edge of every s_cbranch_execz that also falls through: the branch
     skips a region when no lane is active, so without it the region always runs (see the module docstring)."""
     blocks, succ = blocks_of(insns)
+    if not blocks:
+        return {}, {"max_pointer_constant": 0, "max_static_offset": 0, "unreachable": 0}
     if not follow_skips:
         succ = [s[1:] if len(s) == 2 and shader_meta.base_op(blk[-1]["op"]) == "s_cbranch_execz" else s
                 for blk, s in zip(blocks, succ)]
@@ -328,6 +356,7 @@ def analyse(insns, stage, user_count, follow_skips=True):
                 loads[ins["pc"]] = {
                     "base": None if slots is None else [shader_meta._slot_tag(sym, s) for s in slots],
                     "offset": hic._src(sym, a[2]) if len(a) >= 3 else ("const", 0),
+                    "inst_offset": _smem_inst_offset(ins.get("mods")),
                 }
             elif op.startswith(shader_meta.SAMPLER_IMAGE_OPS) and len(a) >= 4:
                 slots = shader_meta._sgpr_slots(a[3], 4, exact=False)
@@ -385,17 +414,29 @@ def analyse(insns, stage, user_count, follow_skips=True):
         if base is None:
             return None, False, 0, "load base not an SGPR range"
         if len(base) == 4:                             # s_buffer_load: the V# decides
-            got = {source(t, seen) for t in base}
-            where, dyn, k = next(iter(got)) if len(got) == 1 else (None, False, 0)
+            got = [source(t, seen) for t in base]
+            wheres = {g[0] for g in got}
+            where = wheres.pop() if len(wheres) == 1 else None
+            dyn, k = any(g[1] for g in got), max(g[2] for g in got)
             reason = "V# from different sources"
         else:
             where, dyn, k = source(base[0], seen)
             reason = "load base not followed"
-            if where == "user" and base[1] != ("const", 0) and source(base[1], seen)[0] != "user":
-                where, reason = None, "pointer high word not followed"
+            hi_zero = base[1] is not None and base[1][0] == "const" and base[1][1] == 0
+            if where == "user" and not hi_zero:
+                hi_where, hi_dyn, hi_k = source(base[1], seen)
+                if hi_where != "user":
+                    where, reason = None, "pointer high word not followed"
+                else:
+                    dyn = dyn or hi_dyn
+                    k = max(k, hi_k)
         off = ld["offset"]
+        inst_off = ld.get("inst_offset", 0)
         static = off is not None and off[0] == "const" and not dyn
-        return where, not static, k if static or off is None else max(k, source(off, seen)[2]), reason
+        if static:
+            return where, False, k, reason
+        off_k = source(off, seen)[2] if off is not None else 0
+        return where, True, max(k, off_k, abs(inst_off)), reason
 
     by_load = {}
 
@@ -411,7 +452,8 @@ def analyse(insns, stage, user_count, follow_skips=True):
             else:
                 stats["max_pointer_constant"] = max(stats["max_pointer_constant"], k)
                 if not dyn:
-                    stats["max_static_offset"] = max(stats["max_static_offset"], ld["offset"][1])
+                    static_off = ld["offset"][1] + ld.get("inst_offset", 0)
+                    stats["max_static_offset"] = max(stats["max_static_offset"], abs(static_off))
                 by_load[pc] = "user_pointer", "dynamic" if dyn else "static"
         return by_load[pc]
 
@@ -539,11 +581,87 @@ def summarise(rows):
     }
 
 
+def _check_positive_int(name, value):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
+
+def _path_inside(path, folder):
+    cur = os.path.realpath(os.path.abspath(path))
+    while True:
+        if same_report_path(cur, folder):
+            return True
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return False
+        cur = parent
+
+
+def _same_stat(st, path):
+    try:
+        return os.path.samestat(st, os.stat(path))
+    except OSError:
+        return False
+
+
+def _json_input_collision(json_path, disasm_dir, stages, listing_names):
+    parent = os.path.dirname(os.path.abspath(disasm_dir))
+    fssm_dir = os.path.join(parent, "fssm")
+    target_real = os.path.realpath(os.path.abspath(json_path))
+    target_dir = os.path.dirname(target_real)
+    try:
+        target_stat = os.stat(target_real)
+    except OSError:
+        target_stat = None
+    in_parent = same_report_path(target_dir, parent)
+    in_fssm = same_report_path(target_dir, fssm_dir)
+    for name in sorted(set(stages) | set(listing_names)):
+        for path, in_dir in (
+            (os.path.join(parent, name + ".dxbc"), in_parent),
+            (os.path.join(fssm_dir, name + ".fssm"), in_fssm),
+            (os.path.join(disasm_dir, name + ".s"), False),
+        ):
+            if (target_stat is not None and _same_stat(target_stat, path)) or (
+                (in_dir or os.path.islink(path)) and same_report_path(json_path, path)
+            ):
+                return path
+    return None
+
+
+def _write_json_atomic(path, data):
+    payload = json.dumps(data, indent=1, sort_keys=True, allow_nan=False) + "\n"
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path)
+    os.makedirs(parent, exist_ok=True)
+    mode = file_mode.published_mode(abs_path)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n",
+            prefix=".sampler_source_census.", suffix=".tmp",
+            dir=parent, delete=False,
+        ) as f:
+            tmp_path = f.name
+            f.write(payload)
+        os.chmod(tmp_path, mode)
+        replace_retry.replace(tmp_path, abs_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def census(disasm_dir, limit=None, jobs=1, stages=None):
+    if limit is not None:
+        _check_positive_int("limit", limit)
+    _check_positive_int("jobs", jobs)
     if stages is None:
         stages = hic.stage_index(disasm_dir)
     names = sorted(n[:-2] for n in os.listdir(disasm_dir) if n.endswith(".s"))
-    if limit:
+    if limit is not None:
         names = names[:limit]
     work = [(disasm_dir, name, stages.get(name)) for name in names]
     if jobs > 1:
@@ -594,20 +712,42 @@ def main(argv=None):
     if not os.path.isdir(args.disasm):
         print(f"ERROR: {args.disasm} is not a folder", file=sys.stderr)
         return 2
+    if args.json:
+        if os.path.isdir(args.json):
+            print(f"ERROR: --json is a folder: {args.json}", file=sys.stderr)
+            return 2
+        index_path = os.path.join(os.path.dirname(os.path.abspath(args.disasm)), "index.json")
+        if same_report_path(args.json, index_path):
+            print(f"ERROR: --json would overwrite the carve index: {args.json}", file=sys.stderr)
+            return 2
+        if _path_inside(args.json, args.disasm):
+            print(f"ERROR: --json must not write inside the disasm folder it reads: {args.json}", file=sys.stderr)
+            return 2
     try:
         stages = hic.stage_index(args.disasm)
     except (OSError, ValueError, KeyError, TypeError) as e:
         print(f"ERROR: cannot read the carve index next to {args.disasm}: {e}", file=sys.stderr)
         return 2
-    out = census(args.disasm, args.limit, args.jobs, stages)
+    if args.json:
+        try:
+            listing_names = [n[:-2] for n in os.listdir(args.disasm) if n.endswith(".s")]
+        except OSError as e:
+            print(f"ERROR: cannot read {args.disasm}: {e}", file=sys.stderr)
+            return 2
+        hit = _json_input_collision(args.json, args.disasm, stages, listing_names)
+        if hit is not None:
+            print(f"ERROR: --json would overwrite an input the census reads: {hit}", file=sys.stderr)
+            return 2
+    try:
+        out = census(args.disasm, args.limit, args.jobs, stages)
+    except OSError as e:
+        print(f"ERROR: cannot read {args.disasm}: {e}", file=sys.stderr)
+        return 2
     print_report(out)
     if args.json:
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
-            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(out, f, indent=1, sort_keys=True)
-                f.write("\n")
-        except OSError as e:
+            _write_json_atomic(args.json, out)
+        except (OSError, ValueError) as e:
             print(f"ERROR: cannot write {args.json}: {e}", file=sys.stderr)
             return 2
     bad = [f"{c}: {out['total']['classes'][c]} instructions" for c in args.expect_none if out["total"]["classes"][c]]
