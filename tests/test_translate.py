@@ -142,7 +142,7 @@ def test_translation_is_deterministic(make_shader):
 
 def test_unsupported_instruction_is_reported_not_guessed(make_shader):
     """Anything outside the supported set must raise Unsupported rather than emit a wrong program."""
-    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_sat_pk_u8_i16 v0, v1"))
+    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_mullit_f32 v0, v1, v1, v1"))
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
 
@@ -1104,9 +1104,9 @@ def test_gather4_l_literal_lod_bounds_feed_mip_selection(make_shader):
     clamp = defs[_gather_rounded_lod(defs)].split()
     assert clamp[:4] == ["OpExtInst", "%float", "%glsl", "FClamp"]
     for limit, bits in zip(clamp[-2:], (0x3e800000, 0x3f400000)):
-        cast, scalar, value = defs[limit].split()
-        assert (cast, scalar) == ("OpBitcast", "%float")
-        assert defs[value] == f"OpConstant %uint {bits}"
+        # Gen.fconst: the float constant with those bits, not a bitcast of the uint constant
+        assert limit == f"%fc{bits:x}"
+        assert defs[limit] == f"OpConstant %float {struct.unpack('<f', struct.pack('<I', bits))[0]!r}"
 
 
 def test_gather4_l_run_time_lod_bounds_clamp_without_fclamp(make_shader):
