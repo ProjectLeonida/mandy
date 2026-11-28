@@ -39,15 +39,18 @@ struct FakeVulkan {
     int free_memory_calls = 0;
     int wait_idle_calls = 0;
     int get_counter_calls = 0;
+    int get_device_address_calls = 0;
     VkBufferUsageFlags last_usage = 0;  // of the last chunk created
     VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
     std::vector<std::uint32_t> families;
 
     VkResult create_buffer_result = VK_SUCCESS;
+    bool write_garbage_on_create_error = false;
     VkResult bind_result = VK_SUCCESS;
     VkResult counter_result = VK_SUCCESS;
     bool counter_write_on_error = false;
     bool return_null_memory = false;
+    bool provide_device_address = false;
     const char* omit_proc = nullptr;
 };
 
@@ -60,7 +63,10 @@ VKAPI_ATTR VkResult VKAPI_CALL fake_create_buffer(
     g_vk->sharing_mode = info->sharingMode;
     if (info->queueFamilyIndexCount)
         g_vk->families.assign(info->pQueueFamilyIndices, info->pQueueFamilyIndices + info->queueFamilyIndexCount);
-    if (g_vk->create_buffer_result != VK_SUCCESS) return g_vk->create_buffer_result;
+    if (g_vk->create_buffer_result != VK_SUCCESS) {
+        if (g_vk->write_garbage_on_create_error) *out = make_handle<VkBuffer>(0xdeadbeef);
+        return g_vk->create_buffer_result;
+    }
     const std::uintptr_t id = g_vk->next_buffer++;
     g_vk->live_buffers[id] = info->size;
     g_vk->last_usage = info->usage;
@@ -108,6 +114,12 @@ VKAPI_ATTR VkResult VKAPI_CALL fake_device_wait_idle(VkDevice) {
     return VK_SUCCESS;
 }
 
+VKAPI_ATTR VkDeviceAddress VKAPI_CALL fake_get_buffer_device_address(
+    VkDevice, const VkBufferDeviceAddressInfo* info) {
+    ++g_vk->get_device_address_calls;
+    return static_cast<VkDeviceAddress>(reinterpret_cast<std::uintptr_t>(info->buffer)) << 20;
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fake_get_device_proc(VkDevice, const char* name) {
     if (g_vk->omit_proc && std::strcmp(name, g_vk->omit_proc) == 0) return nullptr;
     if (std::strcmp(name, "vkCreateBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(fake_create_buffer);
@@ -121,6 +133,8 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fake_get_device_proc(VkDevice, const ch
         return reinterpret_cast<PFN_vkVoidFunction>(fake_get_semaphore_counter_value);
     if (std::strcmp(name, "vkDeviceWaitIdle") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(fake_device_wait_idle);
+    if (g_vk->provide_device_address && std::strcmp(name, "vkGetBufferDeviceAddress") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(fake_get_buffer_device_address);
     return nullptr;
 }
 
@@ -336,6 +350,134 @@ int main() {
             EXPECT(buf2 != VK_NULL_HANDLE && buf2 != buf1 && off2 == 0);
             EXPECT(vk.create_buffer_calls == 2 && vk.allocate_calls == 2);
             EXPECT(vk.live_buffers.size() == 2 && vk.live_memory.size() == 2);
+        }
+        EXPECT(vk.live_buffers.empty() && vk.live_memory.empty());
+    }
+
+    // Addressable chunks cache their VkDeviceAddress once at creation rather than querying per suballocation,
+    // including across retire/collect/spare reuse, and non-addressable pools never call vkGetBufferDeviceAddress.
+    {
+        FakeVulkan vk;
+        vk.provide_device_address = true;
+        g_vk = &vk;
+        {
+            ScratchBuffers plain(fake_get_device_proc, k_device, fake_allocate);
+            VkBuffer buf = VK_NULL_HANDLE;
+            VkDeviceSize off = 0;
+            VkDeviceAddress addr = 0;
+            EXPECT(plain.get(256, buf, off));
+            EXPECT(!plain.get(256, buf, off, addr));
+            EXPECT(vk.get_device_address_calls == 0);
+        }
+        {
+            constexpr VkBufferUsageFlags usage =
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+            ScratchBuffers scratch(fake_get_device_proc, k_device, fake_allocate, nullptr, usage);
+            EXPECT(scratch.loaded());
+            VkBuffer first = VK_NULL_HANDLE;
+            VkDeviceSize off = 0;
+            VkDeviceAddress base = 0;
+            EXPECT(scratch.get(100, first, off, base));
+            EXPECT(first != VK_NULL_HANDLE && off == 0);
+            EXPECT(base == (static_cast<VkDeviceAddress>(reinterpret_cast<std::uintptr_t>(first)) << 20));
+            EXPECT(vk.get_device_address_calls == 1);
+
+            for (std::uint64_t i = 1; i <= 64; ++i) {
+                VkBuffer b = VK_NULL_HANDLE;
+                VkDeviceAddress a = 0;
+                EXPECT(scratch.get(100, b, off, a));
+                EXPECT(b == first && off == i * 256u && a == base + i * 256u);
+            }
+            EXPECT(vk.get_device_address_calls == 1);
+
+            // Retire and collect into spare_, then reuse the cached address without another driver call.
+            scratch.retire(VK_NULL_HANDLE, 0);
+            scratch.collect();
+            VkBuffer reused = VK_NULL_HANDLE;
+            VkDeviceAddress reused_addr = 0;
+            EXPECT(scratch.get(64, reused, off, reused_addr));
+            EXPECT(reused == first && off == 0 && reused_addr == base);
+            EXPECT(vk.get_device_address_calls == 1);
+            EXPECT(vk.create_buffer_calls == 2);  // 1 for plain + 1 for scratch
+        }
+        EXPECT(vk.live_buffers.empty() && vk.live_memory.empty());
+    }
+
+    // Best-fit spare selection picks the smallest fitting spare chunk, preserving larger spares for big copies.
+    {
+        FakeVulkan vk;
+        g_vk = &vk;
+        constexpr VkDeviceSize k_12mib = 12u << 20;
+        constexpr VkDeviceSize k_16mib = 16u << 20;
+        {
+            ScratchBuffers scratch(fake_get_device_proc, k_device, fake_allocate);
+            VkBuffer big = VK_NULL_HANDLE, small = VK_NULL_HANDLE;
+            VkDeviceSize off = 0;
+            EXPECT(scratch.get(k_16mib, big, off));
+            scratch.retire(VK_NULL_HANDLE, 0);
+            EXPECT(scratch.get(256, small, off));
+            scratch.retire(VK_NULL_HANDLE, 0);
+            // spare_ now holds [16 MiB, 4 MiB].
+            scratch.collect();
+            EXPECT(vk.create_buffer_calls == 2);
+
+            // A 512-byte request must take the 4 MiB chunk, leaving the 16 MiB chunk ready for a 12 MiB copy.
+            VkBuffer got_small = VK_NULL_HANDLE, got_big = VK_NULL_HANDLE;
+            EXPECT(scratch.get(512, got_small, off));
+            EXPECT(got_small == small && off == 0);
+            EXPECT(scratch.get(k_12mib, got_big, off));
+            EXPECT(got_big == big && off == 0);
+            EXPECT(vk.create_buffer_calls == 2 && vk.allocate_calls == 2);
+        }
+        EXPECT(vk.live_buffers.empty() && vk.live_memory.empty());
+    }
+
+    // collect() retains the 4 largest chunks past the spare cap so large staging buffers survive eviction.
+    {
+        FakeVulkan vk;
+        g_vk = &vk;
+        constexpr VkDeviceSize k_10mib = 10u << 20;
+        constexpr VkDeviceSize k_12mib = 12u << 20;
+        {
+            ScratchBuffers scratch(fake_get_device_proc, k_device, fake_allocate);
+            VkBuffer buf = VK_NULL_HANDLE;
+            VkDeviceSize off = 0;
+            for (int i = 0; i < 4; ++i) {
+                EXPECT(scratch.get(256, buf, off));
+                scratch.retire(VK_NULL_HANDLE, 0);
+            }
+            scratch.collect();
+            EXPECT(vk.live_buffers.size() == 4 && vk.destroy_buffer_calls == 0);
+
+            // A 12 MiB chunk finishes while spare_ holds four 4 MiB chunks -> evicts one 4 MiB chunk and keeps 12 MiB.
+            VkBuffer big = VK_NULL_HANDLE;
+            EXPECT(scratch.get(k_12mib, big, off));
+            scratch.retire(VK_NULL_HANDLE, 0);
+            scratch.collect();
+            EXPECT(vk.live_buffers.size() == 4 && vk.destroy_buffer_calls == 1 && vk.free_memory_calls == 1);
+            EXPECT(vk.live_buffers.find(reinterpret_cast<std::uintptr_t>(big)) != vk.live_buffers.end());
+
+            // Subsequent 10 MiB request reuses the retained 12 MiB chunk with no new allocation.
+            VkBuffer reused = VK_NULL_HANDLE;
+            EXPECT(scratch.get(k_10mib, reused, off));
+            EXPECT(reused == big && off == 0 && vk.create_buffer_calls == 5);
+        }
+        EXPECT(vk.live_buffers.empty() && vk.live_memory.empty());
+    }
+
+    // A failing vkCreateBuffer that writes a non-null handle must not leave stale state in the pool.
+    {
+        FakeVulkan vk;
+        vk.create_buffer_result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        vk.write_garbage_on_create_error = true;
+        g_vk = &vk;
+        {
+            ScratchBuffers scratch(fake_get_device_proc, k_device, fake_allocate);
+            VkBuffer buf = VK_NULL_HANDLE;
+            VkDeviceSize off = 77;
+            EXPECT(!scratch.get(256, buf, off));
+            EXPECT(buf == VK_NULL_HANDLE && off == 77);
+            EXPECT(vk.destroy_buffer_calls == 0 && vk.allocate_calls == 0);
         }
         EXPECT(vk.live_buffers.empty() && vk.live_memory.empty());
     }

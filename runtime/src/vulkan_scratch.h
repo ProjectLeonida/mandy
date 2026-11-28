@@ -116,8 +116,21 @@ public:
             }
             for (auto& chunk : retired_[i].chunks) {
                 chunk.used = 0;
-                if (spare_.size() < 4) spare_.push_back(chunk);
-                else destroy(chunk);
+                if (spare_.size() < 4) {
+                    spare_.push_back(chunk);
+                } else {
+                    // Keep the 4 largest reusable chunks so large staging buffers are not repeatedly
+                    // destroyed and recreated across frames.
+                    const auto smallest = std::min_element(
+                        spare_.begin(), spare_.end(),
+                        [](const Chunk& a, const Chunk& b) { return a.size < b.size; });
+                    if (chunk.size > smallest->size) {
+                        destroy(*smallest);
+                        *smallest = chunk;
+                    } else {
+                        destroy(chunk);
+                    }
+                }
             }
             retired_[i].chunks.clear();
             retired_.erase(retired_.begin() + std::ptrdiff_t(i));
@@ -129,6 +142,7 @@ private:
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkDeviceSize size = 0, used = 0;
+        VkDeviceAddress address = 0;
     };
     struct Batch {
         std::vector<Chunk> chunks;
@@ -175,23 +189,24 @@ private:
                 chunk.used = start + bytes;
                 buffer = chunk.buffer;
                 offset = start;
-                if (address) *address = device_address(chunk.buffer) + start;
+                if (address) *address = chunk.address + start;
                 return true;
             }
         }
         Chunk chunk;
+        std::size_t best = spare_.size();
         for (std::size_t i = 0; i < spare_.size(); ++i)
-            if (spare_[i].size >= bytes) {
-                chunk = spare_[i];
-                spare_.erase(spare_.begin() + std::ptrdiff_t(i));
-                break;
-            }
+            if (spare_[i].size >= bytes && (best == spare_.size() || spare_[i].size < spare_[best].size)) best = i;
+        if (best != spare_.size()) {
+            chunk = spare_[best];
+            spare_.erase(spare_.begin() + std::ptrdiff_t(best));
+        }
         if (!chunk.buffer && !make_chunk(std::max<std::uint64_t>(bytes, minimum), chunk)) return false;
         chunk.used = bytes;
         buffer = chunk.buffer;
         offset = 0;
         current_.chunks.push_back(chunk);
-        if (address) *address = device_address(buffer);
+        if (address) *address = chunk.address;
         return true;
     }
 
@@ -202,12 +217,16 @@ private:
     }
 
     bool make_chunk(std::uint64_t size, Chunk& out) {
+        out = {};
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
         info.usage = usage_;
         // A retired chunk can be reused by a submission on a different queue family.
         share_across_queue_families(info, families_);
-        if (vk_.vkCreateBuffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
+        if (vk_.vkCreateBuffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) {
+            out = {};
+            return false;
+        }
         VkMemoryRequirements requirements{};
         vk_.vkGetBufferMemoryRequirements(device_, out.buffer, &requirements);
         out.memory = allocate_ ? allocate_(requirements) : VK_NULL_HANDLE;
@@ -216,6 +235,7 @@ private:
             return false;
         }
         out.size = size;
+        if (addressable_) out.address = device_address(out.buffer);
         return true;
     }
     void destroy(Chunk& chunk) {
