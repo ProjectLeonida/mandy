@@ -20,6 +20,12 @@ enum class Binding { Shim, Host, Module, Unimplemented };
 // No module TLS index has been assigned (matches TLS_OUT_OF_INDEXES without pulling <windows.h> into this header).
 inline constexpr uint32_t kNoTlsIndex = 0xFFFFFFFFu;
 
+// The bytes of a section that come from the file: its raw data, cut to its virtual size. A virtual size of 0 means the
+// raw size (the PE rule map_image follows), so such a section is not empty.
+inline constexpr uint32_t section_file_bytes(uint32_t virtual_size, uint32_t raw_size) {
+    return raw_size < virtual_size || !virtual_size ? raw_size : virtual_size;
+}
+
 struct ImportRecord {
     std::string dll;
     std::string name;   // "#123" for ordinals

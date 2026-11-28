@@ -1737,7 +1737,7 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
         if (sec->VirtualAddress < oh.SizeOfHeaders)
             throw std::runtime_error(m->name + ": section " + std::to_string(i) + " overlaps the headers");
-        uint32_t n = std::min(sec->SizeOfRawData, sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData);
+        uint32_t n = section_file_bytes(sec->Misc.VirtualSize, sec->SizeOfRawData);
         if (!n) continue;
         if (sec->PointerToRawData > file.size() || n > file.size() - sec->PointerToRawData)
             throw std::runtime_error(m->name + ": section " + std::to_string(i) + " reads past the end of the file");
@@ -2001,14 +2001,8 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
     if (dot == std::string::npos || dot == 0 || dot + 1 >= spec.size()) return nullptr;
     const std::string module = spec.substr(0, dot), symbol = spec.substr(dot + 1);
 
-    // A forwarder can name a module the loader shims. Shims take precedence over a bundled or host copy, exactly as
-    // they do for a direct import in resolve(); without this, a forwarded xmem or d3d12_xs call becomes a failure thunk.
     std::string shim_key = lower(module);
     if (shim_key.size() < 4 || shim_key.compare(shim_key.size() - 4, 4, ".dll") != 0) shim_key += ".dll";
-    if (void* p = shims::find(shim_key, symbol)) {
-        binding = Binding::Shim;
-        return p;
-    }
 
     const bool by_ordinal = symbol.size() > 1 && symbol[0] == '#';
     uint32_t ordinal = 0;
@@ -2018,6 +2012,22 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
             ordinal = ordinal * 10 + static_cast<uint32_t>(symbol[i] - '0');
             if (ordinal > 0xFFFF) return nullptr;  // checked after the digit, so "#65537" can't truncate to 1
         }
+    }
+
+    // A drop-in DLL in LEONIDA_COMPAT_DIR owns all of its exports, forwarded ones too, as it does for a direct import
+    // in resolve(): one module is never served half by a shim or a bundled copy and half by the drop-in.
+    const std::string compat_dll = shim_key.size() == module.size() ? module : module + ".dll";
+    if (void* p = nullptr; resolve_compat(shim_key, compat_dll, symbol, static_cast<uint16_t>(ordinal), by_ordinal, p)) {
+        if (!p) return nullptr;
+        binding = Binding::Host;
+        return p;
+    }
+
+    // A forwarder can name a module the loader shims. Shims take precedence over a bundled or host copy, exactly as
+    // they do for a direct import in resolve(); without this, a forwarded xmem or d3d12_xs call becomes a failure thunk.
+    if (void* p = shims::find(shim_key, symbol)) {
+        binding = Binding::Shim;
+        return p;
     }
 
     // shim_key, not the bare module name: forwarder strings usually leave out ".dll" ("MSVCP140.?foo"), and the host
@@ -2205,7 +2215,8 @@ void Loader::protect_sections(Module& m) {
         const IMAGE_SECTION_HEADER* cs = IMAGE_FIRST_SECTION(nt);
         for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++cs) {
             if (!(cs->Characteristics & IMAGE_SCN_MEM_EXECUTE) || cs->VirtualAddress >= m.size) continue;
-            const uint64_t size = std::min<uint64_t>(std::min(cs->Misc.VirtualSize, cs->SizeOfRawData),
+            // The bytes map_image copied from the file; a virtual size of 0 is the raw size, not an empty section.
+            const uint64_t size = std::min<uint64_t>(section_file_bytes(cs->Misc.VirtualSize, cs->SizeOfRawData),
                                                      m.size - cs->VirtualAddress);
             if (size) code.push_back({m.base + cs->VirtualAddress, static_cast<size_t>(size)});
         }
