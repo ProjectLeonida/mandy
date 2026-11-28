@@ -39,6 +39,7 @@ As a CLI:
 Usage: `python -I tools/spirv_opt.py --help` lists the options.
 """
 import argparse
+import os
 import sys
 
 _PURE_OPS = frozenset((
@@ -1017,8 +1018,65 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
     return out_lines, deleted_ids
 
 
+_NATIVE: list = []
+
+
+def _native_optimize(spvasm, max_passes):
+    """`optimize(spvasm, max_passes)` from the optional Rust build in tools/spirv_opt_native, or None.
+
+    The crate (built with Cargo, see its README.md) is a line-for-line port of `optimize()`, so its text is the same.
+    None, and `optimize()` goes on in Python, when the library is not built, `LEONIDA_SPIRV_OPT_NATIVE=0`, or the
+    module has anything the port leaves to Python (text that is not ASCII, an input where Python would raise).
+    """
+    if not _NATIVE:
+        _NATIVE.append(_load_native())
+    fn = _NATIVE[0]
+    if fn is None or type(spvasm) is not str or type(max_passes) is not int:
+        return None
+    if not -(1 << 63) <= max_passes < (1 << 63):
+        return None
+    return fn(spvasm, max_passes)
+
+
+def _load_native():
+    if "0" in (os.environ.get("LEONIDA_NATIVE", "1"), os.environ.get("LEONIDA_SPIRV_OPT_NATIVE", "1")):
+        return None
+    name = {"win32": "spirv_opt_native.dll",
+            "darwin": "libspirv_opt_native.dylib"}.get(sys.platform, "libspirv_opt_native.so")
+    # The workspace build (tools/native) first, then a build of the crate on its own.
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, "native", "target", "release", name),
+                 os.path.join(here, "spirv_opt_native", "target", "release", name)):
+        if os.path.isfile(path):
+            break
+    else:
+        return None
+    try:
+        import ctypes
+        fn = ctypes.CDLL(path).spirv_opt_optimize
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int64,
+                       ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t)]
+        fn.restype = ctypes.c_int
+    except (ImportError, OSError, AttributeError):
+        return None
+
+    def call(text: str, max_passes: int) -> str | None:
+        try:
+            raw = text.encode("ascii")      # the port handles ASCII only
+        except UnicodeEncodeError:
+            return None
+        ptr, size = ctypes.c_void_p(), ctypes.c_size_t()
+        if fn(raw, len(raw), max_passes, ctypes.byref(ptr), ctypes.byref(size)) != 0:
+            return None
+        return ctypes.string_at(ptr.value, size.value).decode("ascii") if size.value else ""
+    return call
+
+
 def optimize(spvasm: str, max_passes: int = 4) -> str:
     """Apply sound dominator-tree SPIR-V optimizations to a SPIR-V assembly module."""
+    native = _native_optimize(spvasm, max_passes)
+    if native is not None:
+        return native
     lines = spvasm.splitlines()
 
     # Scan module header for constants, integer types, immutable globals, GLSL ext sets, decorations.

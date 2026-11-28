@@ -1461,11 +1461,20 @@ def decode_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, cod
     return {"name": name, "code_start": code_start, "insns": insns, "invalid": invalid}
 
 
+_NATIVE: list = []  # [None] or [the optional Rust disasm], resolved on the first disasm_bytes call
+
+
 def disasm_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, code_start: int = 0, name: str = "") -> tuple[str, int]:
     """Decode raw RDNA2 machine code into `(llvm_compatible_text, invalid_word_count)`.
 
-    The listing contains only instructions. `name` is accepted for caller compatibility.
+    The listing contains only instructions. `name` is accepted for caller compatibility. When
+    `tools/rdna2_decode_native` is built the same text comes from there (`tools/rdna2_native.py`).
     """
+    if not _NATIVE:
+        import rdna2_native
+        _NATIVE.append(rdna2_native.load(globals()))
+    if _NATIVE[0] is not None and (native := _NATIVE[0](code, mcpu, wave32)) is not None:
+        return native
     invalid = 0
     with StringIO() as listing:
         for ins in _iter_insns(code, wave32, code_start, mcpu):

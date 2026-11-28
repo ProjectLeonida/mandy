@@ -420,21 +420,42 @@ def rehydrate(dehydrated, geometries, header_offset=0):
     src = bytes(dehydrated[header_offset:header_offset + hdr.total_bytes])
     if len(src) < hdr.total_bytes:
         raise ValueError("the input is shorter than the %d bytes the header declares" % hdr.total_bytes)
-    dst = bytearray(hdr.total_bytes)
     kept = hdr.kept_header_bytes()
     if kept > len(src):
         raise ValueError("the kept header bytes (%d) run past the input" % kept)
+    geometries = list(geometries)
+    frame = LeafFrame(hdr)
+    if len(src) == hdr.total_bytes:
+        result = _try_native(src, kept, geometries, frame)
+        if result is not None:
+            return result
+    dst = bytearray(hdr.total_bytes)
     dst[:kept] = src[:kept]
     struct.pack_into("<I", dst, 0, hdr.flags & ~FLAG_DEHYDRATED & M32)
     root_entry = hdr.stored_parent_entry(((hdr.root >> 3) << 6) & M32, len(dst))
     if root_entry is not None:
         struct.pack_into("<I", dst, root_entry, INVALID)
-    write_leaves(src, dst, hdr, list(geometries), LeafFrame(hdr))
+    write_leaves(src, dst, hdr, geometries, frame)
     if hdr.root & 7 in (BOX16, BOX32):
         for b32_start, b32_count, b16_start, b16_count in levels(src, hdr):
             write_box_groups(src, dst, hdr, b32_start, b32_count, True)
             write_box_groups(src, dst, hdr, b16_start, b16_count, False)
     return dst
+
+
+def _try_native(src, kept, geometries, frame):
+    if __name__ == "__main__":  # -I omits the script directory.
+        tools_dir = os.path.dirname(os.path.abspath(__file__))
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+    try:
+        if __package__:
+            from .bvh_native import try_rehydrate
+        else:
+            from bvh_native import try_rehydrate
+    except ImportError:  # ctypes may be unavailable
+        return None
+    return try_rehydrate(src, kept, geometries, frame, Geometry)
 
 
 # --- command line -----------------------------------------------------------------------------------------------

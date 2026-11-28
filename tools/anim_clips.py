@@ -41,6 +41,7 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import anim_index  # noqa: E402
+from _anim_clips_native import decode_sequence as _decode_native_sequence  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
 
 SYSTEM = 0x50000000
@@ -1000,14 +1001,23 @@ def decode_animation(s, anim, stats=None):
     first frame of every sequence after the first is dropped (and compared with the frame it repeats)."""
     tracks, total, frames_sum = {}, 0, 0
     for si, at in enumerate(anim["sequences"]):
-        nf, channels = decode_sequence(s, at, stats)
-        if nf == 0 and len(anim["sequences"]) > 1:
-            raise DecodeError("multi-sequence animation has an empty sequence")
+        native = _decode_native_sequence(s.d, at, anim, stats, CHANNEL_NAMES) if type(s) is System else None
+        if native is None:
+            nf, channels = decode_sequence(s, at, stats)
+            if nf == 0 and len(anim["sequences"]) > 1:
+                raise DecodeError("multi-sequence animation has an empty sequence")
+            if stats is not None:
+                for t, *_ in channels:
+                    stats[f"channel:{t:02d}_{CHANNEL_NAMES[t]}"] += 1
+            part = assemble_tracks(nf, channels, len(anim["tracks"]), stats)
+        else:
+            nf, part = native
+            if nf == 0 and len(anim["sequences"]) > 1:
+                raise DecodeError("multi-sequence animation has an empty sequence")
+            if si == 0:
+                tracks, total, frames_sum = part, nf, nf
+                continue
         frames_sum += nf
-        if stats is not None:
-            for t, *_ in channels:
-                stats[f"channel:{t:02d}_{CHANNEL_NAMES[t]}"] += 1
-        part = assemble_tracks(nf, channels, len(anim["tracks"]), stats)
         for k, frames in part.items():
             if si and stats is not None and k in tracks and frames:
                 a, b = tracks[k][-1], frames[0]

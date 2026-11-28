@@ -123,6 +123,38 @@ jobs:
           python -I -c "import sys; sys.path.insert(0, 'tools'); import calibrated_texture; calibrated_texture.native()"
           python -I tests/test_calibrated_texture.py
           python -I tests/test_ttpf_assets.py
+      # The standard-library loop runs these files before the libraries are built, where the native comparisons
+      # skip. tools/native is one Cargo workspace for the eight accelerators; each loader asserts it found its library.
+      - name: Build the native accelerators workspace and compare each with its Python implementation
+        shell: bash
+        run: |
+          export CARGO_HOME="$(mktemp -d)" RUSTFLAGS="-D warnings"
+          cargo build --release --workspace --locked --offline --manifest-path tools/native/Cargo.toml
+          cargo test --release --workspace --locked --offline --manifest-path tools/native/Cargo.toml
+          unset RUSTFLAGS
+          python -I - <<'EOF'
+          import sys
+          sys.path.insert(0, "tools")
+          import _anim_clips_native, bvh_native, dds_png, glb_native, meshlet_native, rdna2_native, spirv_asm, spirv_opt
+          assert _anim_clips_native.native()
+          assert dds_png._native_bc7()
+          assert bvh_native._load() is not None
+          assert glb_native._load() is not None
+          assert meshlet_native._load() is not None
+          assert "/native/target/" in rdna2_native.library_path().replace("\\", "/")
+          assert spirv_asm._native_assemble("", "vulkan1.2")
+          assert spirv_opt._native_optimize("", 4) is not None
+          EOF
+          failed=()
+          for t in rdna2_decode_native rdna2_decode spirv_asm_native spirv_asm spirv_asm_tables spirv_opt_native spirv_opt \
+                   bvh_native bvh_rehydrate bc7_native dds_png meshlet_native meshlet_page anim_clips_native anim_clips \
+                   glb_native glb_writer native_workspace; do
+            python -I "tests/test_$t.py" || failed+=("tests/test_$t.py")
+          done
+          if ((${#failed[@]})); then
+            for t in "${failed[@]}"; do echo "::error file=$t::$t failed"; done
+            exit 1
+          fi
       - name: Test rpf9dump diagnostics
         run: dotnet run --project tests/Rpf9DumpDiagnostics/Rpf9DumpDiagnostics.csproj -c Release
   translator-tests:

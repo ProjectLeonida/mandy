@@ -386,8 +386,77 @@ def _encode_context_number(tok: str, type_info, lineno: int) -> list[int]:
     raise SpirvAsmError(f"line {lineno}: unsupported constant type {type_info!r}")
 
 
+_NATIVE: list = []
+
+
+def _native_assemble(text, target_env: str) -> bytes | None:
+    """`assemble(text, target_env)` from the optional Rust build in tools/spirv_asm_native, or None.
+
+    The crate (built with Cargo, see its README.md) is a port of `assemble()` fed the tables of spirv_asm_tables,
+    so its bytes are the same. None, and `assemble()` goes on in Python with its usual result or SpirvAsmError,
+    when the library is not built, `LEONIDA_SPIRV_ASM_NATIVE=0`, or the text has anything the port leaves to
+    Python, every error included.
+    """
+    if not _NATIVE:
+        _NATIVE.append(_load_native())
+    version = TARGET_ENV_VERSION.get(target_env)
+    if _NATIVE[0] is None or version is None or not isinstance(text, str):
+        return None
+    return _NATIVE[0](text, version)
+
+
+def _load_native():
+    if "0" in (os.environ.get("LEONIDA_NATIVE", "1"), os.environ.get("LEONIDA_SPIRV_ASM_NATIVE", "1")):
+        return None
+    name = {"win32": "spirv_asm_native.dll",
+            "darwin": "libspirv_asm_native.dylib"}.get(sys.platform, "libspirv_asm_native.so")
+    # The workspace build (tools/native) first, then a build of the crate on its own.
+    for path in (os.path.join(_HERE, "native", "target", "release", name),
+                 os.path.join(_HERE, "spirv_asm_native", "target", "release", name)):
+        if os.path.isfile(path):
+            break
+    else:
+        return None
+    import ctypes
+    try:
+        lib = ctypes.CDLL(path)
+        new, fn = lib.spirv_asm_tables_new, lib.spirv_asm_assemble
+    except (OSError, AttributeError):
+        return None
+    new.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+    new.restype = ctypes.c_void_p
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32,
+                   ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t)]
+    fn.restype = ctypes.c_int
+    # The grammar goes over as text, one record per line (the format is in Tables::parse in src/lib.rs).
+    lines = [" ".join(["I", op, str(opcode), str(int(has_rt)), str(int(has_res))] + [k + q for k, q in specs])
+             for op, (opcode, has_rt, has_res, specs) in INSTRUCTIONS.items()]
+    for tag, enums in (("V", VALUE_ENUMS), ("B", BIT_ENUMS)):
+        lines += [" ".join([tag, kind, flag, str(value), *params])
+                  for kind, entries in enums.items() for flag, (value, params) in entries.items()]
+    lines += [f"X {ext} {inst} {opcode}" for ext, table in _EXT_SETS.items() for inst, opcode in table.items()]
+    blob = "\n".join(lines).encode()
+    tables = new(blob, len(blob))
+    if not tables:
+        return None
+
+    def call(text: str, version: int) -> bytes | None:
+        try:
+            raw = text.encode("ascii")      # the port handles ASCII only
+        except UnicodeEncodeError:
+            return None
+        ptr, size = ctypes.c_void_p(), ctypes.c_size_t()
+        if fn(tables, raw, len(raw), version, ctypes.byref(ptr), ctypes.byref(size)) != 0:
+            return None
+        return ctypes.string_at(ptr.value, size.value)
+    return call
+
+
 def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
     """Assemble SPIR-V text into binary SPIR-V bytes for `target_env`."""
+    native = _native_assemble(text, target_env)
+    if native is not None:
+        return native
     version = TARGET_ENV_VERSION.get(target_env)
     if version is None:
         raise SpirvAsmError(f"unsupported target environment: {target_env!r}")

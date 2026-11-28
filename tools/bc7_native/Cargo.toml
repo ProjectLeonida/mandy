@@ -1,0 +1,11 @@
+[package]
+name = "bc7_native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+workspace = "../native"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]

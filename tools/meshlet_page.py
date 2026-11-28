@@ -76,6 +76,16 @@ import struct
 import sys
 import zlib
 
+try:
+    if __package__:
+        from . import meshlet_native as _native
+    else:
+        if __name__ == "__main__":  # -I omits the script directory.
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import meshlet_native as _native
+except ImportError:  # ctypes or the optional bindings may be unavailable.
+    _native = None
+
 BLOCK_MAGIC = 0x3063
 OTHER_BLOCK_MAGIC = 0x4042
 HEADER_SIZE = 0x60
@@ -176,6 +186,8 @@ def parse_other_block(data, at):
 def positions_4240(data, block):
     """Decode a `42 40` block's slot-0 positions (the packed 8-byte form; see the module docstring). Returns a list of
     (x, y, z) floats. Raises PageError for an axis word other than 0, 1 or 2 or a slot 0 that isn't tag 0x42."""
+    if _native is not None and (result := _native.positions(data, block)) is not None:
+        return result
     at, n = block["offset"], block["vertices"]
     slots = {i: (tag, off) for i, tag, off in block["slots"]}
     if slots.get(0, (None,))[0] != 0x42:
@@ -366,6 +378,8 @@ def _octahedral(u, v):
 def normals_4240(data, block):
     """Decode a `42 40` block's slot-2 normals (see the module docstring). Returns a list of unit (x, y, z), or None
     when slot 2 is absent or of a type other than 1 or 7."""
+    if _native is not None and (result := _native.normals(data, block)) is not None:
+        return result
     slots = {i: (tag, off) for i, tag, off in block["slots"]}
     if 2 not in slots or (slots[2][0] & 15) not in (1, 7) or tag_stride(slots[2][0]) != 4:
         return None
@@ -385,6 +399,8 @@ def normals_4240(data, block):
 def tangents_4240(data, block):
     """Decode a `42 40` block's type-7 tangent slots (11 and 18). Returns {slot: [(x, y, z, sign), ...]}; sign is +1
     for bits 30-31 = 3, -1 for 0, and 0 for anything else."""
+    if _native is not None and (result := _native.tangents(data, block)) is not None:
+        return result
     out = {}
     for slot, tag, off in block["slots"]:
         if slot == 2 or tag & 15 != 7 or tag_stride(tag) != 4:
@@ -505,6 +521,8 @@ def block4240_checks(data, block):
 def parse_group(data, at):
     """Parse and validate a meshlet group at `at`. Returns (record, end offset)."""
     head = _u32(data, at)
+    if _native is not None and (result := _native.parse_legacy_group(data, at, head)) is not None:
+        return result
     if not head & 0x80000000:
         raise PageError(f"no group header at +0x{at:x}")
     meshlets = head & 0x7FFFFFFF
@@ -670,6 +688,10 @@ def summarise_page(data, name, faces=False, centres=False, normals=False, cones=
             for k, v in block_checks(data, b).items():
                 checks[k] = checks.get(k, 0) + v
         for b in others:
+            if _native is not None and (native_checks := _native.block_checks(data, b, normals)) is not None:
+                for k, v in native_checks.items():
+                    checks[k] = checks.get(k, 0) + v
+                continue
             for k, v in block4240_checks(data, b).items():
                 checks[k] = checks.get(k, 0) + v
             if normals:
@@ -698,6 +720,12 @@ def summarise_page(data, name, faces=False, centres=False, normals=False, cones=
                     if best is not b:
                         b = best
                         checks["groups_4240_block_by_centres"] = checks.get("groups_4240_block_by_centres", 0) + 1
+                if _native is not None:
+                    native_checks = _native.geometry(data, g, b, faces, centres, normals, cones)
+                    if native_checks is not None:
+                        for k, v in native_checks.items():
+                            checks[k] = checks.get(k, 0) + v
+                        continue
                 if b["offset"] not in decoded:
                     decoded[b["offset"]] = positions_4240(data, b)
                 if faces:

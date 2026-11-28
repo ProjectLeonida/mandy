@@ -27,6 +27,11 @@ from collections.abc import Iterable, Iterator
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
 
+try:  # optional Rust kernels (tools/glb_native); LEONIDA_GLB_NATIVE=0 or a missing library runs Python
+    import glb_native as _glb_native  # noqa: E402
+except ImportError:
+    _glb_native = None
+
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
 CHUNK_TYPE_JSON = 0x4E4F534A  # b"JSON"
@@ -534,6 +539,9 @@ def parse_obj(
 
 def compute_bounds(primitives: list[dict]) -> list[float] | None:
     """Return [minx, miny, minz, maxx, maxy, maxz] over all finite positions, or None."""
+    native = _glb_native.try_bounds(primitives) if _glb_native is not None else None
+    if native is not None:
+        return None if native is _glb_native.NO_BOUNDS else native
     minx = math.inf
     miny = math.inf
     minz = math.inf
@@ -665,6 +673,9 @@ def pack_primitive(prim: dict) -> dict:
     ``material`` key and optional ``material_index``. The same packed primitive can be written into
     a GLB once and drawn by many instances.
     """
+    native = _glb_native.try_pack(prim) if _glb_native is not None else None
+    if native is not None:
+        return native
     positions = list(prim["positions"])
     indices = list(prim["indices"])
     vert_count = len(positions)

@@ -9,7 +9,8 @@ FLOAT formats, and block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
 
 BC7 covers all eight modes. Decoding DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB)
 preserves the stored RGBA8 values. The reserved mode (no mode bit in the first
-byte) decodes as transparent black. BC6H is not supported.
+byte) decodes as transparent black. BC6H is not supported. When `tools/bc7_native` is built (see its
+README.md), BC7 decodes there with the same bytes; `LEONIDA_BC7_NATIVE=0` keeps it in Python.
 DXT2, DXT4 and premultiplied DX10 images are converted to straight alpha for PNG.
 For tagged sRGB images, unpremultiplication and downscaling use linear light. The PNG stores sRGB bytes.
 
@@ -1364,12 +1365,59 @@ def _decode_bc7_block(block: int) -> bytes:
     return bytes(out)
 
 
+_BC7_NATIVE: list = []
+
+
+def _native_bc7():
+    """`(bc7_decode, part2, part3, anchors)` of the optional Rust decoder, or None.
+
+    `tools/bc7_native` (built with Cargo, see its README.md) exports `bc7_decode`, a port of
+    `_decode_bc7` and `_decode_bc7_block` fed the partition tables of `bcpack_tables_bptc`, so it
+    gives the same bytes. Set `LEONIDA_BC7_NATIVE=0` (or `LEONIDA_NATIVE=0`) to use Python only.
+    """
+    if not _BC7_NATIVE:
+        found = None
+        if "0" not in (os.environ.get("LEONIDA_NATIVE", "1"), os.environ.get("LEONIDA_BC7_NATIVE", "1")):
+            import ctypes
+            name = {"win32": "bc7_native.dll",
+                    "darwin": "libbc7_native.dylib"}.get(sys.platform, "libbc7_native.so")
+            # The workspace build (tools/native) first, then a build of the crate on its own.
+            for path in (os.path.join(_TOOLS_DIR, "native", "target", "release", name),
+                         os.path.join(_TOOLS_DIR, "bc7_native", "target", "release", name)):
+                if os.path.isfile(path):
+                    break
+            if os.path.isfile(path):
+                try:
+                    fn = ctypes.CDLL(path).bc7_decode
+                except (OSError, AttributeError):
+                    fn = None
+                if fn is not None:
+                    fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+                                   ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p,
+                                   ctypes.c_void_p, ctypes.c_size_t]
+                    fn.restype = ctypes.c_ssize_t
+                    found = (fn, (ctypes.c_uint32 * 64)(*_bptc.BC7_PART2_PACKED),
+                             (ctypes.c_uint32 * 64)(*_bptc.BC7_PART3_PACKED),
+                             bytes(_bptc.BC7_ANCHOR2) + bytes(_bptc.BC7_ANCHOR3A) + bytes(_bptc.BC7_ANCHOR3B))
+        _BC7_NATIVE.append(found)
+    return _BC7_NATIVE[0]
+
+
 def _decode_bc7(data: bytes | bytearray | memoryview, offset: int, width: int, height: int) -> bytes:
     blocks_x = (width + 3) // 4
     blocks_y = (height + 3) // 4
     expected = blocks_x * blocks_y * 16
     if len(data) - offset < expected:
         raise DdsError(f"Truncated BC7 payload: {len(data) - offset} bytes (need {expected})")
+
+    native = _native_bc7()
+    if native is not None and width > 0 and height > 0:
+        import ctypes
+        fn, part2, part3, anchors = native
+        out_native = ctypes.create_string_buffer(width * height * 4)
+        if fn(bytes(data[offset:offset + expected]), expected, width, height, part2, part3, anchors,
+              out_native, len(out_native)) == 0:
+            return out_native.raw
 
     out = bytearray(width * height * 4)
     row_stride = width * 4

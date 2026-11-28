@@ -1,0 +1,19 @@
+# One workspace for the optional Rust accelerators under tools/. Every member keeps its own directory and
+# Python loader; the libraries build into tools/native/target/release/, which each loader checks first.
+#   cargo build --release --workspace --locked --offline --manifest-path tools/native/Cargo.toml
+# None of the members has an external dependency.
+[workspace]
+resolver = "2"
+members = [
+    "../anim_clips_native",
+    "../bc7_native",
+    "../bvh_native",
+    "../glb_native",
+    "../meshlet_native",
+    "../rdna2_decode_native",
+    "../spirv_asm_native",
+    "../spirv_opt_native",
+]
+
+[profile.release]
+codegen-units = 1
