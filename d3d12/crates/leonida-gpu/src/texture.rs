@@ -459,9 +459,39 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if read.len() < size {
+            // Exactly the room asked for: grown by doubling, a texture under
+            // [`read_kept`] could leave room over it, which would go below.
+            let more = size - read.len();
+            read.reserve_exact(more);
             read.resize(size, 0);
         }
-        f(&mut read[..size])
+        let out = f(&mut read[..size]);
+        // The buffer only grew, so each thread that refreshes textures (the
+        // submitting one and the helpers of `crate::shadow::wide_each`, which
+        // live for the run) kept the room of the largest texture it ever
+        // read until the end: 22 MB for a 4096² BC7 texture with its levels,
+        // 89 MB for one in RGBA8, on each of those threads (five on a PC of
+        // 16 logical processors). Room over [`read_kept`] goes when the read
+        // is over; the next texture that large makes its room again.
+        if read.capacity() > read_kept() {
+            *read = Vec::new();
+        }
+        out
+    })
+}
+
+/// The bytes of read buffer a thread keeps from one texture to the next
+/// (`LEONIDA_TEXTURE_READ_KEEP_MB`, 16). That holds a 4096² BC1 texture or
+/// a 2048² BC7 one with their levels (11 and 5.6 MB), so that textures of
+/// those sizes do not make their room again at every read.
+fn read_kept() -> usize {
+    static KEPT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KEPT.get_or_init(|| {
+        std::env::var("LEONIDA_TEXTURE_READ_KEEP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(16)
+            .saturating_mul(1 << 20)
     })
 }
 
@@ -2557,6 +2587,50 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod read_buffer_tests {
+    use super::{READ, with_read};
+
+    /// The default of `LEONIDA_TEXTURE_READ_KEEP_MB`, in bytes.
+    const KEPT: usize = 16 << 20;
+
+    /// The capacity of this thread's read buffer.
+    fn room() -> usize {
+        READ.with(|read| read.borrow().capacity())
+    }
+
+    /// A thread that refreshes textures keeps a read buffer of up to the
+    /// kept bytes from one texture to the next, but not the room of a larger
+    /// texture once its read is over: those threads (the submitting one and
+    /// the helpers of `shadow::wide_each`) live for the run, and each held
+    /// the largest texture it ever read until the end. The reads run on
+    /// threads of their own, as refreshes do, so that the buffer of the
+    /// thread the harness runs the test on (shared by the tests with
+    /// `--test-threads=1`) plays no part.
+    #[test]
+    fn a_large_read_gives_its_room_back_when_it_is_over() {
+        std::thread::scope(|threads| {
+            for _ in 0..2 {
+                threads.spawn(|| {
+                    // Up to the kept bytes: kept for the next texture, also
+                    // when the buffer grows from one under them.
+                    with_read(KEPT * 5 / 8, |read| read.fill(1));
+                    with_read(KEPT * 3 / 4, |read| read.fill(1));
+                    assert!(room() >= KEPT * 3 / 4, "a read under the kept bytes keeps its room");
+                    // A larger texture is read whole, then its room goes.
+                    with_read(2 * KEPT, |read| {
+                        assert_eq!(read.len(), 2 * KEPT);
+                        read[2 * KEPT - 1] = 2;
+                    });
+                    assert!(room() <= KEPT, "{} MiB kept after a read of {} MiB", room() >> 20, (2 * KEPT) >> 20);
+                    // And the next read is served as before.
+                    with_read(4096, |read| assert_eq!(read.len(), 4096));
+                });
+            }
+        });
     }
 }
 
