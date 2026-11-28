@@ -387,8 +387,13 @@ void local_mirror_table(const DeviceProxy* device, std::uint64_t gpu_handle) {
         const std::uint64_t offset = (gpu_handle - gpu_start) / kLocalDescriptorBytes * kLocalDescriptorBytes;
         const std::uint64_t slots = (std::min<std::uint64_t>)(kLocalMirrorSlots, (bytes - offset) / kLocalDescriptorBytes);
         const SIZE_T copy_bytes = slots * kLocalDescriptorBytes;
-        // On Wine, VirtualQuery can report a live vkMapMemory span as MEM_FREE (as in local_write_through).
-        if (!range.mapped && !local_accessible(range.real_start + offset, copy_bytes, true)) return;
+        // A mapped real range is the Vulkan device's live arena: shaders of lists already submitted read it, and the
+        // queue rewrites the slots it pulls there in place (buffer addresses rebased) when it submits. A raw copy made
+        // here, while a list is recorded, could overwrite a translated slot an earlier submission is still reading.
+        // The queue pulls the title's slots for every bound table itself (pull_title_descriptors), so a mapped range
+        // is left to it.
+        if (range.mapped) return;
+        if (!local_accessible(range.real_start + offset, copy_bytes, true)) return;
         const auto copied = copy_title_slots(reinterpret_cast<std::uint8_t*>(range.real_start + offset),
                                              range.custom_start + offset, copy_bytes);
         static std::atomic<int> said{0};
