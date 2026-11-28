@@ -492,7 +492,7 @@ const void* const kStoreVtable[] = {
     FN(store_package_updates_async),         // 79 XStoreQueryPackageUpdatesAsync (5)
     FN(store_updates_count),                 // 80 XStoreQueryPackageUpdatesResultCount (5)
     FN(store_updates_result),                // 81 XStoreQueryPackageUpdatesResult (5)
-    FN(offline_failure<82>),                 // 82 XStoreShowGiftingUIAsync (6)
+    FN((offline_failure_async<82, 5>)),      // 82 XStoreShowGiftingUIAsync (6)
     FN(offline_failure<83>),                 // 83 XStoreShowGiftingUIResult (6)
 };
 static_assert(std::size(kStoreVtable) == 84, "IUnknown + IXStoreImpl's 67 methods + 1 + 2 + 4 + 5 + 2");

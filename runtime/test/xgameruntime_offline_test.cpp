@@ -3,6 +3,7 @@
 // call them: QueryApiImpl with the class id (or an interface id), one vtable slot with `this` first. Slots follow
 // xgameruntime-docs' layout; arguments follow the public GDK reference. No game data; nothing online.
 #include <windows.h>
+#include <unknwn.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -20,9 +21,38 @@ namespace rt::shims {
 long xgameruntime_offline_game_events();
 long xgameruntime_user_open_handles();
 long xgameruntime_offline_device_registrations(uint32_t kind);
+void xgameruntime_offline_set_host_speech(IUnknown* base, IUnknown* extended);
 }
 
 namespace {
+
+// A stand-in for the host runtime's accessibility object (LEONIDA_LOCAL_SPEECH=1): slot 16,
+// XSpeechSynthesizerGetStreamData, records what it was given; every other slot fails.
+struct FakeHostSpeech {
+    const void* const* vtable;
+    int data_calls = 0;
+    void* data_stream = nullptr;
+    size_t* data_used = reinterpret_cast<size_t*>(1);
+};
+HRESULT STDMETHODCALLTYPE fake_host_fail(void*) { return E_NOTIMPL; }
+HRESULT STDMETHODCALLTYPE fake_host_stream_data(FakeHostSpeech* self, void* stream, size_t, void*, size_t* used) {
+    ++self->data_calls;
+    self->data_stream = stream;
+    self->data_used = used;
+    return S_OK;
+}
+const void* const kFakeHostSpeechVtable[22] = {
+    reinterpret_cast<const void*>(&fake_host_fail), reinterpret_cast<const void*>(&fake_host_fail),
+    reinterpret_cast<const void*>(&fake_host_fail), reinterpret_cast<const void*>(&fake_host_fail),
+    reinterpret_cast<const void*>(&fake_host_fail), reinterpret_cast<const void*>(&fake_host_fail),
+    reinterpret_cast<const void*>(&fake_host_fail), reinterpret_cast<const void*>(&fake_host_fail),
+    reinterpret_cast<const void*>(&fake_host_fail), reinterpret_cast<const void*>(&fake_host_fail),
+    reinterpret_cast<const void*>(&fake_host_fail), reinterpret_cast<const void*>(&fake_host_fail),
+    reinterpret_cast<const void*>(&fake_host_fail), reinterpret_cast<const void*>(&fake_host_fail),
+    reinterpret_cast<const void*>(&fake_host_fail), reinterpret_cast<const void*>(&fake_host_fail),
+    reinterpret_cast<const void*>(&fake_host_stream_data), reinterpret_cast<const void*>(&fake_host_fail),
+    reinterpret_cast<const void*>(&fake_host_fail), reinterpret_cast<const void*>(&fake_host_fail),
+    reinterpret_cast<const void*>(&fake_host_fail), reinterpret_cast<const void*>(&fake_host_fail)};
 
 int g_checks = 0;
 int g_failures = 0;
@@ -365,6 +395,24 @@ int main() {
     check(at<StreamSize>(acc, 15)(acc, nullptr, &size) == E_INVALIDARG && size == 0 &&
               at<StreamData>(acc, 16)(acc, nullptr, 8, nullptr, &got) == E_INVALIDARG && got == 0,
           "stream size and data on a null stream: E_INVALIDARG, zero written");
+    {
+        // LEONIDA_LOCAL_SPEECH=1: a host stream's data is forwarded whether or not the caller passes `used`, which is
+        // optional (_Out_opt_). Without it the call used to be refused with E_INVALIDARG.
+        FakeHostSpeech host{kFakeHostSpeechVtable};
+        rt::shims::xgameruntime_offline_set_host_speech(reinterpret_cast<IUnknown*>(&host),
+                                                        reinterpret_cast<IUnknown*>(&host));
+        int host_stream = 0;
+        uint8_t host_buffer[16] = {};
+        check(at<StreamData>(acc, 16)(acc, &host_stream, sizeof(host_buffer), host_buffer, &got) == S_OK &&
+                  host.data_calls == 1 && host.data_stream == &host_stream && host.data_used == &got,
+              "a host stream's data is forwarded to the host runtime");
+        check(at<StreamData>(acc, 16)(acc, &host_stream, sizeof(host_buffer), host_buffer, nullptr) == S_OK &&
+                  host.data_calls == 2 && host.data_used == nullptr,
+              "and forwarded without `used` too, not refused with E_INVALIDARG");
+        rt::shims::xgameruntime_offline_set_host_speech(nullptr, nullptr);  // no host again for the checks below
+        check(at<StreamData>(acc, 16)(acc, &host_stream, sizeof(host_buffer), host_buffer, nullptr) == E_INVALIDARG,
+              "with no host runtime a foreign stream is refused");
+    }
     bool speech_to_text_fails = true;
     for (int slot : {6, 7, 17, 18, 19, 20}) speech_to_text_fails = speech_to_text_fails && FAILED(at<NoArgs>(acc, slot)(acc));
     check(speech_to_text_fails, "speech-to-text display calls fail offline");

@@ -1057,11 +1057,9 @@ std::string package_config() {
 // A <Resource> inside an XML comment is not declared (Microsoft's config template ships commented-out entries), XML
 // allows whitespace around an attribute's '=', and only an attribute named exactly Language on an element named
 // exactly Resource counts.
-std::vector<std::string> package_locales() {
-    std::vector<std::string> out;
-    const std::string raw = package_config();
-    if (raw.empty()) return out;
-    std::string xml;   // the config without its comments; an unterminated comment runs to the end of the file
+// The config without its XML comments; an unterminated comment runs to the end of the file.
+std::string config_without_comments(const std::string& raw) {
+    std::string xml;
     xml.reserve(raw.size());
     for (size_t at = 0; at < raw.size();) {
         const size_t open = raw.find("<!--", at);
@@ -1071,6 +1069,14 @@ std::vector<std::string> package_locales() {
         if (close == std::string::npos) break;
         at = close + 3;
     }
+    return xml;
+}
+
+std::vector<std::string> package_locales() {
+    std::vector<std::string> out;
+    const std::string raw = package_config();
+    if (raw.empty()) return out;
+    const std::string xml = config_without_comments(raw);
     const auto space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
     const auto skip_space = [&](size_t p) {
         while (p < xml.size() && space(xml[p])) ++p;
@@ -1501,7 +1507,9 @@ HRESULT STDMETHODCALLTYPE pkg_uninstall_chunks(void*, const char* id, uint32_t c
 // HRESULT XPackageMountWithUiResult(XAsyncBlock* async, XPackageMountHandle* mount). The retail executable calls both
 // once IXPackageImpl4 is served. A content package LEONIDA_CONTENT_PACKAGES maps is mounted as slot 23 mounts it and
 // the result hands out its handle; any other identifier completes with E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER, as
-// VIctory's mount_async answers (no content package is installed). The block completes through XAsyncRun.
+// VIctory's mount_async answers (no content package is installed). Mounting the game's own package is refused with
+// E_ACCESSDENIED, as slot 23 refuses it. The block completes through XAsyncRun. A block reused before its result was
+// read gives up the earlier mount's handle, which nothing could collect any more.
 std::mutex g_ui_mount_mu;
 std::unordered_map<XAsyncBlock*, uint64_t> g_ui_mounts;   // a finished mount's handle until its result is read
 
@@ -1512,17 +1520,33 @@ HRESULT STDMETHODCALLTYPE pkg_mount_with_ui_async(void*, const char* id, XAsyncB
     else if (!id) hr = E_INVALIDARG;
     else {
         XPackageMountHandle mount{};
-        mounted = SUCCEEDED(XPackageMount(id, &mount)) ? S_OK : kNoPackage;
-        if (SUCCEEDED(mounted)) {
+        const HRESULT result = XPackageMount(id, &mount);
+        mounted = SUCCEEDED(result) ? S_OK : result == E_ACCESSDENIED ? E_ACCESSDENIED : kNoPackage;
+        uint64_t replaced = 0;
+        {
             std::lock_guard lock(g_ui_mount_mu);
-            g_ui_mounts[async] = mount.handle;
+            const auto it = g_ui_mounts.find(async);
+            if (it != g_ui_mounts.end()) {
+                replaced = it->second;
+                g_ui_mounts.erase(it);
+            }
+            if (SUCCEEDED(mounted)) g_ui_mounts[async] = mount.handle;
         }
-        hr = SUCCEEDED(mounted) ? XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return S_OK; })
-                                : XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return kNoPackage; });
-        if (FAILED(hr) && SUCCEEDED(mounted)) {
-            std::lock_guard lock(g_ui_mount_mu);
-            g_ui_mounts.erase(async);
-            XPackageCloseMountHandle(mount);
+        hr = SUCCEEDED(mounted)            ? XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return S_OK; })
+             : mounted == E_ACCESSDENIED ? XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return E_ACCESSDENIED; })
+                                         : XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return kNoPackage; });
+        if (FAILED(hr)) {
+            // Not started (the block is still busy, say): the earlier mount keeps its place, this one is closed.
+            {
+                std::lock_guard lock(g_ui_mount_mu);
+                if (SUCCEEDED(mounted)) g_ui_mounts.erase(async);
+                if (replaced) g_ui_mounts[async] = replaced;
+            }
+            if (SUCCEEDED(mounted)) XPackageCloseMountHandle(mount);
+        } else if (replaced) {
+            XPackageMountHandle earlier{};
+            earlier.handle = replaced;
+            XPackageCloseMountHandle(earlier);
         }
     }
     static std::atomic<bool> s_logged{false};
@@ -1617,9 +1641,10 @@ constexpr GUID kGame3 = {0x2549f142, 0x6419, 0x4a06, {0x97, 0xb5, 0x93, 0x1a, 0x
 const GUID* const kGameIids[] = {&kGame2, &kGame3, nullptr};
 
 // The title id MicrosoftGame.Config declares (<TitleId>, eight hex digits), or false when there is none or it is not
-// hex. The first <TitleId> element counts; surrounding whitespace is allowed.
+// hex. The first <TitleId> element outside XML comments counts (as for package_locales: Microsoft's config template
+// ships commented-out entries); surrounding whitespace is allowed.
 bool package_title_id(uint32_t& out) {
-    const std::string xml = package_config();
+    const std::string xml = config_without_comments(package_config());
     const size_t open = xml.find("<TitleId>");
     if (open == std::string::npos) return false;
     const size_t begin = xml.find_first_not_of(" \t\r\n", open + 9);

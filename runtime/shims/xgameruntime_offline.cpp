@@ -604,6 +604,7 @@ struct HostSpeechProvider {
     HMODULE module=nullptr;
     IUnknown* base=nullptr;
     IUnknown* extended=nullptr;
+    HostSpeechProvider(IUnknown* given_base, IUnknown* given_extended) : base(given_base), extended(given_extended) {}
     HostSpeechProvider() {
         char enabled[4]{};
         if(GetEnvironmentVariableA("LEONIDA_LOCAL_SPEECH",enabled,sizeof(enabled))!=1 || enabled[0]!='1') return;
@@ -617,7 +618,18 @@ struct HostSpeechProvider {
     }
     ~HostSpeechProvider(){if(extended)extended->Release();if(base)base->Release();if(module)FreeLibrary(module);}
 };
-HostSpeechProvider& host_speech_provider(){static HostSpeechProvider host;return host;}
+// Made on the first speech call, which is on a title thread: kept in a namespace-scope atomic, not a block-scope
+// static, whose guard has been seen to skip the initializer on such a thread under Wine (see env_is_one). Two threads
+// that race both make one; the loser's is released. Never destroyed: the host runtime stays loaded until exit.
+std::atomic<HostSpeechProvider*> g_host_speech{nullptr};
+HostSpeechProvider& host_speech_provider() {
+    if (HostSpeechProvider* const host = g_host_speech.load(std::memory_order_acquire)) return *host;
+    auto* const made = new HostSpeechProvider;
+    HostSpeechProvider* expected = nullptr;
+    if (g_host_speech.compare_exchange_strong(expected, made, std::memory_order_acq_rel)) return *made;
+    delete made;
+    return *expected;
+}
 template<unsigned Slot,typename... Args>
 bool call_host_speech(HRESULT& result,Args... args) {
     auto& host=host_speech_provider();
@@ -747,7 +759,8 @@ HRESULT STDMETHODCALLTYPE speech_stream_size(void*, void* stream, size_t* size) 
 // 16: HRESULT XSpeechSynthesizerGetStreamData(stream, size_t size, void* buffer, size_t* used)
 HRESULT STDMETHODCALLTYPE speech_stream_data(void*, void* stream, size_t size, void* buffer, size_t* used) {
     HRESULT host_result;
-    if (stream && stream != &g_speech_stream_handle && buffer && used && call_host_speech<16>(host_result, stream, size, buffer, used)) return host_result;
+    // `used` is optional (_Out_opt_): a host stream is forwarded without it too.
+    if (stream && stream != &g_speech_stream_handle && buffer && call_host_speech<16>(host_result, stream, size, buffer, used)) return host_result;
     if (used) *used = 0;
     if (stream != &g_speech_stream_handle) return E_INVALIDARG;
     if (!buffer || size < sizeof(kSilentWave)) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
@@ -880,6 +893,11 @@ bool xgameruntime_offline_query(const GUID& class_id, REFIID interface_id, void*
 
 // For tests: how many game events were written.
 long xgameruntime_offline_game_events() { return g_events.load(); }
+// Tests: the speech calls go to these objects as to the host runtime's (LEONIDA_LOCAL_SPEECH=1). Set before the first
+// speech call; the provider it replaces, if any, is not released.
+void xgameruntime_offline_set_host_speech(IUnknown* base, IUnknown* extended) {
+    g_host_speech.store(new HostSpeechProvider(base, extended), std::memory_order_release);
+}
 
 // For tests: how many XUserDeviceImpl registrations of one kind (0 device association, 1 default audio endpoint)
 // are kept.

@@ -190,6 +190,12 @@ int main() {
     check(at<RedeemAsync>(store, 53)(store, context, "token", nullptr, 0, false, &async) == S_OK && finished(&async) &&
               XAsyncGetStatus(&async, false) == E_FAIL,
           "XStoreShowRedeemTokenUIAsync (block as 6th argument, on the stack) completes with E_FAIL");
+    using GiftingAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char*, const char*, const char*, XAsyncBlock*);
+    async = XAsyncBlock{};
+    check(at<GiftingAsync>(store, 82)(store, context, "9NBLGGH4R315", "name", nullptr, &async) == S_OK &&
+              finished(&async) && XAsyncGetStatus(&async, false) == E_FAIL,
+          "XStoreShowGiftingUIAsync (block as 5th argument) starts and completes with E_FAIL (the block does not hang)");
+    check(at<NoArgs>(store, 83)(store) == E_FAIL, "XStoreShowGiftingUIResult returns E_FAIL");
     check(at<NoArgs>(store, 50)(store) == E_FAIL, "its Result partner returns E_FAIL");
     check(at<NoArgs>(store, 46)(store) == E_NOTIMPL, "an undocumented slot answers E_NOTIMPL");
 

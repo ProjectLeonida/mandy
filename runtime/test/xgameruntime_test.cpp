@@ -1029,7 +1029,28 @@ void check_run_time_load() {
                       ui_need == std::strlen("C:\\LeonidaUiDLC") + 1,
                   "slots 37/38 mount a mapped content package and hand out its mount handle");
             reinterpret_cast<CloseMount>(slot(pk, 26))(pk, ui_mount);
+            // A block used again before its result was read: the earlier mount's handle is closed, not leaked.
+            XAsyncBlock reused{};
+            uint64_t second = 0;
+            check(mount_ui(pk, "UIDLC_1234567890123456789012345", &reused) == S_OK &&
+                      XAsyncGetStatus(&reused, true) == S_OK,
+                  "slot 37 mounts the package; its result is not read");
+            check(mount_ui(pk, "UIDLC_1234567890123456789012345", &reused) == S_OK &&
+                      XAsyncGetStatus(&reused, true) == S_OK &&
+                      mount_ui_result(pk, &reused, &second) == S_OK && second != 0,
+                  "slot 37 on the same block mounts it again and slot 38 hands out the new handle");
+            size_t earlier_need = 0;  // mount handles are numbered in order: the earlier one is second - 1
+            check(reinterpret_cast<MountPathSize>(slot(pk, 24))(pk, second - 1, &earlier_need) ==
+                      HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+                  "the earlier mount the block held was closed, not leaked");
+            reinterpret_cast<CloseMount>(slot(pk, 26))(pk, second);
             SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
+            // The game's own package is refused as slot 23 refuses it, not reported as missing.
+            XAsyncBlock own_block{};
+            uint64_t own_mount = 7;
+            check(mount_ui(pk, own, &own_block) == S_OK && XAsyncGetStatus(&own_block, true) == E_ACCESSDENIED &&
+                      mount_ui_result(pk, &own_block, &own_mount) == E_ACCESSDENIED && own_mount == 0,
+                  "slots 37/38 for the game's own package complete with E_ACCESSDENIED");
             XAsyncBlock ui_missing{};
             uint64_t ui_none = 7;
             check(mount_ui(pk, "NotInstalled_0000000000000000000", &ui_missing) == S_OK &&
@@ -1100,6 +1121,9 @@ void check_run_time_load() {
                   "slot 3 refuses a <TitleId> that is not hex");
             write_config("<Game><TitleId>123456789</TitleId></Game>");
             check(reinterpret_cast<TitleId>(slot(g, 3))(g, &id) == E_FAIL, "slot 3 refuses more than 8 hex digits");
+            write_config("<!-- <TitleId>DEADBEEF</TitleId> --><Game><TitleId>12345678</TitleId></Game>");
+            check(reinterpret_cast<TitleId>(slot(g, 3))(g, &id) == S_OK && id == 0x12345678u,
+                  "slot 3 skips a <TitleId> inside an XML comment");
             DeleteFileA(config.c_str());
             RemoveDirectoryA(game.c_str());
             SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
