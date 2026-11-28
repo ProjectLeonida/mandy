@@ -1,5 +1,7 @@
 // Checks the console lifecycle shim (runtime/shims/lifecycle.cpp): app-state change registrations, suspend
-// callback delivery, oversized window fitting, and window subclass forwarding.
+// callback delivery, oversized window fitting, and window subclass forwarding, which keeps an ANSI window ANSI.
+// lifecycle_utf8_test builds this file again with an activeCodePage manifest (utf8_codepage.manifest), so the
+// WM_CHAR bytes of section 5 are UTF-8 there, where a Unicode subclass splits them.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -11,6 +13,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include "lifecycle.h"
 #include "shims.h"
@@ -52,6 +55,16 @@ void WINAPI on_app_state_unregister(BOOLEAN, PVOID context) {
     auto* probe = static_cast<UnregProbe*>(context);
     ++probe->calls;
     if (probe->target) g_unreg(probe->target);
+}
+
+// The title's own procedure for section 5: an ANSI window procedure that records the WM_CHAR codes it receives.
+std::vector<WPARAM> g_ansi_chars;
+LRESULT CALLBACK ansi_title_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_CHAR) {
+        g_ansi_chars.push_back(wparam);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, message, wparam, lparam);
 }
 
 }  // namespace
@@ -172,8 +185,48 @@ int main() {
     if (main_win) DestroyWindow(main_win);
     HWND again = create_w(0, kClass, L"again", kMain, 0, 0, 64, 64, nullptr, nullptr, nullptr, nullptr);
     check(again && GetPropW(again, kHookProp) != nullptr, "after the title window is destroyed, a new one is hooked");
+    check(again && IsWindowUnicode(again), "a Unicode title window stays Unicode");
     for (HWND w : {second, tool, again}) {
         if (w) DestroyWindow(w);
+    }
+
+    // 5. The title creates its window with CreateWindowExA. The hook keeps it an ANSI window, so WM_CHAR codes the
+    // title posts and dispatches with the A functions reach its procedure as they were sent. A Unicode hook turned
+    // the window Unicode, and under a UTF-8 code page "e acute, euro" (C3 A9 E2 82 AC) arrived split and reordered.
+#ifdef LIFECYCLE_TEST_UTF8
+    check(GetACP() == CP_UTF8, "the activeCodePage manifest makes the ANSI code page UTF-8");
+#endif
+    using CreateExAFn = HWND(WINAPI*)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE,
+                                      LPVOID);
+    WNDCLASSEXA wca{};
+    wca.cbSize = sizeof(wca);
+    wca.lpfnWndProc = ansi_title_proc;
+    wca.hInstance = GetModuleHandleA(nullptr);
+    wca.lpszClassName = "LeonidaLifecycleAnsi";
+    RegisterClassExA(&wca);
+    const HWND ansi = reinterpret_cast<CreateExAFn>(const_cast<void*>(create_a))(
+        0, "LeonidaLifecycleAnsi", "ansi", kMain, 0, 0, 64, 64, nullptr, nullptr, nullptr, nullptr);
+    check(ansi && GetPropW(ansi, kHookProp) != nullptr, "an ANSI title window from CreateWindowExA is hooked");
+    check(ansi && !IsWindowUnicode(ansi), "the hooked ANSI title window stays an ANSI window");
+    if (ansi) {
+        const unsigned char bytes[] = {0xC3, 0xA9, 0xE2, 0x82, 0xAC};
+        g_ansi_chars.clear();
+        for (const unsigned char b : bytes) PostMessageA(ansi, WM_CHAR, b, 0);
+        MSG msg;
+        while (PeekMessageA(&msg, ansi, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
+        bool same = g_ansi_chars.size() == sizeof(bytes);
+        for (size_t i = 0; same && i < sizeof(bytes); ++i) same = g_ansi_chars[i] == bytes[i];
+        if (!same) {
+            std::printf("  received:");
+            for (const WPARAM c : g_ansi_chars) std::printf(" %02llx", static_cast<unsigned long long>(c));
+            std::printf(" (ANSI code page %u)\n", GetACP());
+        }
+        check(same, "WM_CHAR codes reach the title's ANSI procedure unchanged, in order");
+        SetWindowTextA(ansi, "after");
+        char text[16] = {};
+        check(GetWindowTextA(ansi, text, 16) == 5 && std::strcmp(text, "after") == 0,
+              "the ANSI title window still forwards WM_SETTEXT/WM_GETTEXT");
+        DestroyWindow(ansi);
     }
 
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);

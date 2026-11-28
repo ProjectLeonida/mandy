@@ -508,6 +508,21 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(lifecycle_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(lifecycle_test PRIVATE /OPT:NOREF)
   target_link_libraries(lifecycle_test PRIVATE user32)
+  if(MSVC)
+    # The same checks in a process whose ANSI code page is UTF-8 (an activeCodePage manifest), where a Unicode
+    # subclass of the title's ANSI window splits the UTF-8 bytes of WM_CHAR.
+    add_executable(lifecycle_utf8_test
+      test/lifecycle_test.cpp
+      test/utf8_codepage.manifest
+      shims/lifecycle.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(lifecycle_utf8_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+    target_compile_definitions(lifecycle_utf8_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LIFECYCLE_TEST_UTF8)
+    target_compile_options(lifecycle_utf8_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(lifecycle_utf8_test PRIVATE /OPT:NOREF)
+    target_link_libraries(lifecycle_utf8_test PRIVATE user32)
+  endif()
 
   # Console paths (GAME:) and the write overlay: the file shims resolved through the registry, over temporary folders.
   add_executable(file_system_test
@@ -1716,6 +1731,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET lifecycle_test)
     add_test(NAME lifecycle COMMAND lifecycle_test)
+  endif()
+  if(WIN32 AND TARGET lifecycle_utf8_test)
+    add_test(NAME lifecycle_utf8 COMMAND lifecycle_utf8_test)
   endif()
   if(WIN32 AND TARGET file_system_test)
     add_test(NAME file_system COMMAND file_system_test)
