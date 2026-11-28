@@ -2661,7 +2661,9 @@ Pipeline creation:
 - The index's `max_vertices`/`max_primitives` already size the SPIR-V mesh output arrays. Vulkan has no
   per-pipeline mesh output limit: check them against
   `VkPhysicalDeviceMeshShaderPropertiesEXT::maxMeshOutputVertices`/`maxMeshOutputPrimitives` and fail at pipeline
-  creation if the device is smaller.
+  creation if the device is smaller. Workgroup memory (`lds_bytes`) is checked against
+  `maxMeshSharedMemorySize` (and `maxMeshPayloadAndSharedMemorySize`) by `vulkan_mesh_limits.h`; pass the device's
+  value to `rdna2spirv.py --max-mesh-shared-memory` when translating for it (default 0: no check at translation; 28672 is the spec minimum).
 - Vertex input comes from the PSO input layout plus the shader's ISG1 signature. The translator's rule is
   **location = D3D input register**, not the semantic's HLSL slot. Match the layout element's semantic name/index
   to the ISG1 element to get the register, then create a `VkVertexInputAttributeDescription` with that location
