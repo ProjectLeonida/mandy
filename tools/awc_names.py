@@ -294,8 +294,11 @@ def _attack_split(dictionary: Dictionary, bases: list, index: Index, salt: str) 
                 for b in banks:
                     families[(b, base)][i] = (salt + base + s, verbatim)
     family_hits = {}
-    for (b, _base), members in families.items():
-        if family_ok(n for n, _v in members.values()) and any(v for _n, v in members.values()):
+    for (b, base), members in families.items():
+        # Number the members by their suffix (`_02`), not by a digit that ends the base: the unsuffixed member of
+        # `amb_1` has no number, as the one of `amb` has none, so `amb_1` + `amb_1_02` is no family.
+        cut = len(salt) + len(base)
+        if family_ok(n[cut:] for n, _v in members.values()) and any(v for _n, v in members.values()):
             size = len(members)
             for i, (name, _v) in members.items():
                 prev = family_hits.get((b, i))
