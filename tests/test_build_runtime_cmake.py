@@ -35,7 +35,9 @@ class Recorder {
 class CMakeBatchTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temp = tempfile.TemporaryDirectory(prefix="leonida_cmake_")
+        # A recorder.exe a child has just run can stay locked for a moment on Windows (antivirus, a late handle
+        # close); a failed cleanup must not replace the result of the case that used it.
+        cls.temp = tempfile.TemporaryDirectory(prefix="leonida_cmake_", ignore_cleanup_errors=True)
         cls.addClassCleanup(cls.temp.cleanup)
         cls.base = Path(cls.temp.name)
         source = cls.base / "recorder.cs"
@@ -93,7 +95,7 @@ class CMakeBatchTest(unittest.TestCase):
             for extension in (".exe", ".cmd", ".bat"):
                 for fail in ("", "configure", "build"):
                     with self.subTest(folder=name, extension=extension, fail=fail):
-                        with tempfile.TemporaryDirectory(dir=self.base) as tmp:
+                        with tempfile.TemporaryDirectory(dir=self.base, ignore_cleanup_errors=True) as tmp:
                             folder = Path(tmp) / name
                             folder.mkdir()
                             result, src, out, ninja = self.run_build(folder, extension, fail)
