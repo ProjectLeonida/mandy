@@ -1,0 +1,1574 @@
+name: Coordination activity
+
+on:
+  issue_comment:
+    types: [created, edited, deleted]
+  issues:
+    types: [edited]
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, ready_for_review, closed]
+  workflow_run:
+    workflows: ["Coordination claim"]
+    types: [completed]
+  schedule:
+    - cron: "*/15 * * * *"
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number whose current claim status should be refreshed
+        required: false
+        type: number
+
+permissions: {}
+
+jobs:
+  reconcile-claims:
+    concurrency:
+      group: coordination-claim-status
+      queue: max
+      cancel-in-progress: false
+    if: >-
+      (github.event_name != 'issue_comment' ||
+      (github.event.issue.number == 14 &&
+      github.event.comment.user.login != 'github-actions[bot]')) &&
+      (github.event_name != 'issues' ||
+      github.event.issue.number == 14) &&
+      (github.event_name != 'schedule' ||
+      github.event.schedule == '17 * * * *')
+    name: publish-coordination-claim-status
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Publish current claim status for PR heads
+        env:
+          COORDINATION_MODE: reconcile
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          
+          API = "https://api.github.com"
+          OWNER, REPOSITORY = os.environ["GITHUB_REPOSITORY"].split("/", 1)
+          TOKEN = os.environ["GITHUB_TOKEN"]
+          ISSUE_NUMBER = 14
+          BEGIN = "<!-- BEGIN AUTO PR ACTIVITY -->"
+          END = "<!-- END AUTO PR ACTIVITY -->"
+          ID_PATTERN = r"(?<![A-Za-z0-9-])[A-Z0-9]+(?:-[A-Z0-9]+)+(?![A-Za-z0-9-])"
+          WORK_ID_RE = re.compile(ID_PATTERN)
+          ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)(?![A-Za-z0-9-])")
+          BACKTICK = chr(96)
+          MAX_CLAIM_BODY_CHARS = 65536
+          MAX_CLAIM_VALUE_CHARS = 4096
+          
+          
+          def stop(message):
+              safe = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title=Coordination activity::{safe}")
+              sys.exit(1)
+          
+          
+          def api_json(path, method="GET", payload=None):
+              data = None if payload is None else json.dumps(payload).encode("utf-8")
+              request = urllib.request.Request(
+                  API + path,
+                  data=data,
+                  method=method,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {TOKEN}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=25) as response:
+                      raw = response.read()
+                      return json.loads(raw) if raw else {}
+              except urllib.error.HTTPError as error:
+                  detail = error.read().decode("utf-8", "replace")
+                  stop(f"GitHub API request failed (HTTP {error.code}): {detail}; this coordination update may be incomplete.")
+              except (urllib.error.URLError, TimeoutError):
+                  stop("Cannot reach GitHub; this coordination update may be incomplete.")
+          
+          
+          def get_collection(path, label):
+              result = []
+              for page in range(1, 101):
+                  separator = "&" if "?" in path else "?"
+                  batch = api_json(f"{path}{separator}per_page=100&page={page}")
+                  if not isinstance(batch, list):
+                      stop(f"GitHub returned an invalid {label} response.")
+                  result.extend(batch)
+                  if len(batch) < 100:
+                      return result
+              stop(f"The {label} collection is too large to sync safely.")
+          
+          
+          def is_rate_limit_error(error):
+              if not isinstance(error, dict):
+                  return False
+              error_type = error.get("type")
+              if error_type is not None:
+                  return error_type == "RATE_LIMITED"
+              return "rate limit" in (error.get("message") or "").casefold()
+
+          def graphql_json(payload):
+              for attempt in range(2):
+                  request = urllib.request.Request(
+                      API + "/graphql",
+                      data=json.dumps(payload).encode("utf-8"),
+                      method="POST",
+                      headers={
+                          "Accept": "application/vnd.github+json",
+                          "Authorization": f"Bearer {TOKEN}",
+                          "X-GitHub-Api-Version": "2022-11-28",
+                          "Content-Type": "application/json",
+                      },
+                  )
+                  try:
+                      with urllib.request.urlopen(request, timeout=25) as response:
+                          result = json.load(response)
+                          errors = result.get("errors") or []
+                          limited = bool(errors) and all(is_rate_limit_error(error) for error in errors)
+                          retry_after = response.headers.get("Retry-After")
+                          try:
+                              delay = float(retry_after) if retry_after is not None else None
+                          except (TypeError, ValueError):
+                              delay = None
+                          if limited and attempt == 0 and delay is not None and 0 <= delay <= 20:
+                              time.sleep(delay)
+                              continue
+                          return result
+                  except urllib.error.HTTPError as error:
+                      detail = error.read().decode("utf-8", "replace")
+                      try:
+                          error_payload = json.loads(detail)
+                      except (TypeError, ValueError):
+                          error_payload = {}
+                      body_errors = error_payload.get("errors") if isinstance(error_payload, dict) else None
+                      top_level_type = error_payload.get("type") if isinstance(error_payload, dict) else None
+                      if top_level_type is not None:
+                          if top_level_type != "RATE_LIMITED":
+                              rate_limited_http = False
+                          elif body_errors:
+                              rate_limited_http = all(is_rate_limit_error(item) for item in body_errors)
+                          else:
+                              rate_limited_http = True
+                      elif body_errors:
+                          rate_limited_http = all(is_rate_limit_error(item) for item in body_errors)
+                      else:
+                          body_message = error_payload.get("message", "") if isinstance(error_payload, dict) else ""
+                          rate_limited_http = error.code == 429 or (
+                              error.code == 403
+                              and "rate limit" in str(body_message or detail).casefold()
+                          )
+                      retry_after = error.headers.get("Retry-After")
+                      try:
+                          delay = float(retry_after) if retry_after is not None else None
+                      except (TypeError, ValueError):
+                          delay = None
+                      if (
+                          error.code in (403, 429)
+                          and rate_limited_http
+                          and attempt == 0
+                          and delay is not None
+                          and 0 <= delay <= 20
+                      ):
+                          time.sleep(delay)
+                          continue
+                      stop(f"GitHub GraphQL request failed (HTTP {error.code}): {detail}")
+                  except (urllib.error.URLError, TimeoutError) as error:
+                      stop(f"Cannot reach GitHub GraphQL API: {error}")
+
+          def attach_comment_edit_metadata(comments, retry=True):
+              claim_comments = [
+                  comment for comment in comments
+                  if ids_from_claim_comment(comment.get("body") or "")
+              ]
+              if not claim_comments:
+                  return comments
+          
+              def retry_after_fresh_read(reason):
+                  if retry:
+                      refreshed = get_collection(
+                          "/repos/" + OWNER + "/" + REPOSITORY + "/issues/" + str(ISSUE_NUMBER) + "/comments",
+                          "issue #14 comments",
+                      )
+                      return attach_comment_edit_metadata(refreshed, retry=False)
+                  stop("Could not verify issue comment edit history after one fresh read: " + reason)
+          
+              query = (
+                  "query($ids: [ID!]!) { nodes(ids: $ids) { "
+                  "... on IssueComment { fullDatabaseId lastEditedAt } } }"
+              )
+              edited_at_by_id = {}
+              for offset in range(0, len(claim_comments), 100):
+                  batch = claim_comments[offset : offset + 100]
+                  node_ids = [comment.get("node_id") for comment in batch]
+                  if any(not node_id for node_id in node_ids):
+                      stop("Cannot verify issue comment edit history: missing GraphQL node ID.")
+                  result = graphql_json(
+                      {"query": query, "variables": {"ids": node_ids}}
+                  )
+                  errors = result.get("errors") or []
+                  node_errors = []
+                  other_errors = []
+                  for error in errors:
+                      path = error.get("path") if isinstance(error, dict) else None
+                      message = error.get("message") or "" if isinstance(error, dict) else str(error)
+                      is_node_error = bool(path and path[0] == "nodes")
+                      is_rate_limited = is_rate_limit_error(error)
+                      if is_node_error and not is_rate_limited:
+                          node_errors.append(error)
+                      else:
+                          other_errors.append(error)
+                  if other_errors:
+                      details = "; ".join(
+                          str(error.get("message") or "GraphQL error")
+                          if isinstance(error, dict) else str(error)
+                          for error in errors
+                      )
+                      stop("Cannot verify issue comment edit history: " + details)
+                  if node_errors:
+                      details = "; ".join(
+                          str(error.get("message") or "GraphQL node lookup error")
+                          for error in node_errors
+                      )
+                      return retry_after_fresh_read(details)
+                  nodes = ((result.get("data") or {}).get("nodes"))
+                  if not isinstance(nodes, list) or len(nodes) != len(batch):
+                      stop("GitHub returned invalid issue comment edit metadata.")
+                  for node in nodes:
+                      if not isinstance(node, dict) or node.get("fullDatabaseId") is None:
+                          continue
+                      if "lastEditedAt" not in node:
+                          stop("GitHub omitted lastEditedAt from issue comment metadata.")
+                      edited_at_by_id[str(node["fullDatabaseId"])] = node["lastEditedAt"]
+              missing = [
+                  comment for comment in claim_comments
+                  if str(comment.get("id") or "") not in edited_at_by_id
+              ]
+              if missing:
+                  return retry_after_fresh_read("one or more claim comments disappeared from the GraphQL lookup")
+              for comment in claim_comments:
+                  comment["_last_edited_at"] = edited_at_by_id[str(comment["id"])]
+              return comments
+
+          def ids_from_text(text):
+              text = text or ""
+              if len(text) > MAX_CLAIM_BODY_CHARS:
+                  return set()
+              return {value.upper() for value in WORK_ID_RE.findall(text)}
+
+          def strip_html_comments(text):
+              text = text or ""
+              if len(text) > MAX_CLAIM_BODY_CHARS:
+                  return ""
+              visible = []
+              cursor = 0
+              while cursor < len(text):
+                  start = text.find("<!--", cursor)
+                  if start < 0:
+                      visible.append(text[cursor:])
+                      break
+                  visible.append(text[cursor:start])
+                  end = text.find("-->", start + 4)
+                  if end < 0:
+                      break
+                  cursor = end + 3
+              return "".join(visible)
+          
+          
+          def work_id_list(text):
+              listed = ID_LIST_RE.match(text)
+              if listed and re.match(r"^\s*,", text[listed.end():]):
+                  return None
+              return listed
+          
+          
+          def unwrap_work_id_code(text):
+              text = (text or "").strip()
+              pattern = re.escape(BACKTICK) + "([^" + BACKTICK + "]*)" + re.escape(BACKTICK)
+              def replace_code_span(match):
+                  code_text = match.group(1).strip()
+                  before = match.string[match.start() - 1:match.start()]
+                  after = match.string[match.end():match.end() + 1]
+                  if (
+                      ID_LIST_RE.fullmatch(code_text)
+                      and not re.match(r"^[A-Za-z0-9-]", before)
+                      and not re.match(r"^[A-Za-z0-9-]", after)
+                  ):
+                      return code_text
+                  return match.group(0)
+              return re.sub(pattern, replace_code_span, text)
+
+          def ids_from_claim_comment(body):
+              body = body or ""
+              if len(body) > MAX_CLAIM_BODY_CHARS:
+                  return set()
+              lines = body.splitlines()
+              found = set()
+              for index, line in enumerate(lines):
+                  if len(line) > MAX_CLAIM_VALUE_CHARS + 265 and line.lstrip(" \t").casefold().startswith("claiming:"):
+                      return set()
+                  match = re.match(r"^[ \t]{0,128}claiming:[ \t]{0,128}([^\r\n]{0,4096})$", line, re.IGNORECASE)
+                  if not match:
+                      continue
+                  tail = unwrap_work_id_code(match.group(1).strip())
+                  listed = work_id_list(tail)
+                  if listed:
+                      found.update(ids_from_text(listed.group(1)))
+                      continue
+                  batch_intro = re.match(
+                      r"^(?:the items below|a second batch)\b",
+                      tail,
+                      re.IGNORECASE,
+                  )
+                  if tail and not batch_intro:
+                      continue
+                  cursor = index + 1
+                  while cursor < len(lines) and not lines[cursor].strip():
+                      cursor += 1
+                  batch_ids = set()
+                  batch_valid = True
+                  while cursor < len(lines):
+                      line = lines[cursor]
+                      bullet = line.lstrip(" \t")
+                      if not bullet.startswith(("-", "*")):
+                          break
+                      item = bullet[1:]
+                      text = item.lstrip(" \t")
+                      candidate = text.rstrip(" \t")
+                      indent = len(line) - len(bullet)
+                      gap = len(item) - len(text)
+                      if indent <= 128 and 1 <= gap <= 128 and len(candidate) <= 512:
+                          first_ids = work_id_list(unwrap_work_id_code(candidate))
+                          if first_ids:
+                              batch_ids.update(ids_from_text(first_ids.group(1)))
+                              cursor += 1
+                              continue
+                      # A malformed ID-like bullet invalidates the batch. Other bullets end it.
+                      prefix = candidate[:512]
+                      if prefix.startswith(BACKTICK):
+                          prefix = prefix[1:].lstrip(" \t")
+                      if re.match(r"^[A-Z0-9]+-", prefix):
+                          batch_valid = False
+                      break
+                  if batch_valid:
+                      found.update(batch_ids)
+              return found
+
+          def open_work_ids(body):
+              in_open_work = False
+              result = set()
+              for line in (body or "").splitlines():
+                  if re.match(r"^##\s+Open work\b", line, re.IGNORECASE):
+                      in_open_work = True
+                      continue
+                  if in_open_work and re.match(r"^##\s+", line):
+                      break
+                  if not in_open_work or not line.lstrip().startswith("|"):
+                      continue
+                  cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+                  if len(cells) < 5:
+                      continue
+                  item_id = cells[0].strip(BACKTICK).upper()
+                  status = cells[-1].lower()
+                  if item_id != "ID" and WORK_ID_RE.fullmatch(item_id) and status.startswith("open"):
+                      result.add(item_id)
+              return result
+          
+          
+          def parse_time(value):
+              if not value:
+                  return None
+              try:
+                  return datetime.fromisoformat(value.replace("Z", "+00:00"))
+              except ValueError:
+                  return None
+          
+          
+          def claim_fields(body):
+              values = []
+              field_too_long = False
+              label = "claimed in the coordination issue as:"
+              for line in strip_html_comments(body).splitlines():
+                  line = line.lstrip(" \t")
+                  if line.startswith(">"):
+                      line = line[1:].lstrip(" \t")
+                  if line[:len(label)].lower() != label:
+                      continue
+                  value = line[len(label):].strip(" \t")
+                  if len(value) > MAX_CLAIM_VALUE_CHARS:
+                      field_too_long = True
+                  else:
+                      values.append(value)
+              return values, field_too_long
+
+
+          def pull_claim_ids(pull, comments_by_id):
+              found = ids_from_text(pull.get("title") or "")
+              unresolved_links = []
+              raw_body = pull.get("body") or ""
+              if len(raw_body) > MAX_CLAIM_BODY_CHARS:
+                  return found, ["PR body exceeds the claim parser size limit"]
+              fields, field_too_long = claim_fields(raw_body)
+              if field_too_long:
+                  unresolved_links.append("Claimed in the coordination issue field exceeds the parser limit")
+              for value in fields:
+                  found.update(ids_from_text(value))
+                  for comment_id in re.findall(r"#issuecomment-(\d+)", value):
+                      linked = comments_by_id.get(comment_id)
+                      if not linked:
+                          unresolved_links.append(comment_id)
+                          continue
+                      linked_ids = ids_from_claim_comment(linked.get("body") or "")
+                      if not linked_ids:
+                          unresolved_links.append(comment_id)
+                      found.update(linked_ids)
+              return found, unresolved_links
+          def evaluate_claim(pull, allowed_ids, claims_by_id, comments_by_id):
+              author = ((pull.get("user") or {}).get("login") or "")
+              opened_at = parse_time(pull.get("created_at"))
+              if not author or opened_at is None:
+                  return "invalid", set(), None, {}
+              candidates, unresolved_links = pull_claim_ids(pull, comments_by_id)
+              if not candidates and not unresolved_links:
+                  return "needs-claim", set(), None, {}
+              if unresolved_links or candidates - allowed_ids:
+                  return "invalid", candidates, None, {}
+              owners = set()
+              links = {}
+              for item_id in sorted(candidates):
+                  prior = []
+                  for comment in claims_by_id.get(item_id, []):
+                      created_at = parse_time(comment.get("created_at"))
+                      updated_at = parse_time(comment.get("updated_at"))
+                      if (
+                          created_at is not None
+                          and updated_at == created_at
+                          and comment.get("_last_edited_at") is None
+                          and created_at < opened_at
+                      ):
+                          prior.append(comment)
+                  claim_owners = {
+                      ((comment.get("user") or {}).get("login") or "").casefold()
+                      for comment in prior
+                  }
+                  if not prior or len(claim_owners) != 1:
+                      return "invalid", candidates, None, {}
+                  owners.update(claim_owners)
+                  prior.sort(key=lambda comment: comment.get("created_at") or "")
+                  links[item_id] = str(prior[0].get("id") or "")
+              if len(owners) != 1 or next(iter(owners)).casefold() != author.casefold():
+                  return "invalid", candidates, None, {}
+              return "claimed", candidates, author, links
+          def safe_cell(value, limit=180):
+              value = re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
+              value = (
+                  value.replace("\\", "\\\\")
+                  .replace("|", "\\|")
+                  .replace(BACKTICK, "\\" + BACKTICK)
+                  .replace("[", "\\[")
+                  .replace("]", "\\]")
+                  .replace("<", "&lt;")
+                  .replace(">", "&gt;")
+                  .replace("@", "&#64;")
+              )
+              if len(value) > limit:
+                  value = value[:limit - 3].rstrip() + "..."
+              return value
+          
+          
+          def changed_claim_ids(event):
+              comment = event.get("comment") or {}
+              bodies = [comment.get("body") or ""]
+              old_body = ((event.get("changes") or {}).get("body") or {}).get("from")
+              if old_body:
+                  bodies.append(old_body)
+              found = set()
+              for body in bodies:
+                  found.update(ids_from_claim_comment(body))
+              return found, str(comment.get("id") or "")
+          
+          
+          def comment_change_targets_pull(pull, changed_ids, comment_id, comments_by_id):
+              if not changed_ids and not comment_id:
+                  return False
+              candidates, _unresolved = pull_claim_ids(pull, comments_by_id)
+              if candidates & changed_ids:
+                  return True
+              if not comment_id:
+                  return False
+              fields, _field_too_long = claim_fields(pull.get("body") or "")
+              return any(
+                  comment_id in re.findall(r"#issuecomment-(\d+)", value)
+                  for value in fields
+              )
+
+
+          def workflow_run_matches_pull(run, pull):
+              head = pull.get("head") or {}
+              base = pull.get("base") or {}
+              source_repo = head.get("repo") or {}
+              run_source_repo = run.get("head_repository") or {}
+              run_created = parse_time(run.get("created_at"))
+              pull_created = parse_time(pull.get("created_at"))
+              if (
+                  run.get("event") != "pull_request"
+                  or base.get("ref") != "main"
+                  or not source_repo.get("id")
+                  or not run_source_repo.get("id")
+                  or str(source_repo.get("id")) != str(run_source_repo.get("id"))
+                  or run_created is None
+                  or pull_created is None
+                  or run_created < pull_created
+              ):
+                  return False
+              associated = run.get("pull_requests") or []
+              if associated:
+                  matches = [
+                      item for item in associated
+                      if str(item.get("number")) == str(pull.get("number"))
+                  ]
+                  if not matches:
+                      return False
+                  associated_head = ((matches[0].get("head") or {}).get("sha") or "")
+                  if associated_head:
+                      return associated_head == head.get("sha")
+                  return run.get("head_sha") == head.get("sha")
+              return run.get("head_sha") == head.get("sha") and run.get("head_branch") == head.get("ref")
+          
+          
+          def status_target_pulls(event_name, event, pulls, comments_by_id):
+              if event_name == "issue_comment":
+                  if (
+                      str((event.get("issue") or {}).get("number")) != str(ISSUE_NUMBER)
+                      or ((event.get("comment") or {}).get("user") or {}).get("login") == "github-actions[bot]"
+                  ):
+                      return []
+                  changed_ids, comment_id = changed_claim_ids(event)
+
+                  return [
+                      pull for pull in pulls
+                      if comment_change_targets_pull(pull, changed_ids, comment_id, comments_by_id)
+                  ]
+              if event_name == "issues":
+                  if str((event.get("issue") or {}).get("number")) == str(ISSUE_NUMBER):
+                      return pulls
+                  return []
+              if event_name == "pull_request_target":
+                  changed_pull = event.get("pull_request") or {}
+                  action = event.get("action")
+                  base_ref = ((changed_pull.get("base") or {}).get("ref"))
+                  if base_ref != "main" and action != "edited":
+                      return []
+                  # Recompute every open main-targeting head so shared-SHA statuses
+                  # recover when a PR opens, changes commits, changes base, or closes.
+                  return [pull for pull in pulls if ((pull.get("base") or {}).get("ref")) == "main"]
+              if event_name == "workflow_run":
+                  run = event.get("workflow_run") or {}
+                  associated = run.get("pull_requests") or []
+                  if associated:
+                      associated_shas = {
+                          ((item.get("head") or {}).get("sha") or "")
+                          for item in associated
+                          if (item.get("head") or {}).get("sha")
+                      }
+                      if run.get("head_sha"):
+                          associated_shas.add(run.get("head_sha"))
+                      return [
+                          pull for pull in pulls
+                          if ((pull.get("head") or {}).get("sha") or "") in associated_shas
+                      ]
+                  return [pull for pull in pulls if workflow_run_matches_pull(run, pull)]
+              if event_name == "workflow_dispatch":
+                  try:
+                      target_number = int((event.get("inputs") or {}).get("pr_number") or 0)
+                  except (TypeError, ValueError):
+                      target_number = 0
+                  return [pull for pull in pulls if str(pull.get("number")) == str(target_number)]
+              if event_name == "schedule" and event.get("schedule") == "17 * * * *":
+                  return pulls
+              return []
+          
+          
+          def publish_claim_statuses(event_name, event, pulls, activity_rows, comments_by_id):
+              targets = status_target_pulls(event_name, event, pulls, comments_by_id)
+              target_shas = {
+                  ((pull.get("head") or {}).get("sha") or "")
+                  for pull in targets
+                  if ((pull.get("base") or {}).get("ref")) == "main"
+              }
+              by_sha = defaultdict(list)
+              for pull, status, _items, _owner, _links in activity_rows:
+                  if ((pull.get("base") or {}).get("ref")) != "main":
+                      continue
+                  sha = ((pull.get("head") or {}).get("sha") or "")
+                  if sha and sha in target_shas:
+                      by_sha[sha].append(status)
+              updated = 0
+              failures = []
+              for sha, statuses in by_sha.items():
+                  invalid_count = sum(status != "claimed" for status in statuses)
+                  state = "failure" if invalid_count else "success"
+                  description = (
+                      f"{invalid_count} of {len(statuses)} open PR(s) have missing or invalid claims"
+                      if invalid_count
+                      else f"Claims valid for {len(statuses)} open PR(s)"
+                  )
+                  try:
+                      combined = api_json(f"/repos/{OWNER}/{REPOSITORY}/commits/{sha}/status")
+                      existing = [
+                          item for item in (combined.get("statuses") or [])
+                          if item.get("context") == "coordination-claim"
+                      ]
+                      latest = max(
+                          existing,
+                          key=lambda item: item.get("created_at") or "",
+                          default=None,
+                      )
+                      if latest and latest.get("state") == state and latest.get("description") == description:
+                          continue
+                      api_json(
+                          f"/repos/{OWNER}/{REPOSITORY}/statuses/{sha}",
+                          method="POST",
+                          payload={
+                              "state": state,
+                              "context": "coordination-claim",
+                              "description": description,
+                              "target_url": f"https://github.com/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}",
+                          },
+                      )
+                      updated += 1
+                  except SystemExit:
+                      failures.append(sha)
+                      print(f"::warning::Could not publish coordination-claim status for head {sha}.")
+              if failures:
+                  stop("Could not publish claim status for " + ", ".join(failures) + ".")
+              if not targets:
+                  print("No PR heads were selected for claim-status publication.")
+              return updated
+          
+          
+          issue = api_json(f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}")
+          comments = get_collection(
+              f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments",
+              "issue #14 comments",
+          )
+          comments = attach_comment_edit_metadata(comments)
+          pulls = get_collection(
+              f"/repos/{OWNER}/{REPOSITORY}/pulls?state=open",
+              "open pull requests",
+          )
+          pulls = [pull for pull in pulls if pull.get("state") == "open"]
+          comments_by_id = {str(comment.get("id")): comment for comment in comments}
+          claims_by_id = defaultdict(list)
+          for comment in comments:
+              for item_id in ids_from_claim_comment(comment.get("body") or ""):
+                  claims_by_id[item_id].append(comment)
+          allowed_ids = open_work_ids(issue.get("body") or "")
+          
+          event_name = os.environ.get("GITHUB_EVENT_NAME")
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+              event = json.load(event_file)
+          activity_rows = []
+          groups = defaultdict(list)
+          for pull in pulls:
+              status, item_ids, owner, links = evaluate_claim(
+                  pull, allowed_ids, claims_by_id, comments_by_id
+              )
+              activity_rows.append((pull, status, item_ids, owner, links))
+              author = ((pull.get("user") or {}).get("login") or "unknown")
+              groups[author].append((pull, status, item_ids, owner, links))
+          
+          mode = os.environ.get("COORDINATION_MODE", "sync")
+          if mode == "reconcile":
+              updated_statuses = publish_claim_statuses(
+                  event_name, event, pulls, activity_rows, comments_by_id
+              )
+              print(f"Published {updated_statuses} current-head coordination-claim status(es).")
+              sys.exit(0)
+          if mode != "sync":
+              stop("Unknown coordination workflow mode.")
+          updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+          section = [
+              BEGIN,
+              "## Current open pull request activity",
+              "",
+              f"Updated: **{updated_at}** — **{len(pulls)} open PRs** across **{len(groups)} submitters**.",
+              "PR author is the submitter; it does not establish ownership. A claim is valid only when every declared work ID has one unchanged issue #14 claim that predates the PR and names the same owner as its author. Rows marked **Needs claim** need a valid claim. The Action reports status only; it never closes or assigns a PR.",
+              "",
+              "Edit the **Open work** table and rules in this issue directly. The Action manages only this separate comment.",
+          ]
+          for author in sorted(groups, key=str.casefold):
+              author_rows = sorted(
+                  groups[author],
+                  key=lambda row: row[0].get("number", 0),
+                  reverse=True,
+              )
+              section.extend(
+                  [
+                      "",
+                      f"### {BACKTICK}{safe_cell(author)}{BACKTICK} — {len(author_rows)} open PRs",
+                      "",
+                      "| PR | Claim / owner | Work (PR title) | State |",
+                      "|---|---|---|---|",
+                  ]
+              )
+              for pull, status, item_ids, owner, links in author_rows:
+                  claim_cell = "Needs claim"
+                  if status == "claimed":
+                      rendered = []
+                      for item_id in sorted(item_ids):
+                          comment_id = links.get(item_id)
+                          comment_url = (
+                              f"https://github.com/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}"
+                              f"#issuecomment-{comment_id}"
+                          )
+                          rendered.append(f"[{BACKTICK}{item_id}{BACKTICK}]({comment_url})")
+                      claim_cell = ", ".join(rendered) + f" — {BACKTICK}{safe_cell(owner)}{BACKTICK}"
+                  pr_url = pull.get("html_url") or (
+                      f"https://github.com/{OWNER}/{REPOSITORY}/pull/{pull.get('number')}"
+                  )
+                  pr_label = f"[#{pull.get('number')}]({pr_url})"
+                  title = safe_cell(pull.get("title") or "")
+                  state = "Draft" if pull.get("draft") else "Ready"
+                  section.append(f"| {pr_label} | {claim_cell} | {title} | {state} |")
+          section.append(END)
+          managed_block = "\n".join(section)
+          
+          action_comments = [
+              comment
+              for comment in comments
+              if (comment.get("user") or {}).get("login") == "github-actions[bot]"
+              and (BEGIN in (comment.get("body") or "") or END in (comment.get("body") or ""))
+          ]
+          if len(action_comments) > 1:
+              stop("More than one managed activity comment exists; no comment was changed.")
+          
+          if action_comments:
+              comment = action_comments[0]
+              current_body = comment.get("body") or ""
+              if current_body.count(BEGIN) != 1 or current_body.count(END) != 1:
+                  stop("The managed activity comment markers are malformed; no comment was changed.")
+              start = current_body.index(BEGIN)
+              end = current_body.index(END)
+              if end < start:
+                  stop("The managed activity comment markers are out of order; no comment was changed.")
+              end += len(END)
+              new_body = current_body[:start] + managed_block + current_body[end:]
+              normalize = lambda value: re.sub(
+                  r"(?m)^(Updated: \*\*)[^*]+(\*\* — \*\*\d+ open PRs\*\* across \*\*\d+ submitters\*\*\.)$",
+                  r"\1timestamp\2",
+                  value,
+              )
+              if len(new_body) > 65536:
+                  stop("The activity comment would exceed GitHub's comment limit; the previous comment was kept.")
+              if normalize(new_body) == normalize(current_body):
+                  print(f"Activity comment is already current ({len(pulls)} open PRs).")
+              else:
+                  api_json(
+                      f"/repos/{OWNER}/{REPOSITORY}/issues/comments/{comment.get('id')}",
+                      method="PATCH",
+                      payload={"body": new_body},
+                  )
+                  print(f"Updated the activity comment with {len(pulls)} open PRs across {len(groups)} submitters.")
+          else:
+              if len(managed_block) > 65536:
+                  stop("The activity comment would exceed GitHub's comment limit; no comment was created.")
+              api_json(
+                  f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments",
+                  method="POST",
+                  payload={"body": managed_block},
+              )
+              print(f"Created the activity comment with {len(pulls)} open PRs across {len(groups)} submitters.")
+          
+          PY
+
+  sync-activity:
+    concurrency:
+      group: coordination-activity-comment
+      cancel-in-progress: false
+    if: >-
+      (github.event_name != 'issue_comment' ||
+      (github.event.issue.number == 14 &&
+      github.event.comment.user.login != 'github-actions[bot]')) &&
+      (github.event_name != 'issues' ||
+      github.event.issue.number == 14)
+    name: sync-issue-activity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Refresh the Action-owned activity comment
+        env:
+          COORDINATION_MODE: sync
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          
+          API = "https://api.github.com"
+          OWNER, REPOSITORY = os.environ["GITHUB_REPOSITORY"].split("/", 1)
+          TOKEN = os.environ["GITHUB_TOKEN"]
+          ISSUE_NUMBER = 14
+          BEGIN = "<!-- BEGIN AUTO PR ACTIVITY -->"
+          END = "<!-- END AUTO PR ACTIVITY -->"
+          ID_PATTERN = r"(?<![A-Za-z0-9-])[A-Z0-9]+(?:-[A-Z0-9]+)+(?![A-Za-z0-9-])"
+          WORK_ID_RE = re.compile(ID_PATTERN)
+          ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)(?![A-Za-z0-9-])")
+          BACKTICK = chr(96)
+          MAX_CLAIM_BODY_CHARS = 65536
+          MAX_CLAIM_VALUE_CHARS = 4096
+          
+          
+          def stop(message):
+              safe = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title=Coordination activity::{safe}")
+              sys.exit(1)
+          
+          
+          def api_json(path, method="GET", payload=None):
+              data = None if payload is None else json.dumps(payload).encode("utf-8")
+              request = urllib.request.Request(
+                  API + path,
+                  data=data,
+                  method=method,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {TOKEN}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=25) as response:
+                      raw = response.read()
+                      return json.loads(raw) if raw else {}
+              except urllib.error.HTTPError as error:
+                  detail = error.read().decode("utf-8", "replace")
+                  stop(f"GitHub API request failed (HTTP {error.code}): {detail}; this coordination update may be incomplete.")
+              except (urllib.error.URLError, TimeoutError):
+                  stop("Cannot reach GitHub; this coordination update may be incomplete.")
+          
+          
+          def get_collection(path, label):
+              result = []
+              for page in range(1, 101):
+                  separator = "&" if "?" in path else "?"
+                  batch = api_json(f"{path}{separator}per_page=100&page={page}")
+                  if not isinstance(batch, list):
+                      stop(f"GitHub returned an invalid {label} response.")
+                  result.extend(batch)
+                  if len(batch) < 100:
+                      return result
+              stop(f"The {label} collection is too large to sync safely.")
+          
+          
+          def is_rate_limit_error(error):
+              if not isinstance(error, dict):
+                  return False
+              error_type = error.get("type")
+              if error_type is not None:
+                  return error_type == "RATE_LIMITED"
+              return "rate limit" in (error.get("message") or "").casefold()
+
+          def graphql_json(payload):
+              for attempt in range(2):
+                  request = urllib.request.Request(
+                      API + "/graphql",
+                      data=json.dumps(payload).encode("utf-8"),
+                      method="POST",
+                      headers={
+                          "Accept": "application/vnd.github+json",
+                          "Authorization": f"Bearer {TOKEN}",
+                          "X-GitHub-Api-Version": "2022-11-28",
+                          "Content-Type": "application/json",
+                      },
+                  )
+                  try:
+                      with urllib.request.urlopen(request, timeout=25) as response:
+                          result = json.load(response)
+                          errors = result.get("errors") or []
+                          limited = bool(errors) and all(is_rate_limit_error(error) for error in errors)
+                          retry_after = response.headers.get("Retry-After")
+                          try:
+                              delay = float(retry_after) if retry_after is not None else None
+                          except (TypeError, ValueError):
+                              delay = None
+                          if limited and attempt == 0 and delay is not None and 0 <= delay <= 20:
+                              time.sleep(delay)
+                              continue
+                          return result
+                  except urllib.error.HTTPError as error:
+                      detail = error.read().decode("utf-8", "replace")
+                      try:
+                          error_payload = json.loads(detail)
+                      except (TypeError, ValueError):
+                          error_payload = {}
+                      body_errors = error_payload.get("errors") if isinstance(error_payload, dict) else None
+                      top_level_type = error_payload.get("type") if isinstance(error_payload, dict) else None
+                      if top_level_type is not None:
+                          if top_level_type != "RATE_LIMITED":
+                              rate_limited_http = False
+                          elif body_errors:
+                              rate_limited_http = all(is_rate_limit_error(item) for item in body_errors)
+                          else:
+                              rate_limited_http = True
+                      elif body_errors:
+                          rate_limited_http = all(is_rate_limit_error(item) for item in body_errors)
+                      else:
+                          body_message = error_payload.get("message", "") if isinstance(error_payload, dict) else ""
+                          rate_limited_http = error.code == 429 or (
+                              error.code == 403
+                              and "rate limit" in str(body_message or detail).casefold()
+                          )
+                      retry_after = error.headers.get("Retry-After")
+                      try:
+                          delay = float(retry_after) if retry_after is not None else None
+                      except (TypeError, ValueError):
+                          delay = None
+                      if (
+                          error.code in (403, 429)
+                          and rate_limited_http
+                          and attempt == 0
+                          and delay is not None
+                          and 0 <= delay <= 20
+                      ):
+                          time.sleep(delay)
+                          continue
+                      stop(f"GitHub GraphQL request failed (HTTP {error.code}): {detail}")
+                  except (urllib.error.URLError, TimeoutError) as error:
+                      stop(f"Cannot reach GitHub GraphQL API: {error}")
+              stop("GitHub GraphQL retry loop ended unexpectedly.")
+
+          def attach_comment_edit_metadata(comments, retry=True):
+              claim_comments = [
+                  comment for comment in comments
+                  if ids_from_claim_comment(comment.get("body") or "")
+              ]
+              if not claim_comments:
+                  return comments
+          
+              def retry_after_fresh_read(reason):
+                  if retry:
+                      refreshed = get_collection(
+                          "/repos/" + OWNER + "/" + REPOSITORY + "/issues/" + str(ISSUE_NUMBER) + "/comments",
+                          "issue #14 comments",
+                      )
+                      return attach_comment_edit_metadata(refreshed, retry=False)
+                  stop("Could not verify issue comment edit history after one fresh read: " + reason)
+          
+              query = (
+                  "query($ids: [ID!]!) { nodes(ids: $ids) { "
+                  "... on IssueComment { fullDatabaseId lastEditedAt } } }"
+              )
+              edited_at_by_id = {}
+              for offset in range(0, len(claim_comments), 100):
+                  batch = claim_comments[offset : offset + 100]
+                  node_ids = [comment.get("node_id") for comment in batch]
+                  if any(not node_id for node_id in node_ids):
+                      stop("Cannot verify issue comment edit history: missing GraphQL node ID.")
+                  result = graphql_json(
+                      {"query": query, "variables": {"ids": node_ids}}
+                  )
+                  errors = result.get("errors") or []
+                  node_errors = []
+                  other_errors = []
+                  for error in errors:
+                      path = error.get("path") if isinstance(error, dict) else None
+                      message = error.get("message") or "" if isinstance(error, dict) else str(error)
+                      is_node_error = bool(path and path[0] == "nodes")
+                      is_rate_limited = is_rate_limit_error(error)
+                      if is_node_error and not is_rate_limited:
+                          node_errors.append(error)
+                      else:
+                          other_errors.append(error)
+                  if other_errors:
+                      details = "; ".join(
+                          str(error.get("message") or "GraphQL error")
+                          if isinstance(error, dict) else str(error)
+                          for error in errors
+                      )
+                      stop("Cannot verify issue comment edit history: " + details)
+                  if node_errors:
+                      details = "; ".join(
+                          str(error.get("message") or "GraphQL node lookup error")
+                          for error in node_errors
+                      )
+                      return retry_after_fresh_read(details)
+                  nodes = ((result.get("data") or {}).get("nodes"))
+                  if not isinstance(nodes, list) or len(nodes) != len(batch):
+                      stop("GitHub returned invalid issue comment edit metadata.")
+                  for node in nodes:
+                      if not isinstance(node, dict) or node.get("fullDatabaseId") is None:
+                          continue
+                      if "lastEditedAt" not in node:
+                          stop("GitHub omitted lastEditedAt from issue comment metadata.")
+                      edited_at_by_id[str(node["fullDatabaseId"])] = node["lastEditedAt"]
+              missing = [
+                  comment for comment in claim_comments
+                  if str(comment.get("id") or "") not in edited_at_by_id
+              ]
+              if missing:
+                  return retry_after_fresh_read("one or more claim comments disappeared from the GraphQL lookup")
+              for comment in claim_comments:
+                  comment["_last_edited_at"] = edited_at_by_id[str(comment["id"])]
+              return comments
+
+          def ids_from_text(text):
+              text = text or ""
+              if len(text) > MAX_CLAIM_BODY_CHARS:
+                  return set()
+              return {value.upper() for value in WORK_ID_RE.findall(text)}
+
+          def strip_html_comments(text):
+              text = text or ""
+              if len(text) > MAX_CLAIM_BODY_CHARS:
+                  return ""
+              visible = []
+              cursor = 0
+              while cursor < len(text):
+                  start = text.find("<!--", cursor)
+                  if start < 0:
+                      visible.append(text[cursor:])
+                      break
+                  visible.append(text[cursor:start])
+                  end = text.find("-->", start + 4)
+                  if end < 0:
+                      break
+                  cursor = end + 3
+              return "".join(visible)
+          
+          
+          def work_id_list(text):
+              listed = ID_LIST_RE.match(text)
+              if listed and re.match(r"^\s*,", text[listed.end():]):
+                  return None
+              return listed
+          
+          
+          def unwrap_work_id_code(text):
+              text = (text or "").strip()
+              pattern = re.escape(BACKTICK) + "([^" + BACKTICK + "]*)" + re.escape(BACKTICK)
+              def replace_code_span(match):
+                  code_text = match.group(1).strip()
+                  before = match.string[match.start() - 1:match.start()]
+                  after = match.string[match.end():match.end() + 1]
+                  if (
+                      ID_LIST_RE.fullmatch(code_text)
+                      and not re.match(r"^[A-Za-z0-9-]", before)
+                      and not re.match(r"^[A-Za-z0-9-]", after)
+                  ):
+                      return code_text
+                  return match.group(0)
+              return re.sub(pattern, replace_code_span, text)
+
+          def ids_from_claim_comment(body):
+              body = body or ""
+              if len(body) > MAX_CLAIM_BODY_CHARS:
+                  return set()
+              lines = body.splitlines()
+              found = set()
+              for index, line in enumerate(lines):
+                  if len(line) > MAX_CLAIM_VALUE_CHARS + 265 and line.lstrip(" \t").casefold().startswith("claiming:"):
+                      return set()
+                  match = re.match(r"^[ \t]{0,128}claiming:[ \t]{0,128}([^\r\n]{0,4096})$", line, re.IGNORECASE)
+                  if not match:
+                      continue
+                  tail = unwrap_work_id_code(match.group(1).strip())
+                  listed = work_id_list(tail)
+                  if listed:
+                      found.update(ids_from_text(listed.group(1)))
+                      continue
+                  batch_intro = re.match(
+                      r"^(?:the items below|a second batch)\b",
+                      tail,
+                      re.IGNORECASE,
+                  )
+                  if tail and not batch_intro:
+                      continue
+                  cursor = index + 1
+                  while cursor < len(lines) and not lines[cursor].strip():
+                      cursor += 1
+                  batch_ids = set()
+                  batch_valid = True
+                  while cursor < len(lines):
+                      line = lines[cursor]
+                      bullet = line.lstrip(" \t")
+                      if not bullet.startswith(("-", "*")):
+                          break
+                      item = bullet[1:]
+                      text = item.lstrip(" \t")
+                      candidate = text.rstrip(" \t")
+                      indent = len(line) - len(bullet)
+                      gap = len(item) - len(text)
+                      if indent <= 128 and 1 <= gap <= 128 and len(candidate) <= 512:
+                          first_ids = work_id_list(unwrap_work_id_code(candidate))
+                          if first_ids:
+                              batch_ids.update(ids_from_text(first_ids.group(1)))
+                              cursor += 1
+                              continue
+                      # A malformed ID-like bullet invalidates the batch. Other bullets end it.
+                      prefix = candidate[:512]
+                      if prefix.startswith(BACKTICK):
+                          prefix = prefix[1:].lstrip(" \t")
+                      if re.match(r"^[A-Z0-9]+-", prefix):
+                          batch_valid = False
+                      break
+                  if batch_valid:
+                      found.update(batch_ids)
+              return found
+
+          def open_work_ids(body):
+              in_open_work = False
+              result = set()
+              for line in (body or "").splitlines():
+                  if re.match(r"^##\s+Open work\b", line, re.IGNORECASE):
+                      in_open_work = True
+                      continue
+                  if in_open_work and re.match(r"^##\s+", line):
+                      break
+                  if not in_open_work or not line.lstrip().startswith("|"):
+                      continue
+                  cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+                  if len(cells) < 5:
+                      continue
+                  item_id = cells[0].strip(BACKTICK).upper()
+                  status = cells[-1].lower()
+                  if item_id != "ID" and WORK_ID_RE.fullmatch(item_id) and status.startswith("open"):
+                      result.add(item_id)
+              return result
+          
+          
+          def parse_time(value):
+              if not value:
+                  return None
+              try:
+                  return datetime.fromisoformat(value.replace("Z", "+00:00"))
+              except ValueError:
+                  return None
+          
+          
+          def claim_fields(body):
+              values = []
+              field_too_long = False
+              label = "claimed in the coordination issue as:"
+              for line in strip_html_comments(body).splitlines():
+                  line = line.lstrip(" \t")
+                  if line.startswith(">"):
+                      line = line[1:].lstrip(" \t")
+                  if line[:len(label)].lower() != label:
+                      continue
+                  value = line[len(label):].strip(" \t")
+                  if len(value) > MAX_CLAIM_VALUE_CHARS:
+                      field_too_long = True
+                  else:
+                      values.append(value)
+              return values, field_too_long
+
+
+          def pull_claim_ids(pull, comments_by_id):
+              found = ids_from_text(pull.get("title") or "")
+              unresolved_links = []
+              raw_body = pull.get("body") or ""
+              if len(raw_body) > MAX_CLAIM_BODY_CHARS:
+                  return found, ["PR body exceeds the claim parser size limit"]
+              fields, field_too_long = claim_fields(raw_body)
+              if field_too_long:
+                  unresolved_links.append("Claimed in the coordination issue field exceeds the parser limit")
+              for value in fields:
+                  found.update(ids_from_text(value))
+                  for comment_id in re.findall(r"#issuecomment-(\d+)", value):
+                      linked = comments_by_id.get(comment_id)
+                      if not linked:
+                          unresolved_links.append(comment_id)
+                          continue
+                      linked_ids = ids_from_claim_comment(linked.get("body") or "")
+                      if not linked_ids:
+                          unresolved_links.append(comment_id)
+                      found.update(linked_ids)
+              return found, unresolved_links
+          def evaluate_claim(pull, allowed_ids, claims_by_id, comments_by_id):
+              author = ((pull.get("user") or {}).get("login") or "")
+              opened_at = parse_time(pull.get("created_at"))
+              if not author or opened_at is None:
+                  return "invalid", set(), None, {}
+              candidates, unresolved_links = pull_claim_ids(pull, comments_by_id)
+              if not candidates and not unresolved_links:
+                  return "needs-claim", set(), None, {}
+              if unresolved_links or candidates - allowed_ids:
+                  return "invalid", candidates, None, {}
+              owners = set()
+              links = {}
+              for item_id in sorted(candidates):
+                  prior = []
+                  for comment in claims_by_id.get(item_id, []):
+                      created_at = parse_time(comment.get("created_at"))
+                      updated_at = parse_time(comment.get("updated_at"))
+                      if (
+                          created_at is not None
+                          and updated_at == created_at
+                          and comment.get("_last_edited_at") is None
+                          and created_at < opened_at
+                      ):
+                          prior.append(comment)
+                  claim_owners = {
+                      ((comment.get("user") or {}).get("login") or "").casefold()
+                      for comment in prior
+                  }
+                  if not prior or len(claim_owners) != 1:
+                      return "invalid", candidates, None, {}
+                  owners.update(claim_owners)
+                  prior.sort(key=lambda comment: comment.get("created_at") or "")
+                  links[item_id] = str(prior[0].get("id") or "")
+              if len(owners) != 1 or next(iter(owners)).casefold() != author.casefold():
+                  return "invalid", candidates, None, {}
+              return "claimed", candidates, author, links
+          def safe_cell(value, limit=180):
+              value = re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
+              value = (
+                  value.replace("\\", "\\\\")
+                  .replace("|", "\\|")
+                  .replace(BACKTICK, "\\" + BACKTICK)
+                  .replace("[", "\\[")
+                  .replace("]", "\\]")
+                  .replace("<", "&lt;")
+                  .replace(">", "&gt;")
+                  .replace("@", "&#64;")
+              )
+              if len(value) > limit:
+                  value = value[:limit - 3].rstrip() + "..."
+              return value
+          
+          
+          def changed_claim_ids(event):
+              comment = event.get("comment") or {}
+              bodies = [comment.get("body") or ""]
+              old_body = ((event.get("changes") or {}).get("body") or {}).get("from")
+              if old_body:
+                  bodies.append(old_body)
+              found = set()
+              for body in bodies:
+                  found.update(ids_from_claim_comment(body))
+              return found, str(comment.get("id") or "")
+          
+          
+          def comment_change_targets_pull(pull, changed_ids, comment_id, comments_by_id):
+              if not changed_ids and not comment_id:
+                  return False
+              candidates, _unresolved = pull_claim_ids(pull, comments_by_id)
+              if candidates & changed_ids:
+                  return True
+              if not comment_id:
+                  return False
+              fields, _field_too_long = claim_fields(pull.get("body") or "")
+              return any(
+                  comment_id in re.findall(r"#issuecomment-(\d+)", value)
+                  for value in fields
+              )
+
+
+          def workflow_run_matches_pull(run, pull):
+              head = pull.get("head") or {}
+              base = pull.get("base") or {}
+              source_repo = head.get("repo") or {}
+              run_source_repo = run.get("head_repository") or {}
+              run_created = parse_time(run.get("created_at"))
+              pull_created = parse_time(pull.get("created_at"))
+              if (
+                  run.get("event") != "pull_request"
+                  or base.get("ref") != "main"
+                  or not source_repo.get("id")
+                  or not run_source_repo.get("id")
+                  or str(source_repo.get("id")) != str(run_source_repo.get("id"))
+                  or run_created is None
+                  or pull_created is None
+                  or run_created < pull_created
+              ):
+                  return False
+              associated = run.get("pull_requests") or []
+              if associated:
+                  matches = [
+                      item for item in associated
+                      if str(item.get("number")) == str(pull.get("number"))
+                  ]
+                  if not matches:
+                      return False
+                  associated_head = ((matches[0].get("head") or {}).get("sha") or "")
+                  if associated_head:
+                      return associated_head == head.get("sha")
+                  return run.get("head_sha") == head.get("sha")
+              return run.get("head_sha") == head.get("sha") and run.get("head_branch") == head.get("ref")
+          
+          
+          def status_target_pulls(event_name, event, pulls, comments_by_id):
+              if event_name == "issue_comment":
+                  if (
+                      str((event.get("issue") or {}).get("number")) != str(ISSUE_NUMBER)
+                      or ((event.get("comment") or {}).get("user") or {}).get("login") == "github-actions[bot]"
+                  ):
+                      return []
+                  changed_ids, comment_id = changed_claim_ids(event)
+
+                  return [
+                      pull for pull in pulls
+                      if comment_change_targets_pull(pull, changed_ids, comment_id, comments_by_id)
+                  ]
+              if event_name == "issues":
+                  if str((event.get("issue") or {}).get("number")) == str(ISSUE_NUMBER):
+                      return pulls
+                  return []
+              if event_name == "pull_request_target":
+                  closed_pull = event.get("pull_request") or {}
+                  if ((closed_pull.get("base") or {}).get("ref")) != "main":
+                      return []
+                  closed_sha = ((closed_pull.get("head") or {}).get("sha") or "")
+                  return [
+                      pull for pull in pulls
+                      if ((pull.get("base") or {}).get("ref")) == "main"
+                      and ((pull.get("head") or {}).get("sha") or "") == closed_sha
+                  ]
+              if event_name == "workflow_run":
+                  run = event.get("workflow_run") or {}
+                  associated = run.get("pull_requests") or []
+                  if associated:
+                      associated_shas = {
+                          ((item.get("head") or {}).get("sha") or "")
+                          for item in associated
+                          if (item.get("head") or {}).get("sha")
+                      }
+                      if run.get("head_sha"):
+                          associated_shas.add(run.get("head_sha"))
+                      return [
+                          pull for pull in pulls
+                          if ((pull.get("head") or {}).get("sha") or "") in associated_shas
+                      ]
+                  return [pull for pull in pulls if workflow_run_matches_pull(run, pull)]
+              if event_name == "workflow_dispatch":
+                  try:
+                      target_number = int((event.get("inputs") or {}).get("pr_number") or 0)
+                  except (TypeError, ValueError):
+                      target_number = 0
+                  return [pull for pull in pulls if str(pull.get("number")) == str(target_number)]
+              if event_name == "schedule" and event.get("schedule") == "17 * * * *":
+                  return pulls
+              return []
+          
+          
+          def publish_claim_statuses(event_name, event, pulls, activity_rows, comments_by_id):
+              targets = status_target_pulls(event_name, event, pulls, comments_by_id)
+              target_shas = {
+                  ((pull.get("head") or {}).get("sha") or "")
+                  for pull in targets
+                  if ((pull.get("base") or {}).get("ref")) == "main"
+              }
+              by_sha = defaultdict(list)
+              for pull, status, _items, _owner, _links in activity_rows:
+                  if ((pull.get("base") or {}).get("ref")) != "main":
+                      continue
+                  sha = ((pull.get("head") or {}).get("sha") or "")
+                  if sha and sha in target_shas:
+                      by_sha[sha].append(status)
+              updated = 0
+              failures = []
+              for sha, statuses in by_sha.items():
+                  invalid_count = sum(status != "claimed" for status in statuses)
+                  state = "failure" if invalid_count else "success"
+                  description = (
+                      f"{invalid_count} of {len(statuses)} open PR(s) have missing or invalid claims"
+                      if invalid_count
+                      else f"Claims valid for {len(statuses)} open PR(s)"
+                  )
+                  try:
+                      combined = api_json(f"/repos/{OWNER}/{REPOSITORY}/commits/{sha}/status")
+                      existing = [
+                          item for item in (combined.get("statuses") or [])
+                          if item.get("context") == "coordination-claim"
+                      ]
+                      latest = max(
+                          existing,
+                          key=lambda item: item.get("created_at") or "",
+                          default=None,
+                      )
+                      if latest and latest.get("state") == state and latest.get("description") == description:
+                          continue
+                      api_json(
+                          f"/repos/{OWNER}/{REPOSITORY}/statuses/{sha}",
+                          method="POST",
+                          payload={
+                              "state": state,
+                              "context": "coordination-claim",
+                              "description": description,
+                              "target_url": f"https://github.com/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}",
+                          },
+                      )
+                      updated += 1
+                  except SystemExit:
+                      failures.append(sha)
+                      print(f"::warning::Could not publish coordination-claim status for head {sha}.")
+              if failures:
+                  stop("Could not publish claim status for " + ", ".join(failures) + ".")
+              if not targets:
+                  print("No PR heads were selected for claim-status publication.")
+              return updated
+          
+          
+          issue = api_json(f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}")
+          comments = get_collection(
+              f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments",
+              "issue #14 comments",
+          )
+          comments = attach_comment_edit_metadata(comments)
+          pulls = get_collection(
+              f"/repos/{OWNER}/{REPOSITORY}/pulls?state=open",
+              "open pull requests",
+          )
+          pulls = [pull for pull in pulls if pull.get("state") == "open"]
+          comments_by_id = {str(comment.get("id")): comment for comment in comments}
+          claims_by_id = defaultdict(list)
+          for comment in comments:
+              for item_id in ids_from_claim_comment(comment.get("body") or ""):
+                  claims_by_id[item_id].append(comment)
+          allowed_ids = open_work_ids(issue.get("body") or "")
+          
+          event_name = os.environ.get("GITHUB_EVENT_NAME")
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+              event = json.load(event_file)
+          activity_rows = []
+          groups = defaultdict(list)
+          for pull in pulls:
+              status, item_ids, owner, links = evaluate_claim(
+                  pull, allowed_ids, claims_by_id, comments_by_id
+              )
+              activity_rows.append((pull, status, item_ids, owner, links))
+              author = ((pull.get("user") or {}).get("login") or "unknown")
+              groups[author].append((pull, status, item_ids, owner, links))
+          
+          mode = os.environ.get("COORDINATION_MODE", "sync")
+          if mode == "reconcile":
+              updated_statuses = publish_claim_statuses(
+                  event_name, event, pulls, activity_rows, comments_by_id
+              )
+              print(f"Published {updated_statuses} current-head coordination-claim status(es).")
+              sys.exit(0)
+          if mode != "sync":
+              stop("Unknown coordination workflow mode.")
+          updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+          section = [
+              BEGIN,
+              "## Current open pull request activity",
+              "",
+              f"Updated: **{updated_at}** — **{len(pulls)} open PRs** across **{len(groups)} submitters**.",
+              "PR author is the submitter; it does not establish ownership. A claim is valid only when every declared work ID has one unchanged issue #14 claim that predates the PR and names the same owner as its author. Rows marked **Needs claim** need a valid claim. The Action reports status only; it never closes or assigns a PR.",
+              "",
+              "Edit the **Open work** table and rules in this issue directly. The Action manages only this separate comment.",
+          ]
+          for author in sorted(groups, key=str.casefold):
+              author_rows = sorted(
+                  groups[author],
+                  key=lambda row: row[0].get("number", 0),
+                  reverse=True,
+              )
+              section.extend(
+                  [
+                      "",
+                      f"### {BACKTICK}{safe_cell(author)}{BACKTICK} — {len(author_rows)} open PRs",
+                      "",
+                      "| PR | Claim / owner | Work (PR title) | State |",
+                      "|---|---|---|---|",
+                  ]
+              )
+              for pull, status, item_ids, owner, links in author_rows:
+                  claim_cell = "Needs claim"
+                  if status == "claimed":
+                      rendered = []
+                      for item_id in sorted(item_ids):
+                          comment_id = links.get(item_id)
+                          comment_url = (
+                              f"https://github.com/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}"
+                              f"#issuecomment-{comment_id}"
+                          )
+                          rendered.append(f"[{BACKTICK}{item_id}{BACKTICK}]({comment_url})")
+                      claim_cell = ", ".join(rendered) + f" — {BACKTICK}{safe_cell(owner)}{BACKTICK}"
+                  pr_url = pull.get("html_url") or (
+                      f"https://github.com/{OWNER}/{REPOSITORY}/pull/{pull.get('number')}"
+                  )
+                  pr_label = f"[#{pull.get('number')}]({pr_url})"
+                  title = safe_cell(pull.get("title") or "")
+                  state = "Draft" if pull.get("draft") else "Ready"
+                  section.append(f"| {pr_label} | {claim_cell} | {title} | {state} |")
+          section.append(END)
+          managed_block = "\n".join(section)
+          
+          action_comments = [
+              comment
+              for comment in comments
+              if (comment.get("user") or {}).get("login") == "github-actions[bot]"
+              and (BEGIN in (comment.get("body") or "") or END in (comment.get("body") or ""))
+          ]
+          if len(action_comments) > 1:
+              stop("More than one managed activity comment exists; no comment was changed.")
+          
+          if action_comments:
+              comment = action_comments[0]
+              current_body = comment.get("body") or ""
+              if current_body.count(BEGIN) != 1 or current_body.count(END) != 1:
+                  stop("The managed activity comment markers are malformed; no comment was changed.")
+              start = current_body.index(BEGIN)
+              end = current_body.index(END)
+              if end < start:
+                  stop("The managed activity comment markers are out of order; no comment was changed.")
+              end += len(END)
+              new_body = current_body[:start] + managed_block + current_body[end:]
+              normalize = lambda value: re.sub(
+                  r"(?m)^(Updated: \*\*)[^*]+(\*\* — \*\*\d+ open PRs\*\* across \*\*\d+ submitters\*\*\.)$",
+                  r"\1timestamp\2",
+                  value,
+              )
+              if len(new_body) > 65536:
+                  stop("The activity comment would exceed GitHub's comment limit; the previous comment was kept.")
+              if normalize(new_body) == normalize(current_body):
+                  print(f"Activity comment is already current ({len(pulls)} open PRs).")
+              else:
+                  api_json(
+                      f"/repos/{OWNER}/{REPOSITORY}/issues/comments/{comment.get('id')}",
+                      method="PATCH",
+                      payload={"body": new_body},
+                  )
+                  print(f"Updated the activity comment with {len(pulls)} open PRs across {len(groups)} submitters.")
+          else:
+              if len(managed_block) > 65536:
+                  stop("The activity comment would exceed GitHub's comment limit; no comment was created.")
+              api_json(
+                  f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments",
+                  method="POST",
+                  payload={"body": managed_block},
+              )
+              print(f"Created the activity comment with {len(pulls)} open PRs across {len(groups)} submitters.")
+          
+          PY
