@@ -600,10 +600,9 @@ jobs:
         if: ${{ !cancelled() && steps.macos-build.outcome == 'success' }}  # also after a runtime test failure
         shell: bash
         env:
-          # ps_ssharp: #1845 (the S#'s LOD bias, which a Metal sampler can't take). cs_fma_fused is newer than the job
-          # and wrong on MoltenVK: https://github.com/ItsNotRexed/Leonida/issues/3796#issuecomment-7086691314
+          # cs_fma_fused is newer than the job and wrong on MoltenVK:
+          # https://github.com/ItsNotRexed/Leonida/issues/3796#issuecomment-7086691314
           EXPECTED_FAILURES: >-
-            ps_ssharp
             cs_fma_fused
         run: |
           set +e
