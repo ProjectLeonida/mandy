@@ -79,6 +79,11 @@ Xbox device slot 48 is `(desc, riid, out)` with `riid = IID_ID3D12CommandQueue`.
 `Flags` limited to `D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT`, through the existing queue proxy works: four
 queues come from this slot, the first of them a compute queue. The first queue comes from slot 8, as on the PC.
 
+The title also sets bit `0x2` of `Flags` on one queue (a compute queue, right after device creation). The PC runtime
+has no such bit and refuses the whole description, and the title stops on its own assert (+0x2478866) when the queue
+is missing. The bit is accepted as a no-op and logged once, as the console does: it changes nothing about the queue
+that is created, and `GetDesc` hands the bit back.
+
 ### 3.3 Device slot 73 creates a command list
 
 Xbox device slot 73 is `(desc, allocator, pso, riid, out)`. `desc` is 16 bytes and its first word reads as the

@@ -18002,6 +18002,11 @@ public:
     // STUB
     void STDMETHODCALLTYPE RemoveDevice() override { removed_.store(true, std::memory_order_release); }
 
+    // Bits the console accepts in a D3D12_COMMAND_QUEUE_DESC and the PC runtime does not. The title asks for a
+    // compute queue with flags = 0x2 right after device creation; with the bit refused, CreateCommandQueue fails and
+    // the title stops on its own assert (+0x2478866). The bit has no PC meaning here, so it is accepted and logged.
+    static constexpr UINT kConsoleQueueFlags = 0x2u;
+
     HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
                                                  void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandQueue";
@@ -18012,8 +18017,14 @@ public:
             (desc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL &&
              desc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_HIGH &&
              desc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) ||
-            (desc->Flags & ~D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT) || desc->NodeMask > 1) {
+            (desc->Flags & ~(D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT | kConsoleQueueFlags)) || desc->NodeMask > 1) {
             log_once("CreateCommandQueue refused (type, priority, flags or node mask), type", desc->Type);
+            {
+                char detail[128];
+                std::snprintf(detail, sizeof detail, "  queue refused: priority=%d flags=%u node=%u",
+                              int(desc->Priority), unsigned(desc->Flags), unsigned(desc->NodeMask));
+                log_once(detail, int(desc->Type));
+            }
             return d3d12_trace::result(method, E_INVALIDARG);
         }
         // Global realtime priority needs SeIncreaseBasePriorityPrivilege enabled in the effective token, as on the
@@ -18055,6 +18066,8 @@ public:
             slot = chosen.index;
             sharing = (*users)[slot]++;
         }
+        if (desc->Flags & kConsoleQueueFlags)
+            log_once("CreateCommandQueue: console-only queue flag accepted as a no-op, flags", int(desc->Flags));
         const bool own_pool = users != &queue_users_;
         if (sharing)
             log_once("CreateCommandQueue: every Vulkan queue of the family is in use; this D3D12 queue shares one with "
