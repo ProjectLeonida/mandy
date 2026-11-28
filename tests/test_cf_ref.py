@@ -887,6 +887,88 @@ class ExportHaltStepAndErrorTests(CfRefTestCase):
                 f"\ts_endpgm {_enc_bytes(4)}",
             ])
 
+    def test_mask_and_vcmp_operand_width_mismatches_raise(self):
+        cases = [
+            # Wave64 _b64 / compare ops must reject 1-dword SGPRs, 4-dword SGPRs, and 32-bit *_lo/*_hi masks.
+            (64, ["s_mov_b64 s0, exec", "s_endpgm"]),
+            (64, ["s_mov_b64 s[0:3], exec", "s_endpgm"]),
+            (64, ["s_mov_b64 vcc_lo, exec", "s_endpgm"]),
+            (64, ["s_mov_b64 s[0:1], exec_lo", "s_endpgm"]),
+            (64, ["s_mov_b64 s[0:1], vcc_hi", "s_endpgm"]),
+            (64, ["s_and_b64 s0, vcc, exec", "s_endpgm"]),
+            (64, ["s_and_b64 s[0:1], vcc_lo, exec", "s_endpgm"]),
+            (64, ["s_and_saveexec_b64 s0, vcc", "s_endpgm"]),
+            (64, ["s_and_saveexec_b64 s[0:1], vcc_lo", "s_endpgm"]),
+            (64, ["v_cmp_eq_u32_e64 s[0:3], v0, 0", "s_endpgm"]),
+            (64, ["v_cmp_eq_u32_e64 vcc_lo, v0, 0", "s_endpgm"]),
+            # Wave32 _b32 / compare ops and wave64 _b32 ops must reject SGPR pairs.
+            (32, ["s_mov_b32 exec_lo, s[0:1]", "s_endpgm"]),
+            (32, ["s_mov_b32 s[0:1], exec_lo", "s_endpgm"]),
+            (32, ["s_and_b32 s[0:1], vcc_lo, exec_lo", "s_endpgm"]),
+            (32, ["s_and_saveexec_b32 s[0:1], vcc_lo", "s_endpgm"]),
+            (32, ["v_cmp_eq_u32_e64 s[0:1], v0, 0", "s_endpgm"]),
+            (64, ["s_and_b32 s[0:1], exec_lo, 1", "s_endpgm"]),
+        ]
+        for wave, insns in cases:
+            with self.subTest(wave=wave, insn=insns[0]):
+                with self.assertRaises(cpu_ref.Unsupported):
+                    self.run_items(insns, wave=wave)
+
+    def test_exec_zero_still_validates_vector_and_compare_operands(self):
+        cases = [
+            (32, ["s_mov_b32 exec_lo, 0", "v_add_nc_u32 s0, v0, v1", "s_endpgm"]),
+            (32, ["s_mov_b32 exec_lo, 0", "v_add_nc_u32 v0, v[1:2], v2", "s_endpgm"]),
+            (32, ["s_mov_b32 exec_lo, 0", "v_mbcnt_lo_u32_b32 s0, -1, 0", "s_endpgm"]),
+            (32, ["s_mov_b32 exec_lo, 0", "v_mbcnt_hi_u32_b32 v0, v[1:2], 0", "s_endpgm"]),
+            (32, ["s_mov_b32 exec_lo, 0", "v_cndmask_b32 s0, v1, v2", "s_endpgm"]),
+            (32, ["s_mov_b32 exec_lo, 0", "v_cndmask_b32 v0, v[1:2], v2", "s_endpgm"]),
+            (32, ["s_mov_b32 exec_lo, 0", "v_cmp_eq_u32_e32 vcc_lo, v[0:1], 0", "s_endpgm"]),
+            (64, ["s_mov_b64 exec, 0", "v_cmpx_eq_u32_e32 v[0:1], 0", "s_endpgm"]),
+        ]
+        for wave, insns in cases:
+            with self.subTest(wave=wave, insn=insns[1]):
+                with self.assertRaises(cpu_ref.Unsupported):
+                    self.run_items(insns, wave=wave)
+
+    def test_rejects_abs_neg_on_cf_ref_integer_mask_and_export_operands(self):
+        cases = [
+            (64, ["s_mov_b64 s[0:1], neg(1)", "s_endpgm"]),
+            (32, ["s_mov_b32 exec_lo, neg(1)", "s_endpgm"]),
+            (32, ["s_and_b32 exec_lo, -s0, 1", "s_endpgm"]),
+            (32, ["s_and_saveexec_b32 s0, |s1|", "s_endpgm"]),
+            (32, ["s_cmp_eq_u32 -s0, 0", "s_endpgm"]),
+            (32, ["s_sub_u32 s0, |s1|, 1", "s_endpgm"]),
+            (32, ["s_cselect_b32 s0, -s1, 0", "s_endpgm"]),
+            (32, ["v_add_nc_u32 v0, -v1, v2", "s_endpgm"]),
+            (32, ["v_mbcnt_lo_u32_b32 v0, |v1|, 0", "s_endpgm"]),
+            (32, ["v_cmp_eq_u32_e32 vcc_lo, -v0, 0", "s_endpgm"]),
+            (32, ["exp mrt0 v[0:1], v1, v2, v3 done vm", "s_endpgm"]),
+            (32, ["exp mrt0 -v0, v1, v2, v3 done vm", "s_endpgm"]),
+            (32, ["exp mrt0 |v0|, v1, v2, v3 done vm", "s_endpgm"]),
+        ]
+        for wave, insns in cases:
+            with self.subTest(wave=wave, insn=insns[0]):
+                with self.assertRaises(cpu_ref.Unsupported):
+                    self.run_items(insns, wave=wave)
+
+    def test_branch_rejects_out_of_range_simm16_and_modifiers(self):
+        for off in ("0x10000", "-32769", "neg(0)", "|0|"):
+            with self.subTest(off=off):
+                with self.assertRaises(cpu_ref.Unsupported):
+                    self.run_raw([f"\ts_branch {off} {_enc_bytes(4)}", f"\ts_endpgm {_enc_bytes(4)}"])
+
+    def test_duplicate_instruction_pc_raises_program_error(self):
+        info = {
+            "name": "dup_pc",
+            "code_start": 0,
+            "insns": [
+                {"op": "s_endpgm", "args": [], "mods": [], "enc": "00000000", "pc": 0},
+                {"op": "s_endpgm", "args": [], "mods": [], "enc": "00000000", "pc": 0},
+            ],
+        }
+        with self.assertRaisesRegex(cf_ref.ProgramError, "duplicate instruction pc"):
+            cf_ref.WaveMachine(info, wave=32)
+
 
 if __name__ == "__main__":
     unittest.main()

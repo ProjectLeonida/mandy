@@ -84,67 +84,117 @@ class WaveMachine(cpu_ref.Machine):
             if not ins.get("enc"):
                 raise ProgramError(f"instruction at index {i} ({ins['op']}) has no encoding bytes; "
                                    "branch targets need instruction sizes")
+            if ins["pc"] in self.by_pc:
+                raise ProgramError(f"duplicate instruction pc 0x{ins['pc']:x}")
             self.by_pc[ins["pc"]] = i
 
-    # -- masks ---------------------------------------------------------------------------------------------------
-    def _read_mask(self, arg):
-        """A wave-sized lane mask from an SGPR (pair), VCC, EXEC or an inline constant."""
+    # -- operand validation & masks ------------------------------------------------------------------------------
+    def _check_no_mods(self, op, arg):
+        if arg.get("abs") or arg.get("neg"):
+            raise Unsupported(op, self.pc, "abs/neg modifiers are not modelled")
+
+    def _check_vgpr_dst(self, op, dst):
+        self._check_no_mods(op, dst)
+        if dst.get("k") != "vgpr" or dst.get("n", 1) != 1:
+            raise Unsupported(op, self.pc, "vector destination must be a single VGPR")
+
+    def _check_int_src(self, op, arg, lane=0, *, scalar=False):
+        self._check_no_mods(op, arg)
+        if arg.get("k") in ("vgpr", "sgpr") and arg.get("n", 1) != 1:
+            raise Unsupported(op, self.pc, "multi-dword integer operand is not modelled")
+        return self._int_src(arg, lane, scalar=scalar)
+
+    def _read_mask(self, arg, width=None):
+        """A wave- or width-sized lane mask from an SGPR (pair), VCC, EXEC or an inline constant."""
+        width = self.wave if width is None else width
+        mask = MASK64 if width == 64 else MASK32
+        self._check_no_mods(arg.get("t", arg.get("k", "mask")), arg)
         k = arg["k"]
         if k == "sgpr":
+            want_n = 2 if width == 64 else 1
+            n = arg.get("n", 1)
+            if n != want_n:
+                name = "s[%d:%d]" % (arg["r"], arg["r"] + n - 1) if n > 1 else f"s{arg['r']}"
+                raise Unsupported(name, self.pc, f"{width}-bit mask operand needs {want_n} SGPR(s), got {n}")
             lo = self.sgpr.get(arg["r"], 0)
-            if arg.get("n", 1) >= 2:
-                return ((self.sgpr.get(arg["r"] + 1, 0) << 32) | lo) & self.wmask
-            return lo & self.wmask if self.wave == 32 else lo
+            if want_n == 2:
+                return ((self.sgpr.get(arg["r"] + 1, 0) << 32) | lo) & mask
+            return lo & mask
         if k == "special":
             t = arg["t"]
-            if t == "vcc":
-                return self.vcc & self.wmask
-            if t == "vcc_lo":
-                return self.vcc & MASK32
-            if t == "vcc_hi":
-                return (self.vcc >> 32) & MASK32
-            if t == "exec":
-                return self.exec & self.wmask
-            if t == "exec_lo":
-                return self.exec & MASK32
-            if t == "exec_hi":
-                return 0 if self.wave == 32 else (self.exec >> 32) & MASK32
-            if t == "null":
-                return 0
+            if width == 64:
+                if t == "vcc":
+                    return self.vcc & MASK64
+                if t == "exec":
+                    return self.exec & MASK64
+                if t == "null":
+                    return 0
+            else:
+                if t == "vcc" and self.wave == 32:
+                    return self.vcc & MASK32
+                if t == "vcc_lo":
+                    return self.vcc & MASK32
+                if t == "vcc_hi":
+                    return (self.vcc >> 32) & MASK32
+                if t == "exec" and self.wave == 32:
+                    return self.exec & MASK32
+                if t == "exec_lo":
+                    return self.exec & MASK32
+                if t == "exec_hi":
+                    return 0 if self.wave == 32 else (self.exec >> 32) & MASK32
+                if t == "null":
+                    return 0
         if k == "imm":
-            return arg["v"] & self.wmask
+            return arg["v"] & mask
         raise Unsupported(arg.get("t", k), self.pc, "mask operand is not modelled")
 
-    def _write_mask(self, dst, value):
+    def _write_mask(self, dst, value, width=None):
+        width = self.wave if width is None else width
+        self._check_no_mods(dst.get("t", dst.get("k", "mask")), dst)
         k = dst["k"]
         if k == "sgpr":
+            want_n = 2 if width == 64 else 1
+            n = dst.get("n", 1)
+            if n != want_n:
+                name = "s[%d:%d]" % (dst["r"], dst["r"] + n - 1) if n > 1 else f"s{dst['r']}"
+                raise Unsupported(name, self.pc, f"{width}-bit mask destination needs {want_n} SGPR(s), got {n}")
             self.sgpr[dst["r"]] = value & MASK32
-            if dst.get("n", 1) >= 2:
+            if want_n == 2:
                 self.sgpr[dst["r"] + 1] = (value >> 32) & MASK32
             return
         if k == "special":
             t = dst["t"]
-            if t == "vcc":
-                self.vcc = (value & MASK64) if self.wave == 64 else ((self.vcc & ~MASK32 & MASK64) | (value & MASK32))
-                return
-            if t == "vcc_lo":
-                self.vcc = (self.vcc & ~MASK32 & MASK64) | (value & MASK32)
-                return
-            if t == "vcc_hi":
-                self.vcc = (self.vcc & MASK32) | ((value & MASK32) << 32)
-                return
-            if t == "exec":
-                self.exec = value & MASK64
-                return
-            if t == "exec_lo":
-                self.exec = (self.exec & ~MASK32 & MASK64) | (value & MASK32)
-                return
-            if t == "exec_hi":
-                if self.wave == 64:
-                    self.exec = (self.exec & MASK32) | ((value & MASK32) << 32)
-                return
-            if t == "null":
-                return
+            if width == 64:
+                if t == "vcc":
+                    self.vcc = value & MASK64
+                    return
+                if t == "exec":
+                    self.exec = value & MASK64
+                    return
+                if t == "null":
+                    return
+            else:
+                if t == "vcc" and self.wave == 32:
+                    self.vcc = (self.vcc & ~MASK32 & MASK64) | (value & MASK32)
+                    return
+                if t == "vcc_lo":
+                    self.vcc = (self.vcc & ~MASK32 & MASK64) | (value & MASK32)
+                    return
+                if t == "vcc_hi":
+                    self.vcc = (self.vcc & MASK32) | ((value & MASK32) << 32)
+                    return
+                if t == "exec" and self.wave == 32:
+                    self.exec = (self.exec & ~MASK32 & MASK64) | (value & MASK32)
+                    return
+                if t == "exec_lo":
+                    self.exec = (self.exec & ~MASK32 & MASK64) | (value & MASK32)
+                    return
+                if t == "exec_hi":
+                    if self.wave == 64:
+                        self.exec = (self.exec & MASK32) | ((value & MASK32) << 32)
+                    return
+                if t == "null":
+                    return
         raise Unsupported(dst.get("t", k), self.pc, "mask destination is not modelled")
 
     def _wide(self, base):
@@ -165,6 +215,7 @@ class WaveMachine(cpu_ref.Machine):
         return super()._read_special(name)
 
     def _write_scalar_dst(self, dst, value):
+        self._check_no_mods(dst.get("t", dst.get("k", "dst")), dst)
         if dst.get("k") == "special" and dst.get("t") == "exec_hi" and self.wave == 32:
             return
         super()._write_scalar_dst(dst, value)
@@ -209,21 +260,27 @@ class WaveMachine(cpu_ref.Machine):
             return self._branch(base, a)
         if base in ("v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_mul_lo_u32"):
             self._expect(ins, 3)
+            self._check_vgpr_dst(op, a[0])
+            self._check_int_src(op, a[1], 0)
+            self._check_int_src(op, a[2], 0)
             for lane in self._active_lanes():
-                x, y = self._int_src(a[1], lane), self._int_src(a[2], lane)
+                x, y = self._check_int_src(op, a[1], lane), self._check_int_src(op, a[2], lane)
                 r = {"v_add_nc_u32": x + y, "v_sub_nc_u32": x - y, "v_subrev_nc_u32": y - x,
                      "v_mul_lo_u32": x * y}[base]
                 self._write_vgpr(a[0], lane, r)
             return None
         if base in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
             self._expect(ins, 3)
+            self._check_vgpr_dst(op, a[0])
+            self._check_int_src(op, a[1], 0)
+            self._check_int_src(op, a[2], 0)
             for lane in self._active_lanes():
-                m = self._int_src(a[1], lane)
+                m = self._check_int_src(op, a[1], lane)
                 if base == "v_mbcnt_lo_u32_b32":
                     below = m & ((1 << min(lane, 32)) - 1)
                 else:
                     below = m & ((1 << max(lane - 32, 0)) - 1)
-                self._write_vgpr(a[0], lane, below.bit_count() + self._int_src(a[2], lane))
+                self._write_vgpr(a[0], lane, below.bit_count() + self._check_int_src(op, a[2], lane))
             return None
         if base.startswith(("v_cmp_", "v_cmpx_")):
             return self._vcmp(ins, base)
@@ -232,7 +289,7 @@ class WaveMachine(cpu_ref.Machine):
             cc, _, ty = base[len("s_cmp_"):].partition("_")
             if cc not in _CMP or ty not in ("u32", "i32"):
                 raise Unsupported(op, self.pc, "compare is not modelled")
-            x, y = self._int_src(a[0], 0, scalar=True), self._int_src(a[1], 0, scalar=True)
+            x, y = self._check_int_src(op, a[0], 0, scalar=True), self._check_int_src(op, a[1], 0, scalar=True)
             if ty == "i32":
                 x, y = _signed(x), _signed(y)
             self.scc = 1 if _CMP[cc](x, y) else 0
@@ -243,9 +300,9 @@ class WaveMachine(cpu_ref.Machine):
             kind = base[2:].split("_saveexec")[0]
             if kind not in _SAVEEXEC:
                 raise Unsupported(op, self.pc, "saveexec variant is not modelled")
-            s0 = self._read_mask(a[1])
+            s0 = self._read_mask(a[1], width=self.wave)
             old = self.exec & self.wmask
-            self._write_mask(a[0], old)
+            self._write_mask(a[0], old, width=self.wave)
             new = _SAVEEXEC[kind](s0, old, self.wmask) & self.wmask
             self.exec = new if self.wave == 64 else (self.exec & ~MASK32) | new
             self.scc = 1 if new else 0
@@ -257,12 +314,13 @@ class WaveMachine(cpu_ref.Machine):
             if parts[2] == "b64" or mask_op:
                 if parts[2] == "b64" or any(x["k"] == "special" and x["t"] in ("exec", "vcc") for x in a):
                     self._check_width(base, op)
-                mask = MASK64 if parts[2] == "b64" else MASK32
-                x, y = self._read_mask(a[1]) & mask, self._read_mask(a[2]) & mask
+                width = 64 if parts[2] == "b64" else 32
+                mask = MASK64 if width == 64 else MASK32
+                x, y = self._read_mask(a[1], width=width), self._read_mask(a[2], width=width)
                 r = _SOP2_LOGIC[parts[1]](x, y, mask) & mask
-                self._write_mask(a[0], r)
+                self._write_mask(a[0], r, width=width)
             else:
-                x, y = self._int_src(a[1], 0, scalar=True), self._int_src(a[2], 0, scalar=True)
+                x, y = self._check_int_src(op, a[1], 0, scalar=True), self._check_int_src(op, a[2], 0, scalar=True)
                 r = _SOP2_LOGIC[parts[1]](x, y, MASK32) & MASK32
                 self._write_scalar_dst(a[0], r)
             self.scc = 1 if r else 0
@@ -271,20 +329,19 @@ class WaveMachine(cpu_ref.Machine):
             if self.wave != 64:
                 raise Unsupported(op, self.pc, "s_mov_b64 in a wave32 program is not modelled")
             self._expect(ins, 2)
-            src = a[1]
-            v = (src["v"] & MASK64) if src["k"] == "imm" else self._read_mask(src)
-            self._write_mask(a[0], v)
+            v = self._read_mask(a[1], width=64)
+            self._write_mask(a[0], v, width=64)
             return None
         if base == "s_mov_b32" and self._touches_mask(a):
             if any(x["k"] == "special" and x["t"] in ("exec", "vcc") for x in a):
                 self._check_width(base, op)
             self._expect(ins, 2)
-            v = a[1]["v"] & MASK32 if a[1]["k"] == "imm" else self._read_mask(a[1]) & MASK32
-            self._write_mask(a[0], v)
+            v = self._read_mask(a[1], width=32)
+            self._write_mask(a[0], v, width=32)
             return None
         if base in ("s_sub_u32", "s_add_i32", "s_sub_i32"):
             self._expect(ins, 3)
-            x, y = self._int_src(a[1], 0, scalar=True), self._int_src(a[2], 0, scalar=True)
+            x, y = self._check_int_src(op, a[1], 0, scalar=True), self._check_int_src(op, a[2], 0, scalar=True)
             if base == "s_sub_u32":
                 r, self.scc = (x - y) & MASK32, 1 if y > x else 0
             else:
@@ -298,14 +355,17 @@ class WaveMachine(cpu_ref.Machine):
             return None
         if base == "s_cselect_b32":
             self._expect(ins, 3)
-            x, y = self._int_src(a[1], 0, scalar=True), self._int_src(a[2], 0, scalar=True)
+            x, y = self._check_int_src(op, a[1], 0, scalar=True), self._check_int_src(op, a[2], 0, scalar=True)
             self._write_scalar_dst(a[0], x if self.scc else y)
             return None
         if base == "v_cndmask_b32" and self.wave == 32 and len(a) == 3:
             # VOP2 form: the implicit condition is VCC_LO in wave32 (cpu_ref models a wave64 VCC).
+            self._check_vgpr_dst(op, a[0])
+            self._check_int_src(op, a[1], 0)
+            self._check_int_src(op, a[2], 0)
             for lane in self._active_lanes():
                 bit = (self.vcc >> lane) & 1
-                self._write_vgpr(a[0], lane, self._int_src(a[2], lane) if bit else self._int_src(a[1], lane))
+                self._write_vgpr(a[0], lane, self._check_int_src(op, a[2], lane) if bit else self._check_int_src(op, a[1], lane))
             return None
         super().step(ins)
         return None
@@ -318,9 +378,12 @@ class WaveMachine(cpu_ref.Machine):
     def _branch(self, base, a):
         if len(a) != 1 or a[0]["k"] not in ("imm", "label"):
             raise Unsupported(base, self.pc, "branch operand is not an immediate offset")
+        self._check_no_mods(base, a[0])
         off = a[0]["v"] if a[0]["k"] == "imm" else None
         if off is None:
             raise Unsupported(base, self.pc, "symbolic branch labels are not modelled")
+        if off < -32768 or off > 65535:
+            raise Unsupported(base, self.pc, f"branch offset {off} does not fit in a 16-bit simm16")
         target = self.next_pc + 4 * _signed(off, 16)
         cond = {
             "s_branch": True,
@@ -335,7 +398,8 @@ class WaveMachine(cpu_ref.Machine):
         bad_mods = [m for m in (ins.get("mods") or []) if m not in ("done", "vm")]
         if bad_mods:
             raise Unsupported("exp", self.pc, f"modifier(s) {', '.join(bad_mods)} are not modelled")
-        if len(a) != 5 or a[0].get("t") != "mrt0" or any(x["k"] != "vgpr" for x in a[1:]):
+        if (len(a) != 5 or a[0].get("t") != "mrt0" or a[0].get("abs") or a[0].get("neg")
+                or any(x["k"] != "vgpr" or x.get("n", 1) != 1 or x.get("abs") or x.get("neg") for x in a[1:])):
             raise Unsupported("exp", self.pc, "only `exp mrt0 vA, vB, vC, vD` is modelled")
         for lane in self._active_lanes():
             self.exports[lane] = tuple(self._vgpr(x["r"], lane) for x in a[1:])
@@ -353,9 +417,11 @@ class WaveMachine(cpu_ref.Machine):
             raise Unsupported(op, self.pc, "an RDNA2 v_cmpx has no scalar destination")
         if len(srcs) != 2:
             raise Unsupported(op, self.pc, f"expected 2 compare sources, got {len(srcs)}")
+        self._check_int_src(op, srcs[0], 0)
+        self._check_int_src(op, srcs[1], 0)
         mask = 0
         for lane in self._active_lanes():
-            x, y = self._int_src(srcs[0], lane), self._int_src(srcs[1], lane)
+            x, y = self._check_int_src(op, srcs[0], lane), self._check_int_src(op, srcs[1], lane)
             if ty == "i32":
                 x, y = _signed(x), _signed(y)
             if _CMP[cc](x, y):
@@ -363,12 +429,7 @@ class WaveMachine(cpu_ref.Machine):
         if cmpx:
             self.exec = mask if self.wave == 64 else (self.exec & ~MASK32) | mask
             return None
-        dst = a[0]
-        if self.wave == 32 and dst["k"] == "special" and dst["t"] == "vcc":
-            dst = {"k": "special", "t": "vcc_lo"}
-        if self.wave == 64 and dst["k"] == "sgpr" and dst.get("n", 1) < 2:
-            raise Unsupported(op, self.pc, "a wave64 compare needs an SGPR pair destination")
-        self._write_mask(dst, mask)
+        self._write_mask(a[0], mask, width=self.wave)
         return None
 
 
