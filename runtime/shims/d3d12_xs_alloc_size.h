@@ -236,6 +236,7 @@ inline UINT64 console_unordered_access_size(const D3D12_RESOURCE_DESC& desc, UIN
 // Rounds up to a multiple of `to`, stopping at the last multiple below 2^64 instead of wrapping (as the PC device's
 // totals do).
 inline UINT64 align_up_saturating(UINT64 value, UINT64 to) {
+    if (to == 0) return value;
     return value > UINT64_MAX - (to - 1) ? UINT64_MAX / to * to : (value + to - 1) / to * to;
 }
 
