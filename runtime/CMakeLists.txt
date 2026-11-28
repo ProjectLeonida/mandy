@@ -2983,8 +2983,8 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(xbox_linear_texture_map PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
                          ENVIRONMENT "LEONIDA_LINEAR_MAP_FIRST=1")
     set_tests_properties(d3d12_xmem_placed PROPERTIES SKIP_RETURN_CODE 77)
-    # A vertex or index view of title memory that can be neither imported nor shadowed keeps no stand-in buffer and is
-    # tried again after a delay, not at every bind.
+    # A vertex or index view of title memory that can be neither imported nor shadowed gets no stand-in buffer and is
+    # tried again after a delay, not at every bind; after a refusal no other view is tried for that second either.
     add_executable(d3d12_title_buffer_fallback_test test/d3d12_title_buffer_fallback_test.cpp)
     target_link_libraries(d3d12_title_buffer_fallback_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_title_buffer_fallback_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
