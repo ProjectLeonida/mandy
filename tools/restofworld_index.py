@@ -332,8 +332,8 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                                 if total > max_inflate:
                                     too_big = True
                                     break
-                                if len(head) < 256:
-                                    head += chunk[:256 - len(head)]
+                                if len(head) < 512:   # _printable samples 512 bytes, as from a carved file
+                                    head += chunk[:512 - len(head)]
                                 if keep_body:
                                     if len(head) >= 16:
                                         is_psin = head[:4] == b"PSIN"
