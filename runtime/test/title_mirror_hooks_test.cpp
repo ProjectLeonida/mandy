@@ -743,6 +743,106 @@ int lock_free_pending_fast_paths() {
     return 0;
 }
 
+int range_sum_piece_hashing() {
+    Fixture f;
+    TitleMirror mirror(f.hooks());
+    EXPECT(mirror.cover(kBase, kBase + 8 * kPage));
+
+    std::vector<std::uint8_t> f0(kPage, 0x11);
+    std::vector<std::uint8_t> f1(kPage, 0x22);
+    std::vector<std::uint8_t> f2(kPage, 0x33);
+    mirror.map(kBase + 0 * kPage, f0.data(), nullptr, 1);
+    mirror.map(kBase + 1 * kPage, f1.data(), nullptr, 1);
+    EXPECT(mirror.flush(1));
+
+    // Error / boundary cases: zero bytes, overflow, unmirrored page.
+    std::uint64_t h = 0;
+    EXPECT(!mirror.range_sum(kBase, 0, h));
+    EXPECT(!mirror.range_sum(UINT64_MAX - 10, 100, h));
+    EXPECT(!mirror.range_sum(kBase + 2 * kPage, 256, h));               // page 2 not mapped
+    EXPECT(!mirror.range_sum(kBase + kPage, 2 * kPage, h));             // crosses into unmapped page 2
+
+    // 1. Sub-page range [512, 512 + 1024) inside page 0 (pieces [2, 6)).
+    const std::uint64_t tex_a = kBase + 512;
+    const std::uint64_t tex_a_bytes = 1024;
+    std::uint64_t ha0 = 0;
+    EXPECT(mirror.range_sum(tex_a, tex_a_bytes, ha0));
+
+    // Modify neighbor byte in a DIFFERENT 256-byte piece of the SAME 64 KiB page (piece 0 & piece 6):
+    // range_sum for tex_a MUST stay identical!
+    f0[10] = 0xAA;           // piece 0 (before tex_a)
+    f0[6 * 256 + 7] = 0xBB;  // piece 6 (right after tex_a)
+    EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
+    std::uint64_t ha1 = 0;
+    EXPECT(mirror.range_sum(tex_a, tex_a_bytes, ha1));
+    EXPECT(ha1 == ha0);
+
+    // Modify a byte INSIDE tex_a (piece 4): range_sum MUST change!
+    f0[4 * 256 + 13] = 0xCC;
+    EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
+    std::uint64_t ha2 = 0;
+    EXPECT(mirror.range_sum(tex_a, tex_a_bytes, ha2));
+    EXPECT(ha2 != ha0);
+
+    // Revert byte back to original value: range_sum MUST return to ha0!
+    f0[4 * 256 + 13] = 0x11;
+    EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
+    std::uint64_t ha3 = 0;
+    EXPECT(mirror.range_sum(tex_a, tex_a_bytes, ha3));
+    EXPECT(ha3 == ha0);
+
+    // 2. Unaligned multi-page range crossing page 0 -> page 1: [kBase + kPage - 100, kBase + kPage + 300).
+    // Overlaps piece 255 of page 0 and pieces [0, 2) of page 1.
+    const std::uint64_t cross_va = kBase + kPage - 100;
+    const std::uint64_t cross_bytes = 400;
+    std::uint64_t hc0 = 0;
+    EXPECT(mirror.range_sum(cross_va, cross_bytes, hc0));
+
+    // Neighbor write in piece 254 of page 0 and piece 2 of page 1 -> MUST NOT change cross_va's range_sum!
+    f0[254 * 256 + 255] = 0x44;
+    f1[2 * 256 + 0] = 0x55;
+    EXPECT(mirror.dirty(kBase) && mirror.dirty(kBase + kPage) && mirror.upload() == 2);
+    std::uint64_t hc1 = 0;
+    EXPECT(mirror.range_sum(cross_va, cross_bytes, hc1));
+    EXPECT(hc1 == hc0);
+
+    // Write inside piece 255 of page 0 -> MUST change cross_va's range_sum!
+    f0[kPage - 1] = 0x66;
+    EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
+    std::uint64_t hc2 = 0;
+    EXPECT(mirror.range_sum(cross_va, cross_bytes, hc2));
+    EXPECT(hc2 != hc0);
+
+    // Write inside piece 1 of page 1 -> MUST change cross_va's range_sum again!
+    f1[256 + 43] = 0x77;
+    EXPECT(mirror.dirty(kBase + kPage) && mirror.upload() == 1);
+    std::uint64_t hc3 = 0;
+    EXPECT(mirror.range_sum(cross_va, cross_bytes, hc3));
+    EXPECT(hc3 != hc2);
+
+    // 3. write_back() updates home.sums[], so range_sum() MUST reflect GPU write-backs!
+    const auto write = [](std::uint64_t dst, const std::uint8_t* bytes, std::size_t n) {
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), bytes, n);
+        return true;
+    };
+    mirror.home_bytes(kBase + kPage)[0 * 256 + 12] = 0xEE;  // GPU writes piece 0 of page 1 (inside cross_va)
+    EXPECT(mirror.write_back(kBase + kPage, kBase + 2 * kPage, write) == 256);
+    EXPECT(f1[12] == 0xEE);
+    std::uint64_t hc4 = 0;
+    EXPECT(mirror.range_sum(cross_va, cross_bytes, hc4));
+    EXPECT(hc4 != hc3);
+
+    // 4. Remap page 1 to f2 (different bytes): range_sum() MUST change!
+    mirror.map(kBase + kPage, f2.data(), nullptr, 2);
+    EXPECT(mirror.flush(2));
+    std::uint64_t hc5 = 0;
+    EXPECT(mirror.range_sum(cross_va, cross_bytes, hc5));
+    EXPECT(hc5 != hc4);
+
+    std::printf("range_sum_piece_hashing: same-page neighbor invariance, multi-page unaligned, write_back, remap ok\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -757,6 +857,7 @@ int main() {
     if (make_copy_aba_staleness()) return 1;
     if (reentrant_rehash_in_alias_and_handoff()) return 1;
     if (lock_free_pending_fast_paths()) return 1;
+    if (range_sum_piece_hashing()) return 1;
     std::printf("title_mirror_hooks_test: ok\n");
     return 0;
 }

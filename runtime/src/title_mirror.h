@@ -487,6 +487,33 @@ public:
         return true;
     }
     bool mirrored(std::uint64_t va) const { return pages_.count(va & ~(kPage - 1)) != 0; }
+    // Mixes the cached 256-byte piece hashes (Home::sums[]) for every 256-byte piece overlapping [va, va + bytes).
+    // Returns false when bytes == 0, the range overflows, or any 64 KiB page in [va, va + bytes) is not mirrored or
+    // has no home. Zero reads of title or device memory: O(overlapping 256-byte pieces).
+    bool range_sum(std::uint64_t va, std::uint64_t bytes, std::uint64_t& out_hash) const {
+        if (!bytes || va + bytes < va) return false;
+        const std::uint64_t end = va + bytes;
+        std::uint64_t h = 14695981039346656037ull ^ bytes;
+        for (std::uint64_t page = va & ~(kPage - 1); page < end; page += kPage) {
+            const auto mapped = pages_.find(page);
+            if (mapped == pages_.end()) return false;
+            const auto found = homes_.find(mapped->second);
+            if (found == homes_.end()) return false;
+            const std::uint64_t page_end = (page <= UINT64_MAX - kPage) ? (page + kPage) : UINT64_MAX;
+            const std::uint64_t lo = std::max(va, page);
+            const std::uint64_t hi = std::min(end, page_end);
+            const std::size_t k0 = std::size_t((lo - page) / kPiece);
+            const std::size_t k1 = std::size_t((hi - page + kPiece - 1) / kPiece);
+            const std::uint64_t* const sums = found->second.sums.get();
+            for (std::size_t k = k0; k < k1; ++k) {
+                h = (h ^ sums[k]) * 1099511628211ull;
+                h ^= h >> 29;
+            }
+            if (page > UINT64_MAX - kPage) break;
+        }
+        out_hash = h;
+        return true;
+    }
     // The physical page's bytes the mirrored page at `va` shows (its frame; for ordinary memory the page itself).
     std::uint8_t* frame_at(std::uint64_t va) const {
         const auto page = pages_.find(va & ~(kPage - 1));

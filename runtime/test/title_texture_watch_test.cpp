@@ -4,6 +4,7 @@
 #include "../src/title_texture_watch.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <map>
 #include <set>
@@ -431,8 +432,173 @@ int main() {
         EXPECT((pass() == V{2}));
         EXPECT(reserves == 1);
     }
+    {  // Round 2.1: note_changed() / note_changed_and_for_each() on already-armed unchanged tiles skips redundant
+       // watch_.arm(), while remapped, faulted, hot, pinned, and rearm=true tiles STILL call watch_.arm().
+        FakeWatch f;
+        Watch w(f);
+        w.track(1, base, 2 * kTile);
+        w.track(2, base + 4 * kTile, kTile);
+        EXPECT((collect(w) == V{1, 2}));
+        const std::uint64_t arms_initial = w.stats().arms;
+        EXPECT(arms_initial == 3);
+
+        // 1. note_changed_and_for_each on already-armed unchanged tiles: names textures & populates `written`,
+        //    ZERO redundant watch_.arm() calls!
+        std::vector<std::uint64_t> over;
+        w.note_changed_and_for_each(base, base + 5 * kTile, [&](std::uint64_t k) { over.push_back(k); });
+        std::sort(over.begin(), over.end());
+        EXPECT((over == V{1, 2}));
+        std::vector<std::uint64_t> seen;
+        std::vector<std::uintptr_t> written_1, written_2;
+        w.collect([&](std::uint64_t k) {
+            seen.push_back(k);
+            auto look = w.examine(k, k == 1 ? &written_1 : &written_2);
+            EXPECT(look == Watch::Look::armed);
+        });
+        EXPECT((seen == V{1, 2}));
+        EXPECT(written_1.size() == 2 && written_2.size() == 1);
+        EXPECT(w.stats().arms == arms_initial);  // ZERO redundant watch_.arm() calls!
+
+        // 2. Remap (mapping moved) + note_changed: MUST call watch_.arm() and pick up new aliases.
+        const std::uintptr_t alias_addr = 0x5500000000;
+        f.alias[base] = {alias_addr};
+        f.write(base, true);
+        w.note_changed(base, base + kTile);
+        EXPECT((collect(w) == V{1}));
+        EXPECT(w.stats().arms == arms_initial + 1);
+        EXPECT(f.cells.count(alias_addr) && f.cells.at(alias_addr).armed);
+
+        // 3. Faulted (version moved) + pinned: MUST call watch_.arm() and return Look::busy.
+        const std::uint64_t arms_before_pin = w.stats().arms;
+        f.write(base + kTile);
+        f.pinned.insert(base + kTile);
+        w.note_changed(base + kTile, base + 2 * kTile);
+        Watch::Look pin_look = Watch::Look::armed;
+        w.collect([&](std::uint64_t k) { pin_look = w.examine(k); });
+        EXPECT(pin_look == Watch::Look::busy);
+        EXPECT(w.stats().arms == arms_before_pin + 1);
+        f.pinned.clear();
+        EXPECT((collect(w) == V{1}));  // armed once unpinned
+        EXPECT(w.stats().arms == arms_before_pin + 2);
+
+        // 4. Hot tile: MUST still call watch_.arm() on hot pass.
+        const std::uint64_t arms_before_hot = w.stats().arms;
+        f.hot = {base + 4 * kTile};
+        EXPECT((collect(w) == V{2}));
+        EXPECT(w.stats().arms == arms_before_hot + 1);
+        f.hot.clear();
+        f.write(base + 4 * kTile, true);
+        EXPECT((collect(w) == V{2}));
+        EXPECT(w.stats().arms == arms_before_hot + 2);
+
+        // 5. Explicit rearm=true (mapped texture whose pages may be committed without xmem): MUST call watch_.arm().
+        const std::uint64_t arms_before_rearm = w.stats().arms;
+        w.note_changed(base + 4 * kTile, base + 5 * kTile, true);
+        EXPECT((collect(w) == V{2}));
+        EXPECT(w.stats().arms == arms_before_rearm + 1);
+
+        // 6. Shared-tile re-examine safety (for synced_frames reuse gate `look == armed && arms == arms_before`):
+        //    - Two textures sharing a non-hot tile: first examine() arms (+1), second examine() with NO concurrent
+        //      write keeps arms unchanged (+0), whereas a concurrent write between them bumps version and arms (+1)!
+        //    - Two textures sharing a hot tile: BOTH examine() calls MUST delegate to watch_.arm() (+1 each) so a
+        //      hot tile never appears unchanged/armed to the second texture in the same pass!
+        w.track(10, base + 8 * kTile, 0x4000);
+        w.track(11, base + 8 * kTile + 0x8000, 0x4000);
+        EXPECT((collect(w) == V{10, 11}));
+        // 6a. Single pre-pass fault on shared tile, no concurrent write between examine(10) and examine(11):
+        f.write(base + 8 * kTile);
+        std::vector<std::uint64_t> shared_keys;
+        w.collect([&](std::uint64_t k) { shared_keys.push_back(k); });
+        EXPECT((shared_keys == V{10, 11}));
+        const std::uint64_t a0 = w.stats().arms;
+        EXPECT(w.examine(10) == Watch::Look::armed && w.stats().arms == a0 + 1);
+        const std::uint64_t a1 = w.stats().arms;
+        EXPECT(w.examine(11) == Watch::Look::armed && w.stats().arms == a1);  // unchanged since examine(10)
+
+        // 6b. Concurrent write T2 lands on shared tile BETWEEN examine(10) and examine(11):
+        f.write(base + 8 * kTile);
+        shared_keys.clear();
+        w.collect([&](std::uint64_t k) { shared_keys.push_back(k); });
+        EXPECT((shared_keys == V{10, 11}));
+        const std::uint64_t b0 = w.stats().arms;
+        EXPECT(w.examine(10) == Watch::Look::armed && w.stats().arms == b0 + 1);
+        f.write(base + 8 * kTile + 0x8010);  // concurrent title write to texture 11 before examine(11)!
+        const std::uint64_t b1 = w.stats().arms;
+        EXPECT(w.examine(11) == Watch::Look::armed && w.stats().arms == b1 + 1);  // MUST arm (+1) to signal resync!
+
+        // 6c. Shared HOT tile: BOTH examine(10) and examine(11) MUST call watch_.arm() (+1 each)!
+        f.hot = {base + 8 * kTile};
+        shared_keys.clear();
+        w.collect([&](std::uint64_t k) { shared_keys.push_back(k); });
+        EXPECT((shared_keys == V{10, 11}));
+        const std::uint64_t c0 = w.stats().arms;
+        EXPECT(w.examine(10) == Watch::Look::armed && w.stats().arms == c0 + 1);
+        const std::uint64_t c1 = w.stats().arms;
+        EXPECT(w.examine(11) == Watch::Look::armed && w.stats().arms == c1 + 1);  // hot tile never skips arm()!
+        f.hot.clear();
+        f.write(base + 8 * kTile, true);
+        EXPECT((collect(w) == V{10, 11}));
+    }
+    {  // Round 2.1: 86k-tile scale test verifying O(overlapping) chunked region index (no O(86k) std::sort).
+        struct FastScaleWatch {
+            struct Cell {
+                std::atomic<std::uint64_t> version{1}, mapping{1};
+            };
+            Cell shared_cell;
+            Cell* acquire(std::uintptr_t) { return &shared_cell; }
+            void release(std::uintptr_t) {}
+            int arm(std::uintptr_t, Cell&) { return 1; }
+            void aliases(std::uintptr_t, std::vector<std::uintptr_t>&) {}
+            void hot_tiles(std::vector<std::uintptr_t>& out) { out.clear(); }
+            void take_written(std::vector<std::uintptr_t>& out, bool& lost) {
+                out.clear();
+                lost = false;
+            }
+            bool enabled() const { return true; }
+            bool has_written() const { return false; }
+            std::uint64_t hot_generation() const { return 0; }
+        };
+        FastScaleWatch sf;
+        leonida::TitleTextureWatch<FastScaleWatch> sw(sf);
+        constexpr std::size_t kTextures = 43000;  // 2 tiles each = 86,000 tiles across ~336 x 16 MiB regions
+        for (std::size_t i = 0; i < kTextures; ++i) {
+            sw.track(i + 1, base + i * 2 * kTile, 2 * kTile);
+        }
+        EXPECT(sw.tiles() == kTextures * 2);
+        sw.collect([&](std::uint64_t k) { sw.examine(k); });
+
+        // Interleave track/untrack mutations with > 4 MiB range queries (20 iterations).
+        // Previously each track/untrack dirtied sorted_tiles_ and forced O(86k) std::sort (~5-12 ms each!).
+        constexpr std::size_t kIters = 20;
+        const std::uintptr_t probe_from = base + 50000 * kTile;  // spans region boundary
+        const std::uintptr_t probe_to = probe_from + 128 * kTile;  // 8 MiB (> 4 MiB threshold)
+        std::size_t total_over = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (std::size_t iter = 0; iter < kIters; ++iter) {
+            const std::uint64_t temp_key = 1000000 + iter;
+            sw.track(temp_key, base + (kTextures * 2 + iter * 2) * kTile, 2 * kTile);
+            std::size_t over_count = 0;
+            sw.note_changed_and_for_each(probe_from, probe_to, [&](std::uint64_t) { ++over_count; });
+            EXPECT(over_count == 64);  // 128 tiles / 2 tiles per texture = 64 textures
+            total_over += over_count;
+            sw.untrack(temp_key);
+        }
+        const auto elapsed_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        const double per_iter_ms = double(elapsed_us) / 1000.0 / double(kIters);
+        EXPECT(total_over == kIters * 64);
+        EXPECT(per_iter_ms < 0.5);
+        // Untrack one texture inside [probe_from, probe_to) and verify region index swap-and-pop stays exact.
+        sw.untrack(25001);  // covers tiles 50000..50001
+        std::size_t after_untrack = 0;
+        sw.for_each_over(probe_from, probe_to, [&](std::uint64_t) { ++after_untrack; });
+        EXPECT(after_untrack == 63);
+        std::printf("86k-tile region index: %.4f ms/iter across %zu tiles (%zu iters, total %lld us)\n",
+                    per_iter_ms, sw.tiles(), kIters, static_cast<long long>(elapsed_us));
+    }
     if (failures) return 1;
     std::puts("title texture watch: new, untouched, one page, two addresses, remap, every frame, unarmable, kernel "
-              "write in progress, lost queue, O(1) fast-path, buffer-hot decoupling, 1-tile hash-before-reserve");
+              "write in progress, lost queue, O(1) fast-path, buffer-hot decoupling, 1-tile hash-before-reserve, "
+              "note_changed arm-skip, 86k-tile region index");
     return 0;
 }

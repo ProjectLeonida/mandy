@@ -3116,7 +3116,9 @@ struct DeviceState {
     void index_texture(const TitleTexture& t);
     bool page_mirror_texture_chunk(std::uint64_t cpu, std::uint64_t gpu, std::uint64_t bytes, VkBuffer& buffer,
                                    VkDeviceSize& offset, VkDeviceSize& chunk_size, VkSemaphore& timeline,
-                                   std::uint64_t& value);
+                                   std::uint64_t& value, std::uint64_t& mirror_hash,
+                                   std::unordered_set<std::uint8_t*>* synced_frames = nullptr,
+                                   bool reuse_synced_frames = false);
     // The CPU-view ranges of the registered GPU-written textures (render targets, depth, unordered access), by their
     // registry address. A texture over such memory is not filled from it (index_texture): the title's pages there
     // hold what the CPU last put there, never what our GPU renders into the image, and a fill uploaded those old
@@ -15877,6 +15879,8 @@ struct TitleTexture {
     bool write_combined = false;            // cached PAGE_WRITECOMBINE from VirtualQuery; invalidated on remap
     bool write_combined_known = false;
     bool gpu_uploaded = false;              // last upload came directly from TitleMirror (Stage 3b GPU detile/copy)
+    std::uint64_t mirror_hash = 0;          // TitleMirror::range_sum() as of the last Stage 3b GPU upload
+    bool mirror_hash_valid = false;
     std::uint64_t fills = 0;
 
     bool is_write_combined() {
@@ -15965,7 +15969,9 @@ void DeviceState::index_texture(const TitleTexture& t) {
 
 bool DeviceState::page_mirror_texture_chunk(std::uint64_t cpu, std::uint64_t gpu, std::uint64_t bytes,
                                             VkBuffer& buffer, VkDeviceSize& offset, VkDeviceSize& chunk_size,
-                                            VkSemaphore& timeline, std::uint64_t& value) {
+                                            VkSemaphore& timeline, std::uint64_t& value, std::uint64_t& mirror_hash,
+                                            std::unordered_set<std::uint8_t*>* synced_frames,
+                                            bool reuse_synced_frames) {
     if (!page_mirror.mirror || !bytes) return false;
     // Lock order: title_texture_mutex -> page_mirror.mutex (acyclic: nothing under page_mirror.mutex ever takes
     // title_texture_mutex). Called AFTER watch.examine() has re-armed the texture's tiles and AFTER
@@ -15987,26 +15993,43 @@ bool DeviceState::page_mirror_texture_chunk(std::uint64_t cpu, std::uint64_t gpu
             if (p > UINT64_MAX - kPage) break;
         }
         bool need_upload = false;
+        std::vector<std::uint8_t*> newly_synced;
         for (std::uint64_t p = va & ~(kPage - 1); p < end; p += kPage) {
             // For the CPU view, cold pages untouched since T0 have tracking->unwritten(p) == true (zero extra copy).
             // For a dual-view GPU address (va != cpu), shadow_write_fault bumps the CPU view's cell, so always sync
             // into the mirror home (unless the corresponding CPU page is provably unwritten).
             const bool clean_cpu = is_cpu_view && page_mirror.tracking && page_mirror.tracking->unwritten(p);
             if (!clean_cpu) {
+                std::uint8_t* const f = page_mirror.mirror->frame_at(p);
+                if (reuse_synced_frames && synced_frames && f && synced_frames->count(f)) {
+                    if (p > UINT64_MAX - kPage) break;
+                    continue;
+                }
                 if (page_mirror.mirror->dirty(p)) {
                     need_upload = true;
-                    if (page_mirror.readback_in_flight)
-                        if (std::uint8_t* f = page_mirror.mirror->frame_at(p)) page_mirror.readback_invalidated.insert(f);
+                    if (synced_frames && f) newly_synced.push_back(f);
+                    if (page_mirror.readback_in_flight && f) page_mirror.readback_invalidated.insert(f);
                 }
             }
             if (p > UINT64_MAX - kPage) break;
         }
-        if (need_upload) page_mirror.uploads += page_mirror.mirror->upload();
+        if (need_upload) {
+            const std::uint64_t failures_before = page_mirror.mirror->counters().upload_failures;
+            page_mirror.uploads += page_mirror.mirror->upload();
+            // Do not upload zeroed fallback pieces or poison mirror_hash when hooks_.copy failed mid-sync.
+            if (page_mirror.mirror->counters().upload_failures != failures_before) return false;
+            if (synced_frames) {
+                for (std::uint8_t* f : newly_synced) synced_frames->insert(f);
+            }
+        }
+        std::uint64_t m_hash = 0;
+        if (!page_mirror.mirror->range_sum(va, bytes, m_hash)) return false;
         buffer = buf;
         offset = off;
         chunk_size = leonida::TitleMirror::kChunk;
         timeline = page_mirror.timeline;
         value = page_mirror.value;
+        mirror_hash = m_hash;
         return true;
     };
     if (check_va(cpu, true)) return true;
@@ -16029,6 +16052,7 @@ void DeviceState::title_texture_mapped(const void* resource, std::uint64_t addre
         t.layout_known = true;
         t.layout_guessed = false;
         t.layout_from_xg = true;
+        t.mirror_hash_valid = false;
         index_texture(t);
         t.hashed = false;
     }
@@ -16058,6 +16082,7 @@ void DeviceState::title_texture_unmapped(const void* resource, std::uint64_t add
     if (it != title_textures.end() && it->second->resource == resource) {
         it->second->stale = true;
         it->second->write_combined_known = false;
+        it->second->mirror_hash_valid = false;
         it->second->memory.retry();
         index_texture(*it->second);
         texture_watch.touch(address);
@@ -18343,18 +18368,13 @@ public:
             }
         };
         if (map_all || overflow) {
-            watch.for_each_over(0, UINTPTR_MAX, remapped);
-            watch.note_changed(0, UINTPTR_MAX);
+            watch.note_changed_and_for_each(0, UINTPTR_MAX, remapped, map_all);
         } else {
-            for (const auto& [from, to] : title_map_changes_) {
-                watch.for_each_over(from, to, remapped);
-                watch.note_changed(from, to);
-            }
+            for (const auto& [from, to] : title_map_changes_)
+                watch.note_changed_and_for_each(from, to, remapped);
             // A noted write (XG, DirectStorage) can be the texture's first bytes: its memory is probed again too.
-            for (const auto& [from, to] : written) {
-                watch.for_each_over(from, to, remapped);
-                watch.note_changed(from, to);
-            }
+            for (const auto& [from, to] : written)
+                watch.note_changed_and_for_each(from, to, remapped);
         }
         if (state_.titles_named_pending.load(std::memory_order_acquire)) {
             std::vector<std::uint64_t> named;
@@ -18380,8 +18400,12 @@ public:
         // pages may be committed under the pointer Map gave without xmem (the probe answers each pass). Its tiles
         // are armed again then: pages committed since the last arming have no guard yet.
         const auto not_filled = [&](TitleTexture& t) {
-            if ((t.stale || !t.hashed) && t.resource && (!t.memory.pending() || t.mapped))
-                watch.note_changed(t.cpu, t.cpu + t.layout.layout.size);
+            if ((t.stale || !t.hashed) && t.resource) {
+                if (t.mapped)
+                    watch.note_changed(t.cpu, t.cpu + t.layout.layout.size, true);
+                else if (!t.memory.pending())
+                    watch.touch(t.address);
+            }
         };
         // Stage 3a + Stage 3b batch execution:
         //   1. Hash-before-reserve for ALL CPU-checked textures (including tiles == 1) on TitleReadPool.
@@ -18532,6 +18556,7 @@ public:
                         log_once("staged title texture upload failed, format", int(job.resource->format()));
                         ++stats.fill_failures;
                         t.stale = true;
+                        t.mirror_hash_valid = false;
                         not_filled(t);
                         continue;
                     }
@@ -18542,6 +18567,8 @@ public:
                             ++stats.gpu_detile_fills;
                         if (t.owned && !t.fills) job.resource->publish_streamed_texture();
                         t.gpu_uploaded = true;
+                        t.mirror_hash = job.mirror_hash;
+                        t.mirror_hash_valid = true;
                         t.hashed = true;
                         t.pieces.hashes.clear();
                         t.stale = false;
@@ -18558,6 +18585,7 @@ public:
                                          static_cast<unsigned long long>(job.span), int(job.nonzero));
                         if (t.owned && !t.fills) job.resource->publish_streamed_texture();
                         t.gpu_uploaded = false;
+                        t.mirror_hash_valid = false;
                         t.hash = job.hash;
                         t.hashed = true;
                         t.stale = false;
@@ -18581,6 +18609,7 @@ public:
             state_.refresh_page_mirror();
             state_.flush_page_mirror();
         }
+        title_synced_frames_.clear();
         for (const std::uint64_t key : title_named_) {
             const auto it = state_.title_textures.find(key);
             if (it == state_.title_textures.end() || !it->second->resource) continue;
@@ -18589,21 +18618,21 @@ public:
             if (t.gpu_written || !t.layout_known) continue;
             // Armed before it is read: a write from now on is in the next pass. A kernel write still in progress
             // over it: read once it is done (its tile stays unarmed, so the next pass names it again).
-            if (watch.examine(key, &title_written_) == leonida::TitleTextureWatch<TitleTextureCells>::Look::busy) {
+            const std::uint64_t arms_before = watch.stats().arms;
+            const auto look = watch.examine(key, &title_written_);
+            if (look == leonida::TitleTextureWatch<TitleTextureCells>::Look::busy) {
                 ++stats.busy;
                 continue;
             }
+            const bool allow_record_synced = look == leonida::TitleTextureWatch<TitleTextureCells>::Look::armed;
+            const bool reuse_synced_frames = allow_record_synced && watch.stats().arms == arms_before;
             ++stats.checked;
             if (!title_texture_readable(t) || !back_title_texture(t)) {
                 not_filled(t);
                 continue;
             }
-            TitleJob& job = title_jobs_.emplace_back();
-            job.entry = entry;
-            job.resource = t.resource;
-            job.span = t.layout.layout.size;
-            job.previous = (t.hashed && t.fills && !t.gpu_uploaded) ? std::optional<std::uint64_t>(t.hash) : std::nullopt;
-            const std::size_t tiles = std::size_t(((t.cpu + job.span + 0xffff) & ~std::uint64_t(0xffff)) -
+            const std::uint64_t span = t.layout.layout.size;
+            const std::size_t tiles = std::size_t(((t.cpu + span + 0xffff) & ~std::uint64_t(0xffff)) -
                                                   (t.cpu & ~std::uint64_t(0xffff))) >>
                                       16;
             // Stage 3b: check if all pages of this texture are already mirrored and flushed in a single TitleMirror
@@ -18612,8 +18641,18 @@ public:
                 VkBuffer m_buf = VK_NULL_HANDLE;
                 VkDeviceSize m_off = 0, m_chunk = 0;
                 VkSemaphore m_tl = VK_NULL_HANDLE;
-                std::uint64_t m_val = 0;
-                if (state_.page_mirror_texture_chunk(t.cpu, t.address, job.span, m_buf, m_off, m_chunk, m_tl, m_val)) {
+                std::uint64_t m_val = 0, m_hash = 0;
+                if (state_.page_mirror_texture_chunk(t.cpu, t.address, span, m_buf, m_off, m_chunk, m_tl, m_val, m_hash,
+                                                     allow_record_synced ? &title_synced_frames_ : nullptr,
+                                                     reuse_synced_frames)) {
+                    // 256-byte piece-hash filter: skip unchanged Stage 3b GPU textures in ~15 ns (zero CPU read of
+                    // title memory, zero title_upload_mutex lock, zero GPU command recording).
+                    if (t.gpu_uploaded && t.fills && t.mirror_hash_valid && m_hash == t.mirror_hash) {
+                        ++stats.unchanged_parts;
+                        ++stats.gpu_unchanged;
+                        t.stale = false;
+                        continue;
+                    }
                     rt::d3d12::TitleImageUpload::UploadKind kind{};
                     bool gpu_ok = false;
                     {
@@ -18622,6 +18661,12 @@ public:
                                                                     m_off, m_chunk, kind);
                     }
                     if (gpu_ok) {
+                        TitleJob& job = title_jobs_.emplace_back();
+                        job.entry = entry;
+                        job.resource = t.resource;
+                        job.span = span;
+                        job.previous = (t.hashed && t.fills && !t.gpu_uploaded) ? std::optional<std::uint64_t>(t.hash)
+                                                                                : std::nullopt;
                         job.gpu_mirror = true;
                         job.gpu_kind = kind;
                         job.mirror_buffer = m_buf;
@@ -18629,6 +18674,7 @@ public:
                         job.mirror_chunk_size = m_chunk;
                         job.mirror_timeline = m_tl;
                         job.mirror_value = m_val;
+                        job.mirror_hash = m_hash;
                         // If a multi-tile texture already has CPU piece hashes and only a subset of tiles were
                         // written, check those tiles first to skip unchanged neighbor-faulted uploads.
                         if (tiles > 1 && job.previous && t.pieces.valid_for(t.cpu, job.span) &&
@@ -18644,6 +18690,11 @@ public:
                 }
             }
             // Stage 3a CPU path: hash-before-reserve for ALL textures including tiles == 1 (`<= tiles`).
+            TitleJob& job = title_jobs_.emplace_back();
+            job.entry = entry;
+            job.resource = t.resource;
+            job.span = span;
+            job.previous = (t.hashed && t.fills && !t.gpu_uploaded) ? std::optional<std::uint64_t>(t.hash) : std::nullopt;
             job.pieces = t.pieces;
             job.compare = job.previous && t.pieces.valid_for(t.cpu, job.span) && !title_written_.empty() &&
                           title_written_.size() <= tiles;
@@ -18705,7 +18756,8 @@ public:
                            !entry->resource->shader_views();
             std::fprintf(stderr,
                          "[rt] d3d12: title texture refresh: %llu passes (%llu fast-path skipped); %llu textures "
-                         "written or new, %llu read whole, %llu found unchanged by their written parts alone, %llu "
+                         "written or new, %llu read whole, %llu found unchanged by their written parts alone (%llu "
+                         "GPU mirror-hashed), %llu "
                          "left for a kernel write in progress, %llu named over tiles not armed; %llu uploaded "
                          "(%.1f MiB; %llu CPU staged, %llu GPU linear, %llu GPU detiled), %llu read whole and "
                          "unchanged; %llu named for the first time, %zu not named by any descriptor (not read); %llu "
@@ -18716,6 +18768,7 @@ public:
                          static_cast<unsigned long long>(stats.checked),
                          static_cast<unsigned long long>(stats.read_whole),
                          static_cast<unsigned long long>(stats.unchanged_parts),
+                         static_cast<unsigned long long>(stats.gpu_unchanged),
                          static_cast<unsigned long long>(stats.busy),
                          static_cast<unsigned long long>(w.unarmed_named - l.unarmed_named),
                          static_cast<unsigned long long>(stats.changed), double(stats.filled_bytes) / 1048576.0,
@@ -18755,7 +18808,7 @@ public:
                          static_cast<unsigned long long>(stats.whole_by[2]),
                          static_cast<unsigned long long>(stats.whole_by[3]),
                          static_cast<unsigned long long>(stats.whole_by[4]));
-            stats.read_whole = stats.unchanged_parts = stats.first_named = 0;
+            stats.read_whole = stats.unchanged_parts = stats.gpu_unchanged = stats.first_named = 0;
             stats.whole_by = {};
             const double per_pass = 1e-6 / double(std::max<std::uint64_t>(1, title_split_passes_));
             std::fprintf(stderr,
@@ -18794,7 +18847,7 @@ private:
         // threads), and the transfers' recording and submission (staged_ns); bytes read whole.
         std::uint64_t collect_ns = 0, examine_ns = 0, read_ns = 0, detile_ns = 0, read_bytes = 0;
         std::uint64_t staged_fills = 0, staged_fills_logged = 0, staged_ns = 0;
-        std::uint64_t gpu_linear_fills = 0, gpu_detile_fills = 0, fast_passes = 0;
+        std::uint64_t gpu_linear_fills = 0, gpu_detile_fills = 0, gpu_unchanged = 0, fast_passes = 0;
         // refresh_title_textures, since the last log line
         std::uint64_t passes = 0, checked = 0, hashed = 0, changed = 0, deferred = 0, filled_bytes = 0,
                       max_pass_bytes = 0, hash_ns = 0, refresh_ns = 0, max_refresh_ns = 0;
@@ -18812,6 +18865,7 @@ private:
     bool title_pass_ = false;                                      // in refresh_title_textures, likewise
     std::vector<std::uint64_t> title_named_;                       // refresh scratch, under title_texture_mutex
     std::vector<std::uintptr_t> title_written_;                    // likewise
+    std::unordered_set<std::uint8_t*> title_synced_frames_;        // mirror frames synced this pass, likewise
     std::uint64_t title_split_passes_ = 0;                         // passes since the split's last log line
     // One texture of a refresh batch: what the serial part found (the slot reserved for it, the last fill's hash) and
     // what a TitleReadPool thread read (read_title_job).
@@ -18834,6 +18888,7 @@ private:
         VkDeviceSize mirror_offset = 0, mirror_chunk_size = 0;
         VkSemaphore mirror_timeline = VK_NULL_HANDLE;
         std::uint64_t mirror_value = 0;
+        std::uint64_t mirror_hash = 0;
         std::vector<std::uint8_t> tiled;
         std::vector<std::uint64_t> columns;
     };
@@ -19023,6 +19078,7 @@ private:
         if (t.fills != fills) return true;  // another fill recorded itself in between: its hash is as good
         if (t.owned && !t.fills) r.publish_streamed_texture();
         t.gpu_uploaded = false;
+        t.mirror_hash_valid = false;
         t.hash = hash;
         t.hashed = true;
         t.pieces = std::move(pieces);
@@ -19170,6 +19226,7 @@ private:
                     t->memory.retry();
                     t->write_combined_known = false;
                     t->gpu_uploaded = false;
+                    t->mirror_hash_valid = false;
                     t->layout = layout;
                     t->desc = words;
                     t->layout_known = true;
@@ -19433,6 +19490,7 @@ private:
                          static_cast<unsigned long long>(t.cpu), static_cast<unsigned long long>(span), int(nonzero));
         if (t.owned && !t.fills) t.resource->publish_streamed_texture();
         t.gpu_uploaded = false;
+        t.mirror_hash_valid = false;
         t.hash = hash;
         t.hashed = true;
         t.stale = false;
@@ -19449,6 +19507,7 @@ private:
             t.stale = true;
             return false;
         }
+        t.mirror_hash_valid = false;
         t.set_resource(t.resource);
         return true;
     }

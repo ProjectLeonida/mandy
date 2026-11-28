@@ -43,6 +43,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -187,12 +188,12 @@ public:
             if (fresh) {
                 tile.primary = watch_.acquire(a);
                 add_unarmed(a, tile);  // not armed for anyone yet
+                add_region_tile(a, tile);
                 added_tile = true;
             }
             tile.textures.push_back(key);
         }
         if (added_tile) {
-            sorted_tiles_dirty_ = true;
             hot_sync_needed_ = true;
         }
         pending_dirty_keys_.push_back(key);
@@ -203,7 +204,6 @@ public:
     void untrack(Key key) {
         const auto it = textures_.find(key);
         if (it == textures_.end()) return;
-        bool removed_tile = false;
         for (std::uintptr_t a = it->second.first; a < it->second.last; a += kTile) {
             const auto t = tiles_.find(a);
             if (t == tiles_.end()) continue;
@@ -216,11 +216,10 @@ public:
                 drop(a, t->second);
                 remove_unarmed(t->second);
                 if (t->second.hot_index != kNoIndex) remove_active_hot(t->second);
+                remove_region_tile(a, t->second);
                 tiles_.erase(t);
-                removed_tile = true;
             }
         }
-        if (removed_tile) sorted_tiles_dirty_ = true;
         textures_.erase(it);
         hot_overlap_.store(active_hot_tiles_.size(), std::memory_order_release);
     }
@@ -228,16 +227,11 @@ public:
     bool tracked(Key key) const { return textures_.count(key) != 0; }
 
     // Something other than a fault says [from, to) changed (a write noted by its writer, a mapping change seen by
-    // the caller): the textures over it are named by the next collect().
-    void note_changed(std::uintptr_t from, std::uintptr_t to) {
+    // the caller): the textures over it are named by the next collect(). Does NOT force watch_.arm() on already-armed
+    // unchanged tiles unless `rearm` is true (e.g. a mapped texture whose pages may be committed without xmem).
+    void note_changed(std::uintptr_t from, std::uintptr_t to, bool rearm = false) {
         if (from >= to || tiles_.empty()) return;
-        for_each_tile_in(from, to, [&](std::uintptr_t addr, Tile& tile) {
-            tile.stale = true;
-            if (!tile.pending_note) {
-                tile.pending_note = true;
-                pending_noted_tiles_.push_back(addr);
-            }
-        });
+        for_each_tile_in(from, to, [&](std::uintptr_t addr, Tile& tile) { note_tile_changed(addr, tile, rearm); });
         if (!pending_noted_tiles_.empty()) has_pending_.store(true, std::memory_order_release);
     }
 
@@ -265,6 +259,23 @@ public:
         });
     }
 
+    // Combines note_changed(from, to, rearm) and for_each_over(from, to, f) in a single pass over overlapping tiles.
+    template<class F>
+    void note_changed_and_for_each(std::uintptr_t from, std::uintptr_t to, F&& f, bool rearm = false) {
+        if (from >= to || tiles_.empty()) return;
+        const std::uint64_t stamp = ++over_gen_;
+        for_each_tile_in(from, to, [&](std::uintptr_t addr, Tile& tile) {
+            note_tile_changed(addr, tile, rearm);
+            for (const Key k : tile.textures) {
+                if (const auto tex = textures_.find(k); tex != textures_.end() && tex->second.over_gen != stamp) {
+                    tex->second.over_gen = stamp;
+                    f(k);
+                }
+            }
+        });
+        if (!pending_noted_tiles_.empty()) has_pending_.store(true, std::memory_order_release);
+    }
+
     // The textures that may have changed since their last examine(), each once, in key order.
     // Cost: strictly O(dirty tiles + unarmed tiles + overlapping hot tiles), never O(total watched textures/tiles).
     template<class F>
@@ -273,12 +284,13 @@ public:
         const std::uint64_t gen = ++pass_gen_;
         named_.clear();
 
-        // 1. Tiles noted via note_changed() since the last collect().
+        // 1. Tiles noted via note_changed() since the last collect(). Keep tile.stale as-is so arm() skips redundant
+        //    watch_.arm() syscalls on already-armed tiles whose cell version and mapping did not move.
         for (const std::uintptr_t a : pending_noted_tiles_) {
             const auto it = tiles_.find(a);
             if (it == tiles_.end()) continue;
             it->second.pending_note = false;
-            mark_tile_pass(a, it->second, gen, false);
+            mark_tile_pass(a, it->second, gen, false, false);
         }
         pending_noted_tiles_.clear();
 
@@ -401,6 +413,7 @@ public:
 
 private:
     static constexpr std::uint32_t kNoIndex = ~std::uint32_t(0);
+    static constexpr std::uintptr_t kRegion = std::uintptr_t(16) << 20;  // 16 MiB buckets (<= 256 tiles each)
 
     struct Tile {
         Cell* primary = nullptr;
@@ -411,7 +424,8 @@ private:
         std::uint64_t hot_gen = 0;
         std::uint32_t unarmed_index = kNoIndex;
         std::uint32_t hot_index = kNoIndex;
-        bool stale = true;  // changed (or never armed) since it was last armed
+        std::uint32_t region_index = kNoIndex;
+        bool stale = true;  // guard was dropped or never armed since last arm
         bool pending_note = false;
     };
     struct Texture {
@@ -458,15 +472,46 @@ private:
         active_hot_tiles_.clear();
     }
 
+    void add_region_tile(std::uintptr_t address, Tile& tile) {
+        if (tile.region_index != kNoIndex) return;
+        auto& vec = region_tiles_[address & ~(kRegion - 1)];
+        tile.region_index = static_cast<std::uint32_t>(vec.size());
+        vec.push_back(address);
+    }
+    void remove_region_tile(std::uintptr_t address, Tile& tile) {
+        if (tile.region_index == kNoIndex) return;
+        const std::uintptr_t region = address & ~(kRegion - 1);
+        const auto rit = region_tiles_.find(region);
+        if (rit != region_tiles_.end()) {
+            auto& vec = rit->second;
+            const std::uint32_t idx = tile.region_index;
+            const std::uintptr_t last = vec.back();
+            vec[idx] = last;
+            if (idx + 1 < vec.size()) tiles_.find(last)->second.region_index = idx;
+            vec.pop_back();
+            if (vec.empty()) region_tiles_.erase(rit);
+        }
+        tile.region_index = kNoIndex;
+    }
+
+    void note_tile_changed(std::uintptr_t addr, Tile& tile, bool rearm) {
+        if (rearm) tile.stale = true;
+        if (!tile.pending_note) {
+            tile.pending_note = true;
+            pending_noted_tiles_.push_back(addr);
+        }
+    }
+
     template<class F>
     void for_each_tile_in(std::uintptr_t from, std::uintptr_t to, F&& f) {
+        if (from >= to || tiles_.empty()) return;
         if (from == 0 && to == UINTPTR_MAX) {
             for (auto& [addr, tile] : tiles_) f(addr, tile);
             return;
         }
         const std::uintptr_t first = from & ~(kTile - 1);
         const std::uintptr_t span = to > first ? to - first : 0;
-        if (span <= 64u * kTile) {
+        if (span <= 8u * kTile) {
             for (std::uintptr_t a = first; a < to;) {
                 if (const auto it = tiles_.find(a); it != tiles_.end()) f(a, it->second);
                 if (to - a <= kTile) break;
@@ -474,16 +519,15 @@ private:
             }
             return;
         }
-        if (sorted_tiles_dirty_) {
-            sorted_tiles_.clear();
-            sorted_tiles_.reserve(tiles_.size());
-            for (const auto& [addr, tile] : tiles_) sorted_tiles_.push_back(addr);
-            std::sort(sorted_tiles_.begin(), sorted_tiles_.end());
-            sorted_tiles_dirty_ = false;
-        }
-        for (auto it = std::lower_bound(sorted_tiles_.begin(), sorted_tiles_.end(), first);
-             it != sorted_tiles_.end() && *it < to; ++it) {
-            if (const auto found = tiles_.find(*it); found != tiles_.end()) f(*it, found->second);
+        const std::uintptr_t first_region = first & ~(kRegion - 1);
+        for (auto it = region_tiles_.lower_bound(first_region); it != region_tiles_.end() && it->first < to; ++it) {
+            const std::uintptr_t region_start = it->first;
+            const bool full_region = region_start >= first && (to - region_start >= kRegion);
+            for (const std::uintptr_t addr : it->second) {
+                if (full_region || (addr >= first && addr < to)) {
+                    if (const auto found = tiles_.find(addr); found != tiles_.end()) f(addr, found->second);
+                }
+            }
         }
     }
 
@@ -511,8 +555,9 @@ private:
         }
     }
 
-    void mark_tile_pass(std::uintptr_t address, Tile& tile, std::uint64_t gen, bool from_unarmed) {
-        tile.stale = true;
+    void mark_tile_pass(std::uintptr_t address, Tile& tile, std::uint64_t gen, bool from_unarmed,
+                        bool set_stale = true) {
+        if (set_stale) tile.stale = true;
         const bool first_this_pass = tile.pass_written_gen != gen;
         if (first_this_pass) tile.pass_written_gen = gen;
         for (const Key k : tile.textures) {
@@ -546,14 +591,20 @@ private:
     }
 
     int arm(std::uintptr_t address, Tile& tile) {
-        if (!tile.stale && tile.unarmed_index == kNoIndex) return 1;
         if (!watch_.enabled()) {
             add_unarmed(address, tile);
             tile.stale = true;
             return -1;
         }
-        // The tile's other addresses follow its mapping: looked up again when xmem remapped it.
         const std::uint64_t mapping = tile.primary->mapping.load(std::memory_order_acquire);
+        if (!tile.stale && tile.unarmed_index == kNoIndex && tile.hot_index == kNoIndex &&
+            tile.hot_gen != pass_gen_ && mapping == tile.mapping) {
+            std::uint64_t version = tile.primary->version.load(std::memory_order_acquire);
+            for (const auto& [peer, cell] : tile.peers)
+                version = (std::max)(version, cell->version.load(std::memory_order_acquire));
+            if (version == tile.version) return 1;
+        }
+        // The tile's other addresses follow its mapping: looked up again when xmem remapped it.
         if (mapping != tile.mapping) {
             aliases_.clear();
             watch_.aliases(address, aliases_);
@@ -572,8 +623,8 @@ private:
             tile.mapping = mapping;
         }
         // The version is read before arming: a write between the two moves it, and the next collect() sees that.
-        // Always delegate through watch_.arm() even on hot tiles so kernel_writes pin checks (Look::busy) still run
-        // and a concurrent set_hot(false) cannot leave a writable page silently marked armed.
+        // Always delegate through watch_.arm() on hot/stale/unarmed/moved tiles so kernel_writes pin checks
+        // (Look::busy) still run and a concurrent set_hot(false) cannot leave a writable page silently marked armed.
         std::uint64_t version = tile.primary->version.load(std::memory_order_acquire);
         for (const auto& [peer, cell] : tile.peers)
             version = (std::max)(version, cell->version.load(std::memory_order_acquire));
@@ -611,8 +662,7 @@ private:
     std::unordered_map<Key, Texture> textures_;
     std::vector<std::uintptr_t> unarmed_list_;
     std::vector<std::uintptr_t> active_hot_tiles_;
-    std::vector<std::uintptr_t> sorted_tiles_;
-    bool sorted_tiles_dirty_ = false;
+    std::map<std::uintptr_t, std::vector<std::uintptr_t>> region_tiles_;
     std::vector<std::uintptr_t> pending_noted_tiles_;
     std::vector<Key> pending_dirty_keys_;
     std::vector<Key> named_;
