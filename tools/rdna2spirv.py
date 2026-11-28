@@ -108,6 +108,7 @@ FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from si
 # coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
 TEXEL_OFFSET_FALLBACK = False
 FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPreserve, for drivers without the property
+FTZ32 = True             # False (--no-ftz32): keep software flush_f32() instead of DenormFlushToZero 32
 # --mesh-compute: mesh shaders become compute shaders (same workgroup size and code) for devices without
 # VK_EXT_mesh_shader. Instead of SetMeshOutputs and the mesh outputs, the epilogue writes the vertex and primitive
 # counts, each lane's vertex and each lane's primitive into this workgroup's slot of a buffer whose device address is
@@ -502,7 +503,12 @@ class Gen:
         self.round_mode = False     # the program writes MODE.FP_ROUND[3:2] (f16/f64 rounding): kept in %mode_r16
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
-        self.uses_psb_vec = False      # scalar_load's wide loads: uvec2/uvec4 PhysicalStorageBuffer pointers
+        self.uses_psb_vec = False      # scalar_load's read-only wide loads: uvec2/uvec4 NonWritable Block pointers
+        self.uses_psb_vec_rw = False   # scalar_load's mutable wide loads: uvec2/uvec4 Block pointers without NonWritable
+        self.uses_psb_scalar_ro = False  # scalar_load's read-only single-dword loads: uint NonWritable Block pointers
+        self.ftz32 = bool(FLOAT_CONTROLS and FTZ32)  # DenormFlushToZero 32 active for this module
+        self.scalar_load_ro = None     # None (unanalysed), True (all RO), or frozenset of id(ins) safe for NonWritable
+        self.sbuf_slow_fns: dict[int, list[str]] = {}  # width -> outlined %sbuf_slow_x{n} partial-OOB helper lines
         self.uses_int_dot = False      # packed_dot4 emitted OpSDot/OpUDot(AccSat): SPV_KHR_integer_dot_product
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
         self.uses_fma_khr32 = False    # ... on f32 (feature shaderFmaFloat32)
@@ -7126,9 +7132,13 @@ class Gen:
         a subnormal operand or result
         reads as signed zero, whatever the MODE register says. LLVM's SITargetLowering::isFMADLegal forms
         v_mad_f32/v_mac_f32 only when f32 denormals are flushed (SIISelLowering.cpp, llvm-project 1922c0c);
-        v_mad_legacy_f32 is the same VALU. Emulated as |x| < FLT_MIN -> copysign(0, x): inf and NaN compare
-        false and pass through, and 0 keeps its sign. Counted over the corpus before writing this (SHADER-118):
-        9,297 of the 26,503 shaders use at least one of the three, 440,858 occurrences (0.99% of the corpus)."""
+        v_mad_legacy_f32 is the same VALU. When hardware DenormFlushToZero 32 is active (self.ftz32), the f32
+        arithmetic op itself flushes inputs and output; otherwise emulate as |x| < FLT_MIN -> copysign(0, x):
+        inf and NaN compare false and pass through, and 0 keeps its sign. Counted over the corpus before
+        writing this (SHADER-118): 9,297 of the 26,503 shaders use at least one of the three, 440,858
+        occurrences (0.99% of the corpus)."""
+        if self.ftz32:
+            return f
         a, small, sign, z, r = (self.tmp() for _ in range(5))
         self.emit(f"{a} = OpExtInst %float %glsl FAbs {f}")
         self.emit(f"{small} = OpFOrdLessThan %bool {a} {self.fconst(2.0 ** -126)}")
@@ -10508,14 +10518,25 @@ class Gen:
             # zero override gives +0 even when a negative subnormal operand becomes -0 after input flushing.
             # Flush the product before omod: otherwise FLT_MIN * 0.5 mul:2 becomes FLT_MIN, not zero.
             x, y = (self.src_f(t) for t in a[1:3])
-            m, ax, ay, zx, zy, either, r = (self.tmp() for _ in range(7))
-            self.emit(f"{m} = OpFMul %float {x} {y}")
-            self.emit(f"{ax} = OpExtInst %float %glsl FAbs {x}")
-            self.emit(f"{ay} = OpExtInst %float %glsl FAbs {y}")
-            self.emit(f"{zx} = OpFOrdLessThan %bool {ax} {self.fconst(2.0 ** -126)}")
-            self.emit(f"{zy} = OpFOrdLessThan %bool {ay} {self.fconst(2.0 ** -126)}")
-            self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")
-            self.emit(f"{r} = OpSelect %float {either} %f0 {self.flush_f32(m)}")
+            if self.ftz32:
+                # Under DenormFlushToZero 32, OpFOrdEqual flushes subnormal inputs to 0 and OpFMul flushes
+                # subnormal products to signed zero. Emit the canonical Mesa NIR fmulz pattern so RADV/ACO
+                # lowers it to a single native v_mul_legacy_f32.
+                m, zx, zy, either, r = (self.tmp() for _ in range(5))
+                self.emit(f"{m} = OpFMul %float {x} {y}")
+                self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")
+                self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")
+                self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")
+                self.emit(f"{r} = OpSelect %float {either} %f0 {m}")
+            else:
+                m, ax, ay, zx, zy, either, r = (self.tmp() for _ in range(7))
+                self.emit(f"{m} = OpFMul %float {x} {y}")
+                self.emit(f"{ax} = OpExtInst %float %glsl FAbs {x}")
+                self.emit(f"{ay} = OpExtInst %float %glsl FAbs {y}")
+                self.emit(f"{zx} = OpFOrdLessThan %bool {ax} {self.fconst(2.0 ** -126)}")
+                self.emit(f"{zy} = OpFOrdLessThan %bool {ay} {self.fconst(2.0 ** -126)}")
+                self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")
+                self.emit(f"{r} = OpSelect %float {either} %f0 {self.flush_f32(m)}")
             r = self.clamp_mods(r, mods)
             if any(mod in ("mul:2", "mul:4", "div:2") for mod in mods):
                 r = self.flush_f32(r)
@@ -13036,6 +13057,61 @@ class Gen:
         self.emit(f"{r} = OpIAdd %uint {acc} {du}")
         return r
 
+    def sbuf_slow_function(self, n):
+        """Build (once per width n in {2, 4, 8, 16}) the shared partial-OOB helper %sbuf_slow_x{n}(host, off, lim).
+
+        Called from the cold lbl_slow branch of wide s_buffer_load_dwordxN when the last dword is past limit.
+        Returns %arr_sbuf_x{n} (OpTypeArray %uint %c{n}): each dword i with off + 4*i + 4 <= lim is loaded at
+        host + 4*i (Aligned 4); out-of-range dwords return 0 without reading past limit (dword 0 is checked first,
+        and in-bounds partial loads re-read index 0 for out-of-range lanes, matching the inline rule)."""
+        fn = f"%sbuf_slow_x{n}"
+        if n not in self.sbuf_slow_fns:
+            p = f"%sbs{n}_"
+            arr = f"%arr_sbuf_x{n}"
+            null_arr = f"%null_sbuf_x{n}"
+            self.cu(n)
+            self.cu(0)
+            lines = [
+                f"{fn} = OpFunction {arr} None %fn_sbuf_slow_x{n}",
+                f"{p}host = OpFunctionParameter %ulong",
+                f"{p}off = OpFunctionParameter %ulong",
+                f"{p}lim = OpFunctionParameter %ulong",
+                f"{p}entry = OpLabel",
+                f"{p}ptr = OpConvertUToPtr %_ptr_PSB_arr {p}host",
+            ]
+            for i in range(n):
+                lines.append(f"{p}end{i} = OpIAdd %ulong {p}off {self.cl(4 * i + 4)}")
+                lines.append(f"{p}ok{i} = OpUGreaterThanEqual %bool {p}lim {p}end{i}")
+            lines += [
+                f"OpSelectionMerge {p}end None",
+                f"OpBranchConditional {p}ok0 {p}do {p}end",
+                f"{p}do = OpLabel",
+            ]
+            vals = []
+            for i in range(n):
+                if i == 0:
+                    idx = self.cu(0)
+                else:
+                    idx = f"{p}idx{i}"
+                    lines.append(f"{idx} = OpSelect %uint {p}ok{i} {self.cu(i)} {self.cu(0)}")
+                lines.append(f"{p}p{i} = OpAccessChain %_ptr_PSB_uint {p}ptr {idx}")
+                lines.append(f"{p}got{i} = OpLoad %uint {p}p{i} Aligned 4")
+                if i == 0:
+                    vals.append(f"{p}got0")
+                else:
+                    lines.append(f"{p}val{i} = OpSelect %uint {p}ok{i} {p}got{i} {self.cu(0)}")
+                    vals.append(f"{p}val{i}")
+            lines += [
+                f"{p}in = OpCompositeConstruct {arr} " + " ".join(vals),
+                f"OpBranch {p}end",
+                f"{p}end = OpLabel",
+                f"{p}res = OpPhi {arr} {p}in {p}do {null_arr} {p}entry",
+                f"OpReturnValue {p}res",
+                "OpFunctionEnd",
+            ]
+            self.sbuf_slow_fns[n] = lines
+        return fn
+
     def scalar_load(self, op, a, mods):
         """s_load_dwordxN sD, s[p:p+1], off   -> N dwords from a 64-bit pointer, no bound
         s_buffer_load_dwordxN sD, s[v:v+3], off -> N dwords from a V#, each checked against NUM_RECORDS
@@ -13149,9 +13225,19 @@ class Gen:
         self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
         self.emit(f"{addr} = OpBitwiseOr %ulong {sh} {l64}")
         self.emit(f"{full} = OpIAdd %ulong {addr} {o64}")
-        ptr, host = self.tmp(), self.host_addr(full, 'load', 4 * n)
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
+        host = self.host_addr(full, 'load', 4 * n)
         self.uses_psb = True
+        ro = (self.scalar_load_ro is None or self.scalar_load_ro is True or
+              (self.cur_ins is not None and id(self.cur_ins) in self.scalar_load_ro))
+        scalar_ro = ro and self.scalar_load_ro is not None
+        ptr_cache = [None]
+
+        def get_ptr():
+            if ptr_cache[0] is None:
+                p = self.tmp()
+                self.emit(f"{p} = OpConvertUToPtr %_ptr_PSB_arr {host}")
+                ptr_cache[0] = p
+            return ptr_cache[0]
 
         def wide(count):
             """Dwords 0..count-1 at the load's address as the fewest loads SPIR-V types allow: uvec4, then uvec2,
@@ -13160,28 +13246,41 @@ class Gen:
             global_load_b32, 5,935 v_readfirstlane and 5,448 64-bit compares for the 365 s_buffer_load_dwordx16
             of an FSPX program loaded per dword).
 
-            The vectors are read through a Block whose member is NonWritable (%sl_blk2 / %sl_blk4): with it RADV
-            makes the 365 one s_load_b512 each; without it, one global_load_b128 and four v_readfirstlane per uvec4.
-            It says what SMEM is: the scalar cache is not coherent with the vector stores of the same wave, so the
-            title's code cannot rely on an SMEM load seeing its own earlier store to the same address (it would need
-            s_dcache_inv, which the translator does not model), and letting the driver order this load freely
-            against the module's stores keeps that rule rather than weakening it."""
+            Provably non-aliasing scalar loads read through a NonWritable Block (%sl_blk1 / %sl_blk2 / %sl_blk4)
+            so RADV emits SMEM (s_load_b32..b512); loads that may alias a store/atomic in the same module read
+            through a mutable Block (%sl_rw_blk2 / %sl_rw_blk4) or %_ptr_PSB_arr so stores remain visible."""
             got, k = [], 0
             while k < count:
                 w = 4 if count - k >= 4 else 2 if count - k >= 2 else 1
                 if w == 1:
-                    q, v = self.tmp(), self.tmp()
-                    self.emit(f"{q} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(k)}")
-                    self.emit(f"{v} = OpLoad %uint {q} Aligned 4")
+                    if scalar_ro:
+                        self.uses_psb_scalar_ro = True
+                        at = host
+                        if k:
+                            at = self.tmp()
+                            self.emit(f"{at} = OpIAdd %ulong {host} {self.cl(4 * k)}")
+                        b, q, v = self.tmp(), self.tmp(), self.tmp()
+                        self.emit(f"{b} = OpConvertUToPtr %_ptr_PSB_sl_blk1 {at}")
+                        self.emit(f"{q} = OpAccessChain %_ptr_PSB_uint {b} {self.cu(0)}")
+                        self.emit(f"{v} = OpLoad %uint {q} Aligned 4")
+                    else:
+                        q, v = self.tmp(), self.tmp()
+                        self.emit(f"{q} = OpAccessChain %_ptr_PSB_uint {get_ptr()} {self.cu(k)}")
+                        self.emit(f"{v} = OpLoad %uint {q} Aligned 4")
                     got.append(v)
                 else:
-                    self.uses_psb_vec = True
+                    if ro:
+                        self.uses_psb_vec = True
+                        blk_ptr = f"%_ptr_PSB_sl_blk{w}"
+                    else:
+                        self.uses_psb_vec_rw = True
+                        blk_ptr = f"%_ptr_PSB_sl_rw_blk{w}"
                     at = host
                     if k:
                         at = self.tmp()
                         self.emit(f"{at} = OpIAdd %ulong {host} {self.cl(4 * k)}")
                     b, q, v = self.tmp(), self.tmp(), self.tmp()
-                    self.emit(f"{b} = OpConvertUToPtr %_ptr_PSB_sl_blk{w} {at}")
+                    self.emit(f"{b} = OpConvertUToPtr {blk_ptr} {at}")
                     self.emit(f"{q} = OpAccessChain %_ptr_PSB_v{w}uint_sl {b} {self.cu(0)}")
                     self.emit(f"{v} = OpLoad %v{w}uint_sl {q} Aligned 4")
                     for j in range(w):
@@ -13210,10 +13309,9 @@ class Gen:
                 self.emit(f"{raw} = OpIEqual %bool {stride} {self.cu(0)}")
                 self.emit(f"{lim} = OpSelect %ulong {raw} {nr64} {prod}")
         guarded = {}
-        slow_entry = None
         if lim is not None and not (lim_val is not None and reg is None) and n > 1:
-            # Every dword in range (the last one is, so all are): one wide load, the common case. Otherwise the
-            # per-dword path below, which gives the out-of-range dwords 0 without reading them, as before.
+            # Every dword in range (the last one is, so all are): one wide load, the common case. Otherwise call
+            # the shared per-width partial-OOB helper %sbuf_slow_x{n}, keeping cold fallback code out of line.
             last_end, all_ok = self.tmp(), self.tmp()
             if reg is not None:
                 self.emit(f"{last_end} = OpIAdd %ulong {o64} {self.cl(4 * n)}")
@@ -13228,56 +13326,40 @@ class Gen:
             fast_exit = self.current_label_placeholder()
             self.emit(f"OpBranch {lbl_join}")
             self.emit(f"{lbl_slow} = OpLabel")
-            slow_entry = (fast, fast_exit, lbl_join)
-        if lim is not None and not (lim_val is not None and reg is None):
-            # A run-time bound: dword i is in range when off + 4*i + 4 <= limit, and out of range it is 0 with memory
-            # not read. The ends grow with i, so "dword i in range" implies every dword before it is: one selection
-            # on dword 0 covers the load. Inside it each dword reads at index i when in range, else at index 0 (in
-            # range there, so nothing outside the buffer is touched), and the out-of-range ones are then 0. Before,
-            # each dword had its own selection: 2N blocks per s_buffer_load_dwordxN, 11,000 of the 17,000 blocks of
-            # the cascade-shadow CS whose pipeline NVIDIA's compiler could not build in 16 GB.
-            oks = []
+            slow_fn = self.sbuf_slow_function(n)
+            slow_arr = self.tmp()
+            self.emit(f"{slow_arr} = OpFunctionCall %arr_sbuf_x{n} {slow_fn} {host} {o64} {lim}")
+            slow_vals = []
             for i in range(n):
-                end, ok = self.tmp(), self.tmp()
-                if reg is not None:
-                    self.emit(f"{end} = OpIAdd %ulong {o64} {self.cl(4 * i + 4)}")
-                else:
-                    end = self.cl(imm + 4 * i + 4)
-                self.emit(f"{ok} = OpUGreaterThanEqual %bool {lim} {end}")
-                oks.append(ok)
+                e = self.tmp()
+                self.emit(f"{e} = OpCompositeExtract %uint {slow_arr} {i}")
+                slow_vals.append(e)
+            slow_exit = self.current_label_placeholder()
+            self.emit(f"OpBranch {lbl_join}")
+            self.emit(f"{lbl_join} = OpLabel")
+            for i in range(n):
+                v = self.tmp()
+                self.emit(f"{v} = OpPhi %uint {fast[i]} {fast_exit} {slow_vals[i]} {slow_exit}")
+                guarded[i] = v
+        elif lim is not None and not (lim_val is not None and reg is None):
+            # Single-dword run-time bound: 0 without reading memory when off + 4 > limit.
+            end, ok = self.tmp(), self.tmp()
+            if reg is not None:
+                self.emit(f"{end} = OpIAdd %ulong {o64} {self.cl(4)}")
+            else:
+                end = self.cl(imm + 4)
+            self.emit(f"{ok} = OpUGreaterThanEqual %bool {lim} {end}")
             lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
             pre = self.current_label_placeholder()
             self.emit(f"OpSelectionMerge {lbl_end} None")
-            self.emit(f"OpBranchConditional {oks[0]} {lbl_do} {lbl_end}")
+            self.emit(f"OpBranchConditional {ok} {lbl_do} {lbl_end}")
             self.emit(f"{lbl_do} = OpLabel")
-            got_in = []
-            for i in range(n):
-                idx, p, got, val = (self.tmp() for _ in range(4))
-                if i == 0:
-                    idx = self.cu(0)
-                else:
-                    self.emit(f"{idx} = OpSelect %uint {oks[i]} {self.cu(i)} {self.cu(0)}")
-                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {idx}")
-                self.emit(f"{got} = OpLoad %uint {p} Aligned 4")
-                if i == 0:
-                    val = got
-                else:
-                    self.emit(f"{val} = OpSelect %uint {oks[i]} {got} {self.cu(0)}")
-                got_in.append(val)
+            got = wide(1)[0]
             self.emit(f"OpBranch {lbl_end}")
             self.emit(f"{lbl_end} = OpLabel")
-            for i in range(n):
-                v = self.tmp()
-                self.emit(f"{v} = OpPhi %uint {got_in[i]} {lbl_do} {self.cu(0)} {pre}")
-                guarded[i] = v
-            if slow_entry is not None:
-                fast, fast_exit, lbl_join = slow_entry
-                self.emit(f"OpBranch {lbl_join}")
-                self.emit(f"{lbl_join} = OpLabel")
-                for i in range(n):
-                    v = self.tmp()
-                    self.emit(f"{v} = OpPhi %uint {fast[i]} {fast_exit} {guarded[i]} {lbl_end}")
-                    guarded[i] = v
+            v = self.tmp()
+            self.emit(f"{v} = OpPhi %uint {got} {lbl_do} {self.cu(0)} {pre}")
+            guarded[0] = v
         if guarded:
             vals = [guarded[i] for i in range(n)]
         elif lim is None:
@@ -16635,6 +16717,8 @@ def assemble(gen):
         # Core in SPIR-V 1.4, so no extension at vulkan1.2; the runtime checks the properties in "float_controls"
         # (shaderSignedZeroInfNanPreserveFloat64 too for a module that uses Float64, SHADER-597).
         caps += ["SignedZeroInfNanPreserve", "DenormPreserve"]
+        if gen.ftz32:
+            caps.append("DenormFlushToZero")
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
     if gen.uses_int_dot:
@@ -16679,6 +16763,8 @@ def assemble(gen):
             # in modules that declare Float64; --no-float-controls leaves it out with the other modes.
             hdr.append("OpExecutionMode %main SignedZeroInfNanPreserve 64")
         hdr.append("OpExecutionMode %main DenormPreserve 16")
+        if gen.ftz32:
+            hdr.append("OpExecutionMode %main DenormFlushToZero 32")
     dec = []
     if vs:
         dec.append("OpDecorate %vertex_index BuiltIn VertexIndex")
@@ -16767,16 +16853,28 @@ def assemble(gen):
                   "%rt_uint = OpTypeRuntimeArray %uint", "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint",
                   "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint"]
         dec.append("OpDecorate %rt_uint ArrayStride 4")
-        if gen.uses_psb_vec:            # dedupe_types merges these with any other uvec2 / uvec4
+        if gen.uses_psb_scalar_ro:
+            types += ["%sl_blk1 = OpTypeStruct %uint",
+                      "%_ptr_PSB_sl_blk1 = OpTypePointer PhysicalStorageBuffer %sl_blk1"]
+            dec += ["OpDecorate %sl_blk1 Block", "OpMemberDecorate %sl_blk1 0 Offset 0",
+                    "OpMemberDecorate %sl_blk1 0 NonWritable"]
+        if gen.uses_psb_vec or gen.uses_psb_vec_rw:  # dedupe_types merges these with any other uvec2 / uvec4
             types += ["%v2uint_sl = OpTypeVector %uint 2", "%v4uint_sl = OpTypeVector %uint 4",
                       "%_ptr_PSB_v2uint_sl = OpTypePointer PhysicalStorageBuffer %v2uint_sl",
-                      "%_ptr_PSB_v4uint_sl = OpTypePointer PhysicalStorageBuffer %v4uint_sl",
-                      "%sl_blk2 = OpTypeStruct %v2uint_sl", "%sl_blk4 = OpTypeStruct %v4uint_sl",
+                      "%_ptr_PSB_v4uint_sl = OpTypePointer PhysicalStorageBuffer %v4uint_sl"]
+        if gen.uses_psb_vec:
+            types += ["%sl_blk2 = OpTypeStruct %v2uint_sl", "%sl_blk4 = OpTypeStruct %v4uint_sl",
                       "%_ptr_PSB_sl_blk2 = OpTypePointer PhysicalStorageBuffer %sl_blk2",
                       "%_ptr_PSB_sl_blk4 = OpTypePointer PhysicalStorageBuffer %sl_blk4"]
             for blk in ("%sl_blk2", "%sl_blk4"):
                 dec += [f"OpDecorate {blk} Block", f"OpMemberDecorate {blk} 0 Offset 0",
                         f"OpMemberDecorate {blk} 0 NonWritable"]
+        if gen.uses_psb_vec_rw:
+            types += ["%sl_rw_blk2 = OpTypeStruct %v2uint_sl", "%sl_rw_blk4 = OpTypeStruct %v4uint_sl",
+                      "%_ptr_PSB_sl_rw_blk2 = OpTypePointer PhysicalStorageBuffer %sl_rw_blk2",
+                      "%_ptr_PSB_sl_rw_blk4 = OpTypePointer PhysicalStorageBuffer %sl_rw_blk4"]
+            for blk in ("%sl_rw_blk2", "%sl_rw_blk4"):
+                dec += [f"OpDecorate {blk} Block", f"OpMemberDecorate {blk} 0 Offset 0"]
         types += [f"{name} = OpConstant %ulong {v}" for v, name in sorted(gen.lconsts.items())]
     if tex:
         # Bindless set 0: images (binding 0), samplers (binding 1), descriptor hash table (binding 2).
@@ -16881,6 +16979,10 @@ def assemble(gen):
         # --address-guard: (heap_base, on, limit, table, offset, delta, sink) -> host address; no other function
         # type of the module has this signature.
         types.append("%fn_guard = OpTypeFunction %ulong %ulong %bool %ulong %ulong %ulong %ulong %ulong")
+    for n in sorted(gen.sbuf_slow_fns):
+        types += [f"%arr_sbuf_x{n} = OpTypeArray %uint {gen.cu(n)}",
+                  f"%null_sbuf_x{n} = OpConstantNull %arr_sbuf_x{n}",
+                  f"%fn_sbuf_slow_x{n} = OpTypeFunction %arr_sbuf_x{n} %ulong %ulong %ulong"]
     if gen.fmt_fn or gen.fmt_enc_fn:
         types.append("%v4uint_fmt = OpTypeVector %uint 4")      # dedupe_types merges it with any other uvec4
     if gen.fmt_fn:
@@ -17316,6 +17418,8 @@ def assemble(gen):
         helpers.extend(function)
     for function in gen.x_round_fns.values():
         helpers.extend(function)
+    for n in sorted(gen.sbuf_slow_fns):
+        helpers.extend(gen.sbuf_slow_fns[n])
     tree, nesting = (capped_tree(gen.succ, gen.out_pcs) if gen.blocks and not gen.emulate and not gen.bar_rounds
                      else (None, None))
     if nesting is not None:
@@ -17576,9 +17680,12 @@ def assemble(gen):
     if serial_close:
         gen.body = list(gen.body) + [("         " + l if " = OpLabel" not in l else l) for l in serial_close]
     insert_late_constants(gen, out, written)
-    return split_big_switch(no_contraction(scalar_loads_read_only(dedupe_types(
+    assembled = dedupe_types(
         "\n".join("         " + l if not l.startswith("%") or " = " not in l else l for l in out) +
-        "\n" + "\n".join(gen.body) + "\n" + tail))))
+        "\n" + "\n".join(gen.body) + "\n" + tail)
+    if gen.scalar_load_ro is None:
+        assembled = scalar_loads_read_only(assembled)
+    return split_big_switch(no_contraction(assembled))
 
 
 _PSB_POINTER_TYPE = re.compile(r"(?m)^\s*(%[\w.]+) = OpTypePointer PhysicalStorageBuffer ")
@@ -18847,6 +18954,489 @@ def barriers_under_control_flow(text):
     return False
 
 
+_FTZ32_DISABLE_OPS = frozenset({"v_div_scale_f32", "v_div_fmas_f32", "s_denorm_mode"})
+
+
+def _disables_ftz32(insns):
+    """Whether any instruction in `insns` requires disabling hardware DenormFlushToZero 32.
+
+    v_div_scale_f32 and v_div_fmas_f32 preserve subnormal f32 inputs/intermediates on RDNA2 even under denorm32=0,
+    and s_setreg* on HW_REG_MODE / s_denorm_mode modifies the shader's MODE register."""
+    for ins in insns:
+        op = base_op(ins["op"])
+        if op in _FTZ32_DISABLE_OPS:
+            return True
+        if op.startswith("s_setreg") and ins["args"] and "HW_REG_MODE" in ins["args"][0].get("t", ""):
+            return True
+    return False
+
+
+_PSB_WRITE_PREFIXES = (
+    "buffer_store", "tbuffer_store", "buffer_atomic",
+    "global_store", "global_atomic",
+    "flat_store", "flat_atomic",
+    "scratch_store",
+    "s_store", "s_buffer_store", "s_atomic", "s_buffer_atomic",
+)
+
+
+def _scalar_operand_slots(arg):
+    """Return list of scalar slots (int SGPR index or 'vcc_lo'/'vcc_hi') for an operand, or None."""
+    k = arg.get("k")
+    if k == "sgpr":
+        return list(range(arg["r"], arg["r"] + arg.get("n", 1)))
+    if k == "slist":
+        return list(arg["r"])
+    if k == "special" and arg.get("t") in ("vcc", "vcc_lo", "vcc_hi"):
+        return ["vcc_lo", "vcc_hi"] if arg["t"] == "vcc" else [arg["t"]]
+    return None
+
+
+def _symbolic_origin(tag):
+    """Return a non-constant symbolic descriptor/pointer origin tag, or None if unknown/constant."""
+    if tag is None or tag[0] == "const":
+        return None
+    return tag
+
+
+def _origins_may_alias(o1, o2):
+    """Conservative alias check between two symbolic descriptor/pointer origins."""
+    if o1 is None or o2 is None:
+        return True
+    if o1 == o2:
+        return True
+    # Dynamic offset load from the same base table may hit a static offset slot in that table.
+    if o1[0] == "load" and o2[0] == "load_dyn" and o1[1] == o2[1]:
+        return True
+    if o2[0] == "load" and o1[0] == "load_dyn" and o1[1] == o2[1]:
+        return True
+    return False
+
+
+def _psb_write_origin(ins, sym):
+    """Extract the symbolic base-address origin of a PSB memory write instruction, or None if unknown."""
+    op = base_op(ins["op"])
+    a = ins["args"]
+    if op.startswith(("buffer_store", "tbuffer_store", "buffer_atomic")):
+        if len(a) >= 3:
+            slots = _scalar_operand_slots(a[2])
+            if slots and len(slots) == 4:
+                return _symbolic_origin(sym.get(slots[0]))
+        return None
+    if op.startswith("global_store"):
+        if len(a) >= 3:
+            slots = _scalar_operand_slots(a[2])
+            if slots and len(slots) == 2:
+                return _symbolic_origin(sym.get(slots[0]))
+        return None
+    if op.startswith("global_atomic"):
+        idx = 3 if "glc" in ins["mods"] else 2
+        if len(a) > idx:
+            slots = _scalar_operand_slots(a[idx])
+            if slots and len(slots) == 2:
+                return _symbolic_origin(sym.get(slots[0]))
+        return None
+    if op.startswith(("s_store", "s_buffer_store", "s_atomic", "s_buffer_atomic")):
+        if len(a) >= 2:
+            slots = _scalar_operand_slots(a[1])
+            if slots:
+                return _symbolic_origin(sym.get(slots[0]))
+        return None
+    return None
+
+
+def _sload_static_offset(ins, sym, is_sbuf):
+    """Return the normalized static byte offset of an s_load / s_buffer_load, or None if dynamic."""
+    a = ins["args"]
+    off = a[2] if len(a) > 2 else {"k": "imm", "v": 0}
+    inst = [m.split(":", 1)[1] for m in ins["mods"] if m.startswith("offset:")]
+    if len(inst) > 1 or (inst and off["k"] == "imm"):
+        return None
+    imm = 0
+    if inst:
+        try:
+            imm = int(inst[0], 0)
+        except ValueError:
+            return None
+    reg_const = None
+    if off["k"] == "imm":
+        imm = off["v"]
+    elif off["k"] == "special" and off.get("t") == "null":
+        reg_const = 0
+    else:
+        slots = _scalar_operand_slots(off)
+        if not slots or len(slots) != 1:
+            return None
+        tag = sym.get(slots[0])
+        if tag is None or tag[0] != "const":
+            return None
+        reg_const = tag[1] & 0xFFFFFFFC
+    if is_sbuf:
+        imm &= 0xFFFFFFFF
+    else:
+        imm = ((imm & 0x1FFFFF) ^ 0x100000) - 0x100000
+    imm &= ~3
+    return (reg_const + imm) if reg_const is not None else imm
+
+
+def _step_scalar_provenance(sym, ins, desc_src=None):
+    """Advance forward SGPR/VCC provenance state across one instruction.
+
+    When `desc_src` is given (slot -> frozenset of s_load instruction ids), also propagates which s_load
+    instructions originated each slot's value (through copies only) so descriptor-only loads can be verified."""
+    op = base_op(ins["op"])
+    a = ins["args"]
+    if op in ("s_swappc_b64", "s_setpc_b64", "s_call_b64") or op.startswith("s_movreld"):
+        sym.clear()
+        if desc_src is not None:
+            desc_src.clear()
+        return
+    if not a:
+        return
+
+    def read_tag(arg):
+        if arg["k"] == "imm":
+            return ("const", arg["v"] & 0xFFFFFFFF)
+        if arg["k"] == "special" and arg.get("t") == "null":
+            return ("const", 0)
+        slots = _scalar_operand_slots(arg)
+        if slots and len(slots) == 1:
+            return sym.get(slots[0])
+        return None
+
+    def clear_slots(slots):
+        if slots:
+            for s in slots:
+                sym.pop(s, None)
+                if desc_src is not None:
+                    desc_src.pop(s, None)
+
+    if op == "s_mov_b32" and len(a) >= 2:
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 1:
+            t = read_tag(a[1])
+            if t is not None:
+                sym[dst[0]] = t
+            else:
+                sym.pop(dst[0], None)
+            if desc_src is not None:
+                src = _scalar_operand_slots(a[1])
+                if src and len(src) == 1 and src[0] in desc_src:
+                    desc_src[dst[0]] = desc_src[src[0]]
+                else:
+                    desc_src.pop(dst[0], None)
+        return
+    if op == "s_mov_b64" and len(a) >= 2:
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 2:
+            if a[1]["k"] == "imm":
+                v = a[1]["v"]
+                sym[dst[0]] = ("const", v & 0xFFFFFFFF)
+                sym[dst[1]] = ("const", (v >> 32) & 0xFFFFFFFF)
+                if desc_src is not None:
+                    desc_src.pop(dst[0], None)
+                    desc_src.pop(dst[1], None)
+            else:
+                src = _scalar_operand_slots(a[1])
+                if src and len(src) == 2:
+                    vals = [sym.get(src[0]), sym.get(src[1])]
+                    dvals = [desc_src.get(src[0]), desc_src.get(src[1])] if desc_src is not None else None
+                    for i, (d, v) in enumerate(zip(dst, vals)):
+                        if v is not None:
+                            sym[d] = v
+                        else:
+                            sym.pop(d, None)
+                        if desc_src is not None:
+                            if dvals[i] is not None:
+                                desc_src[d] = dvals[i]
+                            else:
+                                desc_src.pop(d, None)
+                else:
+                    clear_slots(dst)
+        return
+    if op == "s_getpc_b64":
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 2:
+            sym[dst[0]] = ("code",)
+            sym[dst[1]] = ("code",)
+            if desc_src is not None:
+                desc_src.pop(dst[0], None)
+                desc_src.pop(dst[1], None)
+        return
+    if op in ("s_add_u32", "s_add_i32", "s_addc_u32", "s_sub_u32", "s_sub_i32", "s_subb_u32",
+              "s_and_b32", "s_or_b32", "s_lshl1_add_u32", "s_lshl2_add_u32",
+              "s_lshl3_add_u32", "s_lshl4_add_u32") and len(a) >= 3:
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 1:
+            t0, t1 = read_tag(a[1]), read_tag(a[2])
+            c0_flag = t0 is not None and t0[0] == "const"
+            c1_flag = t1 is not None and t1[0] == "const"
+            out = None
+            if op == "s_and_b32" and (t0 == ("const", 0) or t1 == ("const", 0)):
+                out = ("const", 0)
+            elif c0_flag and c1_flag:
+                c0, c1 = t0[1], t1[1]
+                if op in ("s_add_u32", "s_add_i32"):
+                    out = ("const", (c0 + c1) & 0xFFFFFFFF)
+                elif op in ("s_sub_u32", "s_sub_i32"):
+                    out = ("const", (c0 - c1) & 0xFFFFFFFF)
+                elif op == "s_and_b32":
+                    out = ("const", c0 & c1)
+                elif op == "s_or_b32":
+                    out = ("const", c0 | c1)
+                elif op.startswith("s_lshl"):
+                    sh = int(op[6])
+                    out = ("const", ((c0 << sh) + c1) & 0xFFFFFFFF)
+            else:
+                s0, s1 = _symbolic_origin(t0), _symbolic_origin(t1)
+                if op.startswith("s_lshl"):
+                    # (S0 << sh) + S1: shifting a base pointer left does not preserve its origin;
+                    # only propagate S1 when the shifted index S0 is a known constant.
+                    if c0_flag and s1 is not None:
+                        out = s1
+                elif s0 is not None and c1_flag:
+                    out = s0
+                elif s1 is not None and c0_flag and op not in ("s_sub_u32", "s_sub_i32", "s_subb_u32"):
+                    out = s1
+                elif op in ("s_and_b32", "s_or_b32") and s0 is not None and s0 == s1:
+                    out = s0
+            if out is not None:
+                sym[dst[0]] = out
+            else:
+                sym.pop(dst[0], None)
+            if desc_src is not None:
+                desc_src.pop(dst[0], None)
+        return
+    if op.startswith(("s_load_dword", "s_buffer_load_dword")) and len(a) >= 2:
+        dst = _scalar_operand_slots(a[0])
+        base = _scalar_operand_slots(a[1])
+        if dst:
+            base_origin = _symbolic_origin(sym.get(base[0])) if base else None
+            if base_origin is not None:
+                off = _sload_static_offset(ins, sym, op.startswith("s_buffer"))
+                for i, slot in enumerate(dst):
+                    sym[slot] = ("load", base_origin, off + 4 * i) if off is not None else ("load_dyn", base_origin)
+            else:
+                clear_slots(dst)
+            if desc_src is not None:
+                tag = frozenset((id(ins),)) if op.startswith("s_load_dword") else None
+                for slot in dst:
+                    if tag is not None:
+                        desc_src[slot] = tag
+                    else:
+                        desc_src.pop(slot, None)
+        return
+    # Any other instruction that writes scalar destination slots clears their provenance.
+    if op.startswith(("s_cmp", "s_bitcmp", "s_cbranch", "s_branch", "s_waitcnt", "s_nop", "s_endpgm",
+                      "s_barrier", "s_sendmsg", "s_setreg", "s_round_mode", "s_store", "s_buffer_store",
+                      "buffer_", "tbuffer_", "global_", "flat_", "scratch_", "image_", "ds_", "exp")):
+        return
+    if op.startswith("s_") or op in ("v_readfirstlane_b32", "v_readlane_b32") or op.startswith("v_cmp"):
+        clear_slots(_scalar_operand_slots(a[0]))
+    if len(a) >= 2 and op in ("v_add_co_u32", "v_add_co_ci_u32", "v_sub_co_u32", "v_sub_co_ci_u32",
+                              "v_subrev_co_u32", "v_subrev_co_ci_u32", "v_mad_u64_u32", "v_mad_i64_i32",
+                              "v_div_scale_f32", "v_div_scale_f64"):
+        clear_slots(_scalar_operand_slots(a[1]))
+
+
+def _classify_scalar_uses(ins, desc_src, used_as_desc, used_as_data):
+    """Record whether scalar operands read by `ins` are used solely as descriptors (T#/S#/V#) or as general data."""
+    if not desc_src:
+        return
+    op = base_op(ins["op"])
+    a = ins["args"]
+    if not a:
+        return
+    if op in ("s_mov_b32", "s_mov_b64"):
+        # Pure copies propagate desc_src without classifying the value yet.
+        return
+    if op in ("s_swappc_b64", "s_setpc_b64", "s_call_b64") or op.startswith("s_movrel"):
+        for tags in desc_src.values():
+            used_as_data.update(tags)
+        return
+    # Identify operand indices that are pure descriptor reads (T#, S#, V#) and operand indices that are write-only.
+    desc_idxs = set()
+    write_only_idxs = set()
+    if op.startswith("image_"):
+        if len(a) >= 3:
+            desc_idxs.add(2)    # T#
+        if len(a) >= 4:
+            desc_idxs.add(3)    # S#
+        if not op.startswith(("image_store", "image_atomic")):
+            write_only_idxs.add(0)
+    elif op.startswith(("buffer_", "tbuffer_")):
+        if len(a) >= 3:
+            desc_idxs.add(2)    # V#
+        if op.startswith(("buffer_load", "tbuffer_load")):
+            write_only_idxs.add(0)
+    elif op.startswith("s_buffer_"):
+        if len(a) >= 2:
+            desc_idxs.add(1)    # V#
+        if op.startswith("s_buffer_load"):
+            write_only_idxs.add(0)
+    elif op.startswith("s_load_dword"):
+        write_only_idxs.add(0)
+    elif op.startswith("s_") and not op.startswith(("s_cmp", "s_bitcmp", "s_cbranch", "s_branch", "s_store",
+                                                    "s_atomic", "s_setreg", "s_sendmsg", "s_waitcnt", "s_nop",
+                                                    "s_endpgm", "s_barrier", "s_round_mode", "s_cmov", "s_bitset")):
+        write_only_idxs.add(0)
+    elif op.startswith("v_") and not op.startswith(("v_cmp", "v_cmpx")) and op not in DST_ALSO_READ:
+        write_only_idxs.add(0)
+        if op in ("v_add_co_u32", "v_add_co_ci_u32", "v_sub_co_u32", "v_sub_co_ci_u32",
+                  "v_subrev_co_u32", "v_subrev_co_ci_u32", "v_mad_u64_u32", "v_mad_i64_i32",
+                  "v_div_scale_f32", "v_div_scale_f64"):
+            write_only_idxs.add(1)
+
+    for idx, arg in enumerate(a):
+        if idx in write_only_idxs:
+            continue
+        slots = _scalar_operand_slots(arg)
+        if not slots:
+            continue
+        target = used_as_desc if idx in desc_idxs else used_as_data
+        for s in slots:
+            tags = desc_src.get(s)
+            if tags:
+                target.update(tags)
+
+
+def analyse_scalar_load_ro(blocks, succ, user_limit=USER_SGPRS, sys_sgprs=()):
+    """Decide which s_load* / s_buffer_load* instructions may safely carry NonWritable (allowing RADV/ACO SMEM).
+
+    Returns True when the shader performs no PhysicalStorageBuffer memory writes at all (all scalar loads are safe),
+    or a frozenset of id(ins) for scalar loads proven not to alias any PSB write in the module:
+      - If any s_dcache_* instruction is present alongside a PSB write, falls back conservatively to frozenset().
+      - Descriptor-heap s_load* (32-bit user SGPR pointer with high dword = constant 0, whose base origin is not
+        explicitly written and whose loaded dwords are consumed solely as T#/S#/V# descriptors) and s_getpc_b64
+        code/rodata loads are read-only.
+      - Any scalar load with no PSB write reachable before OR after it on any CFG path is read-only.
+      - Any scalar load whose symbolic descriptor/pointer origin (user SGPR root or static descriptor-table slot) is
+        strictly disjoint from every PSB write's origin in the module is read-only."""
+    if not blocks:
+        return True
+    nb = len(blocks)
+    has_dcache = False
+    block_writes = [False] * nb
+    has_any_write = False
+    for b, blk in enumerate(blocks):
+        for ins in blk:
+            op = base_op(ins["op"])
+            if op == "s_endpgm":
+                break
+            if op.startswith("s_dcache_"):
+                has_dcache = True
+            if op.startswith(_PSB_WRITE_PREFIXES):
+                block_writes[b] = True
+                has_any_write = True
+    if not has_any_write:
+        return True
+    if has_dcache:
+        return frozenset()
+
+    # Forward CFG reachability: whether any PSB write can precede entry to block b.
+    write_in = [False] * nb
+    write_out = list(block_writes)
+    changed = True
+    while changed:
+        changed = False
+        for b in range(nb):
+            if write_out[b]:
+                for s in succ[b]:
+                    if not write_in[s]:
+                        write_in[s] = True
+                        if not write_out[s]:
+                            write_out[s] = True
+                        changed = True
+
+    # Backward CFG reachability: whether any PSB write can follow exit from block b.
+    write_after_out = [False] * nb
+    write_after_in = list(block_writes)
+    changed = True
+    while changed:
+        changed = False
+        for b in range(nb):
+            if any(write_after_in[s] for s in succ[b]):
+                if not write_after_out[b]:
+                    write_after_out[b] = True
+                    if not write_after_in[b]:
+                        write_after_in[b] = True
+                    changed = True
+
+    # Forward SGPR/VCC descriptor provenance and s_load-origin dataflow.
+    system = set(sys_sgprs)
+    entry_sym = [None] * nb
+    entry_dsrc = [None] * nb
+    entry_sym[0] = {r: ("in", r) for r in range(user_limit) if r not in system}
+    entry_dsrc[0] = {}
+    work = [0]
+    while work:
+        b = work.pop()
+        sym = dict(entry_sym[b])
+        dsrc = dict(entry_dsrc[b])
+        for ins in blocks[b]:
+            if base_op(ins["op"]) == "s_endpgm":
+                break
+            _step_scalar_provenance(sym, ins, dsrc)
+        for s in succ[b]:
+            if entry_sym[s] is None:
+                entry_sym[s] = dict(sym)
+                entry_dsrc[s] = dict(dsrc)
+                work.append(s)
+            else:
+                merged_sym = {k: v for k, v in entry_sym[s].items() if sym.get(k) == v}
+                # Join desc_src by union so any path on which a slot comes from an s_load sees all its uses.
+                merged_dsrc = dict(entry_dsrc[s])
+                for k, v in dsrc.items():
+                    merged_dsrc[k] = merged_dsrc[k] | v if k in merged_dsrc else v
+                if merged_sym != entry_sym[s] or merged_dsrc != entry_dsrc[s]:
+                    entry_sym[s] = merged_sym
+                    entry_dsrc[s] = merged_dsrc
+                    work.append(s)
+
+    # Collect all PSB write origins, classify s_load uses, and evaluate every scalar load at its exact program point.
+    write_origins = set()
+    used_as_desc, used_as_data = set(), set()
+    scalar_loads = []  # (ins, b, idx, is_heap_ptr, origin)
+    for b in range(nb):
+        if entry_sym[b] is None:
+            continue
+        sym = dict(entry_sym[b])
+        dsrc = dict(entry_dsrc[b])
+        for idx, ins in enumerate(blocks[b]):
+            op = base_op(ins["op"])
+            if op == "s_endpgm":
+                break
+            _classify_scalar_uses(ins, dsrc, used_as_desc, used_as_data)
+            if op.startswith(_PSB_WRITE_PREFIXES):
+                write_origins.add(_psb_write_origin(ins, sym))
+            elif op.startswith(("s_load_dword", "s_buffer_load_dword")) and len(ins["args"]) >= 2:
+                base = _scalar_operand_slots(ins["args"][1])
+                origin = _symbolic_origin(sym.get(base[0])) if base else None
+                is_heap_ptr = (op.startswith("s_load_dword") and base is not None and len(base) == 2 and
+                               origin is not None and origin[0] == "in" and sym.get(base[1]) == ("const", 0))
+                scalar_loads.append((ins, b, idx, is_heap_ptr, origin))
+            _step_scalar_provenance(sym, ins, dsrc)
+
+    ro = set()
+    for ins, b, idx, is_heap_ptr, origin in scalar_loads:
+        if origin == ("code",):
+            ro.add(id(ins))
+            continue
+        if is_heap_ptr and origin not in write_origins and id(ins) in used_as_desc and id(ins) not in used_as_data:
+            ro.add(id(ins))
+            continue
+        blk = blocks[b]
+        w_before = write_in[b] or any(base_op(blk[k]["op"]).startswith(_PSB_WRITE_PREFIXES) for k in range(idx))
+        w_after = write_after_out[b] or any(base_op(blk[k]["op"]).startswith(_PSB_WRITE_PREFIXES)
+                                            for k in range(idx + 1, len(blk)))
+        if not w_before and not w_after:
+            ro.add(id(ins))
+            continue
+        if origin is not None and not any(_origins_may_alias(origin, wo) for wo in write_origins):
+            ro.add(id(ins))
+    return frozenset(ro)
+
+
 def _translate(path):
     global GUARD_MODULE_ID
     GUARD_MODULE_ID = fnv1a32(os.path.splitext(os.path.basename(path))[0])
@@ -18956,6 +19546,7 @@ def _translate(path):
     g.round_mode = any(i["op"] == "s_round_mode" or
                        (i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", ""))
                        for i in insns)
+    g.ftz32 = bool(FLOAT_CONTROLS and FTZ32 and not _disables_ftz32(insns))
     w64_marks, code_w64, code_w32 = wave_markers(insns)
     # Authoritative wave size from the FSSM header flags at 0xD4 bit 5 (0x20 = wave32, 0 = wave64;
     # verified with 0 contradictions across all 26,503 corpus blobs). Falls back to the code-marker
@@ -19244,6 +19835,7 @@ def _translate(path):
         g.fit_shared_memory()
         end = next((k for k, ins in enumerate(insns) if base_op(ins["op"]) == "s_endpgm"), len(insns))
         g.tsharp_from_heap = descriptor_sources.analyse([insns[:end]], [[]], user_limit, sys_sgprs)
+        g.scalar_load_ro = analyse_scalar_load_ro([insns[:end]], [[]], user_limit, sys_sgprs)
         g.exec_changes = any(g.may_write_exec(ins) for ins in insns[:end])
         g.insns(insns[:end])
         _translate.last_gen = g
@@ -19315,6 +19907,7 @@ def _translate(path):
 
     g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
     g.tsharp_from_heap = descriptor_sources.analyse(blocks, succ, user_limit, sys_sgprs)
+    g.scalar_load_ro = analyse_scalar_load_ro(blocks, succ, user_limit, sys_sgprs)
     folds, fold_chain, absorbed = {}, {}, set()
     if g.emulate:
         g.scc_live = wave64_emulate_opt.scc_live_outs(blocks, succ)
@@ -20174,6 +20767,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["float_controls"] = [f"shaderSignedZeroInfNanPreserveFloat{w}" for w in widths]
         if "DenormPreserve" in caps:
             m["float_controls"].append("shaderDenormPreserveFloat16")
+        if "DenormFlushToZero" in caps:
+            m["float_controls"].append("shaderDenormFlushToZeroFloat32")
     if g.uses_codebase:
         m["uses_code_base"] = True
     if g.cs:
@@ -20564,9 +21159,12 @@ def main():
     ap.add_argument("--dispatch-loop", action="store_true",
                     help="emit control flow the old way, as one loop around a switch (to compare with the default)")
     ap.add_argument("--no-float-controls", action="store_true",
-                    help="don't declare SignedZeroInfNanPreserve or DenormPreserve (for a driver whose "
-                         "shaderSignedZeroInfNanPreserveFloat32 or shaderDenormPreserveFloat16 is false); NaN, inf, "
-                         "-0 and f16 denormals are then not guaranteed")
+                    help="don't declare SignedZeroInfNanPreserve, DenormPreserve or DenormFlushToZero (for a driver "
+                         "whose float-control properties are false); NaN, inf, -0 and f16/f32 denormals are then not "
+                         "guaranteed")
+    ap.add_argument("--no-ftz32", action="store_true",
+                    help="don't declare DenormFlushToZero 32; keep software f32 denormal flushes instead (for a driver "
+                         "whose shaderDenormFlushToZeroFloat32 is false, e.g. llvmpipe)")
     ap.add_argument("--wave64-emulate", action="store_true",
                     help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): "
                          "cross-lane operations go through workgroup memory instead of subgroup operations")
@@ -20668,8 +21266,9 @@ def main():
     SHADER_CLOCK = a.shader_clock == "khr"
     FMA_EXACT = a.fma == "exact"
     STRUCTURED = not a.dispatch_loop
-    global FLOAT_CONTROLS
+    global FLOAT_CONTROLS, FTZ32
     FLOAT_CONTROLS = not a.no_float_controls
+    FTZ32 = not a.no_ftz32
     WAVE64_EMULATE = a.wave64_emulate
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback

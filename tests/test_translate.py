@@ -931,8 +931,14 @@ def test_float_controls_declared(stage, make_shader):
     assert "OpExecutionMode %main SignedZeroInfNanPreserve 32" in spv
     assert "OpCapability DenormPreserve" in spv
     assert "OpExecutionMode %main DenormPreserve 16" in spv
+    assert "OpCapability DenormFlushToZero" in spv
+    assert "OpExecutionMode %main DenormFlushToZero 32" in spv
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
-    assert meta["float_controls"] == ["shaderSignedZeroInfNanPreserveFloat32", "shaderDenormPreserveFloat16"]
+    assert meta["float_controls"] == [
+        "shaderSignedZeroInfNanPreserveFloat32",
+        "shaderDenormPreserveFloat16",
+        "shaderDenormFlushToZeroFloat32",
+    ]
 
 
 def test_no_float_controls_leaves_them_out(make_shader, monkeypatch):
@@ -944,6 +950,7 @@ def test_no_float_controls_leaves_them_out(make_shader, monkeypatch):
     shader.validate(spv)
     assert "SignedZeroInfNanPreserve" not in spv
     assert "DenormPreserve" not in spv
+    assert "DenormFlushToZero" not in spv
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
     assert "float_controls" not in meta
 

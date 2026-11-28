@@ -715,7 +715,16 @@ class RcpF32AndIflagExecutionTests(unittest.TestCase):
                 for name, x_bits, want in RCP_F32_HAND_WORKED:
                     with self.subTest(op=op + suffix, case=name):
                         got = run_op(f"{op}{suffix} v0, v1", x_bits)
-                        self.assertEqual(got, want)
+                        # Under default DenormFlushToZero 32 (matching RDNA2 denorm32=0), a subnormal reciprocal
+                        # (1 / 2^127 = 2^-127) flushes to +0.0; --no-ftz32 keeps the subnormal.
+                        want_ftz = 0x00000000 if name == "2p127_to_subnorm" else want
+                        self.assertEqual(got, want_ftz)
+                old_ftz = rdna2spirv.FTZ32
+                rdna2spirv.FTZ32 = False
+                try:
+                    self.assertEqual(run_op(f"{op}{suffix} v0, v1", 0x7F000000), 0x00400000)
+                finally:
+                    rdna2spirv.FTZ32 = old_ftz
 
     def test_nan_inputs_preserve_nan(self):
         for op in self.OPS:
@@ -1106,17 +1115,25 @@ class NewtonRaphsonAccuracyAndEdgeCaseTests(unittest.TestCase):
                 )
 
     def test_subnormal_quotients_and_inputs(self):
+        # (name, a, b, want_no_ftz32, want_ftz32)
         cases = (
-            ("subnormal_div_2", 0x00000004, f32_bits(2.0), 0x00000002),
-            ("neg_subnormal_div_2", 0x80000004, f32_bits(2.0), 0x80000002),
-            ("subnormal_div_half", 0x00000002, f32_bits(0.5), 0x00000004),
-            ("normal_underflow_to_subnormal", 0x00400000, f32_bits(2.0), 0x00200000),
-            ("subnormal_divisor_to_normal", f32_bits(1.0), 0x00400000, 0x7F000000),
+            ("subnormal_div_2", 0x00000004, f32_bits(2.0), 0x00000002, 0x00000000),
+            ("neg_subnormal_div_2", 0x80000004, f32_bits(2.0), 0x80000002, 0x80000000),
+            ("subnormal_div_half", 0x00000002, f32_bits(0.5), 0x00000004, 0x00000000),
+            ("normal_underflow_to_subnormal", 0x00400000, f32_bits(2.0), 0x00200000, 0x00000000),
+            ("subnormal_divisor_to_normal", f32_bits(1.0), 0x00400000, 0x7F000000, 0x7F800000),
         )
-        for name, ab, bb, want in cases:
-            with self.subTest(case=name):
-                got = run_nr_fdiv_ps(ab, bb)
-                self.assertEqual(got, want)
+        for name, ab, bb, want_ieee, want_ftz in cases:
+            with self.subTest(case=name, ftz32=True):
+                self.assertEqual(run_nr_fdiv_ps(ab, bb), want_ftz)
+        old_ftz = rdna2spirv.FTZ32
+        rdna2spirv.FTZ32 = False
+        try:
+            for name, ab, bb, want_ieee, _ in cases:
+                with self.subTest(case=name, ftz32=False):
+                    self.assertEqual(run_nr_fdiv_ps(ab, bb), want_ieee)
+        finally:
+            rdna2spirv.FTZ32 = old_ftz
 
     def test_sign_rule_preservation(self):
         cases = (

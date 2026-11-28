@@ -753,7 +753,8 @@ class DenormalFlushTests(unittest.TestCase):
         self.assertEqual(run_three_input("v_mad_legacy_f32", NEG_ZERO, TWO, NEG_ZERO), POS_ZERO)
 
     def test_denormal_divergence_is_still_detectable(self):
-        # Sabotage: turn every flush select into a pass-through; the subnormal cases above now differ.
+        # Sabotage: drop hardware DenormFlushToZero 32 (default) or software flush selects (--no-ftz32);
+        # the subnormal cases above now differ.
         cases = [
             ("v_mad_f32", 0x17800000, 0x1C800000, SUBNORM_MIN, POS_ZERO),
             ("v_mac_f32", SUBNORM_MIN, ONE, SUBNORM_MIN, POS_ZERO),
@@ -768,9 +769,19 @@ class DenormalFlushTests(unittest.TestCase):
                     lines = [f"v_mov_b32 v1, {a:#x}", f"v_mov_b32 v2, {b:#x}",
                              f"v_mov_b32 v3, {c:#x}", f"{op} v0, v1, v2, v3"]
                 spv = translate_ps(lines)
+                self.assertIn("OpExecutionMode %main DenormFlushToZero 32", spv)
                 self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0], want)
+                no_mode = "\n".join(ln for ln in spv.splitlines() if "DenormFlushToZero" not in ln)
+                self.assertNotEqual(si.run_fragment(no_mode)["%out_mrt0"][0], want)
+                old_ftz = rdna2spirv.FTZ32
+                rdna2spirv.FTZ32 = False
+                try:
+                    spv_sw = translate_ps(lines)
+                finally:
+                    rdna2spirv.FTZ32 = old_ftz
+                self.assertEqual(si.run_fragment(spv_sw)["%out_mrt0"][0], want)
                 unflushed, count = re.subn(r"(%\w+) = OpSelect %float (%\w+) (%\w+) (%\w+)",
-                                           r"\1 = OpCopyObject %float \4", spv)
+                                           r"\1 = OpCopyObject %float \4", spv_sw)
                 self.assertGreaterEqual(count, 3)
                 self.assertNotEqual(si.run_fragment(unflushed)["%out_mrt0"][0], want)
 
