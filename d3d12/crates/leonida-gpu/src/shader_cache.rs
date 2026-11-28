@@ -151,7 +151,7 @@ fn paired_override(container: &[u8], mut shader: HostShader) -> HostShader {
     let Some(dir) = DIR.get_or_init(|| std::env::var_os("LEONIDA_PAIRED_SHADER_DIR").map(PathBuf::from)) else {
         return shader;
     };
-    if shader.stage != HwStage::Cs || leonida_shader::emit::host_settings() != [32, 999_999, 0, 0, 0] {
+    if shader.stage != HwStage::Cs || leonida_shader::emit::host_settings() != [32, 999_999, 0, 0, 0, 0] {
         return shader;
     }
     let digest = blake3::hash(container).to_hex();

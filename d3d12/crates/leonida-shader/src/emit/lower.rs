@@ -1539,15 +1539,42 @@ fn own_bits_on() -> bool {
 
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 5] {
+/// what it writes for the console's own hardware, whether mesh programs
+/// run as compute and whether pixel shaders go without barycentrics.
+pub fn host_settings() -> [u32; 6] {
     [
         host_max_wave(),
         super::shader::view_heap_limit(),
         super::shader::raw_views(),
         host_rdna(),
         u32::from(host_mesh_compute()),
+        u32::from(!host_barycentrics()),
     ]
+}
+
+static HOST_NO_BARYCENTRICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the translator whether the host has D3D12 barycentrics
+/// (`SV_Barycentrics`, `attributeAtVertex`; Turing and newer). Without them
+/// a pixel shader reads the weights and the other vertices' values from
+/// ordinary inputs a geometry shader of ours writes ([`super::bary_gs`]).
+pub fn set_host_barycentrics(on: bool) {
+    HOST_NO_BARYCENTRICS.store(!on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`host_barycentrics`], for its thread only.
+    pub(super) static TEST_BARYCENTRICS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether pixel shaders may use D3D12 barycentrics ([`set_host_barycentrics`]).
+pub fn host_barycentrics() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_BARYCENTRICS.get() {
+        return on;
+    }
+    !HOST_NO_BARYCENTRICS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static HOST_MESH_COMPUTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3288,6 +3315,9 @@ impl<'a> Lower<'a> {
             }
             self.fill_phis()?;
         }
+        if self.s.pixel && !host_barycentrics() {
+            place_fallback_inputs(&mut self.s.inputs).map_err(|why| unsupported(0, why))?;
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -3761,6 +3791,9 @@ impl<'a> Lower<'a> {
         if index > 1 {
             return Val::Missing("pull-model barycentrics");
         }
+        if !host_barycentrics() {
+            return self.fallback_barycentric(mode, index);
+        }
         // One element per interpolation mode (the console's own, if its
         // signature declares one): DXIL allows two.
         let bary = |e: &SigElement| e.kind == 28;
@@ -3800,6 +3833,60 @@ impl<'a> Lower<'a> {
         e.row = None;
         e.interp = mode;
         self.s.flags |= flags::BARYCENTRICS;
+        self.load_any_input(id, index + 1)
+    }
+
+    /// [`Self::barycentric`] on a host without barycentrics: channel
+    /// `index + 1` of an ordinary three-float input [`super::BARY_INPUT`]
+    /// interpolated with `mode`, which [`super::bary_gs`] writes as (1, 0,
+    /// 0), (0, 1, 0) and (0, 0, 1) at the triangle's vertices 0, 1 and 2:
+    /// interpolated, the weights `SV_Barycentrics` would hold. Its register
+    /// is placed after the title's inputs when the shader is finished.
+    fn fallback_barycentric(&mut self, mode: u8, index: u8) -> Val {
+        // A barycentrics element the console's signature declared is not
+        // read any more: the weights come from ours.
+        let ours = |e: &SigElement| e.kind == 0 && e.name == super::BARY_INPUT;
+        let console = self
+            .s
+            .inputs
+            .iter()
+            .position(|e| e.kind == 28 && (e.interp == mode || e.usage == 0));
+        let id = match self.s.inputs.iter().position(|e| ours(e) && e.interp == mode) {
+            Some(id) => id,
+            None => {
+                let index = self.s.inputs.iter().filter(|e| ours(e)).count() as u32;
+                if index >= 2 {
+                    return Val::Missing("barycentrics of a third interpolation mode");
+                }
+                if let Some(id) = console
+                    && (self.s.inputs[id].col != 0 || self.s.inputs[id].cols < 3)
+                {
+                    return Val::Missing("a console barycentrics element without i and j");
+                }
+                let e = SigElement {
+                    name: super::BARY_INPUT.into(),
+                    index,
+                    kind: 0,
+                    comp: 9,
+                    interp: mode,
+                    row: None,
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                };
+                match console {
+                    Some(id) => {
+                        self.s.inputs[id] = e;
+                        id
+                    }
+                    None => {
+                        self.s.inputs.push(e);
+                        self.s.inputs.len() - 1
+                    }
+                }
+            }
+        };
         self.load_any_input(id, index + 1)
     }
 
@@ -12215,6 +12302,9 @@ impl<'a> Lower<'a> {
     /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
     /// of a constant input element's channel, as a float.
     fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
+        if !host_barycentrics() {
+            return self.fallback_vertex_input(id, col, k);
+        }
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let int = e.comp != 9;
@@ -12239,6 +12329,69 @@ impl<'a> Lower<'a> {
             137,
             &args,
         );
+        if int {
+            self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.f32)
+        } else {
+            v
+        }
+    }
+
+    /// [`Self::vertex_input`] on a host without barycentrics. Vertex 0 is
+    /// the element itself: it is constant, and a constant input is the
+    /// first vertex's, which [`super::bary_gs`] emits first. Vertices 1 and
+    /// 2 are one-channel constant inputs [`super::VERTEX_INPUT`] of their
+    /// own whose semantic index names the source ([`super::vertex_index`]):
+    /// the geometry shader copies that vertex's value of the vertex
+    /// shader's output in the element's register and column into them.
+    fn fallback_vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
+        let e = &self.s.inputs[id];
+        // The other vertices' values as 32-bit floats or as raw bits.
+        let int = e.comp != 9;
+        let comp = if int { 5 } else { 9 };
+        let source = e.row.map(|row| (row, e.col + col));
+        let id = match (k, source) {
+            (0, _) | (_, None) => id,
+            (k, Some((row, col))) => {
+                let index = super::vertex_index(k, row, col);
+                let ours = |e: &SigElement| e.name == super::VERTEX_INPUT && e.index == index;
+                match self.s.inputs.iter().position(ours) {
+                    Some(id) => id,
+                    None => {
+                        self.s.inputs.push(SigElement {
+                            name: super::VERTEX_INPUT.into(),
+                            index,
+                            kind: 0,
+                            comp,
+                            interp: 1,
+                            row: None,
+                            col: 0,
+                            cols: 1,
+                            usage: 0,
+                            half: false,
+                        });
+                        self.s.inputs.len() - 1
+                    }
+                }
+            }
+        };
+        // A source without a register (a system value) has no vertex
+        // shader output to copy: its vertex 0 value stands for all three.
+        let col = if k == 0 || source.is_none() { col } else { 0 };
+        let e = &mut self.s.inputs[id];
+        e.usage |= 1 << col;
+        let (ty, suffix) = if int {
+            (self.s.t.i32, ".i32")
+        } else {
+            (self.s.t.f32, ".f32")
+        };
+        let entry = self.s.entry;
+        let args = [
+            self.s.m.i32(id as u32),
+            self.s.m.i32(0),
+            self.s.m.i8(col),
+            self.s.m.undef(self.s.t.i32),
+        ];
+        let v = self.s.op(entry, &format!("loadInput{suffix}"), Attr::ReadNone, ty, 4, &args);
         if int {
             self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.f32)
         } else {
@@ -14511,6 +14664,66 @@ impl<'a> Lower<'a> {
 
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
 /// pull model).
+/// The pixel inputs a host without barycentrics reads in their place
+/// ([`super::BARY_INPUT`], [`super::VERTEX_INPUT`]) get registers after the
+/// title's: each weights element a row of its own (its interpolation mode
+/// is the row's), the one-channel vertex values packed four to a row, the
+/// floats and the integers apart. A console barycentrics element no
+/// barycentric read took over is not declared on the host: it turns into
+/// an unread weights element. More rows than a pixel shader has (32) are
+/// refused.
+fn place_fallback_inputs(inputs: &mut [SigElement]) -> Result<(), Why> {
+    const ROWS: u32 = 32;
+    let ours = |e: &SigElement| e.name == super::BARY_INPUT || e.name == super::VERTEX_INPUT;
+    // (indices after the two a barycentric read may take)
+    for (n, e) in inputs.iter_mut().filter(|e| e.kind == 28).enumerate() {
+        *e = SigElement {
+            name: super::BARY_INPUT.into(),
+            index: 2 + n as u32,
+            kind: 0,
+            comp: 9,
+            interp: if e.interp == 0 { 2 } else { e.interp },
+            row: None,
+            col: 0,
+            cols: 3,
+            usage: 0,
+            half: false,
+        };
+    }
+    let mut next = inputs
+        .iter()
+        .filter(|e| !ours(e))
+        .filter_map(|e| e.row)
+        .max()
+        .map_or(0, |r| r + 1);
+    for e in inputs.iter_mut().filter(|e| e.name == super::BARY_INPUT) {
+        e.row = Some(next);
+        next += 1;
+    }
+    for comp in [9, 5] {
+        let mut col = 0;
+        for e in inputs
+            .iter_mut()
+            .filter(|e| e.name == super::VERTEX_INPUT && e.row.is_none() && e.comp == comp)
+        {
+            e.row = Some(next);
+            e.col = col;
+            col += 1;
+            if col == 4 {
+                col = 0;
+                next += 1;
+            }
+        }
+        if col != 0 {
+            next += 1;
+        }
+    }
+    if next > ROWS {
+        return Err("more pixel inputs than 32 registers with the barycentrics stand-ins");
+    }
+    Ok(())
+}
+
 fn interp_mode(kind: Barycentric) -> Option<u8> {
     Some(match kind {
         Barycentric::PerspectiveCenter => 2,

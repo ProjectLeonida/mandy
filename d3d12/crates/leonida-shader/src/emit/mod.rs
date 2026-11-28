@@ -80,6 +80,7 @@
 //!   shaders and draws triangle lists with the title's own vertex counts.
 //!   It binds nothing.
 
+mod bary_gs;
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
@@ -128,7 +129,32 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, mesh_as_compute, set_host_max_wave, set_host_mesh_shaders, set_host_rdna, take_pack_why};
+pub use bary_gs::{bary_gs, needs_bary_gs};
+pub use lower::{
+    host_barycentrics, host_settings, mesh_as_compute, set_host_barycentrics, set_host_max_wave, set_host_mesh_shaders,
+    set_host_rdna, take_pack_why,
+};
+
+/// A host without barycentrics: the pixel input that stands for
+/// `SV_Barycentrics` (three floats, one element per interpolation mode, semantic
+/// index 0 or 1), written by [`bary_gs`].
+pub const BARY_INPUT: &str = "LEONIDA_BARY";
+
+/// A host without barycentrics: a one-channel constant pixel input holding one
+/// channel of another vertex's value (what `attributeAtVertex` read); its
+/// semantic index says which ([`vertex_index`]).
+pub const VERTEX_INPUT: &str = "LEONIDA_VTX";
+
+/// The semantic index of the [`VERTEX_INPUT`] that holds vertex `k` (1 or 2) of
+/// the value in register `row`, column `col`.
+pub fn vertex_index(k: u8, row: u32, col: u8) -> u32 {
+    u32::from(k) << 16 | row << 2 | u32::from(col)
+}
+
+/// [`vertex_index`] read back: (vertex, register, column).
+pub fn vertex_source(index: u32) -> (u8, u32, u8) {
+    ((index >> 16) as u8, (index >> 2) & 0x3fff, (index & 3) as u8)
+}
 pub use mesh_vs::mesh_vs;
 pub use rect::rect_list_gs;
 pub use shader::{
@@ -3956,6 +3982,252 @@ mod barycentric_tests {
         assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
         assert_eq!(texcoord_mode(&shader), 1);
         validate(&shader);
+    }
+
+    /// What a program of [`barycentric_programs`] writes at weights i and j
+    /// of a triangle whose TEXCOORD0 is (2, 3) at vertex 0, (6, 5) at 1 and
+    /// (10, 7) at 2.
+    type Expected = fn(f32, f32) -> f32;
+
+    /// The pixel programs of the barycentrics tests above: (name, words,
+    /// barycentrics the program loads, what it writes).
+    fn barycentric_programs() -> Vec<(&'static str, Vec<u32>, u32, Expected)> {
+        let [e0, e1] = exp_mrt0(2);
+        let [f0, f1] = exp_mrt0(4);
+        let [g0, g1] = exp_mrt0(3);
+        vec![
+            ("values", vec![v_add_f32(2, 0, 1), e0, e1, S_ENDPGM], PERSP_CENTER, |i, j| i + j),
+            ("two modes", vec![v_add_f32(4, 0, 3), f0, f1, S_ENDPGM], PERSP_CENTER | LINEAR_CENTER, |i, j| i + j),
+            (
+                "interpolation and a value",
+                vec![0xC808_0000, 0xC809_0001, v_add_f32(3, 2, 1), g0, g1, S_ENDPGM],
+                PERSP_CENTER,
+                |i, j| 2.0 + 4.0 * i + 8.0 * j + j,
+            ),
+            (
+                "computed i",
+                vec![0x1006_00F0, 0xC808_0003, 0xC809_0001, e0, e1, S_ENDPGM],
+                PERSP_CENTER,
+                |i, j| 2.0 + 2.0 * i + 8.0 * j,
+            ),
+            (
+                "constant weights",
+                vec![0x7E06_02F0, 0xC808_0003, 0xC809_0003, e0, e1, S_ENDPGM],
+                PERSP_CENTER,
+                |_, _| 8.0,
+            ),
+            (
+                "computed and loaded",
+                vec![
+                    0xC810_0100,
+                    0xC811_0101,
+                    0x1006_02F0,
+                    0xC808_0000,
+                    0xC809_0003,
+                    v_add_f32(2, 2, 4),
+                    e0,
+                    e1,
+                    S_ENDPGM,
+                ],
+                PERSP_CENTER,
+                |i, j| 5.0 + 6.0 * i + 8.0 * j,
+            ),
+            (
+                "p10",
+                vec![0xC808_0000, 0xC809_0001, 0xC812_0000, v_add_f32(2, 2, 4), e0, e1, S_ENDPGM],
+                PERSP_CENTER,
+                |i, j| 6.0 + 4.0 * i + 8.0 * j,
+            ),
+        ]
+    }
+
+    /// `pixel` as a host without barycentrics translates it.
+    fn pixel_without_barycentrics(words: &[u32], ena: u32) -> Result<HostShader, ShaderError> {
+        let was = lower::TEST_BARYCENTRICS.replace(Some(false));
+        let shader = pixel(words, ena);
+        lower::TEST_BARYCENTRICS.set(was);
+        shader
+    }
+
+    /// `D3D12-BARYCENTRICS-FALLBACK`: without host barycentrics every one of
+    /// those programs declares neither the feature nor `SV_Barycentrics`;
+    /// it reads `LEONIDA_BARY` and `LEONIDA_VTX` inputs in registers after
+    /// its own, and the validator accepts it.
+    #[test]
+    fn without_host_barycentrics_pixel_programs_read_stand_ins() {
+        for (name, words, ena, _) in barycentric_programs() {
+            let shader = pixel_without_barycentrics(&words, ena).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let (features, inputs) = parts(&shader);
+            assert_eq!(features & 0x2_0000, 0, "{name}: the Barycentrics feature");
+            assert!(inputs.iter().all(|e| e.kind != 28), "{name}: {inputs:?}");
+            let ours: Vec<_> = inputs.iter().filter(|e| e.name == BARY_INPUT || e.name == VERTEX_INPUT).collect();
+            assert!(!ours.is_empty(), "{name}: no stand-ins: {inputs:?}");
+            let own = inputs
+                .iter()
+                .filter(|e| e.name != BARY_INPUT && e.name != VERTEX_INPUT)
+                .filter_map(|e| e.row)
+                .max();
+            for e in &ours {
+                assert!(e.row.is_some() && e.row > own, "{name}: {e:?} not after the title's inputs");
+                if e.name == VERTEX_INPUT {
+                    assert_eq!(e.cols, 1, "{name}: {e:?}");
+                    assert!((1..=2).contains(&vertex_source(e.index).0), "{name}: {e:?}");
+                }
+            }
+            assert!(needs_bary_gs(&shader.dxil), "{name}");
+            validate(&shader);
+            // With host barycentrics the same program needs no stage.
+            assert!(!needs_bary_gs(&pixel(&words, ena).unwrap().dxil), "{name}");
+        }
+        assert_eq!(vertex_source(vertex_index(2, 31, 3)), (2, 31, 3));
+    }
+
+    /// The vertex shader of the device tests: POSITION and TEXCOORD0 through,
+    /// TEXCOORD in output row 0 as the translated pixel shaders read it.
+    #[cfg(windows)]
+    fn texcoord_vs() -> HostShader {
+        use super::bitcode::{Attr, Term};
+        use super::shader::Shader;
+        let mut s = Shader::new(false);
+        s.inputs = vec![element("POSITION", 0, 0), element("TEXCOORD", 0, 1)];
+        for e in &mut s.inputs {
+            e.usage = 15;
+        }
+        s.outputs = vec![element("TEXCOORD", 0, 0), element("SV_Position", 3, 1)];
+        for (i, e) in s.outputs.iter_mut().enumerate() {
+            e.usage = 15;
+            e.interp = if i == 1 { 4 } else { 2 };
+        }
+        for row in 0..2 {
+            for col in 0..4 {
+                let args = [s.m.i32(row), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                let v = s.op(s.entry, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+                let args = [s.m.i32(1 - row), s.m.i32(0), s.m.i8(col), v];
+                s.op(s.entry, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+            }
+        }
+        s.m.terminate(s.entry, Term::Ret);
+        HostShader {
+            stage: HwStage::Vs,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
+            mesh_out: None,
+        }
+    }
+
+    /// The stage links the vertex shader with each stand-in pixel shader,
+    /// and the validator accepts it.
+    #[test]
+    #[cfg(windows)]
+    fn the_barycentrics_stage_is_a_valid_geometry_shader() {
+        let vs = texcoord_vs();
+        for (name, words, ena, _) in barycentric_programs() {
+            let ps = pixel_without_barycentrics(&words, ena).unwrap();
+            let gs = bary_gs(&vs.dxil, &ps.dxil).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let c = Container::parse(&gs).unwrap();
+            // Program version: geometry (2), shader model 6.6.
+            assert_eq!(c.part(FourCC::DXIL).unwrap().data[..4], [0x66, 0, 2, 0], "{name}");
+            let outs = signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+            let (_, ins) = parts(&ps);
+            for e in ins.iter().filter(|e| e.row.is_some() && e.kind == 0) {
+                assert!(
+                    outs.iter().any(|o| (&o.name, o.index, o.row, o.col) == (&e.name, e.index, e.row, e.col)),
+                    "{name}: {e:?} is not written"
+                );
+            }
+            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                v.validate(&mut gs.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
+    }
+
+    /// One triangle over an 8x8 target: each program drawn through the stage
+    /// with the stand-ins writes what the console's interpolation gives
+    /// (worked out by hand), and, where the host has barycentrics to compare
+    /// with, what the host draws with them.
+    #[test]
+    #[cfg(windows)]
+    fn the_barycentrics_stage_draws_what_host_barycentrics_draw() {
+        use super::host::{Draw, Host};
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let vs = texcoord_vs();
+        // (the triangle of `first_half_values_render_on_hardware_and_warp`:
+        // at a pixel's centre i is (row + 0.5) / 16 and j (column + 0.5) / 16)
+        let vertices = [
+            -1.0, 1.0, 0.5, 1.0, 2.0, 3.0, 0.0, 0.0, -1.0, -3.0, 0.5, 1.0, 6.0, 5.0, 0.0, 0.0, 3.0,
+            1.0, 0.5, 1.0, 10.0, 7.0, 0.0, 0.0,
+        ];
+        let mut ran = 0;
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let mut options =
+                windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: a correctly sized output for the feature query.
+            unsafe {
+                host.device
+                    .CheckFeatureSupport(
+                        windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS3,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .unwrap();
+            }
+            let native = options.BarycentricsSupported.as_bool();
+            for (name, words, ena, expected) in barycentric_programs() {
+                let draw = |ps: &HostShader, gs: Option<&[u8]>| {
+                    let root = host.root_signature(&vs, ps).unwrap();
+                    let pso = host
+                        .pipeline_with_gs(&root, &vs.dxil, gs, &ps.dxil)
+                        .unwrap_or_else(|e| panic!("{backend} {name}: {e}"));
+                    let d = Draw {
+                        roots: Vec::new(),
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &vertices,
+                        stride: 32,
+                        size: (8, 8),
+                        mesh_groups: 0,
+                        vertex_count: 0,
+                    };
+                    host.draw(&root, &pso, &d).unwrap()
+                };
+                let ps = pixel_without_barycentrics(&words, ena).unwrap();
+                let gs = bary_gs(&vs.dxil, &ps.dxil).unwrap();
+                let ours = draw(&ps, Some(&gs[..]));
+                for (n, texel) in ours.iter().enumerate() {
+                    let i = (n / 8) as f32 / 16.0 + 0.5 / 16.0;
+                    let j = (n % 8) as f32 / 16.0 + 0.5 / 16.0;
+                    let want = expected(i, j);
+                    assert!(
+                        texel.iter().all(|got| (got - want).abs() < 1e-4),
+                        "{backend} {name} pixel {n}: {texel:?}, not {want}"
+                    );
+                }
+                if native {
+                    let theirs = draw(&pixel(&words, ena).unwrap(), None);
+                    for (n, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                        assert!(
+                            a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4),
+                            "{backend} {name} pixel {n}: stand-ins {a:?}, barycentrics {b:?}"
+                        );
+                    }
+                }
+            }
+            ran += 1;
+            eprintln!("the barycentrics stage draws on {backend} (compared: {native})");
+        }
+        if ran == 0 {
+            eprintln!("no SM 6.6 host; GPU checks skipped");
+        }
     }
 
     /// P10 of an attribute the program interpolates is P1 - P0.
