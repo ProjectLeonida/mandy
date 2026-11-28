@@ -1692,43 +1692,71 @@ class FunctionTranslator:
         a = self.asm
         op = ins.ops[0]
         sz = self._op_size(op)
+        sf = 1 if sz == 8 else 0
         need = self.needed.get(ins.addr, set())
-        keep_c = "C" in need or ins.addr in self.mat
+        flaggy = bool(need) or ins.addr in self.mat
         self._load(ins, op, T0)
+        if flaggy and ("A" in need or ins.addr in self.mat):
+            a.stur(T0, CTX_REG, CTX_A, size=8)
+            a.movz(T1, 1, 0, sf=0)
+            a.stur(T1, CTX_REG, CTX_B, size=8)
         sh = (32 - sz * 8) if sz < 4 else 0
+        if not flaggy:
+            (a.add if ins.mnem == "inc" else a.sub)(T0, T0, 1, sf)
+            if sz == 1:
+                a.uxtb(T0, T0)
+            elif sz == 2:
+                a.uxth(T0, T0)
+            self._store(ins, op, T0)
+            return
         if sh:
             a.lsl(T0, T0, sh, sf=0)
-        if keep_c:
-            a.mrs_nzcv(GTMP)
-        (a.adds if ins.mnem == "inc" else a.subs)(T0, T0, 1, 1 if sz == 8 else 0)
-        if keep_c:
-            a.mrs_nzcv(T3)
-            a.bfi(T3, GTMP, 29, 1)
-            a.msr_nzcv(T3)
+            a.movz(T1, 1 << (sh - 16), 1, sf=0)
+        a.mrs_nzcv(GTMP)
+        if sh:
+            (a.adds_r if ins.mnem == "inc" else a.subs_r)(T0, T0, T1, sf=0)
+        else:
+            (a.adds if ins.mnem == "inc" else a.subs)(T0, T0, 1, sf)
+        a.mrs_nzcv(T3)
+        a.ubfx(GTMP, GTMP, 29, 1)
+        a.bfi(T3, GTMP, 29, 1)
+        a.msr_nzcv(T3)
         if sh:
             a.lsr(T0, T0, sh, sf=0)
         self._store(ins, op, T0)
         self._stash_res(ins, T0)
-        self._maybe_mkflags(ins)
+        if ins.addr in self.mat:
+            # Preserve ctx.eflags CF (bit 0) and do not invert ARM C (dec does not write CF).
+            a.ldur(GTMP, CTX_REG, CTX_EFLAGS, size=8)
+            self._mkflags(0)
+            a.ldur(T0, CTX_REG, CTX_EFLAGS, size=8)
+            a.bfi(T0, GTMP, 0, 1)
+            a.stur(T0, CTX_REG, CTX_EFLAGS, size=8)
 
     def _emit_negnot(self, ins):
         a = self.asm
         op = ins.ops[0]
         sz = self._op_size(op)
+        sf = 1 if sz == 8 else 0
         self._load(ins, op, T0)
-        sh = (32 - sz * 8) if sz < 4 else 0
-        if ins.mnem == "neg":
-            if sh:
-                a.lsl(T0, T0, sh, sf=0)
-            a.subs_r(T0, 31, T0, 1 if sz == 8 else 0)
-            if sh:
-                a.lsr(T0, T0, sh, sf=0)
-        else:
-            a.mvn(T0, T0, 1 if sz == 8 else 0)
+        if ins.mnem == "not":
+            a.mvn(T0, T0, sf)
             if sz == 1:
                 a.uxtb(T0, T0)
             elif sz == 2:
                 a.uxth(T0, T0)
+            self._store(ins, op, T0)
+            return
+        need = self.needed.get(ins.addr, set())
+        if "A" in need or ins.addr in self.mat:
+            a.stur(31, CTX_REG, CTX_A, size=8)
+            a.stur(T0, CTX_REG, CTX_B, size=8)
+        sh = (32 - sz * 8) if sz < 4 else 0
+        if sh:
+            a.lsl(T0, T0, sh, sf=0)
+        a.subs_r(T0, 31, T0, sf)
+        if sh:
+            a.lsr(T0, T0, sh, sf=0)
         self._store(ins, op, T0)
         self._stash_res(ins, T0)
         self._maybe_mkflags(ins)
