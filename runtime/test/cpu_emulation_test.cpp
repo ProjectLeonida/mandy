@@ -224,6 +224,16 @@ bool run(const Code& code, const void* in, void* out, DWORD* exception) {
     }
 }
 
+bool run_ptr(uint8_t* entry, const void* in, void* out, DWORD* exception) {
+    *exception = 0;
+    __try {
+        reinterpret_cast<Fn>(entry)(in, out);
+        return true;
+    } __except (*exception = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 const char* path(bool host_has) { return host_has ? "native" : "emulated"; }
 
 void test_live(const ce::Host& host) {
@@ -329,6 +339,82 @@ void test_live(const ce::Host& host) {
               0xC3});
     check(run(mon, lines, nullptr, &ex), "monitorx/mwaitx ran");
     std::printf("monitorx/mwaitx: %s\n", path(host.monitorx));
+    char mon_patch_env[4]{};
+    const bool mon_patch_on =
+        !(GetEnvironmentVariableA("LEONIDA_MONITORX_PATCH", mon_patch_env, sizeof(mon_patch_env)) > 0 &&
+          mon_patch_env[0] == '0');
+    if (!host.monitorx && !mon_patch_on) {
+        check(mon.mem[7] == 0x0F && mon.mem[8] == 0x01 && mon.mem[9] == 0xFA && mon.mem[14] == 0x0F &&
+                  mon.mem[15] == 0x01 && mon.mem[16] == 0xFB,
+              "LEONIDA_MONITORX_PATCH=0 leaves monitorx/mwaitx bytes untouched");
+    } else if (!host.monitorx) {
+        check(mon.mem[7] == 0x0F && mon.mem[8] == 0x1F && mon.mem[9] == 0x00,
+              "monitorx rewritten in place as 3-byte NOP");
+        check(mon.mem[14] == 0xF3 && mon.mem[15] == 0x90 && mon.mem[16] == 0x90,
+              "mwaitx rewritten in place as pause; nop");
+        const uint64_t mon_before = ce::count(ce::Op::monitorx).load();
+        const uint64_t mwait_before = ce::count(ce::Op::mwaitx).load();
+        check(run(mon, lines, nullptr, &ex), "rewritten monitorx/mwaitx code runs again");
+        check(ce::count(ce::Op::monitorx).load() == mon_before && ce::count(ce::Op::mwaitx).load() == mwait_before,
+              "rewritten monitorx/mwaitx runs without faulting again");
+
+        // Prefixed forms (length 4) stay unpatched and fall back to per-fault emulation.
+        Code mon_pref({0x48, 0x89, 0xC8, 0x31, 0xC9, 0x31, 0xD2, 0x66, 0x0F, 0x01, 0xFA,
+                       0x31, 0xC0, 0x31, 0xC9, 0x66, 0x0F, 0x01, 0xFB, 0xC3});
+        check(run(mon_pref, lines, nullptr, &ex), "prefixed monitorx/mwaitx ran via emulation");
+        check(mon_pref.mem[7] == 0x66 && mon_pref.mem[8] == 0x0F && mon_pref.mem[9] == 0x01 &&
+                  mon_pref.mem[10] == 0xFA && mon_pref.mem[15] == 0x66 && mon_pref.mem[16] == 0x0F &&
+                  mon_pref.mem[17] == 0x01 && mon_pref.mem[18] == 0xFB,
+              "prefixed monitorx/mwaitx bytes stay untouched");
+
+        // Page-end (0xFFD, shift-back atomic window) and page-straddling (0xFFE, emulated fallback).
+        auto* two_pages = static_cast<uint8_t*>(
+            VirtualAlloc(nullptr, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        check(two_pages != nullptr, "allocate two pages for page-boundary monitorx/mwaitx checks");
+        if (two_pages) {
+            // Case 1: 0xFF8: xor eax,eax; 0xFFA: xor ecx,ecx; 0xFFC: nop; 0xFFD..0xFFF: mwaitx; 0x1000: ret
+            two_pages[0xFF8] = 0x31;
+            two_pages[0xFF9] = 0xC0;
+            two_pages[0xFFA] = 0x31;
+            two_pages[0xFFB] = 0xC9;
+            two_pages[0xFFC] = 0x90;
+            two_pages[0xFFD] = 0x0F;
+            two_pages[0xFFE] = 0x01;
+            two_pages[0xFFF] = 0xFB;
+            two_pages[0x1000] = 0xC3;
+            DWORD old = 0;
+            VirtualProtect(two_pages, 0x2000, PAGE_EXECUTE_READ, &old);
+            FlushInstructionCache(GetCurrentProcess(), two_pages, 0x2000);
+            check(run_ptr(two_pages + 0xFF8, lines, nullptr, &ex), "page-end mwaitx at 0xFFD ran");
+            check(two_pages[0xFFC] == 0x90 && two_pages[0xFFD] == 0xF3 && two_pages[0xFFE] == 0x90 &&
+                      two_pages[0xFFF] == 0x90 && two_pages[0x1000] == 0xC3,
+                  "page-end mwaitx at 0xFFD patched without touching adjacent bytes");
+            const uint64_t mwait_edge = ce::count(ce::Op::mwaitx).load();
+            check(run_ptr(two_pages + 0xFF8, lines, nullptr, &ex) && ce::count(ce::Op::mwaitx).load() == mwait_edge,
+                  "page-end rewritten mwaitx runs again without faulting");
+
+            // Case 2: 0xFF7: mov rax,rcx; 0xFFA: xor ecx,ecx; 0xFFC: xor edx,edx; 0xFFE..0x1000: monitorx; 0x1001: ret
+            VirtualProtect(two_pages, 0x2000, PAGE_READWRITE, &old);
+            two_pages[0xFF7] = 0x48;
+            two_pages[0xFF8] = 0x89;
+            two_pages[0xFF9] = 0xC8;
+            two_pages[0xFFA] = 0x31;
+            two_pages[0xFFB] = 0xC9;
+            two_pages[0xFFC] = 0x31;
+            two_pages[0xFFD] = 0xD2;
+            two_pages[0xFFE] = 0x0F;
+            two_pages[0xFFF] = 0x01;
+            two_pages[0x1000] = 0xFA;
+            two_pages[0x1001] = 0xC3;
+            VirtualProtect(two_pages, 0x2000, PAGE_EXECUTE_READ, &old);
+            FlushInstructionCache(GetCurrentProcess(), two_pages, 0x2000);
+            check(run_ptr(two_pages + 0xFF7, lines, nullptr, &ex), "page-straddling monitorx at 0xFFE ran via emulation");
+            check(two_pages[0xFFE] == 0x0F && two_pages[0xFFF] == 0x01 && two_pages[0x1000] == 0xFA &&
+                      two_pages[0x1001] == 0xC3,
+                  "page-straddling monitorx stays untouched");
+            VirtualFree(two_pages, 0, MEM_RELEASE);
+        }
+    }
 
     // xor eax,eax; clwb [rcx]; clwb [rcx+rax+8]; mov dword [rdx],1; ret
     Code wb({0x31, 0xC0, 0x66, 0x0F, 0xAE, 0x31, 0x66, 0x0F, 0xAE, 0x74, 0x01, 0x08, 0xC7, 0x02, 0x01, 0, 0, 0,
