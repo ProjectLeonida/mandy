@@ -7725,7 +7725,9 @@ struct DeviceState {
     std::unordered_map<VkImage, PendingImage> pending_image_keys;
     using ZeroShape = std::tuple<DXGI_FORMAT, UINT64, UINT, UINT16, UINT16>;
     std::mutex zero_image_mutex;
-    std::map<ZeroShape, Resource*> zero_images;
+    std::map<ZeroShape, Resource*> zero_images;  // null: past the 256 MiB the shared images may take
+    // Shapes whose image could not be made, with when to try again (zero_sampled_image). Under zero_image_mutex.
+    std::map<ZeroShape, std::chrono::steady_clock::time_point> zero_image_retry;
     std::atomic<VkDeviceSize> zero_image_bytes{0};
     VkImage zero_sampled_image(const D3D12_RESOURCE_DESC&, const Format&, VkDeviceSize);
     std::multimap<std::uint64_t, leonida::DescriptorKey> image_keys;  // by the texture's address
@@ -10757,13 +10759,27 @@ VkImage DeviceState::zero_sampled_image(const D3D12_RESOURCE_DESC& d, const Form
     const ZeroShape key{d.Format, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels};
     std::lock_guard lock(zero_image_mutex);
     if (auto it = zero_images.find(key); it != zero_images.end()) return it->second ? it->second->image() : VK_NULL_HANDLE;
+    // A shape whose image could not be made is tried again a second later. Under VRAM pressure create_texture fails,
+    // or its image loses host-transfer usage: a shape left without an image for good would have every later placement
+    // of it take memory of its own for the rest of the session, and one tried at every placement would make an image
+    // and ask for its memory each time.
+    const auto now = std::chrono::steady_clock::now();
+    if (auto it = zero_image_retry.find(key); it != zero_image_retry.end()) {
+        if (now < it->second) return VK_NULL_HANDLE;
+        zero_image_retry.erase(it);
+    }
     constexpr VkDeviceSize limit = 256ull << 20;
     const auto used = zero_image_bytes.load(std::memory_order_relaxed);
     if (used >= limit || bytes > limit - used) return VK_NULL_HANDLE;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0, 1, 1};
     auto* zero = new Resource(*this, d, heap, D3D12_HEAP_FLAG_NONE);
-    if (FAILED(zero->create_texture(format)) || (copy_memory_to_image && !zero->host_initialized_image()) ||
-        zero->image_backing_bytes() > limit - used) {
+    if (FAILED(zero->create_texture(format)) || (copy_memory_to_image && !zero->host_initialized_image())) {
+        zero->Release();
+        zero_image_retry[key] = now + std::chrono::seconds(1);
+        return VK_NULL_HANDLE;
+    }
+    // The shared images are never released, so a shape past the limit stays past it.
+    if (zero->image_backing_bytes() > limit - used) {
         zero->Release();
         zero_images.emplace(key, nullptr);
         return VK_NULL_HANDLE;
