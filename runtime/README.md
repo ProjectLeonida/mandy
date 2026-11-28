@@ -351,7 +351,7 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_TITLE_TEXTURE_FILL_MB` | `32` | How many MiB of changed textures one pass fills again; the rest waits for the next pass. |
 | `LEONIDA_TEXTURE_HASH_BUDGET_US` | `400` | Microseconds a pass may spend hashing before it stops at a texture boundary. `0` leaves the byte budget alone to bound it. |
 | `LEONIDA_TEXTURE_SWEEP_BUDGET_US` | `400` | Microseconds a pass may spend on residency checks and uploads between textures. |
-| `LEONIDA_TITLE_BUFFERS_MB` | `512` | The most memory, in MiB, of buffers made over the title's own memory for vertex and index views that name it. |
+| `LEONIDA_TITLE_BUFFERS_MB` | `512` | The most memory, in MiB, of buffers made over the title's own memory for vertex and index views that name it. Only a buffer that covers its view (the pages imported or shadowed) is kept and counted; a view whose pages got neither is tried again a second later. |
 | `LEONIDA_TITLE_BUFFER_COVERAGE` | on | Such a view counts as covered only when a known buffer spans all its bytes. `0` asks for the first byte only. |
 | `LEONIDA_SHADOW_FULL_WALK` | unset | *Diagnostic.* `1` queries every page of the title-memory shadows at every refresh, as before unchanged generations were skipped. |
 | `LEONIDA_STRICT_REPLAY` | unset | *Diagnostic.* `1` makes a draw or dispatch with an unresolvable resource fail its command list (`src/vulkan_replay.h`); by default it is dropped and logged. |

@@ -2983,6 +2983,15 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(xbox_linear_texture_map PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
                          ENVIRONMENT "LEONIDA_LINEAR_MAP_FIRST=1")
     set_tests_properties(d3d12_xmem_placed PROPERTIES SKIP_RETURN_CODE 77)
+    # A vertex or index view of title memory that can be neither imported nor shadowed keeps no stand-in buffer and is
+    # tried again after a delay, not at every bind.
+    add_executable(d3d12_title_buffer_fallback_test test/d3d12_title_buffer_fallback_test.cpp)
+    target_link_libraries(d3d12_title_buffer_fallback_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_title_buffer_fallback_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_title_buffer_fallback_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_title_buffer_fallback COMMAND d3d12_title_buffer_fallback_test)
+    set_tests_properties(d3d12_title_buffer_fallback PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+                         ENVIRONMENT "LEONIDA_SLOT133_IMPORT=0;LEONIDA_ARENA_MB=16")
 
     # Fences and timing (D3D-30): multiple-fence waits, clock calibration, adapter LUID, custom heap properties.
     add_executable(d3d12_fence_timing_test test/d3d12_fence_timing_test.cpp)

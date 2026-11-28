@@ -19608,7 +19608,8 @@ public:
     // TitleVaAliases::want_buffer: a vertex or index view names `va` in the title's own memory and no buffer covers
     // it. A buffer over the 64 KiB-aligned committed pages around it is made the way slot 133 makes one (the pages
     // imported, or a shadow copied from them before every submission) and kept until the device goes, up to
-    // LEONIDA_TITLE_BUFFERS_MB (512 by default).
+    // LEONIDA_TITLE_BUFFERS_MB (512 by default). Only a buffer that covers the view is kept; a range that got none is
+    // not tried again for a second (refused_title_ranges_).
     void make_title_buffer(std::uint64_t va, std::uint64_t bytes) {
         if (!&context()) return;
         static const bool check_size = [] {
@@ -19648,6 +19649,13 @@ public:
         }
         // If the request runs into an uncommitted page or the size limit, reuse its backed prefix.
         if (end <= va || (check_size && state_.context->knows_buffer_va(va, end - va))) return;
+        // The title binds the same views draw after draw: a range whose buffer could not be made a moment ago waits
+        // for its retry time instead of being tried (and its buffers made and let go) at every bind.
+        const auto now = std::chrono::steady_clock::now();
+        if (const auto refused = refused_title_ranges_.find(start); refused != refused_title_ranges_.end()) {
+            if (end <= refused->second.end && now < refused->second.retry) return;
+            refused_title_ranges_.erase(refused);
+        }
         if (title_buffer_bytes_ + (end - start) > cap) {
             log_once("vertex or index data in the title's memory is past LEONIDA_TITLE_BUFFERS_MB, left unresolved; MiB so far:",
                      int(title_buffer_bytes_ >> 20));
@@ -19665,8 +19673,24 @@ public:
         const HRESULT hr = create_at_host_address(reinterpret_cast<void*>(static_cast<std::uintptr_t>(start)), desc,
                                                   0xFFFFFFFFu, __uuidof(ID3D12Resource),
                                                   reinterpret_cast<void**>(&made), nullptr);
-        if (FAILED(hr) || !made) {
-            log_once("a buffer over the title's memory for a vertex or index view could not be made; HRESULT", int(hr));
+        // When the pages can be neither imported nor shadowed, slot 133 answers with an ordinary DEFAULT buffer that
+        // has neither the title's VA nor its bytes (create_at_host_address). It does not cover the view, so keeping it
+        // would only hold its memory until the device goes and make another at the next bind of the same view, until
+        // LEONIDA_TITLE_BUFFERS_MB is used up. It is let go, and the range is tried again a second later, when the
+        // memory may be back.
+        const bool kept = SUCCEEDED(hr) && made && state_.context->knows_buffer_va(va, check_size ? end - va : 1);
+        if (!kept) {
+            if (SUCCEEDED(hr) && made)
+                log_once("a buffer over the title's memory for a vertex or index view could get neither an import nor "
+                         "a shadow, so none is kept; KiB",
+                         int((end - start) >> 10));
+            else
+                log_once("a buffer over the title's memory for a vertex or index view could not be made; HRESULT",
+                         int(hr));
+            if (made) made->Release();
+            if (refused_title_ranges_.size() >= 256)
+                std::erase_if(refused_title_ranges_, [&](const auto& refused) { return refused.second.retry <= now; });
+            refused_title_ranges_[start] = {end, now + std::chrono::seconds(1)};
             return;
         }
         title_buffers_.push_back(made);
@@ -19682,6 +19706,13 @@ public:
     std::mutex title_buffer_mutex_;
     std::vector<ID3D12Resource*> title_buffers_;  // kept: the title's views name their addresses frame after frame
     std::uint64_t title_buffer_bytes_ = 0;
+    // Ranges [start, end) that got no buffer, by start, with when they may be tried again. Under title_buffer_mutex_;
+    // the entries past their time are dropped once there are 256.
+    struct RefusedTitleRange {
+        std::uint64_t end;
+        std::chrono::steady_clock::time_point retry;
+    };
+    std::map<std::uint64_t, RefusedTitleRange> refused_title_ranges_;
 
     HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, std::uint32_t layout, REFIID riid,
                                    void** out, const D3D12_CLEAR_VALUE* clear) {
