@@ -135,8 +135,8 @@ and 76). The IID column is reproduced by `python -I tools/d3d12_iid_scan.py <pac
 following each `0x40`/`0x48`/`0x60`/`0x120` call back to its receiver.
 
 So the four slots' callers are in the game executable, which the package does not contain (the
-same blocker as RT-5). Confidence for slots 8, 9, 12 and 36 stays **Open**: the table in §2.1 is
-still the SDK baseline.
+same blocker as RT-5). From the package alone, slots 8, 9, 12 and 36 stay at the SDK baseline; the
+retail executable resolves both the carried IIDs and the creator call sites below.
 
 **Measured on the retail executable** (`python -I tools/d3d12_iid_scan.py`, 80 SDK IIDs read from
 the Windows SDK 10.0.26100 `d3d12.h`): the image carries 13 of them, and it carries the whole
@@ -161,16 +161,28 @@ The other carried IIDs are `ID3D12CommandSignature`, `ID3D12DescriptorHeap`, `ID
 why both `d3d12_iid_scan.py` and `is_device_iid` in `runtime/shims/d3d12_xs_device.cpp` recognise
 it during [retail_boot_chain.md](retail_boot_chain.md).
 
-A carried IID is necessary but not sufficient: it says the binary can ask for the interface, not
-where it does. The slots stay **Open** until a call site is followed.
-
 One console command-list IID is outside `d3d12.h`, so the scan cannot see it, and a proxy has to
 answer it rather than forward it to the PC device: `{C3827890-4024-474C-98CF-645B51DC4874}`
 (`.rdata` `0x1461E0668`), passed to Xbox device slot 73 (`CreateCommandListX`) in renderer startup
-at `0x142478B56` → `0x142478B71` ([retail_boot_chain.md](retail_boot_chain.md) §3.3,
+at `0x142478B56` → `0x142478B71` and `0x142478C70` ([retail_boot_chain.md](retail_boot_chain.md) §3.3,
 [#523](https://github.com/ubiquitarianism/leonida/issues/523)); the carried
-`IID_ID3D12GraphicsCommandList` (`0x1461ECFA0`) is passed to slot 73 at a separate site
+`IID_ID3D12GraphicsCommandList` (`0x1461ECFA0`) is passed to slot 73 at a separate helper site
 (`0x1417F6D1D` → `0x1417F6D34`).
+
+**Creator call sites in the retail executable** (Capstone disassembly over `.text`
+`0x140001000`–`0x145F40966`, following RIP-relative `lea` references to the five `.rdata` IIDs
+above and loads of the device globals `0x148759D00` and `0x1475DF000`–`0x1475DF048`):
+
+| Object | `.rdata` IID | Device slot(s) called | Call sites in `.text` | Observed arguments (`rcx` = device) | Verdict on §2.1 baseline |
+|---|---|---|---|---|---|
+| `ID3D12CommandQueue` | `0x1461E0648` | **8** (`+0x40`) and **48** (`+0x180`) | slot 8: `0x141E6C2EF`, `0x14247878A` (2); slot 48: `0x142478813`, `0x142478853`, `0x142478893`, `0x1424788D3` (4) | `(rdx=&desc, r8=&IID_ID3D12CommandQueue, r9=&out)` on `[0x148759D00]` | **Measured**: slot 8 matches PC `CreateCommandQueue` (16-byte desc); renderer init adds four console queues through slot 48 ([retail_boot_chain.md](retail_boot_chain.md) §3.2) |
+| `ID3D12CommandAllocator` | `0x1461E0658` | **9** (`+0x48`) | `0x14161D0A0`, `0x1417F6BCF`, `0x141F75D3A`, `0x142478B2D`, `0x142478C3B` (5) | `(edx=type, r8=&IID_ID3D12CommandAllocator, r9=&out)` on `[0x148759D00]`, `[0x1475DF010]` or a passed device pointer | **Measured**: all five allocator creations use public slot 9 (the two nearby `+0x48` calls at `0x141C74559` and `0x141F75FCB` are heap slot 9 on a descriptor heap from slot 14) |
+| `ID3D12GraphicsCommandList` / console list | `0x1461ECFA0`, `0x1461E0668` | **12** (`+0x60`): none; **73** (`+0x248`): 3 | `0x1417F6D34` (`0x1461ECFA0`), `0x142478B71` and `0x142478C70` (`0x1461E0668`) | `(rdx=&16-byte desc, r8=allocator, r9=0, [rsp+0x20]=riid, [rsp+0x28]=&out)` | **Measured**: PC slot 12 has **0** device sites in `.text`; every command-list creation uses console slot 73 (`CreateCommandListX`) and immediately calls list slot 9 (`+0x48`, `Close`) |
+| `ID3D12Fence` | `0x1461E0618` | **36** (`+0x120`) | `0x141D0B2FA` (1) | `(edx=0, r8d=1, r9=&IID_ID3D12Fence, [rsp+0x20]=&out)` on `[0x148759D00]` | **Measured**: matches PC `CreateFence(InitialValue=0, Flags=1, riid, out)` |
+
+So three of the four public creation slots (8, 9 and 36) keep their desktop indices and signatures
+on the Xbox device (with slot 48 alongside slot 8 for the extra queues), while slot 12 is unused by
+the executable in favour of the five-argument console `CreateCommandListX` at slot 73.
 
 ### 2.2 Queue, allocator and fence
 
