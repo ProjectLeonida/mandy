@@ -77,6 +77,7 @@ method, scope and caveats. No game data is included.
 | [modding.md](modding.md) | The mod format: a `mods/<folder>/mod.json` next to `gta6rt.exe` or under `--mods DIR`, swapping a named (or `joaat`) archetype for another; the `tools/leonida_mods.py` manager (`Mods.bat` on Windows, `Mods.sh` on Linux and macOS); load order, the start-up log, and the fact that a swap waits for the executable's archetype lookup address (RT-5). |
 | [descriptor_lookup_apple.md](descriptor_lookup_apple.md) | M3 Max GPU timings for texture and sampler descriptor lookups at 1k, 10k and 100k live entries. |
 | [descriptor_lookup_ada.md](descriptor_lookup_ada.md) | RTX 4070 SUPER (Ada, Windows) timings for the same lookups in VRAM, host-visible and ReBAR memory. |
+| [descriptor_lookup_ampere.md](descriptor_lookup_ampere.md) | RTX 3070 (Ampere, Windows, PCIe 3.0 x16, ReBAR off) timings for the same lookups in VRAM, host-visible and 214 MiB BAR1 memory. |
 | [descriptor_lookup_intel.md](descriptor_lookup_intel.md) | Intel UHD Graphics 770 (Xe-LP, Windows, driver 101.6129) timings for the same lookups at 1k–100k live entries; both memory placements within 0.6% of each other. |
 | [d3d12_xs_surface.md](d3d12_xs_surface.md) | The 116-slot `d3d12_xs.dll` export surface; 83/83 standard GUIDs match the PC SDK. |
 | [xdxr.md](xdxr.md) | `BATCHED_DESC2` (`0x50`) and `XDXR_STREAM_DESC` (`0x10`) from `XboxBvhBuilder.dll`'s reads; stream records' offsets and defaults; offline statistics not in the package. |
