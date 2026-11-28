@@ -241,6 +241,34 @@ class TestDialogue(unittest.TestCase):
         scan.add("c", 0, b"ZZ_KEYAU_ABCD\x00ZZ_TIMELEFT_90s_1\x00")
         self.assertEqual(scan.pairs["ZZ_KEYAU_ABCD"], ["ZZ_TIMELEFT_90s_1"])
 
+    def test_subfolders_are_read_in_name_order(self):
+        # os.walk lists subfolders in the file system's own order (by name on NTFS, by hash on ext4), and the
+        # dialogue table keeps the last text read for a label, so one folder of resources gave one text on Windows
+        # and another on Linux. A walk that lists subfolders backwards stands in for the other file system.
+        real_walk = os.walk
+
+        def backwards(top, *args, **kwargs):
+            for root, dirs, files in real_walk(top, *args, **kwargs):
+                dirs.reverse()
+                yield root, dirs, files
+
+        first = dict(EN, ZZ_LINE_A_1="This is the first table and you know it")
+        second = dict(EN, ZZ_LINE_A_1="This is the second table and you know it")
+        with tempfile.TemporaryDirectory() as tmp:
+            for sub, strings in (("a", first), ("b", second)):
+                os.makedirs(os.path.join(tmp, sub))
+                write(os.path.join(tmp, sub, "res.bin"), make_resource(strings))
+            for walk in (real_walk, backwards):
+                with self.subTest(walk=walk.__name__), patch.object(T.os, "walk", walk):
+                    scan = T.Scan()
+                    read = []
+                    for label, off, data in T.blobs(tmp):
+                        read.append(os.path.relpath(label, tmp))
+                        scan.add(label, off, data)
+                    scan.add("c", 0, CONV)
+                    self.assertEqual(read, [os.path.join("a", "res.bin"), os.path.join("b", "res.bin")])
+                    self.assertEqual(next(scan.dialogue_rows())["text_en"], second["ZZ_LINE_A_1"])
+
 
 class TestCli(unittest.TestCase):
     def test_unreadable_subdirectory_preserves_previous_tables_report(self):

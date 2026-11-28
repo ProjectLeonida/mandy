@@ -259,8 +259,12 @@ def blobs(source: str):
             def scan_failed(error: OSError) -> None:
                 raise error
 
-            paths = [os.path.join(r, f) for r, _d, fs in os.walk(source, onerror=scan_failed)
-                     for f in sorted(fs)]
+            # os.walk lists subfolders in the file system's own order (by name on NTFS, by hash on ext4), and the
+            # dialogue table keeps the last text read for a label, so the subfolders are sorted like the files.
+            paths = []
+            for root, dirs, files in os.walk(source, onerror=scan_failed):
+                dirs.sort()
+                paths += [os.path.join(root, f) for f in sorted(files)]
         for path in paths:
             if os.path.getsize(path) <= MAX_RESOURCE_BYTES:
                 with open(path, "rb") as fh:
