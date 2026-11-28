@@ -216,6 +216,9 @@ def main() -> int:
             counts["failed_inputs"] += 1
             status = 2
             continue
+        # Treat each input as one transaction: a directory may yield documents
+        # before a later malformed or unreadable member aborts its scan.
+        before_input = counts.copy()
         try:
             if os.path.isdir(path):
                 for _, _, doc in carve_documents(path):
@@ -228,6 +231,7 @@ def main() -> int:
                         doc = None
                     add(doc)
         except (OSError, ContentError, ValueError, KeyError, TypeError):
+            counts = before_input
             counts["failed_inputs"] += 1
             status = max(status, 1)
     print(json.dumps(counts, sort_keys=True))
