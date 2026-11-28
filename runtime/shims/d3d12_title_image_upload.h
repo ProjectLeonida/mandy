@@ -189,7 +189,7 @@ public:
                 regions_.push_back(copy);
             }
         }
-        Slot* slot = take_slot(d);
+        Slot* slot = take_slot(d, bytes);
         if (!slot || !prepare(d, *slot, bytes)) return nullptr;
         slot->regions = regions_;
         slot->reserved = true;
@@ -659,20 +659,30 @@ private:
         if (value_ && ready_) wait_value(d, value_);
     }
 
-    // A slot whose last transfer is done (looked up, not waited for); a new one while all are in flight, or the oldest
-    // one's transfer waited for once there are kMaxSlots.
+    // Best-fit idle slot with capacity >= bytes (smallest fit to avoid burning large slots on small uploads);
+    // otherwise the largest idle slot (grown in place so smaller slots stay reusable), a new slot up to kMaxSlots,
+    // or the oldest in-flight slot waited for.
     template<class Device>
-    Slot* take_slot(Device& d) {
+    Slot* take_slot(Device& d, VkDeviceSize bytes) {
         const std::uint64_t reached = poll_ready(d);
+        Slot* best_fit = nullptr;
+        Slot* best_grow = nullptr;
         Slot* oldest = nullptr;
         for (auto& slot : slots_) {
             if (slot->reserved) continue;
             if (!slot->value || slot->value <= reached) {
                 slot->value = 0;
-                return slot.get();
+                if (slot->capacity >= bytes) {
+                    if (!best_fit || slot->capacity < best_fit->capacity) best_fit = slot.get();
+                } else if (!best_grow || slot->capacity > best_grow->capacity) {
+                    best_grow = slot.get();
+                }
+                continue;
             }
             if (!oldest || slot->value < oldest->value) oldest = slot.get();
         }
+        if (best_fit) return best_fit;
+        if (best_grow) return best_grow;
         if (slots_.size() < kMaxSlots) return slots_.emplace_back(std::make_unique<Slot>()).get();
         return oldest && wait_slot(d, *oldest) ? oldest : nullptr;
     }

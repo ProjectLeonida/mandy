@@ -69,13 +69,18 @@ public:
     std::unique_ptr<PooledTitleImage> bind(VkDevice device, VkImage image, const VkMemoryRequirements& req,
                                            PFN_vkBindImageMemory bind_image, PFN_vkDestroyImage destroy_image,
                                            PFN_vkFreeMemory free_memory, Allocate allocate) {
-        constexpr VkDeviceSize largest_slot = VkDeviceSize{2} << 20;
-        const VkDeviceSize needed = std::max(req.size, req.alignment);
+        constexpr VkDeviceSize largest_slot = VkDeviceSize{8} << 20;
+        const VkDeviceSize needed = (std::max)(req.size, req.alignment);
         if (!needed || needed > largest_slot || !req.memoryTypeBits) return {};
         // Eight size classes per power of two keep padding below one eighth (besides required alignment).
-        const VkDeviceSize quantum = std::max(req.alignment, std::max(VkDeviceSize{1}, std::bit_floor(needed) / 8));
+        const VkDeviceSize quantum = (std::max)(req.alignment, (std::max)(VkDeviceSize{1}, std::bit_floor(needed) / 8));
         const VkDeviceSize stride = (needed + quantum - 1) & ~(quantum - 1);
-        const VkDeviceSize page_size = std::min(VkDeviceSize{8} << 20, 256 * stride);
+        const VkDeviceSize max_page = stride > (VkDeviceSize{2} << 20) ? (VkDeviceSize{16} << 20) : (VkDeviceSize{8} << 20);
+        if (!stride || stride > max_page) return {};
+        const VkDeviceSize max_bytes = (std::min)(max_page, 256 * stride);
+        const std::uint32_t capacity = static_cast<std::uint32_t>(max_bytes / stride);
+        if (!capacity) return {};
+        const VkDeviceSize page_size = stride * capacity;
         auto allocation = std::make_unique<PooledTitleImage>();
         std::lock_guard lock(mutex_);
         auto& pages = classes_[stride];

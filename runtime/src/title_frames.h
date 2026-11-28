@@ -41,10 +41,15 @@ struct Frame {
 using Lookup = bool (*)(std::uintptr_t page, Frame& out);
 // xmem's side: the host addresses the page's physical page is mapped at (its other addresses), appended to `out`.
 using Peers = void (*)(std::uintptr_t page, std::vector<std::uintptr_t>& out);
+// xmem's side: single-lock, zero-shared_ptr run_end and batch-backed checks over g_table_frames.
+using RunEnd = std::uintptr_t (*)(std::uintptr_t from, std::uintptr_t to, bool& is_backed);
+using BackedBatch = void (*)(const std::uintptr_t* pages, std::uint8_t* out_backed, std::size_t count);
 
 struct State {
     std::atomic<Lookup> lookup{nullptr};
     std::atomic<Peers> peers{nullptr};
+    std::atomic<RunEnd> run_end{nullptr};
+    std::atomic<BackedBatch> backed_batch{nullptr};
     // Every page ever given a table entry lies in [lo, hi): a range outside costs a reader two loads, not a lookup.
     std::atomic<std::uintptr_t> lo{UINTPTR_MAX}, hi{0};
 };
@@ -54,9 +59,12 @@ inline State& state() {
     return s;
 }
 
-inline void set_lookup(Lookup lookup, Peers peers) {
-    state().peers.store(peers, std::memory_order_release);
-    state().lookup.store(lookup, std::memory_order_release);
+inline void set_lookup(Lookup lookup, Peers peers, RunEnd run_end_fn = nullptr, BackedBatch backed_batch_fn = nullptr) {
+    State& s = state();
+    s.peers.store(peers, std::memory_order_release);
+    s.run_end.store(run_end_fn, std::memory_order_release);
+    s.backed_batch.store(backed_batch_fn, std::memory_order_release);
+    s.lookup.store(lookup, std::memory_order_release);
 }
 
 // xmem, before the page at `page` gets a table entry: the bounds grow to hold it (they never shrink).
@@ -103,11 +111,34 @@ inline void peers(std::uintptr_t va, std::vector<std::uintptr_t>& out) {
     if (const Peers f = state().peers.load(std::memory_order_acquire)) f(va & ~(kPage - 1), out);
 }
 
+// Sets out_backed[k] = 1 iff the 64 KiB page holding pages[k] is a backed table page, else 0.
+// Uses xmem's single-lock, zero-shared_ptr batch hook when registered; falls back to backed() otherwise.
+inline void backed_batch(const std::uintptr_t* pages, std::uint8_t* out_backed, std::size_t count) {
+    if (!count) return;
+    const State& s = state();
+    if (!s.lookup.load(std::memory_order_acquire) ||
+        s.lo.load(std::memory_order_acquire) >= s.hi.load(std::memory_order_acquire)) {
+        for (std::size_t k = 0; k < count; ++k) out_backed[k] = 0;
+        return;
+    }
+    if (const BackedBatch fn = s.backed_batch.load(std::memory_order_acquire)) {
+        fn(pages, out_backed, count);
+        return;
+    }
+    for (std::size_t k = 0; k < count; ++k) out_backed[k] = backed(pages[k]) ? 1u : 0u;
+}
+
 // The end of the run that starts at `from`, at most `to`, whose pages are all table pages or all not; `is_backed`
 // says which. At least one page, or up to `to`.
 inline std::uintptr_t run_end(std::uintptr_t from, std::uintptr_t to, bool& is_backed) {
+    if (!may_hold(from, to)) {
+        is_backed = false;
+        return to;
+    }
+    if (const RunEnd fn = state().run_end.load(std::memory_order_acquire)) {
+        return fn(from, to, is_backed);
+    }
     is_backed = backed(from);
-    if (!may_hold(from, to)) return to;
     std::uintptr_t at = (from & ~(kPage - 1)) + kPage;
     while (at < to && at > from && backed(at) == is_backed) at += kPage;
     return at < to && at > from ? at : to;

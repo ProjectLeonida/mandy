@@ -445,6 +445,7 @@ public:
         batch_tiles_.clear();
         batch_reqs_.clear();
         batch_tile_refs_.clear();
+        bool any_peer_sync = false;
 
         auto queue_tile = [&](std::size_t key_idx, std::uintptr_t a, Tile& tile) {
             if (tile.pass_written_gen == gen || tile.stale || tile.unarmed_index != kNoIndex)
@@ -457,8 +458,10 @@ public:
                 return;
             }
             if (tile.batch_arm_gen == bgen) {
-                out[key_idx].max_version = (std::max)(out[key_idx].max_version, tile.batch_arm_version);
-                if (tile.batch_arm_slot != kNoIndex) batch_tile_refs_.emplace_back(key_idx, tile.batch_arm_slot);
+                if (tile.batch_arm_slot != kNoIndex)
+                    batch_tile_refs_.emplace_back(key_idx, tile.batch_arm_slot);
+                else
+                    out[key_idx].max_version = (std::max)(out[key_idx].max_version, tile.batch_arm_version);
                 return;
             }
             const std::uint64_t mapping = tile.primary->mapping.load(std::memory_order_acquire);
@@ -475,22 +478,13 @@ public:
                     return;
                 }
             }
-            if (mapping != tile.mapping) {
-                sync_tile_peers(a, tile, mapping);
-            }
-            std::uint64_t version = tile.primary->version.load(std::memory_order_acquire);
-            for (const auto& [peer, cell] : tile.peers)
-                version = (std::max)(version, cell->version.load(std::memory_order_acquire));
-            const bool pure_hot_recheck = !tile.stale && tile.unarmed_index == kNoIndex && tile.hot_gen == pass_gen_ &&
-                                          mapping == tile.mapping && version == tile.version;
+            const bool needs_peer_sync = (mapping != tile.mapping);
+            if (needs_peer_sync) any_peer_sync = true;
             const std::uint32_t slot = static_cast<std::uint32_t>(batch_tiles_.size());
             tile.batch_arm_gen = bgen;
             tile.batch_arm_slot = slot;
-            tile.batch_arm_version = version;
-            out[key_idx].max_version = (std::max)(out[key_idx].max_version, version);
-            batch_tiles_.push_back({a, &tile, version, pure_hot_recheck, 1});
-            batch_reqs_.push_back({a, tile.primary, slot});
-            for (const auto& [peer, cell] : tile.peers) batch_reqs_.push_back({peer, cell, slot});
+            tile.batch_arm_version = 0;
+            batch_tiles_.push_back({a, &tile, 0, mapping, false, needs_peer_sync, 1});
             batch_tile_refs_.emplace_back(key_idx, slot);
         };
 
@@ -533,6 +527,23 @@ public:
         }
 
         if (batch_tiles_.empty()) return;
+
+        if (any_peer_sync) sync_batch_tile_peers();
+
+        for (std::size_t slot = 0; slot < batch_tiles_.size(); ++slot) {
+            BatchTile& bt = batch_tiles_[slot];
+            Tile& tile = *bt.tile;
+            std::uint64_t version = tile.primary->version.load(std::memory_order_acquire);
+            for (const auto& [peer, cell] : tile.peers)
+                version = (std::max)(version, cell->version.load(std::memory_order_acquire));
+            bt.version = version;
+            bt.pure_hot_recheck = !bt.needs_peer_sync && !tile.stale && tile.unarmed_index == kNoIndex &&
+                                  tile.hot_gen == pass_gen_ && version == tile.version;
+            tile.batch_arm_version = version;
+            const auto slot_u32 = static_cast<std::uint32_t>(slot);
+            batch_reqs_.push_back({bt.address, tile.primary, slot_u32});
+            for (const auto& [peer, cell] : tile.peers) batch_reqs_.push_back({peer, cell, slot_u32});
+        }
 
         if (batch_reqs_.size() > 1) {
             std::sort(batch_reqs_.begin(), batch_reqs_.end(),
@@ -631,7 +642,9 @@ private:
         std::uintptr_t address = 0;
         Tile* tile = nullptr;
         std::uint64_t version = 0;
+        std::uint64_t mapping = 0;
         bool pure_hot_recheck = false;
+        bool needs_peer_sync = false;
         int result = 1;
     };
     struct BatchArmReq {
@@ -732,6 +745,25 @@ private:
     }
 
     void drop(std::uintptr_t address, Tile& tile) {
+        if constexpr (requires(Watch& w, const std::pair<std::uintptr_t, bool>* items, std::size_t n) {
+                          w.release_batch(items, n);
+                      }) {
+            if (!tile.peers.empty()) {
+                peer_rel_items_.clear();
+                peer_rel_items_.reserve(tile.peers.size() + (tile.primary ? 1 : 0));
+                for (const auto& [peer, cell] : tile.peers) {
+                    unlink_peer(peer, address);
+                    peer_rel_items_.emplace_back(peer, false);
+                }
+                tile.peers.clear();
+                if (tile.primary) {
+                    peer_rel_items_.emplace_back(address, false);
+                    tile.primary = nullptr;
+                }
+                watch_.release_batch(peer_rel_items_.data(), peer_rel_items_.size());
+                return;
+            }
+        }
         for (const auto& [peer, cell] : tile.peers) {
             unlink_peer(peer, address);
             watch_.release(peer);
@@ -806,17 +838,114 @@ private:
             auto old = std::move(tile.peers);
             tile.peers.clear();
             tile.peers.reserve(aliases_.size());
-            for (const std::uintptr_t peer : aliases_) {
-                tile.peers.emplace_back(peer, watch_.acquire(peer));
-                by_peer_[peer].push_back(address);
+            if (!aliases_.empty()) {
+                if constexpr (requires(Watch& w, const std::uintptr_t* vas, Cell** out, std::size_t n) {
+                                  w.acquire_batch(vas, out, n);
+                              }) {
+                    peer_acq_cells_.resize(aliases_.size());
+                    watch_.acquire_batch(aliases_.data(), peer_acq_cells_.data(), aliases_.size());
+                    for (std::size_t k = 0; k < aliases_.size(); ++k) {
+                        const std::uintptr_t peer = aliases_[k];
+                        tile.peers.emplace_back(peer, peer_acq_cells_[k]);
+                        by_peer_[peer].push_back(address);
+                    }
+                } else {
+                    for (const std::uintptr_t peer : aliases_) {
+                        tile.peers.emplace_back(peer, watch_.acquire(peer));
+                        by_peer_[peer].push_back(address);
+                    }
+                }
                 hot_sync_needed_ = true;
             }
-            for (const auto& [peer, cell] : old) {
-                unlink_peer(peer, address);
-                watch_.release(peer);
+            if (!old.empty()) {
+                for (const auto& [peer, cell] : old) unlink_peer(peer, address);
+                if constexpr (requires(Watch& w, const std::pair<std::uintptr_t, bool>* items, std::size_t n) {
+                                  w.release_batch(items, n);
+                              }) {
+                    peer_rel_items_.clear();
+                    peer_rel_items_.reserve(old.size());
+                    for (const auto& [peer, cell] : old) peer_rel_items_.emplace_back(peer, false);
+                    watch_.release_batch(peer_rel_items_.data(), peer_rel_items_.size());
+                } else {
+                    for (const auto& [peer, cell] : old) watch_.release(peer);
+                }
             }
         }
         tile.mapping = mapping;
+    }
+
+    // Batches peer alias syncs across all remapped tiles in examine_batch() into at most ONE acquire_batch() + ONE
+    // release_batch() call (acquiring new peers before releasing old peers so surviving peers never drop refcount 0).
+    void sync_batch_tile_peers() {
+        peer_acq_vas_.clear();
+        peer_acq_spans_.clear();
+        peer_rel_items_.clear();
+        for (std::size_t slot = 0; slot < batch_tiles_.size(); ++slot) {
+            BatchTile& bt = batch_tiles_[slot];
+            if (!bt.needs_peer_sync) continue;
+            Tile& tile = *bt.tile;
+            const std::uintptr_t address = bt.address;
+            aliases_.clear();
+            watch_.aliases(address, aliases_);
+            std::erase(aliases_, address);
+            if (aliases_.size() > 1) {
+                std::sort(aliases_.begin(), aliases_.end());
+                aliases_.erase(std::unique(aliases_.begin(), aliases_.end()), aliases_.end());
+            }
+            bool same_peers = aliases_.size() == tile.peers.size();
+            if (same_peers) {
+                for (std::size_t k = 0; k < aliases_.size(); ++k) {
+                    if (tile.peers[k].first != aliases_[k]) {
+                        same_peers = false;
+                        break;
+                    }
+                }
+            }
+            if (!same_peers) {
+                for (const auto& [peer, cell] : tile.peers) {
+                    unlink_peer(peer, address);
+                    peer_rel_items_.emplace_back(peer, false);
+                }
+                tile.peers.clear();
+                if (!aliases_.empty()) {
+                    const std::size_t begin = peer_acq_vas_.size();
+                    peer_acq_vas_.insert(peer_acq_vas_.end(), aliases_.begin(), aliases_.end());
+                    peer_acq_spans_.push_back({slot, begin, aliases_.size()});
+                    hot_sync_needed_ = true;
+                }
+            }
+            tile.mapping = bt.mapping;
+        }
+        if (!peer_acq_vas_.empty()) {
+            peer_acq_cells_.resize(peer_acq_vas_.size());
+            if constexpr (requires(Watch& w, const std::uintptr_t* vas, Cell** out, std::size_t n) {
+                              w.acquire_batch(vas, out, n);
+                          }) {
+                watch_.acquire_batch(peer_acq_vas_.data(), peer_acq_cells_.data(), peer_acq_vas_.size());
+            } else {
+                for (std::size_t k = 0; k < peer_acq_vas_.size(); ++k)
+                    peer_acq_cells_[k] = watch_.acquire(peer_acq_vas_[k]);
+            }
+            for (const auto& span : peer_acq_spans_) {
+                BatchTile& bt = batch_tiles_[span.slot];
+                Tile& tile = *bt.tile;
+                tile.peers.reserve(span.count);
+                for (std::size_t k = 0; k < span.count; ++k) {
+                    const std::uintptr_t peer = peer_acq_vas_[span.begin + k];
+                    tile.peers.emplace_back(peer, peer_acq_cells_[span.begin + k]);
+                    by_peer_[peer].push_back(bt.address);
+                }
+            }
+        }
+        if (!peer_rel_items_.empty()) {
+            if constexpr (requires(Watch& w, const std::pair<std::uintptr_t, bool>* items, std::size_t n) {
+                              w.release_batch(items, n);
+                          }) {
+                watch_.release_batch(peer_rel_items_.data(), peer_rel_items_.size());
+            } else {
+                for (const auto& [peer, was_hot] : peer_rel_items_) watch_.release(peer);
+            }
+        }
     }
 
     int arm(std::uintptr_t address, Tile& tile) {
@@ -898,10 +1027,19 @@ private:
     std::vector<BatchTile> batch_tiles_;
     std::vector<BatchArmReq> batch_reqs_;
     std::vector<std::pair<std::size_t, std::uint32_t>> batch_tile_refs_;
+    struct PeerAcqSpan {
+        std::size_t slot = 0;
+        std::size_t begin = 0;
+        std::size_t count = 0;
+    };
     std::vector<std::uintptr_t> batch_arm_vas_;
     std::vector<Cell*> batch_arm_cells_;
     std::vector<std::size_t> batch_req_unique_;
     std::vector<std::int8_t> batch_arm_results_;
+    std::vector<std::uintptr_t> peer_acq_vas_;
+    std::vector<Cell*> peer_acq_cells_;
+    std::vector<PeerAcqSpan> peer_acq_spans_;
+    std::vector<std::pair<std::uintptr_t, bool>> peer_rel_items_;
     std::uint64_t pass_gen_ = 0;
     std::uint64_t over_gen_ = 0;
     std::uint64_t batch_arm_gen_ = 0;

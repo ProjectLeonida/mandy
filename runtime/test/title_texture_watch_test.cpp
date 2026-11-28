@@ -1,6 +1,7 @@
 // TitleTextureWatch (src/title_texture_watch.h): a title texture is looked at only when something says it may have
 // changed. A fake geometry watch stands in for the cells: a "write" bumps a tile's version and queues the tile, as
 // the write-fault handler does through geometry_writes::notify.
+#include "../src/title_frames.h"
 #include "../src/title_texture_refresh.h"
 #include "../src/title_texture_watch.h"
 
@@ -1050,10 +1051,159 @@ int main() {
         watch.examine_batch(keys, res);
         EXPECT(res[0].max_version == raced_ver);
     }
+    {  // Batched peer sync (acquire_batch / release_batch) in sync_tile_peers(), examine_batch(), and drop():
+       // across 4 remapping tiles with overlapping surviving peers, examine_batch() issues ONE acquire_batch() before
+       // ONE release_batch() so surviving peers never drop refcount to 0.
+        struct BatchPeerWatch : FakeWatch {
+            std::uint64_t single_acq = 0, single_rel = 0;
+            std::uint64_t batch_acq_calls = 0, batch_rel_calls = 0;
+            std::uint64_t batch_acq_items = 0, batch_rel_items = 0;
+            bool peer_dropped_to_zero = false;
+            std::uintptr_t watch_nonzero_peer = 0;
+            Cell* acquire(std::uintptr_t tile) {
+                ++single_acq;
+                return FakeWatch::acquire(tile);
+            }
+            void release(std::uintptr_t tile) {
+                ++single_rel;
+                FakeWatch::release(tile);
+            }
+            void acquire_batch(const std::uintptr_t* vas, Cell** out, std::size_t n) {
+                ++batch_acq_calls;
+                batch_acq_items += n;
+                for (std::size_t i = 0; i < n; ++i) out[i] = FakeWatch::acquire(vas[i]);
+            }
+            void release_batch(const std::pair<std::uintptr_t, bool>* items, std::size_t n) {
+                ++batch_rel_calls;
+                batch_rel_items += n;
+                for (std::size_t i = 0; i < n; ++i) {
+                    FakeWatch::release(items[i].first);
+                    if (watch_nonzero_peer && items[i].first == watch_nonzero_peer && !cells.count(watch_nonzero_peer))
+                        peer_dropped_to_zero = true;
+                }
+            }
+            void arm_batch(const std::uintptr_t* tiles, Cell* const* cell_ptrs, std::int8_t* results,
+                           std::size_t count) {
+                for (std::size_t i = 0; i < count; ++i) {
+                    const int r = FakeWatch::arm(tiles[i], *cell_ptrs[i]);
+                    results[i] = static_cast<std::int8_t>(r > 0 ? 1 : (r == 0 ? 0 : -1));
+                }
+            }
+        };
+        BatchPeerWatch bpw;
+        leonida::TitleTextureWatch<BatchPeerWatch> bwatch(bpw);
+        const std::uintptr_t p0 = 0x6100000000, p1 = 0x6200000000, p2 = 0x6300000000, p3 = 0x6400000000;
+        for (std::uint64_t k = 0; k < 4; ++k) {
+            bpw.alias[base + k * kTile] = {p0, p1};
+            bwatch.track(k + 1, base + k * kTile, kTile);
+        }
+        std::vector<std::uint64_t> keys;
+        std::vector<leonida::TitleTextureWatch<BatchPeerWatch>::BatchExamine> res;
+        bwatch.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{1, 2, 3, 4}));
+        const std::uint64_t sa0 = bpw.single_acq;
+        bwatch.examine_batch(keys, res);
+        // All 4 tiles' initial peer syncs ran in ONE acquire_batch (8 items, 0 single_acq for peers).
+        EXPECT(bpw.single_acq == sa0);
+        EXPECT(bpw.batch_acq_calls == 1 && bpw.batch_acq_items == 8);
+        EXPECT(bpw.batch_rel_calls == 0);
+        EXPECT(bpw.cells.at(p0).refs == 4 && bpw.cells.at(p1).refs == 4);
+
+        // Remap all 4 tiles from {p0, p1} -> {p0, p2} (p0 survives and MUST never hit refcount 0!).
+        bpw.watch_nonzero_peer = p0;
+        for (std::uint64_t k = 0; k < 4; ++k) {
+            bpw.alias[base + k * kTile] = {p0, p2};
+            bpw.write(base + k * kTile, /*mapping=*/true);
+        }
+        keys.clear();
+        bwatch.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{1, 2, 3, 4}));
+        bwatch.examine_batch(keys, res);
+        EXPECT(!bpw.peer_dropped_to_zero);
+        EXPECT(bpw.batch_acq_calls == 2 && bpw.batch_acq_items == 16);
+        EXPECT(bpw.batch_rel_calls == 1 && bpw.batch_rel_items == 8);
+        EXPECT(bpw.cells.at(p0).refs == 4 && bpw.cells.at(p2).refs == 4 && !bpw.cells.count(p1));
+
+        // Single-key examine() with remap also routes through acquire_batch / release_batch.
+        bpw.alias[base] = {p0, p3};
+        bpw.write(base, /*mapping=*/true);
+        keys.clear();
+        bwatch.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{1}));
+        EXPECT(bwatch.examine(1) == leonida::TitleTextureWatch<BatchPeerWatch>::Look::armed);
+        EXPECT(!bpw.peer_dropped_to_zero);
+        EXPECT(bpw.batch_acq_calls == 3 && bpw.batch_rel_calls == 2);
+        EXPECT(bpw.cells.at(p3).refs == 1 && bpw.cells.at(p2).refs == 3);
+
+        // untrack() releases primary + peers via release_batch.
+        bpw.watch_nonzero_peer = 0;
+        const std::uint64_t sr0 = bpw.single_rel;
+        for (std::uint64_t k = 0; k < 4; ++k) bwatch.untrack(k + 1);
+        EXPECT(bpw.single_rel == sr0);
+        EXPECT(bpw.cells.empty());
+    }
+    {  // title_frames::run_end() and title_frames::backed_batch(): fast single-hook path & fallback path.
+        static std::set<std::uintptr_t> s_pages;
+        static std::uint8_t s_dummy_buf[65536];
+        static std::uint64_t s_lookup_calls = 0;
+        static std::uint64_t s_run_end_calls = 0;
+        static std::uint64_t s_backed_batch_calls = 0;
+        const auto lookup_fn = [](std::uintptr_t page, leonida::title_frames::Frame& out) -> bool {
+            ++s_lookup_calls;
+            if (!s_pages.count(page)) return false;
+            out.bytes = s_dummy_buf;
+            return true;
+        };
+        const auto run_end_fn = [](std::uintptr_t from, std::uintptr_t to, bool& is_backed) -> std::uintptr_t {
+            ++s_run_end_calls;
+            constexpr std::uintptr_t kP = leonida::title_frames::kPage;
+            const std::uintptr_t p0 = from & ~(kP - 1);
+            is_backed = s_pages.count(p0) != 0;
+            std::uintptr_t at = p0 + kP;
+            while (at < to && at > from && (s_pages.count(at) != 0) == is_backed) at += kP;
+            return at < to && at > from ? at : to;
+        };
+        const auto backed_batch_fn = [](const std::uintptr_t* pages, std::uint8_t* out, std::size_t n) {
+            ++s_backed_batch_calls;
+            constexpr std::uintptr_t kP = leonida::title_frames::kPage;
+            for (std::size_t i = 0; i < n; ++i) out[i] = s_pages.count(pages[i] & ~(kP - 1)) ? 1u : 0u;
+        };
+
+        const std::uintptr_t tf_base = 0x700000000000ull;
+        s_pages = {tf_base + 1 * kTile, tf_base + 2 * kTile, tf_base + 5 * kTile};
+        for (const std::uintptr_t p : s_pages) leonida::title_frames::note_page(p);
+
+        // 1. Registered fast hooks: run_end() and backed_batch() invoke fast hooks with ZERO per-page lookup_fn calls!
+        leonida::title_frames::set_lookup(lookup_fn, nullptr, run_end_fn, backed_batch_fn);
+        bool is_b = false;
+        EXPECT(leonida::title_frames::run_end(tf_base, tf_base + 6 * kTile, is_b) == tf_base + 1 * kTile && !is_b);
+        EXPECT(leonida::title_frames::run_end(tf_base + 1 * kTile, tf_base + 6 * kTile, is_b) == tf_base + 3 * kTile &&
+               is_b);
+        EXPECT(leonida::title_frames::run_end(tf_base + 3 * kTile, tf_base + 6 * kTile, is_b) == tf_base + 5 * kTile &&
+               !is_b);
+        EXPECT(leonida::title_frames::run_end(tf_base + 5 * kTile, tf_base + 6 * kTile, is_b) == tf_base + 6 * kTile &&
+               is_b);
+        const std::uintptr_t query[6] = {tf_base,           tf_base + 1 * kTile + 123, tf_base + 2 * kTile,
+                                         tf_base + 3 * kTile, tf_base + 4 * kTile,      tf_base + 5 * kTile};
+        std::uint8_t out[6] = {};
+        leonida::title_frames::backed_batch(query, out, 6);
+        EXPECT(out[0] == 0 && out[1] == 1 && out[2] == 1 && out[3] == 0 && out[4] == 0 && out[5] == 1);
+        EXPECT(s_run_end_calls == 4 && s_backed_batch_calls == 1 && s_lookup_calls == 0);
+
+        // 2. Fallback without fast hooks (2-arg set_lookup): identical results via lookup_fn.
+        leonida::title_frames::set_lookup(lookup_fn, nullptr);
+        std::uint8_t out2[6] = {};
+        leonida::title_frames::backed_batch(query, out2, 6);
+        for (int i = 0; i < 6; ++i) EXPECT(out2[i] == out[i]);
+        EXPECT(leonida::title_frames::run_end(tf_base + 1 * kTile, tf_base + 6 * kTile, is_b) == tf_base + 3 * kTile &&
+               is_b);
+        EXPECT(s_lookup_calls > 0);
+        leonida::title_frames::set_lookup(nullptr, nullptr);
+    }
     if (failures) return 1;
     std::puts("title texture watch: new, untouched, one page, two addresses, remap, every frame, unarmable, kernel "
               "write in progress, lost queue, O(1) fast-path, buffer-hot decoupling, 1-tile hash-before-reserve, "
               "note_changed arm-skip, 86k-tile region index, hot_generation skip, non_hot_arms, mirror piece hash, "
-              "examine_batch, max_version, peer-skip, 41k-tex scale bench");
+              "examine_batch, max_version, peer-skip, batched peer sync, title_frames batch, 41k-tex scale bench");
     return 0;
 }
