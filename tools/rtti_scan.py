@@ -24,6 +24,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 
 
@@ -515,12 +516,7 @@ def main():
         print(f"ERROR: {a.image}: does not exist", file=sys.stderr)
         return 2
     path = a.out or re.sub(r"\.(exe|dll)$", "", a.image, flags=re.I) + ".rtti.json"
-    same_path = os.path.normcase(os.path.realpath(a.image)) == os.path.normcase(os.path.realpath(path))
-    try:
-        same_path = same_path or os.path.samefile(a.image, path)
-    except OSError:
-        pass  # A missing or inaccessible path is handled by the normal read/write error path.
-    if same_path:
+    if same_report_path(a.image, path):
         ap.error("output must not overwrite the source image")
     try:
         with open(a.image, "rb") as f:
