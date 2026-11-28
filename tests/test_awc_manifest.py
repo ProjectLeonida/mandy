@@ -456,6 +456,41 @@ class ManifestTest(unittest.TestCase):
         self.assertIn("0 banks, 0 streams, 0 streamed-music channels", p.stderr)
         self.assertEqual(p.stdout.splitlines()[0], ",".join(HEADER))
 
+    def test_publish_cleans_up_staged_file_when_replace_fails_even_if_readonly(self):
+        path = os.path.join(self.tmp.name, "manifest.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"initial": 1}\n')
+        os.chmod(path, 0o444)
+
+        real_unlink = os.unlink
+
+        def windows_strict_unlink(p):
+            mode = os.stat(p).st_mode
+            if not (mode & 0o200):
+                raise PermissionError(13, f"Access is denied: {p}")
+            return real_unlink(p)
+
+        with mock.patch.object(awc_manifest, "replace_retry", side_effect=OSError(13, "Permission denied")), \
+             mock.patch("os.unlink", side_effect=windows_strict_unlink):
+            with self.assertRaises(OSError):
+                awc_manifest.write_manifest([], 0, 0, "json", path)
+
+        leftover = [f for f in os.listdir(self.tmp.name) if f.startswith(".awc_manifest-")]
+        self.assertEqual(leftover, [])
+
+    def test_publish_applies_published_mode_on_windows(self):
+        path = os.path.join(self.tmp.name, "manifest_win.json")
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(p, mode):
+            chmod_calls.append((p, mode))
+            real_chmod(p, mode)
+
+        with mock.patch("os.name", "nt"), mock.patch("os.chmod", side_effect=track_chmod):
+            awc_manifest.write_manifest([], 0, 0, "json", path)
+        self.assertTrue(len(chmod_calls) > 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
