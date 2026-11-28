@@ -891,6 +891,11 @@ int main() {
         CHECK(!descriptor_table_layout_from_env("Plain", &chosen));
         CHECK(!descriptor_table_layout_from_env("other", &chosen));
         CHECK(chosen == DescriptorTableLayout::tagged);
+
+        // No library loaded (the GPU tests, the tools): the translator's default layout, tagged, as
+        // tools/rdna2spirv.py DESCRIPTOR_TABLE (tests/test_descriptor_table_default.py keeps the two equal). A plain
+        // table there handed cs_texture_uav.spv an all-zero kind, so its stores went to the fallback image.
+        CHECK(kNoLibraryDescriptorTableLayout == DescriptorTableLayout::tagged);
         std::filesystem::remove_all(dir);
     }
 
