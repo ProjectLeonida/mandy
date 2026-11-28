@@ -15,6 +15,7 @@
 #include "../shims/shims.h"
 #include "../shims/xmem.h"
 #include "../src/title_page_watch.h"
+#include "../src/title_texture_memory.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -216,6 +217,135 @@ int main() {
     map(window, 1, nullptr);
     CHECK(free_pages(1, &page));
     std::puts("a write to a PAGE_NOACCESS page of xmem's lands through xmem's own mapping");
+
+    // 4. Round 10 WS3: retroactive GPU-to-GPU wait relay (Wait-before-Signal across two queues -> relayed onto
+    //    writer's written fence with zero unmet gate releases, and cycle preservation when after_gate != 0).
+    {
+        // Console list slot 74: wait64(address, comparison, reference, flags).
+        using WaitOp = void(WINAPI *)(void *, std::uintptr_t, std::uint32_t, std::uint64_t, std::uint32_t);
+        D3D12_COMMAND_QUEUE_DESC compute_desc{};
+        compute_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        Ref<ID3D12CommandQueue> compute_q;
+        Ref<ID3D12CommandAllocator> compute_alloc;
+        CHECK(SUCCEEDED(device->CreateCommandQueue(&compute_desc, IID_PPV_ARGS(&compute_q.p))));
+        CHECK(SUCCEEDED(inner->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&compute_alloc.p))));
+
+        auto *slot_mem =
+            static_cast<volatile LONG64 *>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        CHECK(slot_mem);
+        slot_mem[0] = 0;
+        slot_mem[1] = 0;
+        leonida::title_va_aliases().add_title_memory(reinterpret_cast<std::uint64_t>(slot_mem), 4096);
+
+        // 4a. Direct submits Wait(slot_mem[0] >= 1) BEFORE Compute submits Write(slot_mem[0] = 1).
+        xs::reset_list_value_stats();
+        std::uint64_t desc[4]{};
+        std::uint64_t compute_list_desc[4]{static_cast<std::uint64_t>(D3D12_COMMAND_LIST_TYPE_COMPUTE)};
+        Ref<ID3D12GraphicsCommandList> wait_list, write_list;
+        CHECK(SUCCEEDED(reinterpret_cast<Create>(slot(device.p, 73))(device.p, desc, allocator.p, nullptr,
+                                                                     &__uuidof(ID3D12GraphicsCommandList),
+                                                                     reinterpret_cast<void **>(&wait_list.p))));
+        reinterpret_cast<WaitOp>(slot(wait_list.p, 74))(
+            wait_list.p, reinterpret_cast<std::uintptr_t>(slot_mem), 7 /*>=*/, 1, 0);
+        CHECK(SUCCEEDED(wait_list->Close()));
+        ID3D12CommandList *wl[1] = {wait_list.p};
+        queue->ExecuteCommandLists(1, wl);
+
+        Ref<ID3D12Fence> direct_done;
+        CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&direct_done.p))));
+        CHECK(SUCCEEDED(queue->Signal(direct_done.p, 1)));
+
+        // Now Compute submits the matching write: Pump::add_writes() retroactively relays Direct's gate!
+        CHECK(SUCCEEDED(reinterpret_cast<Create>(slot(device.p, 73))(device.p, compute_list_desc, compute_alloc.p,
+                                                                     nullptr, &__uuidof(ID3D12GraphicsCommandList),
+                                                                     reinterpret_cast<void **>(&write_list.p))));
+        reinterpret_cast<Put>(slot(write_list.p, 72))(
+            write_list.p, reinterpret_cast<std::uintptr_t>(slot_mem), 1, 0, 0);
+        CHECK(SUCCEEDED(write_list->Close()));
+        ID3D12CommandList *wrl[1] = {write_list.p};
+        compute_q->ExecuteCommandLists(1, wrl);
+
+        CHECK(SUCCEEDED(direct_done->SetEventOnCompletion(1, nullptr)));
+        CHECK(xs::list_values_idle(4000));
+        stats = xs::list_value_stats();
+        CHECK(stats.waits_relayed >= 1);
+        CHECK(stats.gates_released == 0);
+        CHECK(InterlockedCompareExchange64(slot_mem, 0, 0) == 1);
+
+        // 4b. Cycle preservation (after_gate != 0): Direct waits on slot_mem[0] >= 10 then writes slot_mem[1] = 10;
+        //     Compute waits on slot_mem[1] >= 10 then writes slot_mem[0] = 10. Neither write group has after_gate == 0,
+        //     so neither is retroactively relayed into a GPU cycle and list_value_progress breaks the cycle cleanly.
+        xs::reset_list_value_stats();
+        Ref<ID3D12GraphicsCommandList> cyc_a, cyc_b;
+        CHECK(SUCCEEDED(reinterpret_cast<Create>(slot(device.p, 73))(device.p, desc, allocator.p, nullptr,
+                                                                     &__uuidof(ID3D12GraphicsCommandList),
+                                                                     reinterpret_cast<void **>(&cyc_a.p))));
+        reinterpret_cast<WaitOp>(slot(cyc_a.p, 74))(
+            cyc_a.p, reinterpret_cast<std::uintptr_t>(slot_mem), 7 /*>=*/, 10, 0);
+        reinterpret_cast<Put>(slot(cyc_a.p, 72))(
+            cyc_a.p, reinterpret_cast<std::uintptr_t>(slot_mem + 1), 10, 0, 0);
+        CHECK(SUCCEEDED(cyc_a->Close()));
+        CHECK(SUCCEEDED(reinterpret_cast<Create>(slot(device.p, 73))(device.p, compute_list_desc, compute_alloc.p,
+                                                                     nullptr, &__uuidof(ID3D12GraphicsCommandList),
+                                                                     reinterpret_cast<void **>(&cyc_b.p))));
+        reinterpret_cast<WaitOp>(slot(cyc_b.p, 74))(
+            cyc_b.p, reinterpret_cast<std::uintptr_t>(slot_mem + 1), 7 /*>=*/, 10, 0);
+        reinterpret_cast<Put>(slot(cyc_b.p, 72))(
+            cyc_b.p, reinterpret_cast<std::uintptr_t>(slot_mem), 10, 0, 0);
+        CHECK(SUCCEEDED(cyc_b->Close()));
+
+        ID3D12CommandList *cal[1] = {cyc_a.p};
+        ID3D12CommandList *cbl[1] = {cyc_b.p};
+        queue->ExecuteCommandLists(1, cal);
+        compute_q->ExecuteCommandLists(1, cbl);
+        Ref<ID3D12Fence> cyc_done_a, cyc_done_b;
+        CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&cyc_done_a.p))));
+        CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&cyc_done_b.p))));
+        CHECK(SUCCEEDED(queue->Signal(cyc_done_a.p, 1)));
+        CHECK(SUCCEEDED(compute_q->Signal(cyc_done_b.p, 1)));
+        CHECK(SUCCEEDED(cyc_done_a->SetEventOnCompletion(1, nullptr)));
+        CHECK(SUCCEEDED(cyc_done_b->SetEventOnCompletion(1, nullptr)));
+        CHECK(xs::list_values_idle(4000));
+        stats = xs::list_value_stats();
+        CHECK(stats.waits_relayed == 0);
+        CHECK(stats.released_cycle >= 1);
+
+        VirtualFree(const_cast<LONG64 *>(slot_mem), 0, MEM_RELEASE);
+        std::puts("retroactive Wait-before-Signal relay and after_gate!=0 cycle preservation ok");
+    }
+
+    // 5. Round 10 WS3: TextureVqCache negative caching & hoisted host_stop over fragmented VMAs.
+    {
+        constexpr SIZE_T kSpan = 4 * kPage64k;
+        auto *region = static_cast<std::uint8_t *>(VirtualAlloc(nullptr, kSpan, MEM_RESERVE, PAGE_READWRITE));
+        CHECK(region);
+        const auto base = reinterpret_cast<std::uintptr_t>(region);
+        leonida::TextureVqCache cache;
+
+        // Reserved (uncommitted) pool caches negative readability across probes in the same region.
+        CHECK(leonida::texture_memory_readable_bytes(base, kPage64k, nullptr, &cache) == 0);
+        CHECK(!cache.readable && cache.lo <= base && cache.hi >= base + kSpan);
+        CHECK(leonida::texture_memory_readable_bytes(base + kPage64k, kPage64k, nullptr, &cache) == 0);
+        CHECK(!cache.readable);
+
+        // Commit all 4 tiles, notify title_memory_map, and fragment alternating RO/RW 64 KiB VMAs.
+        CHECK(VirtualAlloc(region, kSpan, MEM_COMMIT, PAGE_READWRITE) == region);
+        leonida::title_memory_map::changed(base, base + kSpan);
+        DWORD old_prot = 0;
+        CHECK(VirtualProtect(region, kPage64k, PAGE_READONLY, &old_prot));
+        CHECK(VirtualProtect(region + 2 * kPage64k, kPage64k, PAGE_READONLY, &old_prot));
+        CHECK(leonida::texture_memory_readable_bytes(base, kSpan, nullptr, &cache) == kSpan);
+        CHECK(cache.readable);
+
+        // PAGE_NOACCESS in the middle stops readability and populates negative cache entry.
+        CHECK(VirtualProtect(region + 2 * kPage64k, kPage64k, PAGE_NOACCESS, &old_prot));
+        leonida::title_memory_map::changed(base + 2 * kPage64k, base + 3 * kPage64k);
+        CHECK(leonida::texture_memory_readable_bytes(base, kSpan, nullptr, &cache) == 2 * kPage64k);
+        CHECK(!cache.readable && cache.lo == base + 2 * kPage64k && cache.hi == base + 3 * kPage64k);
+
+        VirtualFree(region, 0, MEM_RELEASE);
+        std::puts("TextureVqCache negative caching and fragmented VMA readability ok");
+    }
 
     CHECK(gpu.validation_errors() == 0);
     return 0;

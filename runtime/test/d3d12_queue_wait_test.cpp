@@ -74,5 +74,40 @@ int main(int argc, char** argv) {
         std::_Exit(1);
     }
     std::puts("copy/compute and direct/direct Wait-before-Signal completed");
+
+    // Round 10 WS3: COM-level fence_signal_gpu_relay & retroactive fence_relay_wait (single-wait and multi-wait,
+    // never signaling gate_multi on the CPU or GPU).
+    {
+        Ref<ID3D12Fence> gate_multi, writer_a, writer_b, done_relay, done_multi, gpu_relayed;
+        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate_multi.p))) ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&writer_a.p))) ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&writer_b.p))) ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done_relay.p))) ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done_multi.p))) ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gpu_relayed.p))))
+            return 1;
+
+        // 1. fence_signal_gpu_relay wakes held waiters cleanly.
+        if (FAILED(direct_a->Wait(gpu_relayed.p, 1)) || FAILED(direct_a->Signal(done_relay.p, 1)) ||
+            FAILED(rt::d3d12::fence_signal_gpu_relay(gpu_relayed.p, 1)) || !wait_for(done_relay.p, 1))
+            return 1;
+
+        // 2. Retroactive single-wait & multi-wait fence_relay_wait (direct_a waits on gate_multi -> relayed onto
+        //    compute's writer_a and copy's writer_b without ever signaling gate_multi).
+        if (FAILED(direct_a->Wait(gate_multi.p, 1)) || FAILED(direct_a->Signal(done_multi.p, 1)) ||
+            FAILED(compute->Signal(writer_a.p, 1)) || FAILED(copy->Signal(writer_b.p, 1)))
+            return 1;
+        const rt::d3d12::FenceRelayTarget targets[] = {{writer_a.p, 1}, {writer_b.p, 1}};
+        if (!rt::d3d12::fence_relay_wait(gate_multi.p, 1, targets) || !wait_for(done_multi.p, 1)) {
+            std::fputs("retroactive fence_relay_wait did not complete\n", stderr);
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
+        if (gate_multi->GetCompletedValue() != 0) {
+            std::fputs("retroactive fence_relay_wait unexpectedly signaled gate_multi\n", stderr);
+            return 1;
+        }
+        std::puts("COM fence_signal_gpu_relay and retroactive fence_relay_wait completed");
+    }
     return 0;
 }
