@@ -6877,9 +6877,7 @@ class Gen:
         raise Unsupported("mask operand")
 
     def is_mask_op(self, x):
-        return self.holds_lane_mask(x) or (
-            x["k"] == "special" and x.get("t", "").startswith(("exec", "vcc"))
-        )
+        return self.holds_lane_mask(x)
 
     def f64_literal_one_dword(self, src: dict) -> bool:
         """True when a literal source is the one ISA dword that supplies bits 63:32.
@@ -6918,6 +6916,11 @@ class Gen:
             return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
         if s["k"] == "special" and s.get("t") == "null":
             return self.cu(0), self.cu(0)
+        if s["k"] == "special" and s.get("t") == "vcc" and not self.holds_lane_mask(s):
+            lo, hi = self.tmp(), self.tmp()
+            self.emit(f"{lo} = OpLoad %uint %vcc")
+            self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+            return lo, hi
         raise Unsupported(op + " source")
 
     @staticmethod
