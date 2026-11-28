@@ -78,6 +78,8 @@ void shared_blocks() {
         check(driver.allocations == 1 && pool.stats().blocks == 1 && pool.stats().ranges == 64 &&
                   pool.stats().block_bytes == 64 * kMiB,
               "64 one-MiB textures fill one block");
+        check(pool.stats().used_bytes == 64 * kMiB && pool.stats().empty_blocks == 0 && pool.stats().largest_free == 0,
+              "a full block: every byte in use, no free piece");
         auto extra = pool.allocate(2, kMiB, 65536, 64 * kMiB);
         check(driver.allocations == 2, "the 65th makes a second block");
         check(extra && !extra->reused(), "a range of a new block is fresh");
@@ -85,6 +87,9 @@ void shared_blocks() {
         check(driver.allocations == 3 && other->memory() != extra->memory(), "memory types do not share blocks");
         extra.reset();
         check(driver.frees == 0 && pool.stats().blocks == 3, "an emptied block is kept for the next textures");
+        check(pool.stats().used_bytes == 65 * kMiB && pool.stats().block_bytes == 192 * kMiB &&
+                  pool.stats().empty_blocks == 1 && pool.stats().largest_free == 64 * kMiB,
+              "the stats count used bytes, empty blocks and the largest free piece");
         ranges.clear();
         check(driver.frees == 1 && pool.stats().blocks == 2, "only one empty block is kept per memory type");
         const auto again = pool.allocate(2, kMiB, 65536, 64 * kMiB);

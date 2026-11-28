@@ -87,14 +87,22 @@ int text() {
     share.arena_in_use = 757 * kMiB;
     share.arena_use = {500 * kMiB, 171 * kMiB, 80 * kMiB, 6 * kMiB};
     share.bindless_table_bytes = 2 * kMiB;
+    t.add(mb::Consumer::image_blocks, 4934 * kMiB, false);
+    share.texture_blocks = true;
+    share.block_bytes = 4934 * kMiB;
+    share.block_ranges = 21000;
+    share.block_used = 4100 * kMiB;
+    share.empty_blocks = 2;
+    share.largest_free = 64 * kMiB;
     const std::string line = mb::format(t, share, 12 * kMiB);
     std::fprintf(stderr, "%s\n", line.c_str());
-    EXPECT(line.rfind("allocated 9961 MiB = arena 4095 (1) [reserved 4095, bound 4095, in use 757: buffers 500, "
+    EXPECT(line.rfind("allocated 14895 MiB = arena 4095 (1) [reserved 4095, bound 4095, in use 757: buffers 500, "
                       "descriptor heaps 171, shader code 80, heaps 6]",
                       0) == 0);
     EXPECT(contains(line, " + geometry copies 3867 (1)"));
     EXPECT(contains(line, " + title windows and shadows 0 (0)"));
-    EXPECT(contains(line, " + upload heaps 0 (0) + staging 0 (0) + texture blocks 0 (0) + sampled textures 0 (0)"));
+    EXPECT(contains(line, " + upload heaps 0 (0) + staging 0 (0) + texture blocks 4934 (1) [21000 textures in 4100 MiB, "
+                          "834 MiB free inside the blocks (2 empty blocks, largest free piece 64)] + sampled textures 0 (0)"));
     EXPECT(contains(line, " + render targets and depth 1180 (1) + other 819 (1);"));
     EXPECT(contains(line, "imported 206 MiB (1)"));
     EXPECT(contains(line, "bindless tables 2 MiB"));
@@ -103,6 +111,7 @@ int text() {
     const std::string bare = mb::format(t, mb::DeviceShare{}, 0);
     EXPECT(!contains(bare, "reserved"));
     EXPECT(contains(bare, "arena 4095 (1) + geometry copies"));
+    EXPECT(!contains(bare, "free inside the blocks"));
     return 0;
 }
 
