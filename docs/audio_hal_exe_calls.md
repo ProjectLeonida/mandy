@@ -26,7 +26,7 @@ Every one of the 22 has at least one site, so none is dead code the linker kept.
 | `AcpHalReleaseShapeContexts` | 1 | called with a handle read from the first global; result not used |
 | `ApuCreateHeap` | 1 | second argument `0x226e00`; the result is tested for a negative value |
 | `ApuAlloc` | 1 | second argument `0`, third a computed value, fourth `0x800`; the result is not used at the site |
-| `ApuFree` | 1 tail jump | no call, only a tail jump from a wrapper |
+| `ApuFree` | 1 tail jump | the `site` is a whole function that is one `jmp` to the thunk (`0x1443aea10`), so it forwards its arguments unchanged and adds no arity of its own |
 | `ApuIsVirtualAddressValid` | 4 | second argument `0x40`, `0x80`, `0x800`, `0x800`; the result byte is tested |
 | `ApuMapVirtualAddress` | 4 | the same pointer and the same four constants as `ApuIsVirtualAddressValid`, one after the other; the 32-bit result is stored in a per-entry record |
 | `ApuMapApuAddress` | 2 | the argument is a 32-bit value read from those records; the result is tested for null, so it is a pointer |
@@ -39,14 +39,14 @@ turns such an address back into a pointer. That is an inference from the shapes;
 
 | Import | Sites | What the sites show |
 |---|---:|---|
-| `XApuConnect` | 1 | no argument loaded in the lines before the call was read |
+| `XApuConnect` | 1 | three arguments, the addresses of three `.data` globals (`0x149B69890`, `0x149B698A8`, `0x149B68960`), in `rcx`/`rdx`/`r8`; the result is tested as non-negative (`setns`) |
 | `XApuDisconnect` | 1 | first argument a handle read from a global, second `0x20`; the global is set to 0 right after |
 | `XApuEnqueueCommand` | 4 | the same global handle, a pointer to a stack-built command, and 0 |
-| `XApuDequeueResult` | 1 | the same global handle and a second argument; the result is tested for a negative value |
-| `XApuGetResultCount` | 1 | no argument read |
+| `XApuDequeueResult` | 1 | the same handle global, and a 16-byte stack buffer as the second argument; a negative result jumps out, otherwise the record is read from buffer `+0x20`/`+0x24` |
+| `XApuGetResultCount` | 1 | the queue handle global and a second argument `0`; the result count is tested for zero and both branches are taken on it |
 | `XDspConnectWithMaximumStreamLimit` | 1 | fourth argument `0x80`; the result is compared with 0 and turned into a boolean that is true for 0 |
-| `XDspActivate` | 1 | the result is tested |
-| `XDspSubmitCommand` | 1 | two arguments, both taken from registers; not read further |
+| `XDspActivate` | 1 | a wrapper that swaps the incoming `r8`/`r9` before calling; the result is tested |
+| `XDspSubmitCommand` | 1 | a two-argument wrapper that swaps the incoming registers (`rcx` <- `rdx`, `rdx` <- old `rcx`) before calling, so the published order is the reverse of the wrapper's |
 | `XDspDeactivate`, `XDspDisconnect` | 1 tail jump each | no call |
 
 `XApuEnqueueCommand` and `XApuDequeueResult` share one handle global, which `XApuDisconnect` clears: a command queue
