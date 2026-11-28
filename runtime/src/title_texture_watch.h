@@ -132,8 +132,8 @@ public:
     TitleTextureWatch& operator=(const TitleTextureWatch&) = delete;
 
     struct Stats {
-        std::uint64_t collects = 0, named = 0, unarmed_named = 0, arms = 0, arm_failures = 0, arm_busy = 0,
-                      written_tiles = 0, overflows = 0, hot_skips = 0;
+        std::uint64_t collects = 0, named = 0, unarmed_named = 0, arms = 0, non_hot_arms = 0, arm_failures = 0,
+                      arm_busy = 0, written_tiles = 0, overflows = 0, hot_skips = 0;
     };
     const Stats& stats() const { return stats_; }
     std::size_t textures() const { return textures_.size(); }
@@ -320,9 +320,15 @@ public:
 
         // 4. Tiles another owner keeps writable (TitleMirror hot pages): decouple buffer-only hot pages so
         //    non-overlapping hot pages neither lock geometry_writes on quiet passes nor scan all watched tiles.
+        //    When hot_generation() is provided (monotonic counter bumped on every hot-set mutation), unchanged
+        //    generations reuse active_hot_tiles_ directly without calling watch_.hot_tiles() or locking.
         bool need_hot_poll = true;
         std::uint64_t cur_hot_stamp = 0;
-        if constexpr (has_hot_stamp()) {
+        if constexpr (has_hot_generation()) {
+            cur_hot_stamp = hot_stamp();
+            need_hot_poll = cur_hot_stamp != last_hot_stamp_ || hot_sync_needed_;
+            if (!need_hot_poll) ++stats_.hot_skips;
+        } else if constexpr (has_hot_stamp()) {
             cur_hot_stamp = hot_stamp();
             need_hot_poll = cur_hot_stamp != last_hot_stamp_ || !written_.empty() || overflow || hot_sync_needed_ ||
                             !active_hot_tiles_.empty();
@@ -351,6 +357,13 @@ public:
             }
             last_hot_stamp_ = cur_hot_stamp;
             hot_sync_needed_ = false;
+        } else if (!active_hot_tiles_.empty()) {
+            for (const std::uintptr_t a : active_hot_tiles_) {
+                if (const auto it = tiles_.find(a); it != tiles_.end()) {
+                    it->second.hot_gen = gen;
+                    mark_tile_pass(a, it->second, gen, false);
+                }
+            }
         }
 
         // 5. Tiles not armed: whatever their version says, a write there need not have faulted.
@@ -625,12 +638,18 @@ private:
         // The version is read before arming: a write between the two moves it, and the next collect() sees that.
         // Always delegate through watch_.arm() on hot/stale/unarmed/moved tiles so kernel_writes pin checks
         // (Look::busy) still run and a concurrent set_hot(false) cannot leave a writable page silently marked armed.
+        // Distinguish a second texture's pass-through pin-check on an already-checked hot tile (whose version/mapping
+        // did not move since the first texture checked it this pass) via `non_hot_arms` so shared hot tiles sync once
+        // per pass instead of re-copying 64 KiB per texture.
         std::uint64_t version = tile.primary->version.load(std::memory_order_acquire);
         for (const auto& [peer, cell] : tile.peers)
             version = (std::max)(version, cell->version.load(std::memory_order_acquire));
+        const bool pure_hot_recheck = !tile.stale && tile.unarmed_index == kNoIndex && tile.hot_gen == pass_gen_ &&
+                                      mapping == tile.mapping && version == tile.version;
         ++stats_.arms;
         int result = watch_.arm(address, *tile.primary);
         for (const auto& [peer, cell] : tile.peers) result = (std::min)(result, watch_.arm(peer, *cell) + 0);
+        if (!pure_hot_recheck || result <= 0) ++stats_.non_hot_arms;
         if (result <= 0) {
             ++(result ? stats_.arm_failures : stats_.arm_busy);
             add_unarmed(address, tile);
@@ -643,8 +662,11 @@ private:
         return 1;
     }
 
+    static constexpr bool has_hot_generation() noexcept {
+        return requires(const Watch& w) { w.hot_generation(); };
+    }
     static constexpr bool has_hot_stamp() noexcept {
-        return requires(const Watch& w) { w.hot_generation(); } || requires(const Watch& w) { w.hot_count(); };
+        return has_hot_generation() || requires(const Watch& w) { w.hot_count(); };
     }
     std::uint64_t hot_stamp() const noexcept {
         if constexpr (requires(const Watch& w) { w.hot_generation(); }) {

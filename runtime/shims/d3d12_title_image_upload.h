@@ -422,26 +422,38 @@ private:
         // 1. Prepare GPU detile scratch allocations & compute dispatches (if any mirror_detile items).
         std::uint32_t detile_sets = 0;
         VkDeviceSize total_scratch = 0;
-        std::vector<leonida::TitleDetileDesc> descs(count);
-        std::vector<VkDeviceSize> dst_bases(count, 0), dst_ends(count, 0);
-        std::vector<std::vector<VkBufferImageCopy>> detile_regions(count);
-
-        leonida::TitleDetilePipeline* pipe = nullptr;
+        bool has_detile_items = false;
         for (std::size_t i = 0; i < count; ++i) {
-            if (items[i].kind != UploadKind::mirror_detile) continue;
-            pipe = ensure_detile(d);
-            if (!pipe || !items[i].layout || !make_detile_desc(*items[i].layout, descs[i])) continue;
-            const VkDeviceSize item_align =
-                std::max<VkDeviceSize>(pipe->min_storage_alignment(), VkDeviceSize(4u) * descs[i].element_bytes);
-            dst_bases[i] = leonida::detail::align_up_size(total_scratch, item_align);
-            if (!leonida::TitleDetilePipeline::build_scratch_regions(descs[i], dst_bases[i], items[i].image.width,
-                                                                     items[i].image.height, detile_regions[i],
-                                                                     dst_ends[i])) {
-                detile_regions[i].clear();
-                continue;
+            if (items[i].kind == UploadKind::mirror_detile) {
+                has_detile_items = true;
+                break;
             }
-            total_scratch = dst_ends[i];
-            ++detile_sets;
+        }
+        leonida::TitleDetilePipeline* pipe = nullptr;
+        if (has_detile_items) {
+            if (batch_descs_.size() < count) batch_descs_.resize(count);
+            batch_dst_bases_.assign(count, 0);
+            batch_dst_ends_.assign(count, 0);
+            if (batch_detile_regions_.size() < count) batch_detile_regions_.resize(count);
+            for (std::size_t i = 0; i < count; ++i) batch_detile_regions_[i].clear();
+
+            for (std::size_t i = 0; i < count; ++i) {
+                if (items[i].kind != UploadKind::mirror_detile) continue;
+                pipe = ensure_detile(d);
+                if (!pipe || !items[i].layout || !make_detile_desc(*items[i].layout, batch_descs_[i])) continue;
+                const VkDeviceSize item_align =
+                    (std::max)(pipe->min_storage_alignment(), VkDeviceSize(4u) * batch_descs_[i].element_bytes);
+                batch_dst_bases_[i] = leonida::detail::align_up_size(total_scratch, item_align);
+                if (!leonida::TitleDetilePipeline::build_scratch_regions(batch_descs_[i], batch_dst_bases_[i],
+                                                                         items[i].image.width, items[i].image.height,
+                                                                         batch_detile_regions_[i],
+                                                                         batch_dst_ends_[i])) {
+                    batch_detile_regions_[i].clear();
+                    continue;
+                }
+                total_scratch = batch_dst_ends_[i];
+                ++detile_sets;
+            }
         }
 
         leonida::TitleDetilePipeline::ScratchSlot* scratch_slot = nullptr;
@@ -489,15 +501,16 @@ private:
                     mirror_val = item.mirror_value;
                 }
             } else {  // mirror_detile
-                if (!scratch_slot || !pipe || detile_regions[i].empty()) continue;
+                if (!scratch_slot || !pipe || batch_detile_regions_[i].empty()) continue;
                 const std::size_t disp_start = batch_dispatches_.size();
-                if (!pipe->prepare_texture(*scratch_slot, item.mirror_buffer, item.mirror_offset, descs[i],
-                                           dst_bases[i], dst_ends[i], detile_regions[i], batch_dispatches_)) {
+                if (!pipe->prepare_texture(*scratch_slot, item.mirror_buffer, item.mirror_offset, batch_descs_[i],
+                                           batch_dst_bases_[i], batch_dst_ends_[i], batch_detile_regions_[i],
+                                           batch_dispatches_)) {
                     batch_dispatches_.resize(disp_start);
                     continue;
                 }
                 prep.src_buffer = scratch_slot->buffer;
-                prep.owned_regions = std::move(detile_regions[i]);
+                prep.owned_regions = std::move(batch_detile_regions_[i]);
                 any_mirror = true;
                 any_detile = true;
                 if (item.mirror_timeline && item.mirror_value > mirror_val) {
@@ -778,6 +791,10 @@ private:
     std::vector<PreparedItem> batch_prepared_;
     std::vector<leonida::VulkanContext::StagedImageTarget> batch_targets_;
     std::vector<leonida::TitleDetileDispatch> batch_dispatches_;
+    std::vector<leonida::TitleDetileDesc> batch_descs_;
+    std::vector<VkDeviceSize> batch_dst_bases_;
+    std::vector<VkDeviceSize> batch_dst_ends_;
+    std::vector<std::vector<VkBufferImageCopy>> batch_detile_regions_;
     std::vector<VkImageMemoryBarrier> pre_barriers_;
     std::vector<VkImageMemoryBarrier> post_barriers_;
     VkCommandPool pool_{};
