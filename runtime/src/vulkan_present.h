@@ -1390,10 +1390,17 @@ private:
         vkGetPhysicalDeviceMemoryProperties_(physical_, &memory);
         constexpr VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         std::uint32_t type = UINT32_MAX;
-        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i)
-            if ((requirements.memoryTypeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & wanted) == wanted) {
-                type = i;
-                break;
+        // Host-cached system memory first, as probe_read_source does: the buffer is only read on the CPU (read_back, the
+        // present dump, and every startup frame in finish_startup_frame, which scans it with the submit lock held),
+        // and a host read of an uncached type is many times slower.
+        for (int pass = 0; pass < 2 && type == UINT32_MAX; ++pass)
+            for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+                const VkMemoryPropertyFlags f = memory.memoryTypes[i].propertyFlags;
+                const bool cached = (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) && !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                if ((requirements.memoryTypeBits & (1u << i)) && (f & wanted) == wanted && (pass || cached)) {
+                    type = i;
+                    break;
+                }
             }
         VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocate.allocationSize = requirements.size;
