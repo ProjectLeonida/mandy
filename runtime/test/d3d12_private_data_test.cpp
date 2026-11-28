@@ -360,6 +360,49 @@ int main() {
         };
         if (host.p) EXPECT(compare("the host", theirs) == 0);
         EXPECT(compare("Microsoft's recorded answers", recorded) == 0);
+
+        // Reentrant Release on an interface evicted by overwrite or removal sees the updated private-data entry
+        // without deadlocking on data_mutex_.
+        {
+            Ref<ID3D12Fence> fence;
+            EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+            const GUID g = key(200);
+            struct Reentrant final : public IUnknown {
+                ID3D12Object* owner = nullptr;
+                GUID guid{};
+                UINT expected_value = 0;
+                bool saw_expected = false;
+                ULONG refs = 1;
+                HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+                    if (!out) return E_POINTER;
+                    if (riid == __uuidof(IUnknown)) {
+                        *out = this;
+                        AddRef();
+                        return S_OK;
+                    }
+                    *out = nullptr;
+                    return E_NOINTERFACE;
+                }
+                ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+                ULONG STDMETHODCALLTYPE Release() override {
+                    const ULONG left = --refs;
+                    if (owner && left == 1) {
+                        UINT read = 0;
+                        UINT size = sizeof(read);
+                        const HRESULT hr = owner->GetPrivateData(guid, &size, &read);
+                        saw_expected = (hr == S_OK && size == sizeof(read) && read == expected_value);
+                    }
+                    return left;
+                }
+            } probe;
+            probe.owner = fence.p;
+            probe.guid = g;
+            probe.expected_value = 0x55aa1234u;
+            EXPECT(SUCCEEDED(fence->SetPrivateDataInterface(g, &probe)) && probe.refs == 2);
+            const UINT replacement = 0x55aa1234u;
+            EXPECT(SUCCEEDED(fence->SetPrivateData(g, sizeof(replacement), &replacement)));
+            EXPECT(probe.refs == 1 && probe.saw_expected);
+        }
     }
     std::printf("d3d12_private_data_test: OK\n");
     return 0;

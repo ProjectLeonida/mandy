@@ -6,11 +6,14 @@
 #include <d3d12.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -28,32 +31,34 @@ public:
         if constexpr (requires(Derived& object) { object.last_release(); }) {
             // Such an object can outlive its last Release (its deletion deferred): a reference taken from zero would
             // bring it back, and its next last Release would delete it a second time. Refused, and logged once.
-            ULONG refs = refs_.load();
+            ULONG refs = refs_.load(std::memory_order_relaxed);
             do {
                 if (!refs) {
                     static std::atomic<bool> logged{false};
-                    if (!logged.exchange(true))
+                    if (!logged.exchange(true, std::memory_order_relaxed))
                         std::fprintf(stderr, "[rt] d3d12: AddRef on an object already released (ignored)\n");
                     return 0;
                 }
-            } while (!refs_.compare_exchange_weak(refs, refs + 1));
+            } while (!refs_.compare_exchange_weak(refs, refs + 1, std::memory_order_relaxed,
+                                                  std::memory_order_relaxed));
             return refs + 1;
         } else {
-            return ++refs_;
+            return refs_.fetch_add(1, std::memory_order_relaxed) + 1;
         }
     }
     // At zero, a class with a last_release() decides when it is deleted (PipelineState: after its running build).
     // Adds a reference unless the count already reached zero. Registry callers must hold their registry lock while
     // taking this reference.
     bool try_add_ref() {
-        ULONG count = refs_.load();
+        ULONG count = refs_.load(std::memory_order_relaxed);
         while (count) {
-            if (refs_.compare_exchange_weak(count, count + 1)) return true;
+            if (refs_.compare_exchange_weak(count, count + 1, std::memory_order_relaxed, std::memory_order_relaxed))
+                return true;
         }
         return false;
     }
     ULONG STDMETHODCALLTYPE Release() override {
-        const ULONG left = --refs_;
+        const ULONG left = refs_.fetch_sub(1, std::memory_order_acq_rel) - 1;
         if (!left) {
             if constexpr (requires(Derived& object) { object.last_release(); })
                 static_cast<Derived*>(this)->last_release();
@@ -115,18 +120,27 @@ public:
 
     HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override {
         if (!data) return remove(guid) ? S_OK : S_FALSE;
-        PrivateData entry{guid, {}, nullptr, false};
-        const auto* bytes = static_cast<const std::uint8_t*>(data);
-        entry.bytes.assign(bytes, bytes + size);
-        store(std::move(entry));
-        return S_OK;
+        try {
+            PrivateData entry{guid, {}, nullptr, false};
+            const auto* bytes = static_cast<const std::uint8_t*>(data);
+            entry.bytes.assign(bytes, bytes + size);
+            store(std::move(entry));
+            return S_OK;
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
     }
 
     HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* object) override {
         IUnknown* held = const_cast<IUnknown*>(object);
         if (held) held->AddRef();
-        store(PrivateData{guid, {}, held, true});
-        return S_OK;
+        try {
+            store(PrivateData{guid, {}, held, true});
+            return S_OK;
+        } catch (const std::bad_alloc&) {
+            if (held) held->Release();
+            return E_OUTOFMEMORY;
+        }
     }
 
     // SetName is SetPrivateData with WKPDID_D3DDebugObjectNameW and the name with its terminator, as D3D12 documents
@@ -134,7 +148,9 @@ public:
     // WKPDID_D3DDebugObjectName is not touched. A null name, which the host runtime faults on, changes nothing.
     HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override {
         if (!name) return E_INVALIDARG;
-        return SetPrivateData(kDebugObjectNameW, UINT((std::wcslen(name) + 1) * sizeof(wchar_t)), name);
+        const std::size_t length = std::wcslen(name);
+        if (length >= std::numeric_limits<UINT>::max() / sizeof(wchar_t)) return E_INVALIDARG;
+        return SetPrivateData(kDebugObjectNameW, static_cast<UINT>((length + 1) * sizeof(wchar_t)), name);
     }
 
     // WKPDID_D3DDebugObjectNameW (d3dcommon.h), spelled out so nothing needs dxguid.lib.
@@ -153,7 +169,12 @@ public:
 
 protected:
     virtual ~Object() {
-        for (auto& entry : data_)
+        std::vector<PrivateData> entries;
+        {
+            std::lock_guard lock(data_mutex_);
+            entries.swap(data_);
+        }
+        for (auto& entry : entries)
             if (entry.object) entry.object->Release();
     }
 
@@ -179,12 +200,13 @@ private:
             std::lock_guard lock(data_mutex_);
             for (auto it = data_.begin(); it != data_.end(); ++it) {
                 if (it->key != key) continue;
-                released = it->object;
-                data_.erase(it);
+                released = std::exchange(it->object, nullptr);
+                if (entry) *it = std::move(*entry);
+                else data_.erase(it);
                 found = true;
                 break;
             }
-            if (entry) data_.push_back(std::move(*entry));
+            if (!found && entry) data_.push_back(std::move(*entry));
         }
         if (released) released->Release();
         return found;
@@ -202,8 +224,7 @@ class Child : public Object<Derived, Stubs, Interfaces...> {
 public:
     void attach_device(IUnknown* device) {
         if (device) device->AddRef();
-        if (device_) device_->Release();
-        device_ = device;
+        if (IUnknown* old = std::exchange(device_, device)) old->Release();
     }
 
     IUnknown* attached_device() const { return device_; }
@@ -219,7 +240,7 @@ public:
 
 protected:
     ~Child() override {
-        if (device_) device_->Release();
+        if (IUnknown* old = std::exchange(device_, nullptr)) old->Release();
     }
 
 private:
@@ -228,6 +249,10 @@ private:
 
 template<class T>
 HRESULT hand_out(T* object, REFIID riid, void** out) {
+    if (!object) {
+        if (out) *out = nullptr;
+        return E_OUTOFMEMORY;
+    }
     const HRESULT hr = object->QueryInterface(riid, out);
     object->Release();
     return hr;
