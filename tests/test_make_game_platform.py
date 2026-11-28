@@ -1,4 +1,4 @@
-"""Platform-specific build stages, runtime packaging and vk_pipeline_check discovery.
+"""Platform-specific build stages, runtime packaging and gta6rt.exe discovery.
 
     python -I tests/test_make_game_platform.py
 
@@ -36,6 +36,7 @@ class DefaultStagesTest(unittest.TestCase):
         argv = ["make_game.py", "--game", self.game, "--out", os.path.join(self.tmp.name, "out"), "--no-tui", *args]
         mocks = {n: mock.MagicMock() for n in STAGE_FUNCS}
         with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(make_game, "ROOT", self.tmp.name), \
                 mock.patch.object(make_game.os, "name", os_name), \
                 mock.patch.object(make_game, "cross_build_missing", return_value=list(lacking)), \
                 mock.patch.object(make_game, "below_normal"), \
@@ -46,10 +47,10 @@ class DefaultStagesTest(unittest.TestCase):
             self.assertEqual(make_game.main(), 0)
         return preflight.call_args.args[0], {n: m.called for n, m in mocks.items()}
 
-    def test_default_stages_leave_runtime_out_off_windows_without_the_cross_build(self):
+    def test_default_stages_leave_runtime_and_pipelines_out_off_windows_without_the_cross_build(self):
         stages, ran = self.run_main("posix")
-        self.assertEqual(stages, ["check", "shaders", "assets", "pipelines"])
-        self.assertEqual(ran, {"shaders": True, "assets": True, "runtime": False, "pipelines": True})
+        self.assertEqual(stages, ["check", "shaders", "assets"])
+        self.assertEqual(ran, {"shaders": True, "assets": True, "runtime": False, "pipelines": False})
 
     def test_default_stages_keep_runtime_off_windows_with_the_cross_build(self):
         stages, ran = self.run_main("posix", lacking=())
@@ -486,11 +487,13 @@ class RuntimeBuildPackagingTest(unittest.TestCase):
                 self.assertTrue(os.access(launcher, os.X_OK))
 
 
-class PipelineCheckExeTest(unittest.TestCase):
+class RuntimeExeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.build = os.path.join(self.tmp.name, "runtime", "build")
-        os.makedirs(os.path.join(self.build, "linux"))
+        self.out = os.path.join(self.tmp.name, "out")
+        os.makedirs(os.path.join(self.build, "windows"))
+        os.makedirs(self.out)
         self.root = mock.patch.object(make_game, "ROOT", self.tmp.name)
         self.root.start()
 
@@ -503,63 +506,59 @@ class PipelineCheckExeTest(unittest.TestCase):
         open(p, "w").close()
         return p
 
-    def exe(self, os_name, runtime_build=None):
+    def exe(self, os_name, out=None, runtime_build=None):
         with mock.patch.object(make_game.os, "name", os_name):
-            return make_game.pipeline_check_exe(runtime_build)
+            return make_game.runtime_exe(out, runtime_build)
 
-    def test_linux_prefers_the_readme_build_folder(self):
-        self.assertIsNone(self.exe("posix"))
-        plain = self.touch("vk_pipeline_check")
-        os.chmod(plain, 0o755)
-        self.assertEqual(self.exe("posix"), plain)
-        readme = self.touch("linux", "vk_pipeline_check")
-        os.chmod(readme, 0o755)
-        self.assertEqual(self.exe("posix"), readme)
-
-    @unittest.skipUnless(os.name == "posix", "requires POSIX execute permissions")
-    def test_non_executable_linux_checker_does_not_hide_the_fallback(self):
-        preferred = self.touch("linux", "vk_pipeline_check")
-        os.chmod(preferred, 0o644)
-        fallback = self.touch("vk_pipeline_check")
-        os.chmod(fallback, 0o755)
-        self.assertEqual(self.exe("posix"), fallback)
-
-    def test_windows_finds_only_the_exe(self):
-        self.touch("linux", "vk_pipeline_check")
-        self.assertIsNone(self.exe("nt"))
-        exe = self.touch("vk_pipeline_check.exe")
-        self.assertEqual(self.exe("nt"), exe)
-
-    def test_windows_prefers_supplied_checker_and_falls_back_to_local_build(self):
-        local = self.touch("vk_pipeline_check.exe")
+    def test_posix_uses_cross_build_folder_and_prefers_out_then_runtime_build(self):
+        self.assertIsNone(self.exe("posix", self.out))
+        cross = self.touch("windows", "gta6rt.exe")
+        self.assertEqual(self.exe("posix", self.out), cross)
         with tempfile.TemporaryDirectory() as supplied:
-            self.assertEqual(self.exe("nt", supplied), local)
-            bundled = os.path.join(supplied, "vk_pipeline_check.exe")
-            with open(bundled, "wb"):
-                pass
-            self.assertEqual(self.exe("nt", supplied), bundled)
+            bundled = os.path.join(supplied, "gta6rt.exe")
+            open(bundled, "wb").close()
+            self.assertEqual(self.exe("posix", self.out, supplied), bundled)
+            packaged = os.path.join(self.out, "gta6rt.exe")
+            open(packaged, "wb").close()
+            self.assertEqual(self.exe("posix", self.out, supplied), packaged)
 
-    def test_pipelines_off_windows_runs_the_linux_build(self):
-        exe = self.touch("linux", "vk_pipeline_check")
-        os.chmod(exe, 0o755)
-        self.touch("vk_pipeline_check.exe")
+    def test_windows_uses_runtime_build_folder_and_prefers_out_then_supplied(self):
+        self.touch("windows", "gta6rt.exe")
+        self.assertIsNone(self.exe("nt", self.out))
+        local = self.touch("gta6rt.exe")
+        self.assertEqual(self.exe("nt", self.out), local)
+        with tempfile.TemporaryDirectory() as supplied:
+            self.assertEqual(self.exe("nt", self.out, supplied), local)
+            bundled = os.path.join(supplied, "gta6rt.exe")
+            open(bundled, "wb").close()
+            self.assertEqual(self.exe("nt", self.out, supplied), bundled)
+            packaged = os.path.join(self.out, "gta6rt.exe")
+            open(packaged, "wb").close()
+            self.assertEqual(self.exe("nt", self.out, supplied), packaged)
+
+    def test_pipelines_off_windows_runs_gta6rt_under_wine(self):
+        exe = self.touch("windows", "gta6rt.exe")
         work = os.path.join(self.tmp.name, "work")
         os.makedirs(os.path.join(work, "shaders", "spirv"))
         with open(os.path.join(work, "shaders", "spirv", "index.json"), "w") as f:
-            f.write('{"shader_0": {}}')   # a finished translation is never empty
-        out = os.path.join(self.tmp.name, "out")
+            f.write('{"shader_0": {}}')
         with mock.patch.object(make_game.os, "name", "posix"), \
+                mock.patch.dict(os.environ, {"WINE": "/usr/bin/wine"}), \
+                mock.patch.object(make_game, "wine_available", return_value=True), \
                 mock.patch.object(make_game, "log"), \
-                mock.patch.object(make_game, "run", return_value=0) as run:
-            make_game.pipelines(work, out, runtime_build=self.build)
-        self.assertEqual(run.call_args.args[0][0], exe)
+                mock.patch.object(make_game, "_run_precompile", return_value=0) as run_pre:
+            make_game.pipelines(work, self.out, jobs=3)
+        # Off Windows there is no --parent: Wine cannot open a host process by its PID.
+        self.assertEqual(run_pre.call_args.args[0],
+                         ["/usr/bin/wine", exe, "--precompile-pipelines", "--threads", "3", "--smallest-first"])
 
-    def test_pipelines_off_windows_without_the_build_says_how_to_build_it(self):
+    def test_pipelines_off_windows_without_gta6rt_says_how_to_get_it(self):
         err = io.StringIO()
         with mock.patch.object(make_game.os, "name", "posix"), mock.patch("sys.stderr", err):
             with self.assertRaises(SystemExit):
-                make_game.pipelines(os.path.join(self.tmp.name, "work"), os.path.join(self.tmp.name, "out"))
-        self.assertIn("cmake -S runtime -B runtime/build/linux", err.getvalue())
+                make_game.pipelines(os.path.join(self.tmp.name, "work"), self.out)
+        self.assertIn("gta6rt.exe was not found", err.getvalue())
+        self.assertIn("--runtime-build", err.getvalue())
 
 
 class RuntimeStageCopyTest(unittest.TestCase):

@@ -751,7 +751,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             visual_cpp_tools_ok=mock.Mock(return_value=True),
             cross_build_missing=mock.Mock(return_value=[]),
             cross_configure=mock.DEFAULT,
-            pipeline_check_exe=mock.Mock(return_value="vk_pipeline_check"),
+            runtime_exe=mock.Mock(return_value="gta6rt.exe"),
             assets_exported=mock.Mock(return_value=False),
             shader_outputs_reusable=mock.Mock(return_value=False),
             wave64_settings=mock.Mock(return_value=(False, False)),
@@ -761,7 +761,8 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             assets=mock.DEFAULT,
             runtime=mock.DEFAULT,
             pipelines=mock.DEFAULT,
-        ) as stages, mock.patch("shutil.which", return_value="available-tool"), \
+        ) as stages, mock.patch.dict(os.environ, {"VULKAN_SDK": "C:\\Vulkan"}), \
+                mock.patch("shutil.which", return_value="available-tool"), \
                 mock.patch("shutil.disk_usage") as disk:
             argv = ["make_game.py", "--game", os.path.join(tmp, "input"), "--out", os.path.join(tmp, "out")]
             with mock.patch.object(sys, "argv", argv):

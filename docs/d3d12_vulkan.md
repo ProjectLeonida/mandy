@@ -2672,7 +2672,7 @@ Pipeline creation:
 - Request the subgroup size each shader was translated for (`requiredSubgroupSize` 64 or 32) where the device lists the stage
   in `requiredSubgroupSizeStages`, and say so in the log where it cannot (section 3.2, "Subgroup size").
 - Pipeline caches: graphics and compute PSOs use one `VkPipelineCache` per device. On first use the runtime reads
-  the `pipelines` build stage's `pipeline_cache.bin` beside the executable if its Vulkan header matches the device
+  an offline `pipeline_cache.bin` beside the executable if its Vulkan header matches the device
   and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
   The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
   bindings and the standard 144-byte push-constant range.
@@ -2748,8 +2748,8 @@ Pipeline creation:
   folders can share one; the file names and the driver's checks keep a pipeline from one build from being taken
   for another's.
   `gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--all] [--smallest-first] [--limit N]
-  [--min-bytes N] [--max-bytes N] [--filter PART]... [--skip-listed] [--list]` fills the journal ahead of play, with
-  no game: it
+  [--min-bytes N] [--max-bytes N] [--filter PART]... [--skip-listed] [--list]` (which `make_game.py --stages
+  pipelines` runs) fills the journal ahead of play, with no game: it
   creates the Vulkan device as `--run` does (so the same environment gives the same journal names and driver keys:
   LEONIDA_SHADERS, LEONIDA_PIPELINE_CACHE_DIR, and LEONIDA_DEVICE_FAULT/LEONIDA_AFTERMATH, whose diagnostics config
   makes other pipelines) and builds every compute entry of the library through the dispatch path

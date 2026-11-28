@@ -42,8 +42,8 @@ Build with `make_game.py --stages shaders --compact-spirv` to run SPIRV-Tools lo
 | `--stats FILE` | Write the driver's per-shader statistics as CSV rows `name,stage,statistic,value`. Needs `VK_KHR_pipeline_executable_properties`; use it without `cache.bin`, because a cached pipeline may come without statistics. |
 | `--cache-feedback` | Group successful pipeline creations by `VkPipelineCreationFeedback`: cache hits, no hit reported, and unavailable. |
 | `--isolate` | POSIX only: check in child processes, `--isolate-batch N` modules at a time (default 256), so a crashing module is recorded as `MODULE CRASH` and the pass continues. Not compatible with `--stats`. |
-| `--inflight-file F` | Keep the modules currently in the driver in F as `name<TAB>phase` lines. It is rewritten by the watchdog and when a large module enters or leaves, and emptied at the end; `make_game.py`'s pipelines stage reads it. |
-| `--skip-file F` | Do not compile modules named one per line in F; each is reported as `MODULE CRASH` and counted as a failed pipeline. `make_game.py` writes F after a crash so the next run checks the rest. |
+| `--inflight-file F` | Keep the modules currently in the driver in F as `name<TAB>phase` lines. It is rewritten by the watchdog and when a large module enters or leaves, and emptied at the end. |
+| `--skip-file F` | Do not compile modules named one per line in F; each is reported as `MODULE CRASH` and counted as a failed pipeline. |
 
 `--isolate-child` is internal to the parent/child protocol and is not meant to be passed directly. A module with a missing partner stub is skipped; without `--isolate`, a driver crash ends the run.
 
@@ -285,7 +285,7 @@ of the arenas (16 modules, 6 threads: 6.2 GB; with `MALLOC_ARENA_MAX=1`: 2.1 GB)
 - `--large-parallel N` caps how many large modules compile at once: `0` (default) by the budget, `1` alone with
   the other threads waiting (the behaviour before), `N` at most N without a budget.
 - `--inflight-file` names every module in flight when a large one enters or leaves the driver, so with several
-  large modules in flight it names all of them; the `pipelines` stage of `make_game.py` checks each alone.
+  large modules in flight it names all of them.
 
 ## Skipping huge modules
 
@@ -346,39 +346,42 @@ the loader's `cl` line in `scripts/build_runtime.ps1`). The CTest `gta6rt_stack`
 with `dwStackSize` 0 both report 8 MB. Not covered: a thread the title creates with an explicit smaller size keeps
 that size. Which threads the game creates pipelines on is not known without its executable.
 
-## Build-stage batches (BUILD-1030)
+## Relationship to `make_game.py --stages pipelines`
 
-`make_game.py` runs the pipelines stage in fresh checker processes over at most **500 index entries** each, on
-Windows and POSIX. The ranges partition the same name-sorted index as `--start` / `--count`, including the final
-short range. Each finished process saves to the same `pipeline_cache.bin`, and the next loads that checkpoint.
-This bounds each invocation to a range that can be split further if concurrent heavy compiles exceed available
-memory. A work folder with at most 500 entries keeps the single invocation. An older checker without the range
-options keeps the older invocation; rebuild the runtime to get batching.
+`make_game.py`'s `pipelines` stage no longer drives `vk_pipeline_check`: it runs `gta6rt.exe --precompile-pipelines`
+(directly on Windows, or under `WINE` / `wine` elsewhere) so the stage populates the runtime's own compute pipeline
+journal in `<out>/pipeline_cache.d` with matching device features and driver keys. The stage passes
+`--smallest-first`, so a stage stopped part way has built as many entries as it could (the runtime's own default, the
+largest first, can spend hours on a few modules of several MiB), and `--skip-listed` when `LEONIDA_SKIP_COMPUTE` is
+set. On Windows it also passes `--parent <its pid>`: the runtime stops when `make_game.py` ends, so a closed stage
+leaves no `gta6rt` holding the journal (a Wine process cannot watch a host process).
+It sets `LEONIDA_DEVICE_FAULT=1` unless the environment has it (any value, empty included, is passed on): that is
+what `scripts/windows-boot/boot.ps1` boots with, and on NVIDIA it turns on the driver's diagnostics config, which is
+part of every journal file's name (`nv-diagnostics-config` in `d3d12_vulkan_device.cpp`), so a journal built with
+another value gives a boot no hits. Run the stage with the value the boot uses (`2`, or empty for a plain `gta6rt
+--run`).
 
-If a batch crashes, its in-flight modules are checked alone in fresh processes. A module that reproducibly crashes
-is recorded as failed, and the rest is checked. If none crashes alone, the entire failed range is retried in
-smaller processes, down to one entry; healthy modules are not added to the crash list. An unrecoverable crash,
-an interrupted check or a setup error stops the stage. A validation failure in one batch remains a failure even
-when subsequent batches succeed; it does not prevent those later batches from being checked.
+The runtime keeps the entries inside the driver in `pipeline_cache.d/requests/inflight.txt` (`<name> <key>`, the key
+made from the module file and the driver; `runtime/src/precompile_inflight.h`). A stop the runtime is told about
+(Ctrl+C, the console closing, the parent gone) removes the file. A run killed from outside leaves it as a crash would,
+so one death proves nothing: the next run makes each entry left in flight a suspect (`requests/suspect.txt`) and builds
+it again, and only an entry left in flight a second time with the same key is held as crashed (`requests/crashed.txt`)
+and skipped. A crash is held against that module file on that device and driver: once the module is translated again
+or the driver changes, the next run builds it again, and a build that returns clears it from both lists.
+`gta6rt --precompile-pipelines --all` tries every recorded entry again now.
 
-The native checker returns 1 for initialization failures as well as validation failures. A completed shader pass
-writes/clears its in-flight report even when validation fails. Exit 1 without a new report stops the stage instead
-of repeating failed setup for the remaining batches; diagnostic probes use the same distinction. Each process
-starts with a cleared report path, so an earlier process's report cannot hide an initialization failure.
+`make_game.py` reads the exit code (`precompile_exit_kind`): 0 done, 2 some entries failed (a warning), 1 no Vulkan
+device or shader library and 3 another precompile holds `requests/precompile.lock` (both end the stage). A crash is an
+NTSTATUS error or warning on Windows other than `STATUS_CONTROL_C_EXIT`, or under Wine any other positive code (its low
+byte) or a signal other than SIGHUP/SIGINT/SIGKILL/SIGTERM; anything else is a stop, which ends the stage without a
+restart. After a crash the stage restarts `gta6rt`: a crash inside a pipeline build always moves on (suspect, then
+crashed and skipped), so only crashes outside one count against `PIPELINE_CRASH_RETRIES` in a row, and
+`PIPELINE_MAX_RESTARTS` bounds the stage. Crashed entries go to `<out>/pipeline_crashes.json` with their SPIR-V's
+SHA-256. For tests, `LEONIDA_PRECOMPILE_CRASH_TEST=<entry name>` ends the precompile just before that entry's pipeline
+create, as a driver crash there would.
 
-An abnormal diagnostic-probe exit confirms a module crash only when that probe's fresh in-flight report names
-the selected module. A missing, empty or unrelated report makes the result inconclusive and stops the stage
-without blaming that module. The native report is periodic for small modules, so even a real fast crash can
-leave no evidence; this conservative fallback does not guess its cause or add an unconfirmed crash-list entry.
-
-The batch size limits the index range, **not total memory usage**. Concurrent heavy modules, loading a large
-saved cache or compiling one large shader can still exceed a process's available memory; a range that
-cannot complete even alone fails with a diagnostic rather than being counted as checked.
-
-`tests/test_make_game_pipeline_batches.py` runs the real build-stage orchestration against scripted child processes:
-bounded coverage and cache checkpoints, collective memory-crash recovery, a genuinely crashing module, validation
-failures, interruptions, setup failures, inconclusive probes and compatibility with older checkers. It needs no
-game files or GPU.
+`vk_pipeline_check` remains a standalone diagnostic tool (and CI test binary) for corpus-wide module/pipeline checks,
+Mesa DRM-shim profiling, `--stats`, `--cache-feedback`, and `--isolate` crash bisection.
 
 ## Crash isolation (`--isolate`)
 

@@ -905,6 +905,11 @@ if(BUILD_TESTING)
   add_executable(pipeline_cache_journal_test test/pipeline_cache_journal_test.cpp)
   add_test(NAME pipeline_cache_journal COMMAND pipeline_cache_journal_test)
 
+  # gta6rt --precompile-pipelines: entries a dead run left in the driver are skipped next time (precompile_inflight.h).
+  add_executable(precompile_inflight_test test/precompile_inflight_test.cpp)
+  target_link_libraries(precompile_inflight_test PRIVATE Threads::Threads)
+  add_test(NAME precompile_inflight COMMAND precompile_inflight_test)
+
   # The compile helper's request files and building markers (shims/d3d12_compile_helper.h): Win32 file calls only.
   if(WIN32)
     add_executable(compile_helper_test test/compile_helper_test.cpp)

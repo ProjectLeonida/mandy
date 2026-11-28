@@ -35,9 +35,10 @@ scripts/linux-boot/configure-worktree.sh <checkout>      # XWIN_DIR=<sdk>, SDL3_
 cmake --build <checkout>/runtime/build/boot --target gta6rt -j6
 ```
 
-`gta6rt_tls_host.dll` is built with the `gta6rt` target and must stay next to the executable. Unit tests are Windows
-executables too and run under Wine (`scripts/run_wine_tests.py`, or directly with the same `wine` binary and a
-prefix of their own: sharing the game's prefix with tests breaks its window).
+`gta6rt_tls_host.dll` is built with the `gta6rt` target and must stay next to the executable. `make_game.py --stages pipelines`
+runs `gta6rt.exe --precompile-pipelines` under Wine (honouring `WINE`) to fill `<out>/pipeline_cache.d/`. Unit tests
+are Windows executables too and run under Wine (`scripts/run_wine_tests.py`, or directly with the same `wine` binary
+and a prefix of their own: sharing the game's prefix with tests breaks its window).
 
 ## Booting on Linux
 
@@ -194,13 +195,14 @@ they were found.
    translator no longer does that for single-wave programs ([design.md](design.md), row "Wave64 emulation:
    single-wave barrier fallback").
    The auto mode now leaves CPU devices out when a GPU is listed and names the device that decided.
-3. **Fill the pipeline journal with the runtime itself.** `gta6rt --precompile-pipelines --threads 16`, under Wine,
+3. **Fill the pipeline journal with the runtime itself.** `make_game.py --stages pipelines` (or
+   `gta6rt --precompile-pipelines --threads 16` directly), under Wine,
    with the environment of the game run (`LEONIDA_SHADERS`, `LEONIDA_PIPELINE_CACHE_DIR`, `LEONIDA_DEVICE_FAULT`;
    `--precompile-pipelines` in [d3d12_vulkan.md](d3d12_vulkan.md)). It built 3,693 compute pipelines; the next boot took
    1,900 of them from the journal in 0.1 s of driver time, and the menus ran at 30 frames/s instead of under one.
    That run left out the programs `LEONIDA_SKIP_COMPUTE` named, which kept them out of the journal; the pre-compile
    now builds them too unless it is given `--skip-listed`.
-   The `pipeline_cache.bin` that `make_game.py`'s pipelines stage writes with `vk_pipeline_check` gave no hits: 0 of
+   The `pipeline_cache.bin` that `make_game.py`'s pipelines stage previously wrote with `vk_pipeline_check` gave no hits: 0 of
    5,526 journal pipeline keys were in its 29,861 objects (9 shader binaries were identical, so the machine code
    matched and the keys did not). Each of three differences is enough for a miss on RADV:
    - **The set of shaders:** the runtime's warm-up builds the library's compute programs (`library/index.json`,

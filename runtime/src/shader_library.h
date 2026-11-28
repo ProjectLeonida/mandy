@@ -1145,6 +1145,19 @@ public:
         return ec ? 0 : static_cast<std::size_t>(size);
     }
 
+    // The module's file: <dir>/<name>.spv, or the entry's spv_file when that one is missing.
+    std::filesystem::path spirv_path(const ShaderEntry& entry) const {
+        auto path = dir_;
+        path += "/" + entry.name + ".spv";
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec) && !entry.spv_file.empty()) {
+            auto alt = dir_;
+            alt += "/" + entry.spv_file;
+            return alt;
+        }
+        return path;
+    }
+
     // Every entry of `stage` once, in name order, from every index (an entry reachable both by its FSSM and its FSPX
     // hash is one entry). gta6rt --precompile-pipelines builds them all.
     std::vector<const ShaderEntry*> stage_entries(std::string_view stage) const {

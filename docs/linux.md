@@ -11,7 +11,7 @@ names; the build lists anything it can't find before it starts.
 
 | Piece | On Linux | How it is checked |
 |---|---|---|
-| `make_game.py`: check, shaders, assets, pipelines | Native | CI (`stdlib-tests-linux`, `translator-tests`, `semantic-tests`) |
+| `make_game.py`: check, shaders, assets | Native | CI (`stdlib-tests-linux`, `translator-tests`, `semantic-tests`) |
 | `Build.sh`, `Mods.sh` | Native (`/bin/sh`) | `tests/test_shell_launchers.py`, in the standard-library loop of `stdlib-tests-linux` |
 | Shader translator, its tests and the GPU test tools (`vk_harness`, `vk_pipeline_check`, ...) | Native, GCC or Clang | CI (`linux-gpu-tools`: GCC, tests on llvmpipe); Clang builds them too, but no CI job uses it yet |
 | `rpf9dump` (asset export) | Native, .NET 8 or newer | CI builds it on Windows only (the `check` job) |
@@ -32,7 +32,7 @@ sudo apt install git python3 \
 #   llvm-21, spirv-tools  the shaders stage: llvm-mc with the AMDGPU target, spirv-as and spirv-val
 #   dotnet-sdk-10.0       the assets stage builds rpf9dump; Ubuntu 26.04 packages no .NET 8 SDK, and 10 builds the
 #                         net8.0 project through global.json's roll-forward
-#   cmake ... libvulkan-dev  the pipelines stage builds vk_pipeline_check
+#   cmake ... libvulkan-dev  optional: standalone native Vulkan test tools (vk_harness, vk_pipeline_check)
 #   ffmpeg                optional: XMA2 audio and --wav
 #   zenity, python3-tk    optional: the --pick folder dialog and the mod manager window
 ```
@@ -48,8 +48,8 @@ cd leonida
 ```
 
 `./Build.sh` is `python3 -I make_game.py` with the newest Python 3.12+ it finds, so every `make_game.py` option in
-the README works with it (`--game`, `--out`, `--work`, `--stages`, ...). Without the cross-build tools below, the
-default stages leave `runtime` out (`check,shaders,assets,pipelines`).
+the README works with it (`--game`, `--out`, `--work`, `--stages`, ...). Without the cross-build tools below (or
+`--runtime-build`), the default stages leave `runtime` and `pipelines` out (`check,shaders,assets`).
 
 Notes:
 

@@ -200,7 +200,7 @@ class SkipAssetsAndStageIsolationTest(unittest.TestCase):
                 mock.patch.object(make_game, "dotnet_sdk_ok") as mock_dotnet, \
                 mock.patch.object(make_game, "ensure_submodule") as mock_submodule, \
                 mock.patch.object(make_game, "tool_available", return_value=True), \
-                mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"), \
+                mock.patch.object(make_game, "runtime_exe", return_value="/out/gta6rt.exe"), \
                 mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                 mock.patch("shutil.disk_usage", return_value=mock.Mock(free=100 * (2**30))):
             make_game.preflight(["shaders", "pipelines"], self.work_dir, wav=True)  # no runtime: Windows-only
@@ -272,10 +272,10 @@ class PipelineStageIsolationTest(unittest.TestCase):
         os.makedirs(self.out_dir, exist_ok=True)
 
     def test_pipelines_fails_when_spirv_index_is_missing(self) -> None:
-        dummy_exe = os.path.join(self.tmp.name, "vk_pipeline_check.exe")
+        dummy_exe = os.path.join(self.tmp.name, "gta6rt.exe")
         with open(dummy_exe, "w", encoding="utf-8") as f:
             f.write("dummy")
-        with mock.patch("make_game.pipeline_check_exe", return_value=dummy_exe):
+        with mock.patch("make_game.runtime_exe", return_value=dummy_exe):
             stderr_buf = io.StringIO()
             with mock.patch("sys.stderr", stderr_buf):
                 with self.assertRaises(SystemExit) as ctx:
@@ -283,67 +283,63 @@ class PipelineStageIsolationTest(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, 1)
                 self.assertIn("No translated shaders yet: run the shaders stage first.", stderr_buf.getvalue())
 
-    def test_pipelines_fails_when_pipeline_check_exe_not_built_on_windows(self) -> None:
+    def test_pipelines_fails_when_runtime_exe_not_built_on_windows(self) -> None:
         spirv_dir = os.path.join(self.work_dir, "shaders", "spirv")
         os.makedirs(spirv_dir, exist_ok=True)
         with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8") as f:
             f.write("{}")
 
-        with mock.patch("make_game.pipeline_check_exe", return_value=None), \
+        with mock.patch("make_game.runtime_exe", return_value=None), \
                 mock.patch.object(make_game.os, "name", "nt"):
             stderr_buf = io.StringIO()
             with mock.patch("sys.stderr", stderr_buf):
                 with self.assertRaises(SystemExit) as ctx:
                     make_game.pipelines(self.work_dir, self.out_dir)
                 self.assertEqual(ctx.exception.code, 1)
-                self.assertIn("vk_pipeline_check.exe wasn't built", stderr_buf.getvalue())
+                self.assertIn("gta6rt.exe was not found", stderr_buf.getvalue())
 
-    def test_pipelines_fails_when_pipeline_check_exe_not_built_on_posix(self) -> None:
+    def test_pipelines_fails_when_runtime_exe_not_built_on_posix(self) -> None:
         spirv_dir = os.path.join(self.work_dir, "shaders", "spirv")
         os.makedirs(spirv_dir, exist_ok=True)
         with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8") as f:
             f.write("{}")
 
-        with mock.patch("make_game.pipeline_check_exe", return_value=None), \
+        with mock.patch("make_game.runtime_exe", return_value=None), \
                 mock.patch.object(make_game.os, "name", "posix"):
             stderr_buf = io.StringIO()
             with mock.patch("sys.stderr", stderr_buf):
                 with self.assertRaises(SystemExit) as ctx:
                     make_game.pipelines(self.work_dir, self.out_dir)
                 self.assertEqual(ctx.exception.code, 1)
-                self.assertIn("vk_pipeline_check wasn't built", stderr_buf.getvalue())
+                self.assertIn("gta6rt.exe was not found", stderr_buf.getvalue())
 
-    def test_pipelines_executes_compiler_isolated_with_expected_command_line(self) -> None:
+    def test_pipelines_executes_precompiler_isolated_with_expected_command_line(self) -> None:
         spirv_dir = os.path.join(self.work_dir, "shaders", "spirv")
         os.makedirs(spirv_dir, exist_ok=True)
         index_path = os.path.join(spirv_dir, "index.json")
         with open(index_path, "w", encoding="utf-8") as f:
             f.write('{"shader_0": {}}')   # a finished translation is never empty
 
-        dummy_exe = os.path.join(self.tmp.name, "vk_pipeline_check.exe")
+        dummy_exe = os.path.join(self.tmp.name, "gta6rt.exe")
         with open(dummy_exe, "w", encoding="utf-8") as f:
             f.write("binary")
 
-        expected_cache = os.path.join(self.out_dir, "pipeline_cache.bin")
         executed_cmds = []
 
-        def fake_run(args: list[str], **kwargs: object) -> int:
-            executed_cmds.append(args)
+        def fake_run_precompile(cmd: list[str], env: dict[str, str], progress_box: list) -> int:
+            executed_cmds.append(cmd)
             return 0
 
-        # The usage probe (checker_supports) really launches the checker, so it is stubbed too: CreateProcess on a
-        # text file named .exe makes native Windows show a modal "Unsupported 16-Bit Application" dialog that blocks
-        # the run. A checker without --inflight-file is what the old dummy answered.
-        with mock.patch("make_game.pipeline_check_exe", return_value=dummy_exe), \
-                mock.patch("make_game.checker_supports", return_value=False) as supports, \
-                mock.patch("make_game.run", side_effect=fake_run), \
-                mock.patch.object(make_game.subprocess, "run", side_effect=AssertionError("launched the dummy")), \
+        with mock.patch("make_game.runtime_exe", return_value=dummy_exe), \
+                mock.patch.object(make_game.os, "name", "nt"), \
+                mock.patch("make_game._run_precompile", side_effect=fake_run_precompile), \
                 mock.patch("make_game.log"):
-            make_game.pipelines(self.work_dir, self.out_dir)
+            make_game.pipelines(self.work_dir, self.out_dir, jobs=4)
 
-        supports.assert_called_once()
         self.assertEqual(len(executed_cmds), 1)
-        self.assertEqual(executed_cmds[0], [dummy_exe, spirv_dir, expected_cache])
+        # Windows: smallest first, and --parent so the run stops when this make_game process ends.
+        self.assertEqual(executed_cmds[0], [dummy_exe, "--precompile-pipelines", "--threads", "4",
+                                            "--smallest-first", "--parent", str(os.getpid())])
 
     def test_pipelines_stage_alone_invokes_no_asset_or_shader_compilers(self) -> None:
         game_dir = os.path.join(self.tmp.name, "game")

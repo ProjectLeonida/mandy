@@ -176,7 +176,7 @@ translates every shader again. A `disasm` folder that is a symlink is refused wh
 |---|---|---|---|---|
 | your package | `--game` | your copy of the game; only read, never written | as copied | yes, in place (`game_path.txt`) |
 | work | `--work` (default `<out>\work`) | `shaders` (carved, disassembled, translated) and `assets` (exports) | about 30 GB + about 370 GB | only `shaders\spirv` (`shader_path.txt`) |
-| port | `--out` (default `Documents\Leonida`) | `gta6rt.exe`, its DLL, the path files, the pipeline cache, `overlay` | small | yes |
+| port | `--out` (default `Documents\Leonida`) | `gta6rt.exe`, its DLL, the path files, `pipeline_cache.d`, `overlay` | small | yes |
 
 The free-space check before a build counts the `--work` drive only, because that is where the large files go.
 Nothing in `<work>\assets` is read by the game, so with a small SSD you can keep what the game loads on the SSD and
@@ -243,11 +243,10 @@ upgrading.
 
 Stages: `check` always runs first; then `shaders`, `assets` and `runtime` run together when selected (they do not
 depend on each other). `pipelines` starts once the translated shaders are ready and, when this run includes runtime,
-that stage has finished rebuilding `vk_pipeline_check`, so it can overlap the rest of assets; it creates every
-translated shader on your GPU driver, reports any it has to skip, and saves a pipeline cache to `pipeline_cache.bin`
-in `--out`, which also holds `gta6rt.exe` after the `runtime` stage. The runtime seeds its Vulkan pipeline cache
-from the file beside the executable when its header matches the device and pipeline cache UUID. It falls back to
-an empty cache if the file is missing, incompatible, or rejected by the driver. Shader translation is the longest
+that stage has finished building `gta6rt.exe`, so it can overlap the rest of assets; it runs
+`gta6rt.exe --precompile-pipelines` (under Wine off Windows) to fill the runtime's own compute pipeline journal in
+`pipeline_cache.d` under `--out`, and reports any failures or crashing entries (writing `pipeline_crashes.json` if
+any entry crashed the driver). Shader translation is the longest
 CPU step. It runs on `--jobs` processes (half the CPU threads by default). When shaders and assets share the machine,
 that budget is split between them and passed to `rpf9dump` as `--jobs`. A solo assets run still lets `rpf9dump` use
 every core. Progress lines include percent and a rough ETA for translation shards, asset steps, and overall stage
@@ -272,8 +271,8 @@ cmake --build runtime/build/linux --parallel
 
 Pass the directory containing `index.json` and the translated SPIR-V files to `vk_pipeline_check`.
 
-`make_game.py` runs on Linux too. The `pipelines` stage uses the `vk_pipeline_check` built above
-(`runtime/build/linux`, or `runtime/build`), and builds it there itself before any other work if it is missing.
+`make_game.py` runs on Linux too. Its `pipelines` stage runs `gta6rt.exe --precompile-pipelines` under Wine
+(honouring `WINE`) to populate `<out>/pipeline_cache.d`, rather than `vk_pipeline_check`.
 
 ### Running the loader on Linux
 
