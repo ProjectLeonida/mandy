@@ -35,15 +35,18 @@ REVERT_SUBJECT = re.compile(r"^Revert\b", re.IGNORECASE)
 # Where a doubled block is the repeated-merge damage. In code, three equal lines in two functions are ordinary, so a
 # block there is listed but does not change the verdict.
 TEXT_SUFFIXES = (".md", ".txt", ".rst")
+GIT_TIMEOUT = 120
 
 
 class GitError(Exception):
     pass
 
 
-def git(repo, *args, check=True):
+def git(repo, *args, check=True, timeout=GIT_TIMEOUT):
     try:
-        r = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+        r = subprocess.run(["git", "-C", repo, *args], capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise GitError(f"git {' '.join(args)}: timed out after {timeout}s") from None
     except OSError as e:  # git is not on PATH, or cannot be executed: a usage error (exit 2), not a traceback
         raise GitError(f"cannot run git: {e.strerror or e}") from None
     # Decode without universal-newline translation: a bare CR inside a Git line is content.
@@ -177,20 +180,40 @@ def check(repo, main, number, ref, min_length, merges):
             "duplicate_samples": {p: v[:3] for p, v in dups.items()}}
 
 
+def _positive_int(text):
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {text!r}")
+    return value
+
+
+def _validate_ref(ref, label):
+    if not ref or ref != ref.strip() or ref.startswith("-"):
+        raise argparse.ArgumentTypeError(f"invalid {label} ref: {ref!r}")
+    return ref
+
+
 def parse_pair(text):
     number, sep, ref = text.partition("=")
-    if not sep or not number.lstrip("#").isdigit() or not ref:
+    raw_num = number[1:] if number.startswith("#") else number
+    if not sep or not raw_num.isascii() or not raw_num.isdigit() or int(raw_num) < 1:
         raise argparse.ArgumentTypeError(f"expected PR=REF, got {text!r}")
-    return int(number.lstrip("#")), ref
+    return int(raw_num), _validate_ref(ref, "PR target")
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     ap.add_argument("pairs", nargs="+", type=parse_pair, metavar="PR=REF")
-    ap.add_argument("--main", default="origin/main", help="the branch the round merges into (default origin/main)")
+    ap.add_argument("--main", default="origin/main", type=lambda s: _validate_ref(s, "--main"),
+                    help="the branch the round merges into (default origin/main)")
     ap.add_argument("--repo", default=".", help="repository folder (default: the current one)")
-    ap.add_argument("--min-length", type=int, default=40, help="shortest stripped line counted as a duplicate (40)")
-    ap.add_argument("--depth", type=int, default=5000, help="first-parent commits searched for earlier merges (5000)")
+    ap.add_argument("--min-length", type=_positive_int, default=40,
+                    help="shortest stripped line counted as a duplicate (40)")
+    ap.add_argument("--depth", type=_positive_int, default=5000,
+                    help="first-parent commits searched for earlier merges (5000)")
     ap.add_argument("--json", action="store_true", help="one JSON report instead of text")
     args = ap.parse_args(argv)
     try:
