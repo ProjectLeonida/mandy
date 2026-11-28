@@ -46,7 +46,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from meshlet_page import PageError, parse_group  # noqa: E402  (same group validation as the 63 30 pages)
-from report_paths import path_key  # noqa: E402
+from report_paths import path_key, same_report_path  # noqa: E402
 
 MAGIC = 0x4042
 HEADER = 0x80
@@ -679,15 +679,6 @@ def summarise(T):
     return out
 
 
-def same_output_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def _walk_error(exc: OSError):
     # os.walk skips a directory it cannot list unless onerror raises; a scan must not report an
     # incomplete directory as complete. main() turns the OSError into one error line and exit 2.
@@ -729,7 +720,7 @@ def main(argv=None):
             print(f"error: --json {args.json} is a directory", file=sys.stderr)
             return 2
         for path in archives.values():
-            if same_output_path(args.json, path):
+            if same_report_path(args.json, path):
                 print(f"error: --json would overwrite the input {path}", file=sys.stderr)
                 return 2
     rng = random.Random(args.seed)
