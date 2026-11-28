@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string_view>
 #include <vector>
 
@@ -16,6 +18,16 @@ namespace rt::package_splash {
 namespace {
 using Microsoft::WRL::ComPtr;
 std::filesystem::path image_path;
+
+// The decoded, scaled splash for one client size. The GDI paint (ShowWindow) and the D3D12 splash texture used to
+// decode and Fant-scale the WIC image separately, at start-up and twice; one decode is shared here instead. A
+// different window size decodes once more; the cache is cleared when the package is configured again.
+std::mutex cache_mutex;
+struct SplashPixels {
+    UINT width = 0, height = 0;
+    std::shared_ptr<const std::vector<BYTE>> pixels;
+};
+SplashPixels cache;
 
 std::filesystem::path declared_image(const std::filesystem::path& package, const wchar_t* manifest,
                                      const wchar_t* element, const wchar_t* attribute) {
@@ -80,8 +92,12 @@ std::vector<BYTE> decode(UINT width, UINT height) {
     return pixels;
 }
 
-std::vector<BYTE> load_pixels(UINT width, UINT height) {
+std::shared_ptr<const std::vector<BYTE>> load_pixels(UINT width, UINT height) {
     if (image_path.empty() || !width || !height || std::uint64_t(width) * height > (64u << 20)) return {};
+    {
+        std::lock_guard lock(cache_mutex);
+        if (cache.pixels && cache.width == width && cache.height == height) return cache.pixels;
+    }
     const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(apartment) && apartment != RPC_E_CHANGED_MODE) return {};
     std::vector<BYTE> pixels;
@@ -91,13 +107,21 @@ std::vector<BYTE> load_pixels(UINT width, UINT height) {
         // Optional startup art must leave the first title frame available on low-memory hosts.
     }
     if (SUCCEEDED(apartment)) CoUninitialize();
-    return pixels;
+    if (pixels.empty()) return {};
+    auto shared = std::make_shared<const std::vector<BYTE>>(std::move(pixels));
+    std::lock_guard lock(cache_mutex);
+    if (!cache.pixels) cache = {width, height, shared};
+    return cache.pixels;  // another thread may have decoded this size first; share its copy
 }
 
 }  // namespace
 
 void configure(const std::filesystem::path& package) {
     image_path.clear();
+    {
+        std::lock_guard lock(cache_mutex);
+        cache = {};
+    }
     wchar_t value[4]{};
     if (GetEnvironmentVariableW(L"LEONIDA_PACKAGE_SPLASH", value, 4) == 1 && value[0] == L'0') return;
     wchar_t window_mode[16]{};
@@ -118,7 +142,7 @@ bool paint_window(HWND window) {
     if (!GetClientRect(window, &client) || client.right <= 0 || client.bottom <= 0 || painted.exchange(true))
         return false;
     auto pixels = load_pixels(UINT(client.right), UINT(client.bottom));
-    if (pixels.empty()) return false;
+    if (!pixels || pixels->empty()) return false;
     BITMAPINFO bitmap{};
     bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bitmap.bmiHeader.biWidth = client.right;
@@ -130,7 +154,7 @@ bool paint_window(HWND window) {
     HDC dc = GetDC(window);
     if (!dc) return false;
     int lines = SetDIBitsToDevice(dc, 0, 0, client.right, client.bottom, 0, 0, 0, client.bottom,
-                                  pixels.data(), &bitmap, DIB_RGB_COLORS);
+                                  pixels->data(), &bitmap, DIB_RGB_COLORS);
     ReleaseDC(window, dc);
     return lines > 0;
 }
@@ -138,7 +162,7 @@ bool paint_window(HWND window) {
 ID3D12Resource* create_texture(ID3D12Device* device, UINT width, UINT height) {
     if (!device) return nullptr;
     const auto pixels = load_pixels(width, height);
-    if (pixels.empty()) return nullptr;
+    if (!pixels || pixels->empty()) return nullptr;
     const UINT pitch = width * 4;
     const UINT bytes = pitch * height;
     D3D12_RESOURCE_DESC desc{};
@@ -152,7 +176,7 @@ ID3D12Resource* create_texture(ID3D12Device* device, UINT width, UINT height) {
     ComPtr<ID3D12Resource> texture;
     if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
                                                nullptr, IID_PPV_ARGS(&texture))) ||
-        FAILED(texture->WriteToSubresource(0, nullptr, pixels.data(), pitch, bytes)))
+        FAILED(texture->WriteToSubresource(0, nullptr, pixels->data(), pitch, bytes)))
         return nullptr;
     return texture.Detach();
 }

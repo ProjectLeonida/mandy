@@ -1,5 +1,6 @@
 #include "dxgi_com.h"
 #include "d3d12_stubs.h"
+#include "../src/fps_cap.h"
 
 #include <winternl.h>  // NTSTATUS, which d3dkmthk.h needs and WIN32_LEAN_AND_MEAN leaves out
 #include <d3dkmthk.h>
@@ -309,6 +310,10 @@ public:
             return DXGI_ERROR_INVALID_CALL;
         if (lost_) return DXGI_ERROR_INVALID_CALL;  // host-measured: no buffers after a failed ResizeBuffers
         if (flags & DXGI_PRESENT_TEST) return S_OK;  // only asks whether a present would succeed
+        // LEONIDA_FPS_CAP: the PresentX pacer is not on this path, so pace the presents here. The frame's lists were
+        // already submitted on this thread, so the wait lets the GPU drain them before the next frame is queued.
+        leonida::log_fps_cap_once();
+        rate_limiter_.wait();
         const std::uint32_t cur = swapchain_.current_back_buffer_index();
         if (!swapchain_.present(cur)) return E_FAIL;
         ++present_count_;
@@ -670,6 +675,7 @@ private:
     IUnknown* device_ = nullptr;
     leonida::VulkanContext& context_;
     leonida::VulkanSwapchain swapchain_;
+    leonida::PresentRateLimiter rate_limiter_;  // LEONIDA_FPS_CAP
     HWND hwnd_ = nullptr;
     IDXGIOutput* restrict_to_output_ = nullptr;
     UINT flags_ = 0;

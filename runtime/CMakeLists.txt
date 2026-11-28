@@ -4731,6 +4731,13 @@ if(TARGET Vulkan::Headers)
     endif()
     add_test(NAME frame_pacer COMMAND frame_pacer_test)
 
+    # The LEONIDA_FPS_CAP present-rate ceiling (src/fps_cap.h): pure stdlib, no GPU.
+    add_executable(fps_cap_test test/fps_cap_test.cpp)
+    if(MSVC)
+      target_compile_options(fps_cap_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME fps_cap COMMAND fps_cap_test)
+
     # Replay refuses a list whose whole-view or implicit zero-clear needs an unset vkCmdClear*Image (no GPU).
     add_executable(replay_clear_gate_test test/replay_clear_gate_test.cpp)
     target_link_libraries(replay_clear_gate_test PRIVATE Vulkan::Headers)

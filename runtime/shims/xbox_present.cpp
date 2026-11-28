@@ -5,6 +5,7 @@
 #include "d3d12_xs_device.h"
 
 #include "../src/vulkan_present.h"
+#include "../src/fps_cap.h"
 
 #include <atomic>
 #include <cerrno>
@@ -128,7 +129,10 @@ float XboxPresentation::effective_sdr_white_nits() {
 }
 
 HRESULT XboxPresentation::SetFrameIntervalX(IUnknown*, UINT interval_period_us, UINT latency, UINT flags) {
-    return from_pacer(pacer_.set_frame_interval(interval_period_us, latency, flags));
+    // LEONIDA_FPS_CAP: a requested interval shorter than the cap is lengthened to it, so the pacer's vblank grid,
+    // latency, tokens and statistics pace the GPU at the cap and the GPU gets the idle time between frames.
+    leonida::log_fps_cap_once();
+    return from_pacer(pacer_.set_frame_interval(leonida::capped_interval_us(interval_period_us), latency, flags));
 }
 
 HRESULT XboxPresentation::ScheduleFrameEventX(UINT event, UINT offset_us, UINT flags) {
