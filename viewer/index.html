@@ -16,10 +16,20 @@
   #help kbd { color: var(--fg); background: #1c2129; padding: 0 5px; border-radius: 3px; }
   #start { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,.45); cursor: pointer; font-size: 15px; }
   #start.hidden { display: none; }
+  /* Above #start, so the map stays clickable while "Click to fly" covers the rest of the page; opaque, so that
+     prompt does not show through it in a narrow window. */
+  #map { position: fixed; right: 12px; top: 50%; transform: translateY(-50%); z-index: 1; background: var(--bg); padding: 8px; border-radius: 8px; }
+  #map.hidden { display: none; }
+  #map canvas { width: min(420px, calc(100vw - 40px)); height: min(420px, calc(100vh - 300px)); min-height: 120px; border-radius: 4px; cursor: crosshair; }
+  #map-legend, #map-info { width: min(420px, calc(100vw - 40px)); margin-top: 6px; }
+  #map-legend { display: flex; flex-wrap: wrap; gap: 0 12px; color: var(--dim); font-size: 11px; }
+  #map-legend i { font-style: normal; }
+  #map-info { min-height: 2.9em; overflow-wrap: anywhere; }
   @media (max-width: 760px) {
     #hud { right: 12px; min-width: 0; }
     #banner { top: auto; bottom: 104px; left: 12px; max-width: none; }
     #help { right: 12px; }
+    #map canvas { height: min(420px, calc(100vh - 420px)); }
   }
 </style>
 </head>
@@ -33,6 +43,16 @@
 <div id="help">
   <kbd>W A S D</kbd> move · <kbd>Q</kbd>/<kbd>E</kbd> down/up · <kbd>Shift</kbd> fast · <kbd>Ctrl</kbd> slow · wheel: speed<br>
   <kbd>F</kbd> wireframe · <kbd>T</kbd> textures/clay · <kbd>G</kbd> chunk bounds · <kbd>R</kbd> back to spawn · <kbd>P</kbd> copy link to this view · <kbd>Esc</kbd> release mouse
+  <br><kbd>M</kbd> overview map: click on it to fly there, wheel over it to zoom
+</div>
+<div id="map" class="hidden">
+  <canvas role="img" aria-label="Overview map: every chunk of the world seen from above, with the camera"></canvas>
+  <div id="map-legend">
+    <span><i style="color:#5fb3ff">■</i> loaded</span> <span><i style="color:#b7dcff">■</i> loading</span>
+    <span><i style="color:#ffb454">■</i> failed</span> <span><i style="color:#3a4553">■</i> not loaded</span>
+    <span>▲ camera</span> <span>○ spawn</span>
+  </div>
+  <div id="map-info"></div>
 </div>
 <div id="start">Click to fly</div>
 
@@ -247,6 +267,7 @@ addEventListener("keydown", e => {
   if (e.code === "KeyF" && !e.repeat) wire = !wire, applyWire();
   if (e.code === "KeyT" && !e.repeat) clay = !clay, applyClay();
   if (e.code === "KeyG" && !e.repeat) toggleBounds();
+  if (e.code === "KeyM" && !e.repeat) toggleMap();
   if (e.code === "KeyR") camera.position.fromArray(world.spawn);
   if (e.code === "KeyP" && !e.repeat) {
     history.replaceState(null, "", formatCamHash(camera.position.toArray(), yaw, pitch));
@@ -424,6 +445,162 @@ function stream(now = performance.now()) {
   }
 }
 
+// ---------- overview map ----------
+// M opens a map of the whole world from above, drawn from the manifest alone: one rectangle per chunk (its grid
+// cell when it names one, otherwise its bounds), coloured by what the streaming code is doing with it. +x is
+// right and +z is down, so a placed world (RAGE x, y, z -> glTF x, z, -y) has north at the top. A click moves the
+// camera there. Nothing here touches the page until the map is first opened.
+const MAP_PAD = 10, MAP_MAX_ZOOM = 64, MAP_REDRAW_MS = 100, MAP_JUMP_CLEARANCE = 10;
+// In drawing order: what is loaded, loading or failed stays on top of the idle tiers of the same cell.
+const MAP_COLORS = { idle: "#3a4553", loaded: "#5fb3ff", loading: "#b7dcff", failed: "#ffb454" };
+const MAP_STATES = Object.keys(MAP_COLORS);
+let mapOpen = false, mapCanvas = null, mapInfo = null, mapExtent = null, mapZoom = 1, mapCenter = null;
+let mapCursor = null, mapDrawnAt = -Infinity;
+// manifestError() checks a chunk's cell only when the chunk names a tier, so only then is it used.
+function mapRect(def) { const b = def.bounds; return def.lod !== undefined ? def.cell : [b[0], b[2], b[3], b[5]]; }
+function mapState(entry) {
+  if (entry?.obj) return "loaded";
+  if (entry?.loading) return "loading";
+  return entry?.attempts >= MAX_LOAD_ATTEMPTS ? "failed" : "idle";
+}
+function worldExtent() {
+  let e = null;
+  for (const def of world.chunks) {
+    const r = mapRect(def);
+    e = e ? [Math.min(e[0], r[0]), Math.min(e[1], r[1]), Math.max(e[2], r[2]), Math.max(e[3], r[3])] : [...r];
+  }
+  const [x, , z] = world.spawn;
+  return e ?? [x - 512, z - 512, x + 512, z + 512]; // a world without chunks still shows the camera and the spawn
+}
+// Metres to CSS pixels on the map canvas: pixel = metres * scale + offset. At zoom 1 the whole extent fits,
+// centred, with the same scale on both axes.
+function mapTransform(width = mapCanvas.clientWidth, height = mapCanvas.clientHeight) {
+  const [minX, minZ, maxX, maxZ] = mapExtent;
+  const fit = Math.min(Math.max(width - 2 * MAP_PAD, 1) / Math.max(maxX - minX, 1),
+                       Math.max(height - 2 * MAP_PAD, 1) / Math.max(maxZ - minZ, 1));
+  const [cx, cz] = mapCenter ?? [(minX + maxX) / 2, (minZ + maxZ) / 2], scale = fit * mapZoom;
+  return { fit, scale, x: width / 2 - cx * scale, y: height / 2 - cz * scale, width, height };
+}
+function mapPoint(e, t = mapTransform()) { return [(e.offsetX - t.x) / t.scale, (e.offsetY - t.y) / t.scale]; }
+function drawMap(now = performance.now()) {
+  mapDrawnAt = now;
+  const t = mapTransform(), { width, height, scale } = t;
+  if (!(width > 0 && height > 0)) return;
+  const dpr = Math.min(devicePixelRatio || 1, 2), pw = Math.round(width * dpr), ph = Math.round(height * dpr);
+  if (mapCanvas.width !== pw || mapCanvas.height !== ph) { mapCanvas.width = pw; mapCanvas.height = ph; }
+  const ctx = mapCanvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  const rects = Object.fromEntries(MAP_STATES.map(state => [state, []]));
+  for (const def of world.chunks) {
+    const r = mapRect(def);
+    const x = r[0] * scale + t.x, y = r[1] * scale + t.y, w = (r[2] - r[0]) * scale, h = (r[3] - r[1]) * scale;
+    if (x > width || y > height || x + w < 0 || y + h < 0) continue;
+    rects[mapState(live.get(def.id))].push(x, y, w, h);
+  }
+  for (const state of MAP_STATES) {
+    const list = rects[state];
+    if (!list.length) continue;
+    ctx.fillStyle = MAP_COLORS[state];
+    ctx.beginPath();
+    for (let i = 0; i < list.length; i += 4) {
+      // A gap between neighbours once a cell is wide enough to show one; a cell is never thinner than a pixel.
+      const gap = list[i + 2] > 4 && list[i + 3] > 4 ? 0.5 : 0;
+      ctx.rect(list[i] + gap, list[i + 1] + gap, Math.max(list[i + 2] - 2 * gap, 1), Math.max(list[i + 3] - 2 * gap, 1));
+    }
+    ctx.fill();
+  }
+  const p = camera.position, px = p.x * scale + t.x, py = p.z * scale + t.y;
+  ctx.lineWidth = 1;
+  if (!world.lod_bands) { // the radius inside which chunks load; a world with LOD sets has a band per tier instead
+    ctx.strokeStyle = "rgba(230,232,235,.35)";
+    ctx.beginPath(); ctx.arc(px, py, LOAD_R * scale, 0, 2 * Math.PI); ctx.stroke();
+  }
+  ctx.strokeStyle = "#e6e8eb";
+  ctx.beginPath(); ctx.arc(world.spawn[0] * scale + t.x, world.spawn[2] * scale + t.y, 4, 0, 2 * Math.PI); ctx.stroke();
+  // The camera: an arrow along the view direction (yaw 0 looks down -z, which is up here), kept on the canvas
+  // when the camera is outside the part of the world the map shows.
+  const cx = Math.min(Math.max(px, 8), width - 8), cy = Math.min(Math.max(py, 8), height - 8);
+  const dx = -Math.sin(yaw), dz = -Math.cos(yaw);
+  ctx.fillStyle = "#ffffff"; ctx.strokeStyle = "#0d1014";
+  ctx.beginPath();
+  ctx.moveTo(cx + dx * 9, cy + dz * 9);
+  ctx.lineTo(cx - dx * 5 - dz * 5, cy - dz * 5 + dx * 5);
+  ctx.lineTo(cx - dx * 5 + dz * 5, cy - dz * 5 - dx * 5);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  // Scale bar: the largest of 1, 2 or 5 x 10^n metres that is at most a quarter of the map's width.
+  const span = width / 4 / scale, pow = 10 ** Math.floor(Math.log10(span));
+  const bar = Number(((span >= 5 * pow ? 5 : span >= 2 * pow ? 2 : 1) * pow).toPrecision(1));
+  ctx.fillStyle = "#e6e8eb"; ctx.font = "11px ui-monospace, Consolas, monospace";
+  ctx.fillRect(MAP_PAD, height - MAP_PAD - 2, bar * scale, 2);
+  ctx.fillText(bar >= 1000 ? `${bar / 1000} km` : `${bar} m`, MAP_PAD, height - MAP_PAD - 6);
+  if (world.layout === "placements") ctx.fillText("N ↑", width - MAP_PAD - 22, MAP_PAD + 10);
+  describeMapCursor(t);
+}
+function refreshMap(now = performance.now()) { if (mapOpen && now - mapDrawnAt >= MAP_REDRAW_MS) drawMap(now); }
+// The line under the map: what is under the cursor, or how to use the map when the cursor is elsewhere. Every
+// redraw writes it again, so a chunk's state changes under a cursor that rests. Chunk ids come from world.json,
+// so they are written as text.
+function describeMapCursor(t = mapTransform()) {
+  if (!mapCursor) { mapInfo.textContent = `${world.chunks.length} chunks · click: fly there · wheel: zoom`; return; }
+  const [x, z] = mapPoint(mapCursor, t);
+  let hit = null, more = 0;
+  for (const def of world.chunks) {
+    const r = mapRect(def);
+    if (x < r[0] || x > r[2] || z < r[1] || z > r[3]) continue;
+    const state = mapState(live.get(def.id));
+    if (hit) more++;
+    if (!hit || MAP_STATES.indexOf(state) > MAP_STATES.indexOf(hit.state)) hit = { id: def.id, state };
+  }
+  // A placed world's RAGE X and Y, the numbers world_build.py --region takes.
+  mapInfo.textContent = `x ${Math.round(x)}, z ${Math.round(z)}` +
+    (world.layout === "placements" ? ` (RAGE X ${Math.round(x)}, Y ${Math.round(-z)})` : "") +
+    (hit ? ` · ${hit.id}: ${hit.state === "idle" ? "not loaded" : hit.state}${more ? ` (+${more} more here)` : ""}` : "");
+}
+function mapJump(e) {
+  const [x, z] = mapPoint(e), p = camera.position;
+  // Arrive above what stands there: the top of the full-detail chunks whose bounds hold the point, or the height
+  // the camera already has if that is more. Coarser LOD tiers are left out, since one distant model in them can
+  // span kilometres.
+  let top = -Infinity;
+  for (const { bounds: b, lod } of world.chunks)
+    if ((lod === undefined || lod === "hd" || lod === "orphan_hd") && x >= b[0] && x <= b[3] && z >= b[2] && z <= b[5])
+      top = Math.max(top, b[4]);
+  p.x = x; p.z = z; p.y = Math.max(p.y, top + MAP_JUMP_CLEARANCE);
+  drawMap();
+}
+function mapWheel(e) {
+  e.stopPropagation(); // over the map the wheel zooms the map; the window's handler would change the speed too
+  if (!e.deltaY || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+  const t = mapTransform(), [x, z] = mapPoint(e, t);
+  const zoom = Math.min(Math.max(mapZoom * (e.deltaY < 0 ? 1.25 : 0.8), 1), MAP_MAX_ZOOM);
+  if (zoom < 1.01) { mapZoom = 1; mapCenter = null; }
+  else {
+    // Keep the point under the cursor where it is.
+    mapZoom = zoom;
+    mapCenter = [x - (e.offsetX - t.width / 2) / (t.fit * zoom), z - (e.offsetY - t.height / 2) / (t.fit * zoom)];
+  }
+  drawMap();
+}
+function toggleMap() {
+  const panel = document.getElementById("map");
+  mapOpen = !mapOpen;
+  panel.classList.toggle("hidden", !mapOpen);
+  if (!mapOpen) return;
+  if (!mapCanvas) {
+    mapCanvas = panel.querySelector("canvas"); mapInfo = document.getElementById("map-info");
+    mapExtent = worldExtent();
+    const cursor = at => { mapCursor = at && { offsetX: at.offsetX, offsetY: at.offsetY }; describeMapCursor(); };
+    mapCanvas.addEventListener("mousemove", cursor);
+    mapCanvas.addEventListener("mouseleave", () => cursor(null));
+    mapCanvas.addEventListener("click", mapJump);
+    mapCanvas.addEventListener("wheel", mapWheel, { passive: true });
+  }
+  // The map is used with the cursor, which pointer lock hides. A click outside the map locks the mouse again.
+  if (document.pointerLockElement) document.exitPointerLock();
+  drawMap();
+}
+
 // ---------- main loop ----------
 camera.position.fromArray(world.spawn);
 const startCam = parseCamHash(location.hash);
@@ -445,6 +622,7 @@ renderer.setAnimationLoop(() => {
   if (keys.has("KeyE")) v.y += 1; if (keys.has("KeyQ")) v.y -= 1;
   if (v.lengthSq()) camera.position.addScaledVector(v.normalize(), s * dt);
   stream();
+  refreshMap();
   renderer.render(scene, camera);
   fpsN++; fpsT += dt; if (fpsT > 0.5) { fps = fpsN / fpsT; fpsN = 0; fpsT = 0; }
   const p = camera.position, loaded = [...live.values()].filter(c => c.obj).length;
