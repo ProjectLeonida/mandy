@@ -279,6 +279,15 @@ class RuntimePackagingTest(unittest.TestCase):
         result = subprocess.check_output([launcher, "--run", "other.exe", "--", "two words"], cwd=self.root, env=env)
         self.assertEqual(json.loads(result)[:2], [real(self.root), ["--run", "other.exe", "--", "two words"]])
 
+        # A relative WINE names a file from the caller's folder, although the packaged modes start in the game's.
+        proton = os.path.join(self.root, "Proton 9.0", "files", "bin")
+        os.makedirs(proton)
+        os.symlink(sys.executable, os.path.join(proton, "wine"))
+        relative = dict(env, WINE=os.path.join("Proton 9.0", "files", "bin", "wine"))
+        result = subprocess.check_output([launcher, "--dry-run"], cwd=self.root, env=relative)
+        self.assertEqual(json.loads(result)[:2], [real(self.game), ["--dry-run", "./" + image, "--overlay",
+                                                                    "Z:" + real(self.out) + "/overlay"]])
+
         work = os.path.join(self.out, "Shader cache '$HOME'")
         make_game.runtime(self.game, self.out, {"expected_exe": image}, self.build, work=work)
         moved = self.out + " moved"

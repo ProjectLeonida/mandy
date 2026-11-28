@@ -2597,6 +2597,11 @@ if [ -n "${{LEONIDA_CX_BOTTLE:-}}" ]; then
 fi
 if [ "$#" -eq 1 ] && {{ [ "$1" = --dry-run ] || [ "$1" = --init ] || [ "$1" = --run ]; }}; then
     game=$(cat "$here/game_path.txt" && printf .) || exit 1
+    # A relative WINE (a Proton build's files/bin/wine) names a file from the caller's folder, not the game's.
+    case ${{WINE-}} in
+        /*) ;;
+        */*) WINE=$PWD/$WINE ;;
+    esac
     cd "${{game%.}}" || exit 1
     image={shlex.quote(image)}
     if [ ! -f "./$image" ]; then
