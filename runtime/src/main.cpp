@@ -38,6 +38,8 @@
 
 #include <cstring>
 
+#include "title_patch.h"
+
 namespace {
 
 // The retail title runs a hang watchdog thread: when the game's main loop has not set its "kick" byte for 30
@@ -104,6 +106,34 @@ void keep_title_watchdog_kicked(std::uint8_t* base) {
         CloseHandle(thread);
         std::fprintf(stderr, "[rt] loader: keeping the title's hang watchdog kicked (LEONIDA_TITLE_WATCHDOG=0; unset or 1 keeps it armed)\n");
     }
+}
+
+// LEONIDA_TITLE_PATCH (title_patch.h): checked byte patches of the title's image from the environment, applied before
+// it runs. Each one is reported as applied or left alone.
+void apply_title_patches(std::uint8_t* base, std::size_t image_size) {
+    static char spec[2048];
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_TITLE_PATCH", spec, sizeof(spec));
+    if (!n) return;
+    if (n >= sizeof(spec)) {
+        std::fprintf(stderr, "[rt] loader: LEONIDA_TITLE_PATCH is longer than %zu characters; nothing patched\n",
+                     sizeof(spec) - 1);
+        return;
+    }
+    std::vector<std::string> bad;
+    for (const auto& p : rt::title_patch::parse(spec, &bad)) {
+        const auto r = rt::title_patch::apply(base, image_size, p);
+        const char* what = r == rt::title_patch::Result::applied    ? "applied"
+                           : r == rt::title_patch::Result::mismatch ? "left alone: the expected bytes are not there"
+                           : r == rt::title_patch::Result::outside  ? "left alone: outside the image"
+                           : r == rt::title_patch::Result::unreadable
+                               ? "left alone: not all of it is committed, readable memory"
+                                                                    : "left alone: VirtualProtect failed";
+        std::fprintf(stderr, "[rt] loader: LEONIDA_TITLE_PATCH at +0x%llx (%zu bytes) %s\n",
+                     static_cast<unsigned long long>(p.rva), p.replace.size(), what);
+    }
+    for (const auto& item : bad)
+        std::fprintf(stderr, "[rt] loader: LEONIDA_TITLE_PATCH item '%s' is not <rva>:<expected hex>:<new hex> of equal "
+                             "lengths; skipped\n", item.c_str());
 }
 
 // LEONIDA_PEEK="<rva>:3,<rva>,<rva>" (diagnostic): a thread prints the 8-byte values at these RVAs of the
@@ -668,6 +698,7 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         keep_title_watchdog_kicked(main_module.base);
+        apply_title_patches(main_module.base, main_module.size);
         start_title_peek(main_module.base);
         leonida::dev_overlay::start();  // LEONIDA_DEV_OVERLAY=1
         leonida::thread_sampler::start(main_module.base, main_module.size);  // LEONIDA_SAMPLE_MS (diagnostic)

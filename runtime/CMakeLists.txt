@@ -619,6 +619,11 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(title_write_watch_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(title_write_watch_test PRIVATE /W4 /permissive- /utf-8)
 
+  # LEONIDA_TITLE_PATCH (src/title_patch.h): the parser and the checked writes into a stand-in image.
+  add_executable(title_patch_test test/title_patch_test.cpp)
+  target_compile_definitions(title_patch_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+  target_compile_options(title_patch_test PRIVATE /W4 /permissive- /utf-8)
+
   # title_memory_map (src/title_page_watch.h): map changes by range, and the texture pass that probes only what they hit.
   add_executable(title_memory_map_test test/title_memory_map_test.cpp)
   target_compile_definitions(title_memory_map_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
@@ -1763,6 +1768,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET title_memory_map_test)
     add_test(NAME title_memory_map COMMAND title_memory_map_test)
+  endif()
+  if(WIN32 AND TARGET title_patch_test)
+    add_test(NAME title_patch COMMAND title_patch_test)
   endif()
   if(WIN32 AND TARGET title_write_watch_test)
     add_test(NAME title_write_watch COMMAND title_write_watch_test)
