@@ -165,11 +165,17 @@ def _split_operands(ins):
     if op in SGPR_RMW:
         reads = [r for x in a for r in _sgpr_regs(x)]
         return reads, _sgpr_regs(a[0])
-    if (op.startswith("v_") and "_co_" in op) or op in (
+    if op.startswith(("s_atomic_", "s_buffer_atomic_")):
+        # SMEM atomics always read a[0] (operand data) and only write a[0] back when glc is set.
+        reads = [r for x in a for r in _sgpr_regs(x)]
+        writes = _sgpr_regs(a[0]) if "glc" in ins.get("mods", ()) else []
+        return reads, writes
+    if ((op.startswith("v_") and "_co_" in op) or op in (
         "v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64",
-    ):
+    )) and len(a) >= 4:
         # vdst in a[0], scalar carry/scale-out dst in a[1], sources in a[2:].
-        writes = _sgpr_regs(a[0]) + (_sgpr_regs(a[1]) if len(a) > 1 else [])
+        # (3-operand short forms like `v_add_co_ci_u32 vD, src0, src1` use implicit VCC and fall through.)
+        writes = _sgpr_regs(a[0]) + _sgpr_regs(a[1])
         reads = [r for x in a[2:] for r in _sgpr_regs(x)]
         return reads, writes
     reads = [r for x in a[1:] for r in _sgpr_regs(x)]
@@ -235,7 +241,7 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
 
     # Record pointer, descriptor, stride and literal-sampler observations BEFORE writes clobber operands.
     if events is not None:
-        if op.startswith(("s_load_dword", "s_store_dword")) and len(a) >= 2:
+        if op.startswith(("s_load_dword", "s_store_dword", "s_atomic_")) and len(a) >= 2:
             slots = _sgpr_slots(a[1], 2)
             if slots is not None:
                 is_desc_width = op in ("s_load_dwordx4", "s_load_dwordx8", "s_load_dwordx16")
@@ -245,7 +251,7 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                         events["strides"].update(ptr_stride.get(slots[0], ()))
                     if len(a) >= 3 and a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1:
                         events["strides"].update(scale.get(a[2]["r"], ()))
-        elif op.startswith(("s_buffer_load_dword", "s_buffer_store_dword")) and len(a) >= 2:
+        elif op.startswith(("s_buffer_load_dword", "s_buffer_store_dword", "s_buffer_atomic_")) and len(a) >= 2:
             slots = _sgpr_slots(a[1], 4)
             if slots is not None:
                 tags = [_slot_tag(sym, s) for s in slots]
@@ -265,13 +271,16 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                 slots = _sgpr_slots(a[saddr_idx], 2)
                 if slots is not None:
                     _record_ptr_pair(events, sym, slots, is_desc_width=False)
-        elif op.startswith(("buffer_load", "buffer_store", "buffer_atomic", "tbuffer_")) and len(a) >= 3:
-            slots = _sgpr_slots(a[2], 4)
-            if slots is not None:
-                tags = [_slot_tag(sym, s) for s in slots]
-                if all(t is not None and t[0] == "user" for t in tags):
-                    for t in tags:
-                        events["vsharp"].add(t[1])
+        elif op.startswith(("buffer_load", "buffer_store", "buffer_atomic", "tbuffer_")):
+            # buffer_load_* / tbuffer_load_* with `lds` omit vdata: operands are (vaddr, srsrc, soffset).
+            srsrc_idx = 1 if (op.startswith(("buffer_load", "tbuffer_load")) and "lds" in ins.get("mods", ())) else 2
+            if len(a) > srsrc_idx:
+                slots = _sgpr_slots(a[srsrc_idx], 4)
+                if slots is not None:
+                    tags = [_slot_tag(sym, s) for s in slots]
+                    if all(t is not None and t[0] == "user" for t in tags):
+                        for t in tags:
+                            events["vsharp"].add(t[1])
         elif op.startswith("image_") and len(a) >= 3:
             slots = _sgpr_slots(a[2], 8, exact=False)
             if slots is not None:
@@ -290,7 +299,24 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                             events["ssharp"].add(t[1])
 
     # Track VGPR index scaling (e.g. v_lshlrev_b32 -> v_readfirstlane_b32 -> s_load_dwordx8).
-    if a[0]["k"] == "vgpr" and not op.startswith(NO_SGPR_DST) and not op.startswith("v_cmp"):
+    if op == "v_swap_b32" and len(a) >= 2 and a[0]["k"] == "vgpr" and a[1]["k"] == "vgpr":
+        r0, r1 = a[0]["r"], a[1]["r"]
+        s0, s1 = vscale.get(r0), vscale.get(r1)
+        if s1:
+            vscale[r0] = s1
+        else:
+            vscale.pop(r0, None)
+        if s0:
+            vscale[r1] = s0
+        else:
+            vscale.pop(r1, None)
+    elif op in ("v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32", "v_swaprel_b32"):
+        bases = [x["r"] for x in (a[:2] if op == "v_swaprel_b32" else a[:1]) if x["k"] == "vgpr"]
+        if bases:
+            lo = min(bases)
+            for r in [r for r in vscale if r >= lo]:
+                vscale.pop(r, None)
+    elif a[0]["k"] == "vgpr" and not op.startswith(NO_SGPR_DST) and not op.startswith("v_cmp"):
         vd = a[0]["r"]
         vn = a[0].get("n", 1)
         new_vs = frozenset()
