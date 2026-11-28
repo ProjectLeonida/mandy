@@ -2838,16 +2838,17 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
         shrink(a.binding, draw.depth, a.range);
     }
     if (p.area.width == UINT32_MAX) {  // no attachment: the viewports bound the rendering
-        std::uint32_t max_w = std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width));
-        std::uint32_t max_h = std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height));
+        float right = std::max(0.0f, draw.viewport.x + draw.viewport.width);
+        float bottom = std::max(0.0f, draw.viewport.y + draw.viewport.height);
         if (draw.viewports) {
             for (std::uint32_t i = 0; i < draw.viewports->viewport_count; ++i) {
                 const Viewport& v = draw.viewports->viewports[i];
-                max_w = std::max(max_w, std::uint32_t(std::max(0.0f, v.x + v.width)));
-                max_h = std::max(max_h, std::uint32_t(std::max(0.0f, v.y + v.height)));
+                right = std::max(right, v.x + v.width);
+                bottom = std::max(bottom, v.y + v.height);
             }
         }
-        p.area = {max_w, max_h};
+        // Include the final pixel when its samples can fall inside a fractional viewport edge.
+        p.area = {std::uint32_t(std::ceil(right)), std::uint32_t(std::ceil(bottom))};
     }
     p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
 

@@ -673,7 +673,11 @@ static int indirect_tests(bool bounded_only) {
         vk.bind_vertex_buffers2 = ignore; vk.set_viewport = ignore; vk.set_scissor = ignore;
         vk.set_primitive_topology = ignore; vk.set_primitive_restart_enable = ignore;
         vk.set_stencil_reference = ignore; vk.set_blend_constants = ignore;
-        vk.begin_rendering = [](auto...) { events += '['; };
+        static VkExtent2D render_area;
+        vk.begin_rendering = [](VkCommandBuffer, const VkRenderingInfo* info) {
+            render_area = info->renderArea.extent;
+            events += '[';
+        };
         vk.end_rendering = [](auto...) { events += ']'; };
         vk.bind_pipeline = [](auto...) { events += 'P'; };
         vk.push_constants = [](auto...) { events += 'C'; };
@@ -725,6 +729,20 @@ static int indirect_tests(bool bounded_only) {
         };
         CHECK(run() == ReplayResult::success && events == "[PCd]");
         CHECK(argument_offset == 272 && argument_count == 1 && argument_stride == 24);
+        CHECK(render_area.width == 8 && render_area.height == 8);
+        // No attachments: the fractional last row and column can contain covered samples.
+        d.viewport = {0.25f, -0.25f, 3.5f, 3, 0, 1};
+        CHECK(run() == ReplayResult::success);
+        CHECK(render_area.width == 4 && render_area.height == 3);
+        auto viewports = std::make_shared<DrawViewports>();
+        viewports->viewport_count = 2;
+        viewports->viewports[0] = d.viewport;
+        viewports->viewports[1] = {-1, 1, 2, 4.75f, 0, 1};
+        d.viewports = viewports;
+        CHECK(run() == ReplayResult::success);
+        CHECK(render_area.width == 4 && render_area.height == 6);
+        d.viewports.reset();
+        d.viewport = {0,0,8,8,0,1};
         d.indexed = true; d.index = {0x1000, 8, 57};
         CHECK(run() == ReplayResult::success && events.empty());  // supported draw, no safe index binding
         vk.bind_robust_index_view = bounded;
