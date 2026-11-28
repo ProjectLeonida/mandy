@@ -638,10 +638,14 @@ PICK_UNSUPPORTED = ("That folder isn't a supported version of the game. Choose t
 
 def native_picker():
     """The desktop's own folder dialog on Linux and the BSDs, where Tk's is a bare one of its own: kdialog on
-    KDE, zenity elsewhere (GNOME and the rest), either one when only that one is installed. Returns
-    (tool, path) or None: on Windows and macOS Tk already opens the system dialog, and with no display there
-    is nothing to open."""
-    if os.name == "nt" or sys.platform == "darwin":
+    KDE, zenity elsewhere (GNOME and the rest), either one when only that one is installed. On macOS, osascript's
+    "choose folder", the system dialog with no Tk needed (Homebrew's Python ships without Tkinter). Returns
+    (tool, path) or None: on Windows Tk already opens the system dialog, and with no display there is nothing to
+    open."""
+    if sys.platform == "darwin":
+        exe = shutil.which("osascript")
+        return ("osascript", exe) if exe else None
+    if os.name == "nt":
         return None
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         return None
@@ -657,6 +661,13 @@ def native_ask(tool: str, exe: str, start: str) -> str:
     """One folder dialog from `tool`: the chosen folder, or "" on cancel. OSError when the tool itself fails."""
     if tool == "kdialog":
         cmd = [exe, "--title", "Leonida", "--getexistingdirectory", start]
+    elif tool == "osascript":
+        # The prompt and folder go in as arguments, not into the script text, so nothing needs quoting. Cancel is
+        # error -128, which osascript exits 1 with, as kdialog and zenity do.
+        cmd = [exe, "-e", "on run argv",
+               "-e", "return POSIX path of (choose folder with prompt (item 1 of argv) "
+                     "default location (POSIX file (item 2 of argv)))",
+               "-e", "end run", PICK_TITLE, start]
     else:
         cmd = [exe, "--file-selection", "--directory", "--title=" + PICK_TITLE,
                "--filename=" + os.path.join(start, "")]
@@ -669,8 +680,14 @@ def native_ask(tool: str, exe: str, start: str) -> str:
 
 
 def native_warn(tool: str, exe: str, msg: str) -> None:
-    cmd = ([exe, "--title", "Leonida", "--sorry", msg] if tool == "kdialog"
-           else [exe, "--warning", "--title=Leonida", "--text=" + msg])
+    if tool == "osascript":
+        cmd = [exe, "-e", "on run argv",
+               "-e", 'display dialog (item 1 of argv) with title "Leonida" buttons {"OK"} default button 1 '
+                     "with icon caution",
+               "-e", "end run", msg]
+    else:
+        cmd = ([exe, "--title", "Leonida", "--sorry", msg] if tool == "kdialog"
+               else [exe, "--warning", "--title=Leonida", "--text=" + msg])
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 

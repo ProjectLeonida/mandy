@@ -111,15 +111,24 @@ class NativePickerTest(unittest.TestCase):
                 patch("make_game.shutil.which", side_effect=lambda t: "/usr/bin/zenity" if t == "zenity" else None):
             self.assertEqual(make_game.native_picker(), ("zenity", "/usr/bin/zenity"))
 
-    def test_none_without_a_display_or_on_windows_and_macos(self):
+    def test_none_without_a_display_or_on_windows(self):
         which = patch("make_game.shutil.which", return_value="/usr/bin/x")
         with self.env(), patch.object(make_game.os, "name", "posix"), \
                 patch.object(make_game.sys, "platform", "linux"), which:
             self.assertIsNone(make_game.native_picker())
-        for name, platform in (("nt", "win32"), ("posix", "darwin")):
-            with self.env(DISPLAY=":0"), patch.object(make_game.os, "name", name), \
-                    patch.object(make_game.sys, "platform", platform), which:
-                self.assertIsNone(make_game.native_picker())
+        with self.env(DISPLAY=":0"), patch.object(make_game.os, "name", "nt"), \
+                patch.object(make_game.sys, "platform", "win32"), which:
+            self.assertIsNone(make_game.native_picker())
+
+    def test_macos_uses_osascript_with_or_without_tk(self):
+        # Homebrew's Python has no Tkinter; osascript's "choose folder" is the system dialog on every Mac.
+        with self.env(), patch.object(make_game.os, "name", "posix"), \
+                patch.object(make_game.sys, "platform", "darwin"), \
+                patch("make_game.shutil.which", side_effect=lambda t: "/usr/bin/osascript" if t == "osascript" else None):
+            self.assertEqual(make_game.native_picker(), ("osascript", "/usr/bin/osascript"))
+        with self.env(), patch.object(make_game.sys, "platform", "darwin"), \
+                patch("make_game.shutil.which", return_value=None):
+            self.assertIsNone(make_game.native_picker())
 
 
 class PickNativeTest(unittest.TestCase):
@@ -146,6 +155,25 @@ class PickNativeTest(unittest.TestCase):
         self.assertIn("--directory", ask1)
         self.assertIn("--warning", warn)
         self.assertIn("--filename=" + os.path.join(os.path.normpath("/games/wrong"), ""), ask2)
+
+    def test_osascript_passes_prompt_and_folder_as_arguments(self):
+        run = runs((0, "/Volumes/Games/wrong/\n"), (0, ""), (0, "/Volumes/Games/right/\n"))
+        got = self.pick("osascript", run, version=lambda d: VERSION if d.endswith("right") else None)
+        self.assertEqual(got, os.path.normpath("/Volumes/Games/right"))
+        ask1, warn, ask2 = (c[0][0] for c in run.call_args_list)
+        self.assertEqual(ask1[0], "/usr/bin/osascript")
+        self.assertTrue(any("choose folder" in a for a in ask1))
+        self.assertEqual(ask1[-2:], [make_game.PICK_TITLE, os.path.expanduser("~")])   # data, not script text
+        self.assertTrue(any("display dialog" in a for a in warn))
+        self.assertTrue(warn[-1].startswith(make_game.PICK_UNSUPPORTED))
+        self.assertEqual(ask2[-1], os.path.normpath("/Volumes/Games/wrong"))
+
+    def test_osascript_cancel_stops_with_a_pointer_to_game(self):
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as stop:
+            self.pick("osascript", runs((1, "")))        # error -128, user canceled
+        self.assertEqual(stop.exception.code, 1)
+        self.assertIn("--game", err.getvalue())
 
     def test_cancel_stops_with_a_pointer_to_game(self):
         err = io.StringIO()
