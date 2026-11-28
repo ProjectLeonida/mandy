@@ -591,9 +591,13 @@ int compare_footprints(ID3D12Device* ours) {
 // must match it exactly. A texture's size is the driver's choice on both sides, so ours is only checked to be a
 // whole number of alignments and at least the texels of its top mip; both sizes are printed. Also checks the
 // Device4/Device8 variants' per-resource layout. Returns the number of mismatches, or -1 without a host device.
+// Output: a mismatch is an "allocation info MISMATCH ..." line on stderr; the "allocation info <case>: alignment ...,
+// size ours ... host ..." lines on stdout are printed for every compared texture, matching or not; the last line
+// counts both.
 int compare_allocation_info(ID3D12Device* ours) {
     Ref<ID3D12Device> host;
-    if (!create_host_device(host)) return -1;
+    std::string adapter_name;
+    if (!create_host_device(host, &adapter_name)) return -1;
     const auto with = [](D3D12_RESOURCE_DESC desc, UINT64 alignment, UINT samples = 1) {
         desc.Alignment = alignment;
         desc.SampleDesc.Count = samples;
@@ -850,10 +854,12 @@ int compare_allocation_info(ID3D12Device* ours) {
          with(texture_desc(256, 256, rgba8, rt | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 1), 0, 4), 0},
     };
     int mismatches = 0;
+    unsigned compared = 0;
     const auto mismatch = [&](const char* name, const D3D12_RESOURCE_ALLOCATION_INFO& a,
                               const D3D12_RESOURCE_ALLOCATION_INFO& b) {
         if (mismatches++ < 24)
-            std::fprintf(stderr, "allocation info %s: ours size %llu alignment %llu, host size %llu alignment %llu\n",
+            std::fprintf(stderr,
+                         "allocation info MISMATCH %s: ours size %llu alignment %llu, host size %llu alignment %llu\n",
                          name, (unsigned long long)a.SizeInBytes, (unsigned long long)a.Alignment,
                          (unsigned long long)b.SizeInBytes, (unsigned long long)b.Alignment);
     };
@@ -872,6 +878,7 @@ int compare_allocation_info(ID3D12Device* ours) {
                 continue;
             }
         }
+        ++compared;
         if (b.SizeInBytes == UINT64_MAX || !c.top_mip_bytes) {
             if (a.SizeInBytes != b.SizeInBytes || (b.SizeInBytes != UINT64_MAX && a.Alignment != b.Alignment))
                 mismatch(c.name, a, b);
@@ -890,6 +897,7 @@ int compare_allocation_info(ID3D12Device* ours) {
     const D3D12_RESOURCE_DESC buffers[] = {buffer_desc(300), buffer_desc(70000), buffer_desc(1)};
     const D3D12_RESOURCE_ALLOCATION_INFO a = ours->GetResourceAllocationInfo(0, 3, buffers);
     const D3D12_RESOURCE_ALLOCATION_INFO b = host->GetResourceAllocationInfo(0, 3, buffers);
+    ++compared;
     if (a.SizeInBytes != b.SizeInBytes || a.Alignment != b.Alignment) mismatch("three buffers", a, b);
     // The total is rounded up to the largest alignment, saturates rather than wraps, and is aligned 1 when empty.
     // The textures here are smaller than their alignment, so their sizes are fixed too.
@@ -910,6 +918,7 @@ int compare_allocation_info(ID3D12Device* ours) {
     for (int i = 0; i < 4; ++i) {
         const D3D12_RESOURCE_ALLOCATION_INFO x = ours->GetResourceAllocationInfo(0, 2, to_total[i]);
         const D3D12_RESOURCE_ALLOCATION_INFO y = host->GetResourceAllocationInfo(0, 2, to_total[i]);
+        ++compared;
         if (i >= 2) {
             if (x.SizeInBytes != saturated || x.Alignment != k64) mismatch(total_names[i], x, y);
             else if (y.SizeInBytes < to_total[i][0].Width && y.Alignment == k64)
@@ -923,6 +932,7 @@ int compare_allocation_info(ID3D12Device* ours) {
     }
     const D3D12_RESOURCE_ALLOCATION_INFO empty_a = ours->GetResourceAllocationInfo(0, 0, nullptr);
     const D3D12_RESOURCE_ALLOCATION_INFO empty_b = host->GetResourceAllocationInfo(0, 0, nullptr);
+    ++compared;
     if (empty_a.SizeInBytes != empty_b.SizeInBytes || empty_a.Alignment != empty_b.Alignment)
         mismatch("no resources", empty_a, empty_b);
 
@@ -953,6 +963,7 @@ int compare_allocation_info(ID3D12Device* ours) {
                 const D3D12_RESOURCE_DESC* descs = count ? &buffer : nullptr;
                 const auto ia = ours->GetResourceAllocationInfo(mask, count, descs);
                 const auto ib = host->GetResourceAllocationInfo(mask, count, descs);
+                ++compared;
                 if (!same_info(ia, ib)) mismatch(name, ia, ib);
             }
             if (ours4.p && host4.p) {
@@ -960,6 +971,7 @@ int compare_allocation_info(ID3D12Device* ours) {
                 D3D12_RESOURCE_ALLOCATION_INFO1 each_a = sentinel, each_b = sentinel;
                 const auto ia = ours4->GetResourceAllocationInfo1(mask, 1, &buffer, &each_a);
                 const auto ib = host4->GetResourceAllocationInfo1(mask, 1, &buffer, &each_b);
+                ++compared;
                 if (!same_info(ia, ib) || each_a.Offset != each_b.Offset || each_a.SizeInBytes != each_b.SizeInBytes ||
                     each_a.Alignment != each_b.Alignment)
                     mismatch("visible mask, GetResourceAllocationInfo1", ia, ib);
@@ -969,6 +981,7 @@ int compare_allocation_info(ID3D12Device* ours) {
                 D3D12_RESOURCE_ALLOCATION_INFO1 each_a = sentinel, each_b = sentinel;
                 const auto ia = ours8_mask->GetResourceAllocationInfo2(mask, 1, &buffer1, &each_a);
                 const auto ib = host8_mask->GetResourceAllocationInfo2(mask, 1, &buffer1, &each_b);
+                ++compared;
                 if (!same_info(ia, ib) || each_a.Offset != each_b.Offset || each_a.SizeInBytes != each_b.SizeInBytes ||
                     each_a.Alignment != each_b.Alignment)
                     mismatch("visible mask, GetResourceAllocationInfo2", ia, ib);
@@ -989,6 +1002,7 @@ int compare_allocation_info(ID3D12Device* ours) {
             const HRESULT hx = ours->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &x, sizeof(x));
             const HRESULT hy = host->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &y, sizeof(y));
             const bool wide = format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+            ++compared;
             if (hx == hy && (x.NumQualityLevels == y.NumQualityLevels ||
                              (wide && samples == 4 && x.NumQualityLevels == 1 && y.NumQualityLevels == 0)))
                 continue;
@@ -1025,11 +1039,14 @@ int compare_allocation_info(ID3D12Device* ours) {
     const D3D12_RESOURCE_DESC with_bad[] = {buffer_desc(300), buffer_desc(0)};
     layout_ok = layout_ok && ours8->GetResourceAllocationInfo1(0, 2, with_bad, each).SizeInBytes == UINT64_MAX &&
                 host->GetResourceAllocationInfo(0, 2, with_bad).SizeInBytes == UINT64_MAX;
+    ++compared;
     if (!layout_ok) {
         ++mismatches;
-        std::fprintf(stderr, "allocation info: Device4/Device8 per-resource layout wrong (total %llu/%llu)\n",
+        std::fprintf(stderr, "allocation info MISMATCH: Device4/Device8 per-resource layout wrong (total %llu/%llu)\n",
                      (unsigned long long)total.SizeInBytes, (unsigned long long)total.Alignment);
     }
+    std::printf("GetResourceAllocationInfo against the host on %s: %u compared, %d mismatches\n", adapter_name.c_str(),
+                compared, mismatches);
     return mismatches;
 }
 
