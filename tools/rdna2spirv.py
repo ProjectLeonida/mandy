@@ -7563,6 +7563,13 @@ class Gen:
             self.x_memory_order(base_op(ins["op"]))
         self.cur_either = self.lane_either.get(id(ins), ())
         try:
+            if ins["op"] == lane_masks.TO_DATA:
+                # A lane mask that a merge further on takes as data (lane_masks.insert_data_merges): the
+                # register gets the wave's real bits, the same number in every lane.
+                src = ins["args"][1]
+                val = self.lane_mask_word(src) if self.holds_lane_mask(src) else self.src_u(src)
+                self.dst(ins["args"][0], val)
+                return None
             if ins["op"].endswith("_dpp"):
                 bop = base_op(ins["op"])
                 if bop in SOPC_CMP32_OPS or bop in SOPC_CMP64_OPS or bop in SOPC_BITCMP_OPS:
@@ -19047,6 +19054,8 @@ def _translate(path):
     succ = [list(dict.fromkeys(e)) for e in raw_edges]
     g.out_pcs = _block_out_pcs(blocks, raw_edges, succ)
     g.vm_latch = stage == "ps" and exec_changes_after_vm(blocks, succ)
+    # A lane mask that meets data at a merge is turned into the wave's bits on the way there (lane_masks.py).
+    lane_masks.insert_data_merges(blocks, succ, BRANCHES | {"s_endpgm"}, wave64=g.wave64)
     g.park_masks((blocks, succ))
     halves_analysis(g, blocks, succ)
     g.build_meta = _shader_meta.collect(path, info["name"], blocks, succ,
