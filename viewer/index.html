@@ -345,19 +345,95 @@ function drop(id) {
     disposeObject(c.obj);
   }
 }
+const MAX_PREALLOC_BYTES = 1024 * 1024 * 1024;
+function parseContentLength(response) {
+  if (!response.headers || typeof response.headers.get !== "function" || response.headers.get("content-encoding")) {
+    return null;
+  }
+  const raw = response.headers.get("content-length");
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) && n > 0 && n <= MAX_PREALLOC_BYTES ? n : null;
+}
+async function readChunkBytes(response, signal, resetDeadline) {
+  if (!response.body || typeof response.body.getReader !== "function") {
+    return response.arrayBuffer();
+  }
+  const reader = response.body.getReader();
+  const cancelReader = () => {
+    try { Promise.resolve(reader.cancel(signal.reason)).catch(() => {}); } catch {}
+  };
+  signal.addEventListener("abort", cancelReader, { once: true });
+  const expected = parseContentLength(response);
+  let target = null;
+  if (expected !== null) {
+    try { target = new Uint8Array(expected); } catch {}
+  }
+  let parts = null, offset = 0;
+  try {
+    if (signal.aborted) cancelReader();
+    for (;;) {
+      signal.throwIfAborted();
+      const { done, value } = await reader.read();
+      signal.throwIfAborted();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      resetDeadline();
+      const chunk = value instanceof Uint8Array
+        ? value
+        : ArrayBuffer.isView(value)
+          ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+          : new Uint8Array(value);
+      if (target) {
+        if (offset + chunk.byteLength <= target.byteLength) {
+          target.set(chunk, offset);
+          offset += chunk.byteLength;
+          continue;
+        }
+        parts = offset > 0 ? [target.subarray(0, offset), chunk] : [chunk];
+        target = null;
+        offset += chunk.byteLength;
+        continue;
+      }
+      if (!parts) parts = [];
+      parts.push(chunk);
+      offset += chunk.byteLength;
+    }
+  } finally {
+    signal.removeEventListener("abort", cancelReader);
+    try { reader.releaseLock(); } catch {}
+  }
+  if (target) return offset === target.byteLength ? target.buffer : target.buffer.slice(0, offset);
+  if (!parts || parts.length === 0) return new ArrayBuffer(0);
+  if (parts.length === 1 && parts[0].byteOffset === 0 && parts[0].byteLength === parts[0].buffer.byteLength) {
+    return parts[0].buffer;
+  }
+  const merged = new Uint8Array(offset);
+  let at = 0;
+  for (const part of parts) { merged.set(part, at); at += part.byteLength; }
+  return merged.buffer;
+}
 async function loadChunk(entry) {
   const { def, controller } = entry;
   inflight++;
+  let timer, active = true;
+  const resetDeadline = () => {
+    clearTimeout(timer);
+    if (active) timer = setTimeout(() => controller.abort(), CHUNK_DOWNLOAD_TIMEOUT_MS);
+  };
   try {
     let response, bytes;
-    const timer = setTimeout(() => controller.abort(), CHUNK_DOWNLOAD_TIMEOUT_MS);
+    timer = setTimeout(() => controller.abort(), CHUNK_DOWNLOAD_TIMEOUT_MS);
     try {
       response = await fetch(def.url, { signal: controller.signal });
       if (!response.ok) throw new Error(`Chunk request failed: ${response.status}`);
-      bytes = await response.arrayBuffer();
+      bytes = await readChunkBytes(response, controller.signal, resetDeadline);
       controller.signal.throwIfAborted();
     } finally {
-      // Bound both headers and body, but not the non-cancellable GLB parse.
+      // Bound idle stalls on headers or between body chunks, not the non-cancellable GLB parse.
+      active = false;
       clearTimeout(timer);
     }
     const url = response.url || def.url;
