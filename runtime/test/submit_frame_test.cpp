@@ -2016,6 +2016,267 @@ int queue_sync_and_async() {
         std::printf("queue r6 contention: 24-wait frame 0 room stalls, frame-group bound, held run_ns & visibility coalescing ok\n");
     }
 
+    // 13. Round 7 sync & texture upload optimizations:
+    //     (a) Per-fence vis_seq in QueueHolds + GPU-only VulkanQueue::signal() does NOT bump visibility_seq_
+    //         (stopping cross-fence & GPU-signal false invalidations while preserving CPU Fence::Signal visibility,
+    //         including across Wait -> Signal -> Execute);
+    //     (b) Unlocked QueueHolds::run_barriers() under barrier_mutex_: strict FIFO Present ordering while
+    //         concurrent cross-queue pump_ready() never stalls behind a blocked barrier, plus cancel_after() wait;
+    //     (c) Lazy title-upload semaphore in VulkanQueue::submit_multi() + submit_mutex_ unlocked during
+    //         write_staged_title_images() recording.
+    {
+        // (a) Per-fence vis_seq & GPU-only signal visibility isolation.
+        VulkanContext context(d.device_proc, d.device, true);
+        EXPECT(context.loaded());
+        VulkanQueue direct(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
+        VulkanQueue compute(context, d.queue, d.family, VulkanQueue::QueueKind::compute);
+        EXPECT(direct.ok() && compute.ok());
+        direct.set_async_depth(4);
+        compute.set_async_depth(4);
+
+        auto empty = std::make_shared<CommandList>();
+        EXPECT(empty->close());
+        std::shared_ptr<const CommandList> snap = empty;
+
+        // GPU-only queue Signal must NOT bump visibility_seq_.
+        VulkanFence gpu_f(context, 0);
+        EXPECT(gpu_f.semaphore());
+        const std::uint64_t vis_before_gpu_sig = context.current_visibility_seq();
+        EXPECT(direct.signal(gpu_f.semaphore(), 1));
+        EXPECT(gpu_f.wait(1, 5'000'000'000ull));
+        EXPECT(direct.idle());
+        EXPECT(context.current_visibility_seq() == vis_before_gpu_sig);
+        EXPECT(context.holds().signaled_vis_seq(gpu_f.semaphore(), 1) == 0);
+
+        // Unrelated CPU Fence::Signal on fence_a MUST NOT invalidate a held batch waiting on GPU-signaled fence_b.
+        std::mutex coal_m;
+        std::uint64_t coal_completed = 0;
+        std::atomic<unsigned> coal_ran{0}, coal_skipped{0};
+        std::atomic<int> cpu_val{0}, seen_val{0};
+        context.set_before_execute([&] {
+            const std::uint64_t req = VulkanContext::current_before_execute_seq();
+            std::unique_lock lock(coal_m);
+            if (req && coal_completed >= req) {
+                coal_skipped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            const std::uint64_t pass = (std::max)(req, context.current_visibility_seq());
+            lock.unlock();
+            seen_val.store(cpu_val.load(std::memory_order_acquire), std::memory_order_release);
+            coal_ran.fetch_add(1, std::memory_order_relaxed);
+            lock.lock();
+            if (pass > coal_completed) coal_completed = pass;
+        });
+
+        VulkanFence fence_a(context, 0), fence_b(context, 0), comp_done(context, 0);
+        EXPECT(fence_a.semaphore() && fence_b.semaphore() && comp_done.semaphore());
+
+        // Hold compute batch on GPU fence_b.
+        compute.wait(fence_b.semaphore(), 1);
+        EXPECT(compute.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(compute.signal(comp_done.semaphore(), 1));
+        EXPECT(compute.idle());
+
+        // Direct runs a pass advancing coal_completed past compute's enqueue visibility_seq.
+        EXPECT(direct.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(direct.idle());
+        const unsigned ran_before = coal_ran.load(std::memory_order_acquire);
+        const unsigned skipped_before = coal_skipped.load(std::memory_order_acquire);
+
+        // Unrelated CPU signal on fence_a bumps visibility_seq_ and fence_a's per-fence vis_seq ONLY.
+        EXPECT(fence_a.signal(1));
+        EXPECT(context.holds().signaled_vis_seq(fence_a.semaphore(), 1) > 0);
+        EXPECT(context.holds().signaled_vis_seq(fence_b.semaphore(), 1) == 0);
+
+        // GPU-only signal on fence_b releases compute: must COALESCE (not re-run) because fence_b has vis_seq == 0!
+        EXPECT(direct.signal(fence_b.semaphore(), 1));
+        EXPECT(comp_done.wait(1, 5'000'000'000ull));
+        EXPECT(direct.idle() && compute.idle());
+        EXPECT(coal_ran.load(std::memory_order_acquire) == ran_before);
+        EXPECT(coal_skipped.load(std::memory_order_acquire) == skipped_before + 1);
+
+        // Wait(cpu_f, 1) -> Signal(mid, 1) -> Execute(B2): CPU Fence::Signal on cpu_f MUST still lift B2's req_seq!
+        VulkanFence cpu_f(context, 0), mid_f(context, 0), done_f(context, 0);
+        EXPECT(cpu_f.semaphore() && mid_f.semaphore() && done_f.semaphore());
+        compute.wait(cpu_f.semaphore(), 1);
+        EXPECT(compute.signal(mid_f.semaphore(), 1));
+        EXPECT(compute.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(compute.signal(done_f.semaphore(), 1));
+        EXPECT(compute.idle());
+
+        EXPECT(direct.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(direct.idle());
+        const unsigned ran_before_cpu = coal_ran.load(std::memory_order_acquire);
+        cpu_val.store(777, std::memory_order_release);
+        EXPECT(cpu_f.signal(1));
+        EXPECT(done_f.wait(1, 5'000'000'000ull));
+        EXPECT(compute.idle());
+        EXPECT(coal_ran.load(std::memory_order_acquire) == ran_before_cpu + 1);
+        EXPECT(seen_val.load(std::memory_order_acquire) == 777);
+
+        // (b) Unlocked QueueHolds::run_barriers(): strict FIFO order + concurrent pump_ready() unblocked + cancel_after.
+        context.set_before_execute({});
+        VulkanFence hold_b1(context, 0), hold_comp(context, 0), comp_b_done(context, 0);
+        EXPECT(hold_b1.semaphore() && hold_comp.semaphore() && comp_b_done.semaphore());
+
+        direct.wait(hold_b1.semaphore(), 1);
+        EXPECT(direct.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(direct.idle());
+
+        std::mutex fifo_m;
+        std::vector<int> fifo_order;
+        std::atomic<bool> in_b1{false}, release_b1{false}, b3_ran{false};
+        int owner_fifo = 0, owner_cancel = 0;
+        context.holds().after_held(&owner_fifo, [&] {
+            in_b1.store(true, std::memory_order_release);
+            while (!release_b1.load(std::memory_order_acquire)) std::this_thread::yield();
+            std::lock_guard lk(fifo_m);
+            fifo_order.push_back(1);
+        });
+        context.holds().after_held(&owner_fifo, [&] {
+            std::lock_guard lk(fifo_m);
+            fifo_order.push_back(2);
+        });
+        context.holds().after_held(&owner_cancel, [&] { b3_ran.store(true, std::memory_order_release); });
+
+        // Hold an independent compute batch behind hold_comp.
+        compute.wait(hold_comp.semaphore(), 1);
+        EXPECT(compute.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(compute.signal(comp_b_done.semaphore(), 1));
+        EXPECT(compute.idle());
+
+        // Release direct -> starts barrier 1 (blocks on release_b1).
+        std::thread sig_b1([&] { (void)hold_b1.signal(1); });
+        while (!in_b1.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        // While barrier 1 is blocked inside barrier_mutex_, pump_mutex_ MUST be free so hold_comp.signal(1)
+        // releases compute and completes comp_b_done immediately without stalling!
+        EXPECT(hold_comp.signal(1));
+        EXPECT(comp_b_done.wait(1, 2'000'000'000ull));
+        EXPECT(compute.idle());
+
+        // Cancel owner_cancel while barrier 1 is running: b3 must be dropped and never run!
+        std::atomic<bool> cancel_done{false};
+        std::thread canceller([&] {
+            context.holds().cancel_after(&owner_cancel);
+            cancel_done.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        // cancel_after waits for barrier_mutex_ (running barrier) before returning!
+        EXPECT(!cancel_done.load(std::memory_order_acquire));
+
+        release_b1.store(true, std::memory_order_release);
+        sig_b1.join();
+        canceller.join();
+        EXPECT(direct.idle());
+        EXPECT(cancel_done.load(std::memory_order_acquire));
+        EXPECT(!b3_ran.load(std::memory_order_acquire));
+        EXPECT((fifo_order == std::vector<int>{1, 2}));
+
+        // (c) Lazy title-upload semaphore in submit_multi() + submit_mutex_ unlocked during write_staged_title_images()
+        //     recording.
+        static PFN_vkQueueSubmit s_r7_real_submit = nullptr;
+        static VkSemaphore s_r7_watch_sem = VK_NULL_HANDLE;
+        static std::atomic<unsigned> s_r7_wait_hits{0};
+        static std::atomic<std::uint64_t> s_r7_last_wait_val{0};
+        struct R7HookSubmit {
+            static VKAPI_ATTR VkResult VKAPI_CALL call(VkQueue q, std::uint32_t count, const VkSubmitInfo* infos,
+                                                       VkFence fence) {
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    const auto* tl = static_cast<const VkTimelineSemaphoreSubmitInfo*>(infos[i].pNext);
+                    for (std::uint32_t w = 0; w < infos[i].waitSemaphoreCount; ++w) {
+                        if (infos[i].pWaitSemaphores[w] == s_r7_watch_sem) {
+                            s_r7_wait_hits.fetch_add(1, std::memory_order_relaxed);
+                            if (tl && tl->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO &&
+                                w < tl->waitSemaphoreValueCount) {
+                                s_r7_last_wait_val.store(tl->pWaitSemaphoreValues[w], std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                }
+                return s_r7_real_submit(q, count, infos, fence);
+            }
+        };
+
+        VulkanContext ctx_up(d.device_proc, d.device, true);
+        EXPECT(ctx_up.loaded());
+        VulkanFence upload_tl(ctx_up, 0);
+        EXPECT(upload_tl.semaphore());
+        s_r7_real_submit = ctx_up.vk.vkQueueSubmit;
+        s_r7_watch_sem = upload_tl.semaphore();
+        s_r7_wait_hits.store(0, std::memory_order_relaxed);
+        s_r7_last_wait_val.store(0, std::memory_order_relaxed);
+        ctx_up.vk.vkQueueSubmit = &R7HookSubmit::call;
+
+        VulkanQueue q_dir(ctx_up, d.queue, d.family, VulkanQueue::QueueKind::direct);
+        VulkanQueue q_cmp(ctx_up, d.queue, d.family, VulkanQueue::QueueKind::compute);
+        EXPECT(q_dir.ok() && q_cmp.ok());
+        q_dir.set_async_depth(0);
+        q_cmp.set_async_depth(0);
+
+        // Register a dummy image so write_staged_title_images() exercises its split record/submit path.
+        ResourceBinding img_b{};
+        img_b.image = reinterpret_cast<VkImage>(0x1234);
+        img_b.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        img_b.mip_levels = 1;
+        img_b.array_layers = 1;
+        ctx_up.add_resource(99, img_b, VK_IMAGE_LAYOUT_UNDEFINED);
+
+        bool submit_unlocked_in_record = false;
+        bool submit_locked_in_submit = false;
+        const VulkanContext::StagedImageTarget target{99, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        const VkResult staged_r = ctx_up.write_staged_title_images(
+            {&target, 1},
+            [&](const ReplayFunctions&, const std::vector<LayoutPieces>& pieces) -> VkResult {
+                if (pieces.size() != 1 || pieces[0].empty()) return VK_ERROR_UNKNOWN;
+                // submit_mutex_ MUST be unlocked during command recording!
+                if (ctx_up.submit_mutex().try_lock()) {
+                    submit_unlocked_in_record = true;
+                    ctx_up.submit_mutex().unlock();
+                }
+                return VK_SUCCESS;
+            },
+            [&](const auto&) -> VkResult {
+                // submit_mutex_ MUST be held during submit callback!
+                submit_locked_in_submit = !ctx_up.submit_mutex().try_lock();
+                ctx_up.note_title_upload_locked(upload_tl.semaphore(), 1);
+                return VK_SUCCESS;
+            });
+        EXPECT(staged_r == VK_SUCCESS);
+        EXPECT(submit_unlocked_in_record && submit_locked_in_submit);
+        EXPECT(ctx_up.layout(99, 0) == VK_IMAGE_LAYOUT_GENERAL);
+
+        // Signal upload_tl to 1 so GPU waits complete immediately.
+        EXPECT(upload_tl.signal(1));
+
+        // A signal-only submit on q_dir must NOT consume title_upload_seen_.
+        VulkanFence sig_only(ctx_up, 0);
+        EXPECT(sig_only.semaphore());
+        EXPECT(q_dir.signal(sig_only.semaphore(), 1));
+        EXPECT(sig_only.wait(1, 5'000'000'000ull));
+        EXPECT(s_r7_wait_hits.load(std::memory_order_acquire) == 0);
+
+        // First command-buffer submit on q_dir MUST wait on (upload_tl, 1); second MUST NOT wait redundantly!
+        EXPECT(q_dir.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(s_r7_wait_hits.load(std::memory_order_acquire) == 1);
+        EXPECT(s_r7_last_wait_val.load(std::memory_order_acquire) == 1);
+        EXPECT(q_dir.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(s_r7_wait_hits.load(std::memory_order_acquire) == 1);
+
+        // First command-buffer submit on q_cmp MUST ALSO wait on (upload_tl, 1) independently!
+        EXPECT(q_cmp.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(s_r7_wait_hits.load(std::memory_order_acquire) == 2);
+        EXPECT(q_cmp.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(s_r7_wait_hits.load(std::memory_order_acquire) == 2);
+
+        {
+            std::lock_guard lk(ctx_up.submit_mutex());
+            ctx_up.clear_title_upload_locked(upload_tl.semaphore());
+        }
+        EXPECT(q_dir.idle() && q_cmp.idle());
+        std::printf("queue r7 sync-tex: per-fence vis_seq, unlocked run_barriers FIFO, lazy title_upload wait & unlocked record ok\n");
+    }
+
     return 0;
 }
 

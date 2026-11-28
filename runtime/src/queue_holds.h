@@ -154,7 +154,7 @@ public:
 
     void add_fence(Semaphore semaphore, std::uint64_t initial) {
         std::lock_guard lock(mutex_);
-        fences_[semaphore] = initial;
+        fences_[semaphore] = FenceState{initial};
     }
 
     // The fence is gone. Operations that still reference it are dropped and reported (the COM layer keeps a fence
@@ -178,17 +178,45 @@ public:
 
     // A Signal of `value` was submitted to the GPU (or the CPU set the fence). Call after the submission, with no
     // queue lock held; then pump_ready() to release what it satisfied.
-    void signaled(Semaphore semaphore, std::uint64_t value) {
+    // `vis_seq` is non-zero for CPU-side Fence::Signal edges (establishing a happens-before edge for CPU memory
+    // written before the signal) and 0 for GPU-only queue Signals, tracked per `(semaphore, value)` so waiters on
+    // unrelated fences or GPU-only signals never force redundant global visibility refreshes.
+    void signaled(Semaphore semaphore, std::uint64_t value, std::uint64_t vis_seq = 0) {
         bool advanced = false;
         {
             std::lock_guard lock(mutex_);
             const auto it = fences_.find(semaphore);
-            if (it != fences_.end() && it->second < value) {
-                it->second = value;
-                advanced = true;
+            if (it != fences_.end()) {
+                FenceState& fs = it->second;
+                if (fs.value < value) {
+                    fs.value = value;
+                    advanced = true;
+                }
+                if (vis_seq) {
+                    if (vis_seq > fs.max_cpu_vis_seq) fs.max_cpu_vis_seq = vis_seq;
+                    if (!fs.cpu_vis.empty() && fs.cpu_vis.back().first == value) {
+                        if (vis_seq > fs.cpu_vis.back().second) fs.cpu_vis.back().second = vis_seq;
+                    } else {
+                        if (fs.cpu_vis.size() >= kMaxFenceVisHistory) fs.cpu_vis.pop_front();
+                        fs.cpu_vis.emplace_back(value, vis_seq);
+                    }
+                }
             }
         }
         if (advanced && any_held()) signaled_unpumped_.store(true, std::memory_order_release);
+    }
+
+    // Minimum CPU visibility epoch established by a CPU Fence::Signal that reached `wait_value` on `semaphore`
+    // (0 when `semaphore` has never received a CPU signal).
+    std::uint64_t signaled_vis_seq(Semaphore semaphore, std::uint64_t wait_value) const {
+        std::lock_guard lock(mutex_);
+        const auto it = fences_.find(semaphore);
+        if (it == fences_.end() || it->second.max_cpu_vis_seq == 0) return 0;
+        const FenceState& fs = it->second;
+        for (const auto& [sig_val, seq] : fs.cpu_vis) {
+            if (sig_val >= wait_value) return seq;
+        }
+        return fs.max_cpu_vis_seq;
     }
 
     // A queue is about to submit a Signal of `value`; call inside the device submit lock, and record the value with
@@ -200,21 +228,21 @@ public:
     bool would_signal(Semaphore semaphore, std::uint64_t value) const {
         std::lock_guard lock(mutex_);
         const auto it = fences_.find(semaphore);
-        return it == fences_.end() || it->second < value;
+        return it == fences_.end() || it->second.value < value;
     }
 
     // The highest Signal submitted for the fence (or set by the CPU); 0 for an unknown semaphore.
     std::uint64_t submitted_value(Semaphore semaphore) const {
         std::lock_guard lock(mutex_);
         const auto it = fences_.find(semaphore);
-        return it == fences_.end() ? 0 : it->second;
+        return it == fences_.end() ? 0 : it->second.value;
     }
 
     // true when no submitted Signal reaches `value` yet. Unknown semaphores are satisfied.
     bool pending(Semaphore semaphore, std::uint64_t value) const {
         std::lock_guard lock(mutex_);
         const auto it = fences_.find(semaphore);
-        return it != fences_.end() && it->second < value;
+        return it != fences_.end() && it->second.value < value;
     }
 
     void attach(Holder* holder) {
@@ -262,17 +290,26 @@ public:
     }
 
     // Drops the callbacks of `owner` that have not run, and waits for one that is running.
+    // Lock order: never hold pump_mutex_ and barrier_mutex_ together (mutex_ is always leaf).
     void cancel_after(const void* owner) {
         {
-            std::lock_guard pump(pump_mutex_);
             std::lock_guard lock(mutex_);
-            for (auto it = barriers_.begin(); it != barriers_.end();)
-                if (it->owner == owner) {
-                    it = barriers_.erase(it);
-                    barrier_count_.fetch_sub(1, std::memory_order_acq_rel);
-                } else {
-                    ++it;
+            auto erase_from = [&](std::deque<Barrier>& q) {
+                for (auto it = q.begin(); it != q.end();) {
+                    if (it->owner == owner) {
+                        it = q.erase(it);
+                        barrier_count_.fetch_sub(1, std::memory_order_acq_rel);
+                    } else {
+                        ++it;
+                    }
                 }
+            };
+            erase_from(barriers_);
+            erase_from(ready_barriers_);
+        }
+        // Wait for any already-popped callback currently running in drain_ready_barriers().
+        if (!in_barrier()) {
+            std::lock_guard bl(barrier_mutex_);
         }
         pump_ready();
     }
@@ -282,8 +319,9 @@ public:
     bool any_held() const { return held_.load(std::memory_order_acquire) > 0; }
 
     // Releases every held operation that has become ready, in dependency order: a release can submit a Signal
-    // that makes another queue's front ready, so passes repeat until one finds nothing new. Then the callbacks
-    // whose held work is all gone.
+    // that makes another queue's front ready, so passes repeat until one finds nothing new. Satisfied barriers
+    // (Present / after_held()) are popped in FIFO order under pump_mutex_ into ready_barriers_ and executed OUTSIDE
+    // pump_mutex_ under barrier_mutex_ so Presents stay strictly FIFO while never stalling cross-queue pump_ready().
     void pump_ready() {
         if (!any_held() && barrier_count_.load(std::memory_order_acquire) == 0) {
             signaled_unpumped_.store(false, std::memory_order_release);
@@ -296,6 +334,7 @@ public:
             std::unique_lock pump(pump_mutex_, std::try_to_lock);
             if (!pump) return;  // another thread is releasing and will see dirty_
             in_pump() = true;
+            bool collected_barriers = false;
             while (dirty_.exchange(false, std::memory_order_acq_rel)) {
                 signaled_unpumped_.store(false, std::memory_order_release);
                 bool progress = true;
@@ -304,22 +343,42 @@ public:
                     for (Holder* holder : snapshot()) {
                         if (holder->release_ready()) {
                             progress = true;
-                            run_barriers();  // fire any barrier (e.g. Present) satisfied before draining post-barrier work
+                            if (collect_ready_barriers()) {
+                                collected_barriers = true;
+                                // Pause pumping to run satisfied barriers outside pump_mutex_ before draining
+                                // post-barrier work on the next pass.
+                                dirty_.store(true, std::memory_order_release);
+                                break;
+                            }
                         }
                     }
+                    if (collected_barriers) break;
                 }
-                run_barriers();
+                if (collected_barriers) break;
+                if (collect_ready_barriers()) {
+                    collected_barriers = true;
+                    break;
+                }
             }
             in_pump() = false;
             pump.unlock();
+            if (collected_barriers) drain_ready_barriers();
             if (!dirty_.load(std::memory_order_acquire)) return;
         }
     }
 
 private:
+    static constexpr std::size_t kMaxFenceVisHistory = 32;
+
+    struct FenceState {
+        std::uint64_t value = 0;
+        std::uint64_t max_cpu_vis_seq = 0;
+        std::deque<std::pair<std::uint64_t, std::uint64_t>> cpu_vis;  // (signaled_value, vis_seq)
+    };
+
     struct Barrier {
-        const void* owner;
-        std::uint64_t seq;
+        const void* owner = nullptr;
+        std::uint64_t seq = 0;
         std::function<void()> fn;
     };
 
@@ -328,32 +387,73 @@ private:
         return pumping;
     }
 
+    static bool& in_barrier() {
+        static thread_local bool running = false;
+        return running;
+    }
+
     std::vector<Holder*> snapshot() const {
         std::lock_guard lock(mutex_);
         return holders_;
     }
 
-    // Called with pump_mutex_ held. A callback runs when no held operation is older than the moment it was asked.
-    void run_barriers() {
+    // Called with pump_mutex_ held. Moves every satisfied barrier from barriers_ to ready_barriers_ in strict FIFO
+    // order without invoking any callback under pump_mutex_. True when at least one barrier became ready.
+    bool collect_ready_barriers() {
+        bool moved = false;
         for (;;) {
-            Barrier front;
+            const void* owner = nullptr;
+            std::uint64_t seq = 0;
             {
                 std::lock_guard lock(mutex_);
-                if (barriers_.empty()) return;
-                front = barriers_.front();
+                if (barriers_.empty()) return moved;
+                owner = barriers_.front().owner;
+                seq = barriers_.front().seq;
             }
             for (Holder* holder : snapshot()) {
                 const std::uint64_t oldest = holder->oldest_held_seq();
-                if (oldest && oldest <= front.seq) return;
+                if (oldest && oldest <= seq) return moved;
             }
             {
                 std::lock_guard lock(mutex_);
-                if (barriers_.empty() || barriers_.front().seq != front.seq || barriers_.front().owner != front.owner)
+                if (barriers_.empty() || barriers_.front().seq != seq || barriers_.front().owner != owner)
                     continue;  // cancelled meanwhile
+                ready_barriers_.push_back(std::move(barriers_.front()));
                 barriers_.pop_front();
-                barrier_count_.fetch_sub(1, std::memory_order_acq_rel);
+                moved = true;
             }
-            front.fn();
+        }
+    }
+
+    // Called OUTSIDE pump_mutex_. Executes all queued ready_barriers_ in strict FIFO order under barrier_mutex_.
+    void drain_ready_barriers() {
+        if (in_barrier()) return;
+        struct InBarrierGuard {
+            bool& flag;
+            explicit InBarrierGuard(bool& f) noexcept : flag(f) { flag = true; }
+            ~InBarrierGuard() { flag = false; }
+        };
+        for (;;) {
+            std::unique_lock bl(barrier_mutex_);
+            InBarrierGuard running(in_barrier());
+            for (;;) {
+                Barrier next;
+                {
+                    std::lock_guard lock(mutex_);
+                    if (ready_barriers_.empty()) break;
+                    next = std::move(ready_barriers_.front());
+                    ready_barriers_.pop_front();
+                    barrier_count_.fetch_sub(1, std::memory_order_acq_rel);
+                }
+                next.fn();
+            }
+            bl.unlock();
+            bool more = false;
+            {
+                std::lock_guard lock(mutex_);
+                more = !ready_barriers_.empty();
+            }
+            if (!more) return;
         }
     }
 
@@ -361,12 +461,14 @@ private:
         return static_cast<const QueueHolds*>(owner)->has_progress();
     }
 
-    mutable std::mutex mutex_;  // leaf: fences_, holders_ and barriers_
-    std::mutex pump_mutex_;     // one releasing thread; held across release_ready(), so detach() waits for it
+    mutable std::mutex mutex_;  // leaf: fences_, holders_, barriers_, ready_barriers_
+    std::mutex pump_mutex_;     // one releasing thread; held across release_ready(), never across barrier callbacks
+    std::mutex barrier_mutex_;  // serializes ready_barriers_ execution in strict FIFO order outside pump_mutex_
     mutable std::shared_mutex holders_use_mutex_;  // shared by has_progress(), unique in detach() after erasing holder
-    std::unordered_map<Semaphore, std::uint64_t> fences_;
+    std::unordered_map<Semaphore, FenceState> fences_;
     std::vector<Holder*> holders_;
     std::deque<Barrier> barriers_;
+    std::deque<Barrier> ready_barriers_;
     std::atomic<std::int64_t> held_{0};
     std::atomic<std::int64_t> barrier_count_{0};
     std::atomic<std::uint64_t> seq_{0};

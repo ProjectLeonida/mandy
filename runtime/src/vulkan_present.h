@@ -517,11 +517,29 @@ private:
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
         if (planes && !prepare_compose()) return VK_ERROR_FORMAT_NOT_SUPPORTED;
         const VkDevice device = context_.device();
-        Frame& frame = frames_[frame_index_ % frames_.size()];
+        const std::size_t slot_idx = frame_index_ % frames_.size();
+        Frame& frame = frames_[slot_idx];
         if (const VkResult waited = context_.observe_result(
                 vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX), "vkWaitForFences (present)");
             waited != VK_SUCCESS)
             return stop(waited);
+        // PresentComposer owns PresentComposer::frame_slots (2) descriptor sets indexed by slot % frame_slots.
+        // When frames_ is deeper than frame_slots and this present uses the composer, also wait for any peer slot
+        // sharing the same composer descriptor set before vkUpdateDescriptorSets rewrites it.
+        if (planes && frames_.size() > PresentComposer::frame_slots) {
+            const std::size_t comp_slot = slot_idx % PresentComposer::frame_slots;
+            for (std::size_t i = 0; i < frames_.size(); ++i) {
+                if (i == slot_idx || (i % PresentComposer::frame_slots) != comp_slot || !frames_[i].used_composer)
+                    continue;
+                if (const VkResult waited = context_.observe_result(
+                        vkWaitForFences_(device, 1, &frames_[i].done, VK_TRUE, UINT64_MAX),
+                        "vkWaitForFences (present compose slot)");
+                    waited != VK_SUCCESS)
+                    return stop(waited);
+                frames_[i].used_composer = false;
+            }
+        }
+        frame.used_composer = false;
         // Drain the preceding disk sample before reusing its fence or advancing its metadata.
         if (const VkResult r = finish_pending_capture(); r != VK_SUCCESS) return stop(r);
 
@@ -674,6 +692,7 @@ private:
             }
         }
         if (submitted != VK_SUCCESS) return give_back(frame, submitted);
+        frame.used_composer = (planes != nullptr);
         ++frame_index_;
         // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
@@ -1025,6 +1044,7 @@ private:
         VkFence done = VK_NULL_HANDLE;
         VkSemaphore acquired = VK_NULL_HANDLE;
         std::array<VkImageView, 2> views{};  // the plane views of the last composed present, until the frame is reused
+        bool used_composer = false;          // true when this slot's in-flight submission used PresentComposer
     };
 
     bool recreate_for_present(bool vsync, bool srgb, bool hdr);
@@ -1813,7 +1833,7 @@ private:
     VkExtent2D extent_{};
     std::vector<VkImage> images_;
     std::vector<VkSemaphore> ready_;  // per swapchain image: blit done, present may start
-    std::array<Frame, 2> frames_{};
+    std::array<Frame, 4> frames_{};
     VkCommandPool pool_ = VK_NULL_HANDLE;
     std::uint64_t frame_index_ = 0;
     std::atomic<std::uint64_t> presented_{0};

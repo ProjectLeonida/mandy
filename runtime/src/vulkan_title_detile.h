@@ -483,7 +483,9 @@ public:
 
     TitleDetilePipeline(PFN_vkGetDeviceProcAddr get, VkDevice device, const VkPhysicalDeviceLimits& limits,
                         Allocate allocate)
-        : get_(get), device_(device), limits_(limits), allocate_(std::move(allocate)) {}
+        : get_(get), device_(device), limits_(limits), allocate_(std::move(allocate)) {
+        load_fns();
+    }
 
     ~TitleDetilePipeline() { release(); }
 
@@ -492,26 +494,22 @@ public:
 
     void release() {
         if (!device_ || !get_) return;
-        const auto destroy_buf = fn<PFN_vkDestroyBuffer>("vkDestroyBuffer");
-        const auto free_mem = fn<PFN_vkFreeMemory>("vkFreeMemory");
-        const auto destroy_pool = fn<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool");
         for (auto& s : scratch_slots_) {
-            if (s->buffer && destroy_buf) destroy_buf(device_, s->buffer, nullptr);
-            if (s->memory && free_mem) free_mem(device_, s->memory, nullptr);
-            if (s->pool && destroy_pool) destroy_pool(device_, s->pool, nullptr);
+            if (s->buffer && vk_.destroy_buffer) vk_.destroy_buffer(device_, s->buffer, nullptr);
+            if (s->memory && vk_.free_memory) vk_.free_memory(device_, s->memory, nullptr);
+            if (s->pool && vk_.destroy_descriptor_pool) vk_.destroy_descriptor_pool(device_, s->pool, nullptr);
         }
         scratch_slots_.clear();
         if (pipeline_) {
-            if (const auto f = fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")) f(device_, pipeline_, nullptr);
+            if (vk_.destroy_pipeline) vk_.destroy_pipeline(device_, pipeline_, nullptr);
             pipeline_ = VK_NULL_HANDLE;
         }
         if (layout_) {
-            if (const auto f = fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")) f(device_, layout_, nullptr);
+            if (vk_.destroy_pipeline_layout) vk_.destroy_pipeline_layout(device_, layout_, nullptr);
             layout_ = VK_NULL_HANDLE;
         }
         if (set_layout_) {
-            if (const auto f = fn<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout"))
-                f(device_, set_layout_, nullptr);
+            if (vk_.destroy_descriptor_set_layout) vk_.destroy_descriptor_set_layout(device_, set_layout_, nullptr);
             set_layout_ = VK_NULL_HANDLE;
         }
         failed_ = false;
@@ -647,10 +645,11 @@ public:
         std::uint64_t value = 0;  // timeline semaphore value when its last batch completes; 0: idle
     };
 
-    // Acquires an idle ScratchSlot (looking up `reached` without waiting; creates new up to kMaxSlots, else returns
-    // nullptr so caller can wait or fall back), ensures its device-local scratch buffer holds `min_bytes` and its
-    // descriptor pool holds `sets_needed` sets (resetting the pool for fresh allocation).
-    static constexpr std::size_t kMaxScratchSlots = 16;
+    // Acquires an idle ScratchSlot (looking up `reached` without waiting; creates new up to kMaxScratchSlots, else
+    // returns nullptr so caller can wait on oldest_in_flight_scratch_value() or fall back), ensures its device-local
+    // scratch buffer holds `min_bytes` and its descriptor pool holds `sets_needed` sets (resetting the pool for fresh
+    // allocation).
+    static constexpr std::size_t kMaxScratchSlots = 32;
     ScratchSlot* acquire_scratch(std::uint64_t reached, VkDeviceSize min_bytes, std::uint32_t sets_needed) {
         if (!ensure_pipeline()) return nullptr;
         ScratchSlot* chosen = nullptr;
@@ -671,14 +670,61 @@ public:
         return chosen;
     }
 
+    // Smallest non-zero timeline value among currently in-flight scratch slots (0 if none are in flight).
+    // Waiting on this instead of the latest upload value frees a slot without draining the entire upload pipeline.
+    std::uint64_t oldest_in_flight_scratch_value() const noexcept {
+        std::uint64_t oldest = 0;
+        for (const auto& s : scratch_slots_) {
+            if (s->value && (!oldest || s->value < oldest)) oldest = s->value;
+        }
+        return oldest;
+    }
+
+    // Deferred descriptor update entry for batching vkUpdateDescriptorSets across all detiled textures in a sub-batch.
+    struct PendingDescriptorUpdate {
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VkDescriptorBufferInfo src{};
+        VkDescriptorBufferInfo dst{};
+    };
+
+    // Flushes all queued descriptor updates for a sub-batch in a single vkUpdateDescriptorSets call.
+    void flush_descriptor_updates(const std::vector<PendingDescriptorUpdate>& updates) {
+        if (updates.empty() || !vk_.update_descriptor_sets) return;
+        batch_writes_.resize(updates.size() * 2);
+        for (std::size_t i = 0; i < updates.size(); ++i) {
+            VkWriteDescriptorSet& w0 = batch_writes_[i * 2];
+            w0 = {};
+            w0.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w0.dstSet = updates[i].set;
+            w0.dstBinding = 0;
+            w0.descriptorCount = 1;
+            w0.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w0.pBufferInfo = &updates[i].src;
+
+            VkWriteDescriptorSet& w1 = batch_writes_[i * 2 + 1];
+            w1 = {};
+            w1.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w1.dstSet = updates[i].set;
+            w1.dstBinding = 1;
+            w1.descriptorCount = 1;
+            w1.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w1.pBufferInfo = &updates[i].dst;
+        }
+        vk_.update_descriptor_sets(device_, static_cast<std::uint32_t>(batch_writes_.size()), batch_writes_.data(), 0,
+                                   nullptr);
+    }
+
     // Prepares descriptor set and per-(layer, mip) compute dispatches for one swizzled texture into `slot`.
     // `regions` must have been built by build_scratch_regions() with `dst_base` inside `slot.buffer`.
+    // When `pending_updates` is non-null, descriptor writes are appended for one batched flush_descriptor_updates()
+    // call across the sub-batch; otherwise vkUpdateDescriptorSets runs immediately.
     bool prepare_texture(ScratchSlot& slot, VkBuffer src_buffer, VkDeviceSize src_offset, const TitleDetileDesc& desc,
                          VkDeviceSize dst_base, VkDeviceSize dst_end, const std::vector<VkBufferImageCopy>& regions,
-                         std::vector<TitleDetileDispatch>& dispatches) {
+                         std::vector<TitleDetileDispatch>& dispatches,
+                         std::vector<PendingDescriptorUpdate>* pending_updates = nullptr) {
         if (!ensure_pipeline() || !slot.buffer || !slot.pool || dst_end > slot.capacity || dst_end < dst_base)
             return false;
-        const VkDeviceSize min_ssbo = std::max<VkDeviceSize>(4, limits_.minStorageBufferOffsetAlignment);
+        const VkDeviceSize min_ssbo = (std::max)(VkDeviceSize(4), limits_.minStorageBufferOffsetAlignment);
         const VkDeviceSize aligned_src = src_offset - (src_offset % min_ssbo);
         const VkDeviceSize src_range =
             detail::align_up_size((src_offset - aligned_src) + desc.total_size, 4);
@@ -693,25 +739,10 @@ public:
         alloc.descriptorPool = slot.pool;
         alloc.descriptorSetCount = 1;
         alloc.pSetLayouts = &set_layout_;
-        if (fn<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(device_, &alloc, &set) != VK_SUCCESS)
-            return false;
+        if (vk_.allocate_descriptor_sets(device_, &alloc, &set) != VK_SUCCESS) return false;
 
         const VkDescriptorBufferInfo src_info{src_buffer, aligned_src, src_range};
         const VkDescriptorBufferInfo dst_info{slot.buffer, aligned_dst, dst_range};
-        VkWriteDescriptorSet writes[2]{};
-        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = set;
-        writes[0].dstBinding = 0;
-        writes[0].descriptorCount = 1;
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[0].pBufferInfo = &src_info;
-        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = set;
-        writes[1].dstBinding = 1;
-        writes[1].descriptorCount = 1;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[1].pBufferInfo = &dst_info;
-        fn<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(device_, 2, writes, 0, nullptr);
 
         const std::uint32_t bpe_log2 = static_cast<std::uint32_t>(std::countr_zero(desc.element_bytes));
         const std::uint32_t mode_d = desc.mode == TitleDetileMode::sw_64kb_d ? 1u : 0u;
@@ -722,6 +753,7 @@ public:
         const std::uint32_t mips = static_cast<std::uint32_t>(desc.mips.size());
         if (regions.size() != std::size_t(desc.array_layers) * mips) return false;
 
+        const std::size_t disp_start = dispatches.size();
         std::size_t region_idx = 0;
         for (std::uint32_t layer = 0; layer < desc.array_layers; ++layer) {
             const VkDeviceSize slice_off = src_offset + VkDeviceSize(layer) * desc.slice_bytes;
@@ -729,10 +761,19 @@ public:
                 const auto& m = desc.mips[level];
                 const auto& copy = regions[region_idx];
                 const VkDeviceSize mip_src = m.in_tail ? slice_off : slice_off + m.offset;
-                if (mip_src < aligned_src || mip_src - aligned_src > UINT32_MAX) return false;
-                if (copy.bufferOffset < aligned_dst || ((copy.bufferOffset - aligned_dst) & 3u) != 0) return false;
+                if (mip_src < aligned_src || mip_src - aligned_src > UINT32_MAX) {
+                    dispatches.resize(disp_start);
+                    return false;
+                }
+                if (copy.bufferOffset < aligned_dst || ((copy.bufferOffset - aligned_dst) & 3u) != 0) {
+                    dispatches.resize(disp_start);
+                    return false;
+                }
                 const VkDeviceSize dst_words = (copy.bufferOffset - aligned_dst) >> 2;
-                if (dst_words > UINT32_MAX) return false;
+                if (dst_words > UINT32_MAX) {
+                    dispatches.resize(disp_start);
+                    return false;
+                }
 
                 TitleDetileDispatch d{};
                 d.set = set;
@@ -755,15 +796,35 @@ public:
                         std::uint64_t(m.width_elements) * m.height_elements * desc.element_bytes;
                     const std::uint64_t total_words = (total_bytes + 3u) / 4u;
                     const std::uint64_t total_groups = (total_words + 63u) / 64u;
-                    d.groups_x = static_cast<std::uint32_t>(std::min<std::uint64_t>(total_groups, 1024u));
+                    d.groups_x = static_cast<std::uint32_t>((std::min)(total_groups, std::uint64_t(1024u)));
                     d.groups_y = static_cast<std::uint32_t>((total_groups + d.groups_x - 1u) / d.groups_x);
                 }
                 if (d.groups_x == 0 || d.groups_y == 0 ||
                     d.groups_x > limits_.maxComputeWorkGroupCount[0] ||
-                    d.groups_y > limits_.maxComputeWorkGroupCount[1])
+                    d.groups_y > limits_.maxComputeWorkGroupCount[1]) {
+                    dispatches.resize(disp_start);
                     return false;
+                }
                 dispatches.push_back(d);
             }
+        }
+        if (pending_updates) {
+            pending_updates->push_back({set, src_info, dst_info});
+        } else {
+            VkWriteDescriptorSet writes[2]{};
+            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[0].dstSet = set;
+            writes[0].dstBinding = 0;
+            writes[0].descriptorCount = 1;
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[0].pBufferInfo = &src_info;
+            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[1].dstSet = set;
+            writes[1].dstBinding = 1;
+            writes[1].descriptorCount = 1;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[1].pBufferInfo = &dst_info;
+            vk_.update_descriptor_sets(device_, 2, writes, 0, nullptr);
         }
         return true;
     }
@@ -771,45 +832,86 @@ public:
     // Records all compute detile dispatches in one pass (caller emits memory barriers before and after).
     void emit_dispatches(VkCommandBuffer cb, const std::vector<TitleDetileDispatch>& dispatches) const {
         if (dispatches.empty() || !pipeline_) return;
-        const auto bind_pipe = fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline");
-        const auto bind_sets = fn<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets");
-        const auto push_const = fn<PFN_vkCmdPushConstants>("vkCmdPushConstants");
-        const auto dispatch = fn<PFN_vkCmdDispatch>("vkCmdDispatch");
-        bind_pipe(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        vk_.cmd_bind_pipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         VkDescriptorSet bound = VK_NULL_HANDLE;
         for (const auto& d : dispatches) {
             if (d.set != bound) {
-                bind_sets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &d.set, 0, nullptr);
+                vk_.cmd_bind_descriptor_sets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &d.set, 0, nullptr);
                 bound = d.set;
             }
-            push_const(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TitleDetilePush), &d.push);
-            dispatch(cb, d.groups_x, d.groups_y, 1);
+            vk_.cmd_push_constants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TitleDetilePush), &d.push);
+            vk_.cmd_dispatch(cb, d.groups_x, d.groups_y, 1);
         }
     }
 
     VkDeviceSize min_storage_alignment() const {
-        return std::max<VkDeviceSize>(4, limits_.minStorageBufferOffsetAlignment);
+        return (std::max)(VkDeviceSize(4), limits_.minStorageBufferOffsetAlignment);
     }
 
 private:
-    template <class T>
-    T fn(const char* name) const {
-        return reinterpret_cast<T>(get_(device_, name));
+    struct VkFns {
+        PFN_vkCreateBuffer create_buffer = nullptr;
+        PFN_vkDestroyBuffer destroy_buffer = nullptr;
+        PFN_vkGetBufferMemoryRequirements get_buffer_memory_requirements = nullptr;
+        PFN_vkBindBufferMemory bind_buffer_memory = nullptr;
+        PFN_vkFreeMemory free_memory = nullptr;
+        PFN_vkCreateDescriptorPool create_descriptor_pool = nullptr;
+        PFN_vkDestroyDescriptorPool destroy_descriptor_pool = nullptr;
+        PFN_vkResetDescriptorPool reset_descriptor_pool = nullptr;
+        PFN_vkAllocateDescriptorSets allocate_descriptor_sets = nullptr;
+        PFN_vkUpdateDescriptorSets update_descriptor_sets = nullptr;
+        PFN_vkCreateShaderModule create_shader_module = nullptr;
+        PFN_vkDestroyShaderModule destroy_shader_module = nullptr;
+        PFN_vkCreateDescriptorSetLayout create_descriptor_set_layout = nullptr;
+        PFN_vkDestroyDescriptorSetLayout destroy_descriptor_set_layout = nullptr;
+        PFN_vkCreatePipelineLayout create_pipeline_layout = nullptr;
+        PFN_vkDestroyPipelineLayout destroy_pipeline_layout = nullptr;
+        PFN_vkCreateComputePipelines create_compute_pipelines = nullptr;
+        PFN_vkDestroyPipeline destroy_pipeline = nullptr;
+        PFN_vkCmdBindPipeline cmd_bind_pipeline = nullptr;
+        PFN_vkCmdBindDescriptorSets cmd_bind_descriptor_sets = nullptr;
+        PFN_vkCmdPushConstants cmd_push_constants = nullptr;
+        PFN_vkCmdDispatch cmd_dispatch = nullptr;
+        bool all_loaded = false;
+    };
+
+    void load_fns() {
+        if (!get_ || !device_) return;
+        auto load = [&]<class T>(T& dst, const char* name) {
+            dst = reinterpret_cast<T>(get_(device_, name));
+            return dst != nullptr;
+        };
+        bool ok = true;
+        ok = load(vk_.create_buffer, "vkCreateBuffer") && ok;
+        ok = load(vk_.destroy_buffer, "vkDestroyBuffer") && ok;
+        ok = load(vk_.get_buffer_memory_requirements, "vkGetBufferMemoryRequirements") && ok;
+        ok = load(vk_.bind_buffer_memory, "vkBindBufferMemory") && ok;
+        ok = load(vk_.free_memory, "vkFreeMemory") && ok;
+        ok = load(vk_.create_descriptor_pool, "vkCreateDescriptorPool") && ok;
+        ok = load(vk_.destroy_descriptor_pool, "vkDestroyDescriptorPool") && ok;
+        ok = load(vk_.reset_descriptor_pool, "vkResetDescriptorPool") && ok;
+        ok = load(vk_.allocate_descriptor_sets, "vkAllocateDescriptorSets") && ok;
+        ok = load(vk_.update_descriptor_sets, "vkUpdateDescriptorSets") && ok;
+        ok = load(vk_.create_shader_module, "vkCreateShaderModule") && ok;
+        ok = load(vk_.destroy_shader_module, "vkDestroyShaderModule") && ok;
+        ok = load(vk_.create_descriptor_set_layout, "vkCreateDescriptorSetLayout") && ok;
+        ok = load(vk_.destroy_descriptor_set_layout, "vkDestroyDescriptorSetLayout") && ok;
+        ok = load(vk_.create_pipeline_layout, "vkCreatePipelineLayout") && ok;
+        ok = load(vk_.destroy_pipeline_layout, "vkDestroyPipelineLayout") && ok;
+        ok = load(vk_.create_compute_pipelines, "vkCreateComputePipelines") && ok;
+        ok = load(vk_.destroy_pipeline, "vkDestroyPipeline") && ok;
+        ok = load(vk_.cmd_bind_pipeline, "vkCmdBindPipeline") && ok;
+        ok = load(vk_.cmd_bind_descriptor_sets, "vkCmdBindDescriptorSets") && ok;
+        ok = load(vk_.cmd_push_constants, "vkCmdPushConstants") && ok;
+        ok = load(vk_.cmd_dispatch, "vkCmdDispatch") && ok;
+        vk_.all_loaded = ok;
     }
 
     bool ensure_pipeline() {
         if (pipeline_) return true;
         if (failed_) return false;
         failed_ = true;
-        for (const char* name :
-             {"vkCreateBuffer", "vkDestroyBuffer", "vkGetBufferMemoryRequirements", "vkBindBufferMemory",
-              "vkFreeMemory", "vkCreateDescriptorPool", "vkDestroyDescriptorPool", "vkResetDescriptorPool",
-              "vkAllocateDescriptorSets", "vkUpdateDescriptorSets", "vkCreateShaderModule", "vkDestroyShaderModule",
-              "vkCreateDescriptorSetLayout", "vkDestroyDescriptorSetLayout", "vkCreatePipelineLayout",
-              "vkDestroyPipelineLayout", "vkCreateComputePipelines", "vkDestroyPipeline", "vkCmdBindPipeline",
-              "vkCmdBindDescriptorSets", "vkCmdPushConstants", "vkCmdDispatch"}) {
-            if (!get_(device_, name)) return false;
-        }
+        if (!vk_.all_loaded) return false;
         VkDescriptorSetLayoutBinding bindings[2]{};
         bindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -820,33 +922,30 @@ private:
         VkPipelineLayout pl = VK_NULL_HANDLE;
         VkShaderModule sm = VK_NULL_HANDLE;
         VkPipeline pipe = VK_NULL_HANDLE;
-        bool ok = fn<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(device_, &set_info, nullptr, &sl) ==
-                  VK_SUCCESS;
+        bool ok = vk_.create_descriptor_set_layout(device_, &set_info, nullptr, &sl) == VK_SUCCESS;
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TitleDetilePush)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.setLayoutCount = 1;
         layout_info.pSetLayouts = &sl;
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
-        ok = ok && fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(device_, &layout_info, nullptr, &pl) ==
-                       VK_SUCCESS;
+        ok = ok && vk_.create_pipeline_layout(device_, &layout_info, nullptr, &pl) == VK_SUCCESS;
         VkShaderModuleCreateInfo mod_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         mod_info.codeSize = sizeof(detail::kTitleDetileSpirv);
         mod_info.pCode = detail::kTitleDetileSpirv;
-        ok = ok && fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(device_, &mod_info, nullptr, &sm) == VK_SUCCESS;
+        ok = ok && vk_.create_shader_module(device_, &mod_info, nullptr, &sm) == VK_SUCCESS;
         VkComputePipelineCreateInfo pipe_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipe_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         pipe_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pipe_info.stage.module = sm;
         pipe_info.stage.pName = "main";
         pipe_info.layout = pl;
-        ok = ok && fn<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(device_, VK_NULL_HANDLE, 1, &pipe_info,
-                                                                                nullptr, &pipe) == VK_SUCCESS;
-        if (sm) fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(device_, sm, nullptr);
+        ok = ok && vk_.create_compute_pipelines(device_, VK_NULL_HANDLE, 1, &pipe_info, nullptr, &pipe) == VK_SUCCESS;
+        if (sm) vk_.destroy_shader_module(device_, sm, nullptr);
         if (!ok) {
-            if (pipe) fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device_, pipe, nullptr);
-            if (pl) fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device_, pl, nullptr);
-            if (sl) fn<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(device_, sl, nullptr);
+            if (pipe) vk_.destroy_pipeline(device_, pipe, nullptr);
+            if (pl) vk_.destroy_pipeline_layout(device_, pl, nullptr);
+            if (sl) vk_.destroy_descriptor_set_layout(device_, sl, nullptr);
             return false;
         }
         set_layout_ = sl;
@@ -857,38 +956,36 @@ private:
     }
 
     bool prepare_scratch(ScratchSlot& slot, VkDeviceSize min_bytes, std::uint32_t sets_needed) {
-        const VkDeviceSize need = detail::align_up_size(std::max<VkDeviceSize>(min_bytes, 4u), 4u);
+        const VkDeviceSize need = detail::align_up_size((std::max)(min_bytes, VkDeviceSize(4u)), 4u);
         if (need > slot.capacity) {
-            if (slot.buffer) fn<PFN_vkDestroyBuffer>("vkDestroyBuffer")(device_, slot.buffer, nullptr);
-            if (slot.memory) fn<PFN_vkFreeMemory>("vkFreeMemory")(device_, slot.memory, nullptr);
+            if (slot.buffer) vk_.destroy_buffer(device_, slot.buffer, nullptr);
+            if (slot.memory) vk_.free_memory(device_, slot.memory, nullptr);
             slot.buffer = VK_NULL_HANDLE;
             slot.memory = VK_NULL_HANDLE;
             slot.capacity = 0;
 
             // Grow in power-of-two steps (min 4 MiB) to avoid frequent reallocation churn.
-            VkDeviceSize cap = std::max<VkDeviceSize>(4ull << 20, need);
+            VkDeviceSize cap = (std::max)(VkDeviceSize(4ull << 20), need);
             if (cap < (UINT64_MAX >> 1)) cap = std::bit_ceil(cap);
             VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             info.size = cap;
             info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-            if (fn<PFN_vkCreateBuffer>("vkCreateBuffer")(device_, &info, nullptr, &slot.buffer) != VK_SUCCESS)
-                return false;
+            if (vk_.create_buffer(device_, &info, nullptr, &slot.buffer) != VK_SUCCESS) return false;
             VkMemoryRequirements req{};
-            fn<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(device_, slot.buffer, &req);
+            vk_.get_buffer_memory_requirements(device_, slot.buffer, &req);
             slot.memory = allocate_(req, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            if (!slot.memory ||
-                fn<PFN_vkBindBufferMemory>("vkBindBufferMemory")(device_, slot.buffer, slot.memory, 0) != VK_SUCCESS) {
-                if (slot.buffer) fn<PFN_vkDestroyBuffer>("vkDestroyBuffer")(device_, slot.buffer, nullptr);
-                if (slot.memory) fn<PFN_vkFreeMemory>("vkFreeMemory")(device_, slot.memory, nullptr);
+            if (!slot.memory || vk_.bind_buffer_memory(device_, slot.buffer, slot.memory, 0) != VK_SUCCESS) {
+                if (slot.buffer) vk_.destroy_buffer(device_, slot.buffer, nullptr);
+                if (slot.memory) vk_.free_memory(device_, slot.memory, nullptr);
                 slot.buffer = VK_NULL_HANDLE;
                 slot.memory = VK_NULL_HANDLE;
                 return false;
             }
             slot.capacity = cap;
         }
-        const std::uint32_t want_sets = std::max<std::uint32_t>(sets_needed, 64u);
+        const std::uint32_t want_sets = (std::max)(sets_needed, std::uint32_t(64u));
         if (want_sets > slot.pool_sets) {
-            if (slot.pool) fn<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(device_, slot.pool, nullptr);
+            if (slot.pool) vk_.destroy_descriptor_pool(device_, slot.pool, nullptr);
             slot.pool = VK_NULL_HANDLE;
             slot.pool_sets = 0;
             const std::uint32_t alloc_sets = std::bit_ceil(want_sets);
@@ -897,13 +994,10 @@ private:
             pool_info.maxSets = alloc_sets;
             pool_info.poolSizeCount = 1;
             pool_info.pPoolSizes = &size;
-            if (fn<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(device_, &pool_info, nullptr, &slot.pool) !=
-                VK_SUCCESS)
-                return false;
+            if (vk_.create_descriptor_pool(device_, &pool_info, nullptr, &slot.pool) != VK_SUCCESS) return false;
             slot.pool_sets = alloc_sets;
         } else if (slot.pool) {
-            if (fn<PFN_vkResetDescriptorPool>("vkResetDescriptorPool")(device_, slot.pool, 0) != VK_SUCCESS)
-                return false;
+            if (vk_.reset_descriptor_pool(device_, slot.pool, 0) != VK_SUCCESS) return false;
         }
         return true;
     }
@@ -912,11 +1006,13 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkPhysicalDeviceLimits limits_{};
     Allocate allocate_;
+    VkFns vk_{};
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     bool failed_ = false;
     std::vector<std::unique_ptr<ScratchSlot>> scratch_slots_;
+    std::vector<VkWriteDescriptorSet> batch_writes_;
 };
 
 }  // namespace leonida

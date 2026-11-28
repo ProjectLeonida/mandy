@@ -36,6 +36,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <chrono>
@@ -137,14 +138,22 @@ struct ClampedIndirect {
     std::uint32_t max_records = 0;
 };
 
-// One device's clamp: the pass's pipeline (made on the first call), the per-submission record pool, and the counter
-// slots. Single-threaded per list, as the replay's preparation is: the caller holds the context's tracker lock for
-// prepare and emit, and the batch destructor only touches the slot bookkeeping under `mutex_`.
+// One device's clamp: the pass's pipeline (made on the first call), the per-batch record scratch pool, and the
+// counter slots. Thread-safe across concurrent queue preparations via its own internal locks (never requires the
+// context's tracker_mutex_), while each Batch owns its own disjoint scratch chunks until the submission's timeline
+// ticket retires and ~Batch() returns them to the pool.
 class IndirectArgumentClamp {
 private:
     struct Slot {
         std::uint32_t area;
         std::uint32_t index;
+    };
+    struct ScratchChunk {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceSize size = 0;
+        VkDeviceSize used = 0;
+        VkDeviceAddress address = 0;
     };
     static constexpr std::uint32_t no_slot = UINT32_MAX;  // Slot::area of a call clamped without counters
 
@@ -161,12 +170,13 @@ public:
 
     // False when the pass cannot run on this device (no device addresses, no compute): the replay then keeps the
     // application's buffer.
-    bool loaded() const { return scratch_.loaded() && limits_.maxComputeWorkGroupCount[0] != 0; }
+    bool loaded() const { return scratch_loaded_ && limits_.maxComputeWorkGroupCount[0] != 0; }
 
-    // The record pool's life cycle, as the copy scratch's (vulkan_scratch.h).
-    void collect() { scratch_.collect(); }
-    void retire(VkSemaphore timeline, std::uint64_t ticket) { scratch_.retire(timeline, ticket); }
-    void forget(VkSemaphore timeline) { scratch_.forget(timeline); }
+    // Kept for API compatibility: scratch chunks are owned per Batch and returned to the spare pool in ~Batch() once
+    // the submission's timeline ticket completes (CommandSlot destruction/reuse).
+    void collect() {}
+    void retire(VkSemaphore /*timeline*/, std::uint64_t /*ticket*/) {}
+    void forget(VkSemaphore /*timeline*/) {}
 
     // What the pass found since the process started. `records_clamped` counts the records whose values the pass
     // changed (the ones it emptied included).
@@ -192,12 +202,16 @@ public:
         std::uint64_t dispatch_cut = 0;
     };
 
-    // One submission's clamp state: the counter slots its calls claimed, read and released together once that
-    // submission has completed. Retained by the command-buffer slot until its timeline ticket does.
+    // One submission's clamp state: the counter slots and disjoint scratch chunks its calls claimed, read and
+    // released together once that submission has completed. Retained by the command-buffer slot until its timeline
+    // ticket completes.
     class Batch {
     public:
         explicit Batch(IndirectArgumentClamp& owner) : owner_(owner) {}
-        ~Batch() { owner_.release(slots_, true); }
+        ~Batch() {
+            owner_.release(slots_, true);
+            owner_.return_chunks(chunks_);
+        }
         Batch(const Batch&) = delete;
         Batch& operator=(const Batch&) = delete;
 
@@ -215,7 +229,8 @@ public:
                 owner_.note_uncounted();
                 slot = Slot{no_slot, 0};
             }
-            if (!owner_.prepare(arguments, argument_offset, count, count_offset, kind, stride, max_count, slot, out)) {
+            if (!owner_.prepare(chunks_, arguments, argument_offset, count, count_offset, kind, stride, max_count, slot,
+                                out)) {
                 if (counted) owner_.release_one(slot);
                 return false;
             }
@@ -235,6 +250,7 @@ public:
     private:
         IndirectArgumentClamp& owner_;
         std::vector<Slot> slots_;
+        std::vector<ScratchChunk> chunks_;
     };
 
     std::unique_ptr<Batch> batch() { return std::make_unique<Batch>(*this); }
@@ -257,19 +273,51 @@ private:
         std::uint32_t slots = 0;
         static constexpr std::uint32_t slot_bytes = 64;  // 16 words of counters (words 4-7 unused)
     };
+    struct VkFns {
+        PFN_vkCreateBuffer create_buffer = nullptr;
+        PFN_vkDestroyBuffer destroy_buffer = nullptr;
+        PFN_vkGetBufferMemoryRequirements get_buffer_memory_requirements = nullptr;
+        PFN_vkAllocateMemory allocate_memory = nullptr;
+        PFN_vkFreeMemory free_memory = nullptr;
+        PFN_vkBindBufferMemory bind_buffer_memory = nullptr;
+        PFN_vkMapMemory map_memory = nullptr;
+        PFN_vkUnmapMemory unmap_memory = nullptr;
+        PFN_vkGetBufferDeviceAddress get_buffer_device_address = nullptr;
+        PFN_vkDeviceWaitIdle device_wait_idle = nullptr;
+        PFN_vkCreateShaderModule create_shader_module = nullptr;
+        PFN_vkDestroyShaderModule destroy_shader_module = nullptr;
+        PFN_vkCreatePipelineLayout create_pipeline_layout = nullptr;
+        PFN_vkDestroyPipelineLayout destroy_pipeline_layout = nullptr;
+        PFN_vkCreateComputePipelines create_compute_pipelines = nullptr;
+        PFN_vkDestroyPipeline destroy_pipeline = nullptr;
+        PFN_vkCmdPipelineBarrier cmd_pipeline_barrier = nullptr;
+        PFN_vkCmdBindPipeline cmd_bind_pipeline = nullptr;
+        PFN_vkCmdPushConstants cmd_push_constants = nullptr;
+        PFN_vkCmdDispatch cmd_dispatch = nullptr;
+        PFN_vkCmdFillBuffer cmd_fill_buffer = nullptr;
+        PFN_vkCmdCopyBuffer cmd_copy_buffer = nullptr;
+        bool pipeline_fns_loaded = false;
+    };
     static constexpr std::uint32_t slots_per_area = 64;
     // 4,096 slots (128 KiB of host memory): enough for a submission's ExecuteIndirect calls after the load, and the
     // calls past them are still clamped (no_slot).
     static constexpr std::uint32_t max_areas = 64;
+    static constexpr std::size_t max_spare_chunks = 16;
 
-    template<typename T> T fn(const char* name) const { return reinterpret_cast<T>(get_(device_, name)); }
+    void load_fns();
     bool make_pipeline();
     bool make_area();
+    bool make_scratch_chunk(VkDeviceSize size, ScratchChunk& out);
+    void destroy_scratch_chunk(ScratchChunk& chunk);
+    bool claim_scratch(std::vector<ScratchChunk>& batch_chunks, VkDeviceSize bytes, VkBuffer& buffer,
+                       VkDeviceSize& offset, VkDeviceAddress& address);
+    void return_chunks(std::vector<ScratchChunk>& chunks);
     bool claim_slot(Slot& out);
     void release_one(Slot slot);
     void release(std::vector<Slot>& slots, bool read);
-    bool prepare(VkBuffer arguments, VkDeviceSize argument_offset, VkBuffer count, VkDeviceSize count_offset,
-                 std::uint32_t kind, std::uint32_t stride, std::uint32_t max_count, Slot slot, ClampedIndirect& out);
+    bool prepare(std::vector<ScratchChunk>& batch_chunks, VkBuffer arguments, VkDeviceSize argument_offset,
+                 VkBuffer count, VkDeviceSize count_offset, std::uint32_t kind, std::uint32_t stride,
+                 std::uint32_t max_count, Slot slot, ClampedIndirect& out);
     void fallback(const char* reason);
     void note_uncounted();
 
@@ -277,10 +325,18 @@ private:
     VkDevice device_;
     VkPhysicalDeviceMemoryProperties memory_{};
     VkPhysicalDeviceLimits limits_{};
+    Allocate allocate_;
+    DeviceFaultDiagnostics* diagnostics_ = nullptr;
     std::vector<std::uint32_t> families_;
-    ScratchBuffers scratch_;
+    VkFns vk_{};
+    bool scratch_loaded_ = false;
+    std::mutex pipeline_mutex_;  // guards lazy one-time make_pipeline()
+    std::atomic<bool> pipeline_ready_{false};
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+
+    std::mutex scratch_mutex_;  // guards spare_chunks_
+    std::vector<ScratchChunk> spare_chunks_;
 
     mutable std::mutex mutex_;  // the slot bookkeeping and the counters
     std::vector<HostArea> areas_;
@@ -321,48 +377,166 @@ inline constexpr VkBufferUsageFlags indirect_clamp_scratch_usage =
 
 }  // namespace detail
 
+inline void IndirectArgumentClamp::load_fns() {
+    if (!get_ || !device_) return;
+    auto load = [&]<class T>(T& dst, const char* name) {
+        dst = reinterpret_cast<T>(get_(device_, name));
+        return dst != nullptr;
+    };
+    bool scratch_ok = true;
+    scratch_ok = load(vk_.create_buffer, "vkCreateBuffer") && scratch_ok;
+    scratch_ok = load(vk_.destroy_buffer, "vkDestroyBuffer") && scratch_ok;
+    scratch_ok = load(vk_.get_buffer_memory_requirements, "vkGetBufferMemoryRequirements") && scratch_ok;
+    scratch_ok = load(vk_.bind_buffer_memory, "vkBindBufferMemory") && scratch_ok;
+    scratch_ok = load(vk_.free_memory, "vkFreeMemory") && scratch_ok;
+    scratch_ok = load(vk_.get_buffer_device_address, "vkGetBufferDeviceAddress") && scratch_ok;
+    scratch_ok = load(vk_.device_wait_idle, "vkDeviceWaitIdle") && scratch_ok;
+    scratch_loaded_ = scratch_ok;
+
+    bool pipe_ok = scratch_ok;
+    pipe_ok = load(vk_.allocate_memory, "vkAllocateMemory") && pipe_ok;
+    pipe_ok = load(vk_.map_memory, "vkMapMemory") && pipe_ok;
+    pipe_ok = load(vk_.unmap_memory, "vkUnmapMemory") && pipe_ok;
+    pipe_ok = load(vk_.create_shader_module, "vkCreateShaderModule") && pipe_ok;
+    pipe_ok = load(vk_.destroy_shader_module, "vkDestroyShaderModule") && pipe_ok;
+    pipe_ok = load(vk_.create_pipeline_layout, "vkCreatePipelineLayout") && pipe_ok;
+    pipe_ok = load(vk_.destroy_pipeline_layout, "vkDestroyPipelineLayout") && pipe_ok;
+    pipe_ok = load(vk_.create_compute_pipelines, "vkCreateComputePipelines") && pipe_ok;
+    pipe_ok = load(vk_.destroy_pipeline, "vkDestroyPipeline") && pipe_ok;
+    pipe_ok = load(vk_.cmd_pipeline_barrier, "vkCmdPipelineBarrier") && pipe_ok;
+    pipe_ok = load(vk_.cmd_bind_pipeline, "vkCmdBindPipeline") && pipe_ok;
+    pipe_ok = load(vk_.cmd_push_constants, "vkCmdPushConstants") && pipe_ok;
+    pipe_ok = load(vk_.cmd_dispatch, "vkCmdDispatch") && pipe_ok;
+    pipe_ok = load(vk_.cmd_fill_buffer, "vkCmdFillBuffer") && pipe_ok;
+    pipe_ok = load(vk_.cmd_copy_buffer, "vkCmdCopyBuffer") && pipe_ok;
+    vk_.pipeline_fns_loaded = pipe_ok;
+}
+
 inline IndirectArgumentClamp::IndirectArgumentClamp(PFN_vkGetDeviceProcAddr get, VkDevice device,
                                                     const VkPhysicalDeviceMemoryProperties& memory,
                                                     const VkPhysicalDeviceLimits& limits, Allocate allocate,
                                                     DeviceFaultDiagnostics* diagnostics,
                                                     std::vector<std::uint32_t> families)
-    : get_(get), device_(device), memory_(memory), limits_(limits), families_(std::move(families)),
-      scratch_(get, device, std::move(allocate), diagnostics, detail::indirect_clamp_scratch_usage, families_) {}
+    : get_(get), device_(device), memory_(memory), limits_(limits), allocate_(std::move(allocate)),
+      diagnostics_(diagnostics), families_(std::move(families)) {
+    load_fns();
+}
 
 inline IndirectArgumentClamp::~IndirectArgumentClamp() {
-    const auto destroy_pipeline = fn<PFN_vkDestroyPipeline>("vkDestroyPipeline");
-    const auto destroy_layout = fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
-    if (pipeline_ && destroy_pipeline) destroy_pipeline(device_, pipeline_, nullptr);
-    if (layout_ && destroy_layout) destroy_layout(device_, layout_, nullptr);
-    const auto destroy_buffer = fn<PFN_vkDestroyBuffer>("vkDestroyBuffer");
-    const auto free_memory = fn<PFN_vkFreeMemory>("vkFreeMemory");
+    if (scratch_loaded_ && vk_.device_wait_idle) {
+        DeviceFaultDiagnostics::observe(diagnostics_, vk_.device_wait_idle(device_), "vkDeviceWaitIdle");
+    }
+    for (auto& chunk : spare_chunks_) destroy_scratch_chunk(chunk);
+    spare_chunks_.clear();
+    if (pipeline_ && vk_.destroy_pipeline) vk_.destroy_pipeline(device_, pipeline_, nullptr);
+    if (layout_ && vk_.destroy_pipeline_layout) vk_.destroy_pipeline_layout(device_, layout_, nullptr);
     for (auto& area : areas_) {
-        if (area.buffer && destroy_buffer) destroy_buffer(device_, area.buffer, nullptr);
-        if (area.memory && free_memory) free_memory(device_, area.memory, nullptr);
+        if (area.buffer && vk_.destroy_buffer) vk_.destroy_buffer(device_, area.buffer, nullptr);
+        if (area.memory && vk_.free_memory) vk_.free_memory(device_, area.memory, nullptr);
     }
 }
 
+inline bool IndirectArgumentClamp::make_scratch_chunk(VkDeviceSize size, ScratchChunk& out) {
+    if (!scratch_loaded_) return false;
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = size;
+    info.usage = detail::indirect_clamp_scratch_usage;
+    share_across_queue_families(info, families_);
+    if (vk_.create_buffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
+    VkMemoryRequirements requirements{};
+    vk_.get_buffer_memory_requirements(device_, out.buffer, &requirements);
+    out.memory = allocate_ ? allocate_(requirements) : VK_NULL_HANDLE;
+    if (!out.memory || vk_.bind_buffer_memory(device_, out.buffer, out.memory, 0) != VK_SUCCESS) {
+        destroy_scratch_chunk(out);
+        return false;
+    }
+    VkBufferDeviceAddressInfo addr_info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    addr_info.buffer = out.buffer;
+    out.address = vk_.get_buffer_device_address(device_, &addr_info);
+    if (!out.address) {
+        destroy_scratch_chunk(out);
+        return false;
+    }
+    out.size = size;
+    out.used = 0;
+    return true;
+}
+
+inline void IndirectArgumentClamp::destroy_scratch_chunk(ScratchChunk& chunk) {
+    if (chunk.buffer && vk_.destroy_buffer) vk_.destroy_buffer(device_, chunk.buffer, nullptr);
+    if (chunk.memory && vk_.free_memory) vk_.free_memory(device_, chunk.memory, nullptr);
+    chunk = {};
+}
+
+inline bool IndirectArgumentClamp::claim_scratch(std::vector<ScratchChunk>& batch_chunks, VkDeviceSize bytes,
+                                                 VkBuffer& buffer, VkDeviceSize& offset, VkDeviceAddress& address) {
+    constexpr VkDeviceSize alignment = 256, minimum = 4u << 20;
+    if (!scratch_loaded_ || !bytes) return false;
+    for (auto& chunk : batch_chunks) {
+        const VkDeviceSize rem = chunk.used % alignment;
+        const VkDeviceSize pad = rem ? alignment - rem : 0;
+        if (pad > chunk.size - chunk.used) continue;
+        const VkDeviceSize start = chunk.used + pad;
+        if (bytes <= chunk.size - start) {
+            chunk.used = start + bytes;
+            buffer = chunk.buffer;
+            offset = start;
+            address = chunk.address + start;
+            return true;
+        }
+    }
+    ScratchChunk chunk{};
+    {
+        std::lock_guard lock(scratch_mutex_);
+        for (std::size_t i = 0; i < spare_chunks_.size(); ++i) {
+            if (spare_chunks_[i].size >= bytes) {
+                chunk = spare_chunks_[i];
+                spare_chunks_.erase(spare_chunks_.begin() + std::ptrdiff_t(i));
+                break;
+            }
+        }
+    }
+    if (!chunk.buffer && !make_scratch_chunk((std::max)(bytes, minimum), chunk)) return false;
+    chunk.used = bytes;
+    buffer = chunk.buffer;
+    offset = 0;
+    address = chunk.address;
+    batch_chunks.push_back(chunk);
+    return true;
+}
+
+inline void IndirectArgumentClamp::return_chunks(std::vector<ScratchChunk>& chunks) {
+    if (chunks.empty()) return;
+    std::vector<ScratchChunk> to_destroy;
+    {
+        std::lock_guard lock(scratch_mutex_);
+        for (auto& chunk : chunks) {
+            chunk.used = 0;
+            if (spare_chunks_.size() < max_spare_chunks) spare_chunks_.push_back(chunk);
+            else to_destroy.push_back(chunk);
+        }
+    }
+    chunks.clear();
+    for (auto& chunk : to_destroy) destroy_scratch_chunk(chunk);
+}
+
 inline bool IndirectArgumentClamp::make_pipeline() {
+    if (pipeline_ready_.load(std::memory_order_acquire)) return true;
+    std::lock_guard lock(pipeline_mutex_);
     if (pipeline_) return true;
-    for (const char* name : {"vkCreateBuffer", "vkDestroyBuffer", "vkGetBufferMemoryRequirements",
-             "vkAllocateMemory", "vkFreeMemory", "vkBindBufferMemory", "vkMapMemory", "vkUnmapMemory",
-             "vkGetBufferDeviceAddress", "vkCreateShaderModule", "vkDestroyShaderModule", "vkCreatePipelineLayout",
-             "vkDestroyPipelineLayout", "vkCreateComputePipelines", "vkDestroyPipeline", "vkCmdPipelineBarrier",
-             "vkCmdBindPipeline", "vkCmdPushConstants", "vkCmdDispatch", "vkCmdFillBuffer", "vkCmdCopyBuffer"})
-        if (!get_(device_, name)) return false;
+    if (!vk_.pipeline_fns_loaded) return false;
     VkShaderModule module = VK_NULL_HANDLE;
     VkShaderModuleCreateInfo shader{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     shader.codeSize = sizeof(indirect_clamp_spirv);
     shader.pCode = indirect_clamp_spirv;
     const aftermath::ShaderName aftermath_name("(runtime) indirect_clamp");
-    bool ok = fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(device_, &shader, nullptr, &module) == VK_SUCCESS;
+    bool ok = vk_.create_shader_module(device_, &shader, nullptr, &module) == VK_SUCCESS;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(detail::IndirectClampPush)};
     VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layout_info.pushConstantRangeCount = 1;
     layout_info.pPushConstantRanges = &range;
-    ok = ok && fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(device_, &layout_info, nullptr, &layout) ==
-                  VK_SUCCESS;
+    ok = ok && vk_.create_pipeline_layout(device_, &layout_info, nullptr, &layout) == VK_SUCCESS;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -370,28 +544,24 @@ inline bool IndirectArgumentClamp::make_pipeline() {
     info.stage.module = module;
     info.stage.pName = "main";
     info.layout = layout;
-    ok = ok && fn<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(device_, VK_NULL_HANDLE, 1, &info, nullptr,
-                                                                           &pipeline) == VK_SUCCESS;
-    if (module) fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(device_, module, nullptr);
+    ok = ok && vk_.create_compute_pipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) == VK_SUCCESS;
+    if (module) vk_.destroy_shader_module(device_, module, nullptr);
     if (!ok) {
-        if (pipeline) fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device_, pipeline, nullptr);
-        if (layout) fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device_, layout, nullptr);
+        if (pipeline) vk_.destroy_pipeline(device_, pipeline, nullptr);
+        if (layout) vk_.destroy_pipeline_layout(device_, layout, nullptr);
         return false;
     }
     layout_ = layout;
     pipeline_ = pipeline;
+    pipeline_ready_.store(true, std::memory_order_release);
     return true;
 }
 
 // One host-visible buffer of counter slots: a coherent mapping the pass's counters are copied into.
 inline bool IndirectArgumentClamp::make_area() {
     if (areas_.size() >= max_areas) return false;
-    const auto create_buffer = fn<PFN_vkCreateBuffer>("vkCreateBuffer");
-    const auto requirements_fn = fn<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements");
-    const auto bind_fn = fn<PFN_vkBindBufferMemory>("vkBindBufferMemory");
-    const auto allocate_fn = fn<PFN_vkAllocateMemory>("vkAllocateMemory");
-    const auto map_fn = fn<PFN_vkMapMemory>("vkMapMemory");
-    if (!create_buffer || !requirements_fn || !bind_fn || !allocate_fn || !map_fn || !memory_.memoryTypeCount)
+    if (!vk_.create_buffer || !vk_.get_buffer_memory_requirements || !vk_.bind_buffer_memory ||
+        !vk_.allocate_memory || !vk_.map_memory || !memory_.memoryTypeCount)
         return false;
     HostArea area{};
     area.slots = slots_per_area;
@@ -400,17 +570,15 @@ inline bool IndirectArgumentClamp::make_area() {
     info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     // Direct and async-compute queues copy counter slots into the same HostArea buffer concurrently.
     share_across_queue_families(info, families_);
-    if (create_buffer(device_, &info, nullptr, &area.buffer) != VK_SUCCESS) return false;
-    const auto destroy_buffer = fn<PFN_vkDestroyBuffer>("vkDestroyBuffer");
-    const auto free_memory = fn<PFN_vkFreeMemory>("vkFreeMemory");
+    if (vk_.create_buffer(device_, &info, nullptr, &area.buffer) != VK_SUCCESS) return false;
     const auto cleanup = [&] {
-        if (area.buffer && destroy_buffer) destroy_buffer(device_, area.buffer, nullptr);
-        if (area.memory && free_memory) free_memory(device_, area.memory, nullptr);
+        if (area.buffer && vk_.destroy_buffer) vk_.destroy_buffer(device_, area.buffer, nullptr);
+        if (area.memory && vk_.free_memory) vk_.free_memory(device_, area.memory, nullptr);
         area.buffer = VK_NULL_HANDLE;
         area.memory = VK_NULL_HANDLE;
     };
     VkMemoryRequirements requirements{};
-    requirements_fn(device_, area.buffer, &requirements);
+    vk_.get_buffer_memory_requirements(device_, area.buffer, &requirements);
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = requirements.size;
     bool bound = false;
@@ -419,16 +587,17 @@ inline bool IndirectArgumentClamp::make_area() {
                                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                                       0, requirements.size)) {
         allocation.memoryTypeIndex = type;
-        if (allocate_fn(device_, &allocation, nullptr, &area.memory) != VK_SUCCESS) {
+        if (vk_.allocate_memory(device_, &allocation, nullptr, &area.memory) != VK_SUCCESS) {
             area.memory = VK_NULL_HANDLE;
             continue;
         }
-        bound = bind_fn(device_, area.buffer, area.memory, 0) == VK_SUCCESS;
+        bound = vk_.bind_buffer_memory(device_, area.buffer, area.memory, 0) == VK_SUCCESS;
         if (bound) break;
-        if (free_memory) free_memory(device_, area.memory, nullptr);
+        if (vk_.free_memory) vk_.free_memory(device_, area.memory, nullptr);
         area.memory = VK_NULL_HANDLE;
     }
-    if (!bound || map_fn(device_, area.memory, 0, info.size, 0, reinterpret_cast<void**>(&area.host)) != VK_SUCCESS) {
+    if (!bound || vk_.map_memory(device_, area.memory, 0, info.size, 0, reinterpret_cast<void**>(&area.host)) !=
+                      VK_SUCCESS) {
         cleanup();
         return false;
     }
@@ -558,9 +727,10 @@ inline void IndirectArgumentClamp::fallback(const char* reason) {
                          "indirect command\n", static_cast<unsigned long long>(total), reason);
 }
 
-inline bool IndirectArgumentClamp::prepare(VkBuffer arguments, VkDeviceSize argument_offset, VkBuffer count,
-                                           VkDeviceSize count_offset, std::uint32_t kind, std::uint32_t stride,
-                                           std::uint32_t max_count, Slot slot, ClampedIndirect& out) {
+inline bool IndirectArgumentClamp::prepare(std::vector<ScratchChunk>& batch_chunks, VkBuffer arguments,
+                                           VkDeviceSize argument_offset, VkBuffer count, VkDeviceSize count_offset,
+                                           std::uint32_t kind, std::uint32_t stride, std::uint32_t max_count, Slot slot,
+                                           ClampedIndirect& out) {
     out = {};
     const std::uint32_t record_size = indirect_clamp_record_size(kind);
     if (kind > indirect_clamp_mesh || !arguments || !max_count || stride < record_size || stride % 4 ||
@@ -580,19 +750,19 @@ inline bool IndirectArgumentClamp::prepare(VkBuffer arguments, VkDeviceSize argu
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceSize offset = 0;
     VkDeviceAddress address = 0;
-    if (!scratch_.get(stats_scratch + 64, buffer, offset, address)) {
+    if (!claim_scratch(batch_chunks, stats_scratch + 64, buffer, offset, address)) {
         fallback("no scratch");
+        return false;
+    }
+    if (!make_pipeline()) {
+        fallback("no compute pipeline");
         return false;
     }
     const auto arguments_address = [&](VkBuffer b) {
         VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         info.buffer = b;
-        return fn<PFN_vkGetBufferDeviceAddress>("vkGetBufferDeviceAddress")(device_, &info);
+        return vk_.get_buffer_device_address(device_, &info);
     };
-    if (!make_pipeline()) {
-        fallback("no compute pipeline");
-        return false;
-    }
     const VkDeviceAddress arguments_va = arguments_address(arguments);
     const VkDeviceAddress count_va = count ? arguments_address(count) : 0;
     if (!arguments_va || (count && !count_va) || argument_offset > UINT64_MAX - arguments_va ||
@@ -628,29 +798,27 @@ inline bool IndirectArgumentClamp::prepare(VkBuffer arguments, VkDeviceSize argu
 }
 
 inline void IndirectArgumentClamp::emit(VkCommandBuffer cb, const ClampedIndirect& job) {
-    const auto barrier = fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
-    const auto bind = fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline");
-    const auto push = fn<PFN_vkCmdPushConstants>("vkCmdPushConstants");
-    const auto dispatch = fn<PFN_vkCmdDispatch>("vkCmdDispatch");
     // The counters start at zero: the budget's compare-and-swap and the record counts accumulate into them. A
     // transfer write, ordered to the compute stage by the barrier below, like the arguments' own writes.
-    fn<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(cb, job.buffer, job.stats_scratch_offset, job.list_budget == job.stats + 16 ? 20 : 16, 0);
+    vk_.cmd_fill_buffer(cb, job.buffer, job.stats_scratch_offset, job.list_budget == job.stats + 16 ? 20 : 16, 0);
     // Words 8-15: the mesh and dispatch counters.
-    fn<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(cb, job.buffer, job.stats_scratch_offset + 32, 32, 0);
+    vk_.cmd_fill_buffer(cb, job.buffer, job.stats_scratch_offset + 32, 32, 0);
     VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;  // every earlier write: the compute that wrote these arguments
     before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    barrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &before, 0, nullptr, 0,
-            nullptr);
-    bind(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+    vk_.cmd_pipeline_barrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                             &before, 0, nullptr, 0, nullptr);
+    vk_.cmd_bind_pipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
     const VkDeviceSize dispatch_limit = VkDeviceSize(limits_.maxComputeWorkGroupCount[0]) * 64;
     // Bound per-dispatch indexing to 32 bits, even when the D3D12 stride is very large.
-    const std::uint32_t index_limit = (UINT32_MAX - 4u) / std::max<std::uint32_t>(1u, job.stride_words);
-    const VkDeviceSize chunk_limit = std::max<VkDeviceSize>(1, std::min(dispatch_limit, VkDeviceSize(index_limit)));
+    const std::uint32_t index_limit = (UINT32_MAX - 4u) / (std::max)(std::uint32_t(1u), job.stride_words);
+    const VkDeviceSize chunk_limit =
+        (std::max)(VkDeviceSize(1), (std::min)(dispatch_limit, VkDeviceSize(index_limit)));
     const std::uint32_t tags = job.kind <= indirect_clamp_draw_indexed ? (job.kind == indirect_clamp_draw ? 4u : 5u)
                                                                        : 3u;
     for (VkDeviceSize first = 0; first < job.max_records;) {
-        const std::uint32_t records = std::uint32_t(std::min<VkDeviceSize>(chunk_limit, job.max_records - first));
+        const std::uint32_t records =
+            std::uint32_t((std::min)(chunk_limit, VkDeviceSize(job.max_records) - first));
         // Use local word offsets within each chunk. Only the count comparison needs the global record index.
         const detail::IndirectClampPush constants{job.arguments + first * job.stride_words * 4,
                                                   job.count,
@@ -669,24 +837,24 @@ inline void IndirectArgumentClamp::emit(VkCommandBuffer cb, const ClampedIndirec
                                                   indirect_clamp_dispatch_limit(limits_, 1),
                                                   indirect_clamp_dispatch_limit(limits_, 2),
                                                   0u};
-        push(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), &constants);
-        dispatch(cb, (records - 1u) / 64u + 1u, 1, 1);
+        vk_.cmd_push_constants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), &constants);
+        vk_.cmd_dispatch(cb, (records - 1u) / 64u + 1u, 1, 1);
         first += records;
     }
     if (job.stats_buffer) {  // none for a call clamped without a counter slot
         VkMemoryBarrier after_copy{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         after_copy.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         after_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &after_copy, 0, nullptr,
-                0, nullptr);
+        vk_.cmd_pipeline_barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                                 &after_copy, 0, nullptr, 0, nullptr);
         VkBufferCopy copy{job.stats_scratch_offset, job.stats_offset, 16 * sizeof(std::uint32_t)};
-        fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(cb, job.buffer, job.stats_buffer, 1, &copy);
+        vk_.cmd_copy_buffer(cb, job.buffer, job.stats_buffer, 1, &copy);
     }
     // The indirect command reads the records, and nothing else may read them while it does.
     VkMemoryBarrier done{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     done.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     done.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_MEMORY_READ_BIT;
-    barrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &done, 0, nullptr, 0,
-            nullptr);
+    vk_.cmd_pipeline_barrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &done,
+                             0, nullptr, 0, nullptr);
 }
 }  // namespace leonida

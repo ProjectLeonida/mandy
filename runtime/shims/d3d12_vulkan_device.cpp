@@ -1673,18 +1673,53 @@ struct TitleTextureCells {
         return leonida::geometry_writes::arm(tile, cell) ? 1 : -1;
     }
     // Batched arming of sorted, unique 64 KiB tiles: coalesces kernel-pin checks, geometry_writes::state().mutex
-    // acquisitions, and contiguous VirtualQuery/VirtualProtect runs across all examined textures in a pass.
+    // acquisitions, a per-tile known-protection cache invalidated via title_memory_map::changes_since() (skipping
+    // VirtualQuery on repeat tile re-arms), and contiguous VirtualQuery/VirtualProtect runs across all examined
+    // textures in a pass.
     // results[i]: 1 = armed (or hot & unpinned), 0 = busy (pinned), -1 = failed / raced write.
+    void sync_known_protect() {
+        const std::uint64_t cur = leonida::title_memory_map::generation();
+        if (cur == known_protect_gen_) return;
+        if (!has_known_protect_) {
+            known_protect_gen_ = cur;
+            return;
+        }
+        std::uint64_t now = cur;
+        bool invalidate_all = false;
+        if (!leonida::title_memory_map::changes_since(
+                known_protect_gen_, now, 0, UINTPTR_MAX, [&](std::uintptr_t c_from, std::uintptr_t c_to) {
+                    if (invalidate_all || c_from >= c_to) return;
+                    constexpr std::uintptr_t kTile = leonida::geometry_writes::tile_size;
+                    const std::uintptr_t first = c_from & ~(kTile - 1);
+                    const std::uintptr_t span = c_to - first;
+                    const std::size_t tiles = std::size_t((span - 1) / kTile) + 1;
+                    if (tiles > known_protect_.size() / 2 + 64) {
+                        invalidate_all = true;
+                        return;
+                    }
+                    for (std::size_t t = 0; t < tiles; ++t) known_protect_.erase(first + std::uintptr_t(t) * kTile);
+                })) {
+            invalidate_all = true;
+        }
+        if (invalidate_all || known_protect_.empty()) {
+            known_protect_.clear();
+            has_known_protect_ = false;
+        }
+        known_protect_gen_ = now;
+    }
+
     void arm_batch(const std::uintptr_t* tiles, Cell* const* cells, std::int8_t* results, std::size_t count) {
         constexpr std::size_t kMaxBatchRunPages = 1024;  // up to 64 MiB per contiguous VirtualProtect run
         constexpr std::size_t kMaxLockBatchPages = 128;  // pages per pin check + geometry_writes lock hold
+        constexpr std::size_t kMaxKnownProtectEntries = 262144;
         constexpr std::uintptr_t kTile = leonida::geometry_writes::tile_size;
         constexpr std::uintptr_t kHostPage = leonida::geometry_writes::page_size;
 
         if (!count) return;
-        if (count == 1) {
-            results[0] = static_cast<std::int8_t>(arm(tiles[0], *cells[0]));
-            return;
+        sync_known_protect();
+        if (known_protect_.size() > kMaxKnownProtectEntries) {
+            known_protect_.clear();
+            has_known_protect_ = false;
         }
 
         for (std::size_t i = 0; i < count;) {
@@ -1768,21 +1803,65 @@ struct TitleTextureCells {
                     const std::uintptr_t sub_hi = sub_lo + (sub_end - sub_start) * kTile;
 
                     for (std::uintptr_t p = sub_lo; p < sub_hi;) {
+                        // Fast path: tile-aligned repeat arm with verified uniform protection and unchanged map
+                        // generation & cell mapping -> VirtualProtect directly with 0 VirtualQuery syscalls.
+                        if ((p & (kTile - 1)) == 0 && sub_hi - p >= kTile && has_known_protect_ &&
+                            leonida::title_memory_map::generation() == known_protect_gen_) {
+                            const std::size_t tile_k = sub_start + std::size_t((p - sub_lo) / kTile);
+                            const auto it0 = known_protect_.find(batch_tiles[tile_k]);
+                            if (it0 != known_protect_.end() && it0->second.protect != 0 &&
+                                it0->second.mapping == batch_cells[tile_k]->mapping.load(std::memory_order_acquire)) {
+                                const DWORD kp = it0->second.protect;
+                                const DWORD kg = it0->second.guarded;
+                                std::size_t fast_end = tile_k + 1;
+                                while (fast_end < sub_end) {
+                                    const auto itn = known_protect_.find(batch_tiles[fast_end]);
+                                    if (itn == known_protect_.end() || itn->second.protect != kp ||
+                                        itn->second.guarded != kg ||
+                                        itn->second.mapping !=
+                                            batch_cells[fast_end]->mapping.load(std::memory_order_acquire))
+                                        break;
+                                    ++fast_end;
+                                }
+                                const std::uintptr_t end = p + (fast_end - tile_k) * kTile;
+                                DWORD old{};
+                                if (VirtualProtect(reinterpret_cast<void*>(p), end - p, kg, &old)) {
+                                    if (old == kp || old == kg) {
+                                        for (std::size_t t = tile_k; t < fast_end; ++t)
+                                            batch_cells[t]->restore.fill(kp);
+                                        if (cached_hi && p >= cached_lo && end <= cached_hi) cached_lo = end;
+                                        p = end;
+                                        continue;
+                                    }
+                                    // Unexpected prior protection (caller bypassed title_memory_map::changed):
+                                    // restore `old` before falling through to VirtualQuery + VirtualProtect.
+                                    DWORD dummy{};
+                                    VirtualProtect(reinterpret_cast<void*>(p), end - p, old, &dummy);
+                                }
+                                for (std::size_t t = tile_k; t < fast_end; ++t) known_protect_.erase(batch_tiles[t]);
+                                cached_hi = 0;
+                            }
+                        }
+
+                        std::uintptr_t region_base = 0;
                         std::uintptr_t region_end = 0;
                         DWORD state = 0;
                         DWORD protect = 0;
                         DWORD guarded = 0;
+                        std::uint64_t query_gen = 0;
                         bool from_cache = false;
 
                         if (p >= cached_lo && p < cached_hi &&
                             leonida::title_memory_map::generation() == cached_gen) {
+                            region_base = cached_lo;
                             region_end = cached_hi;
                             state = MEM_COMMIT;
                             protect = cached_protect;
                             guarded = cached_guarded;
+                            query_gen = cached_gen;
                             from_cache = true;
                         } else {
-                            const std::uint64_t gen_before = leonida::title_memory_map::generation();
+                            query_gen = leonida::title_memory_map::generation();
                             MEMORY_BASIC_INFORMATION m{};
                             if (!VirtualQuery(reinterpret_cast<void*>(p), &m, sizeof m)) {
                                 const std::size_t tile_k = sub_start + std::size_t((p - sub_lo) / kTile);
@@ -1790,7 +1869,8 @@ struct TitleTextureCells {
                                 p = (p & ~(kTile - 1)) + kTile;
                                 continue;
                             }
-                            region_end = reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize;
+                            region_base = reinterpret_cast<std::uintptr_t>(m.BaseAddress);
+                            region_end = region_base + m.RegionSize;
                             state = m.State;
                             protect = m.Protect;
                             guarded = leonida::geometry_writes::read_only(m.Protect);
@@ -1799,7 +1879,7 @@ struct TitleTextureCells {
                                 cached_hi = region_end;
                                 cached_protect = protect;
                                 cached_guarded = guarded;
-                                cached_gen = gen_before;
+                                cached_gen = query_gen;
                             } else {
                                 cached_hi = 0;
                             }
@@ -1820,6 +1900,21 @@ struct TitleTextureCells {
                                     const std::size_t tile_k = sub_start + std::size_t((q - sub_lo) / kTile);
                                     const std::size_t sub_p = std::size_t((q & (kTile - 1)) / kHostPage);
                                     batch_cells[tile_k]->restore[sub_p] = protect;
+                                }
+                                if (query_gen == known_protect_gen_ &&
+                                    leonida::title_memory_map::generation() == known_protect_gen_) {
+                                    const std::uintptr_t first_full = (p + kTile - 1) & ~(kTile - 1);
+                                    const std::uintptr_t last_full = end & ~(kTile - 1);
+                                    if (first_full < last_full && region_base <= first_full &&
+                                        region_end >= last_full) {
+                                        for (std::uintptr_t t = first_full; t < last_full; t += kTile) {
+                                            const std::size_t tile_k = sub_start + std::size_t((t - sub_lo) / kTile);
+                                            known_protect_[batch_tiles[tile_k]] = {
+                                                batch_cells[tile_k]->mapping.load(std::memory_order_acquire), protect,
+                                                guarded};
+                                        }
+                                        has_known_protect_ = true;
+                                    }
                                 }
                                 if (cached_hi) cached_lo = end;
                             } else if (from_cache) {
@@ -1853,6 +1948,14 @@ struct TitleTextureCells {
             i = j;
         }
     }
+    struct KnownProtect {
+        std::uint64_t mapping = 0;
+        DWORD protect = 0;
+        DWORD guarded = 0;
+    };
+    std::unordered_map<std::uintptr_t, KnownProtect> known_protect_;
+    std::uint64_t known_protect_gen_ = 0;
+    bool has_known_protect_ = false;
     std::vector<std::uint64_t> run_versions_;
     std::vector<std::uint8_t> run_pinned_;
     std::vector<std::uint8_t> run_eligible_;
@@ -17699,6 +17802,11 @@ void DeviceState::index_texture(const TitleTexture& t) {
     }
 }
 
+// Set on the current thread by refresh_title_textures(true) right after refresh_page_mirror() + flush_page_mirror()
+// ran in the same BeforeExecuteCoalescer leader pass so page_mirror_check_batch() can skip re-dirtying hot pages
+// that were just uploaded (while NEVER skipping cold pages that faulted after refresh_page_mirror()).
+static thread_local bool t_page_mirror_just_synced = false;  // trivially destructible (no TLS callback)
+
 // Single-lock batched TitleMirror check & sync for all examined textures of a refresh_title_textures() pass:
 //   - Acquires page_mirror.mutex ONCE per pass (eliminating per-texture lock contention with refresh_page_mirror and
 //     write_back_batch).
@@ -17713,6 +17821,7 @@ void DeviceState::page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& ite
     if (!page_mirror.mirror || items.empty()) return;
     constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
     constexpr std::uint64_t kPiece = leonida::shadow_keep::kPiece;
+    const bool mirror_just_synced = t_page_mirror_just_synced;
 
     std::lock_guard lock(page_mirror.mutex);
 
@@ -17754,7 +17863,8 @@ void DeviceState::page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& ite
                 if (p > UINT64_MAX - kPage) break;
                 continue;
             }
-            const bool clean_cpu = is_cpu_view && tracking && tracking->unwritten(p);
+            const bool clean_cpu =
+                is_cpu_view && tracking && (tracking->unwritten(p) || (mirror_just_synced && tracking->hot(p)));
             if (!clean_cpu) mark_dirty_page(p);
             if (p > UINT64_MAX - kPage) break;
         }
@@ -17798,7 +17908,8 @@ void DeviceState::page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& ite
                 item.mode = TitleMirrorCheckItem::Mode::partial_tiles;
                 for (const std::uintptr_t tile : *item.tile_cmp_written) {
                     const std::uint64_t p = static_cast<std::uint64_t>(tile) & ~(kPage - 1);
-                    const bool clean_cpu = tracking && tracking->unwritten(p);
+                    const bool clean_cpu =
+                        tracking && (tracking->unwritten(p) || (mirror_just_synced && tracking->hot(p)));
                     if (!clean_cpu) mark_dirty_page(p);
                 }
             }
@@ -18785,6 +18896,11 @@ public:
             std::uint64_t coalesced = 0;
             std::uint64_t wait_count = 0;
             std::uint64_t wait_ns = 0;
+            std::uint64_t wb_ns = 0;
+            std::uint64_t mirror_ns = 0;
+            std::uint64_t shadows_ns = 0;
+            std::uint64_t flush_ns = 0;
+            std::uint64_t tex_ns = 0;
             std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
         };
         auto before_coalescer = std::make_shared<BeforeExecuteCoalescer>();
@@ -18818,25 +18934,42 @@ public:
             struct LeaderGuard {
                 BeforeExecuteCoalescer* c = nullptr;
                 std::uint64_t pass_seq = 0;
+                std::uint64_t wb_ns = 0;
+                std::uint64_t mirror_ns = 0;
+                std::uint64_t shadows_ns = 0;
+                std::uint64_t flush_ns = 0;
+                std::uint64_t tex_ns = 0;
                 bool completed = false;
                 ~LeaderGuard() {
                     if (!c) return;
                     bool log = false;
                     std::uint64_t ran = 0, coalesced = 0, waits = 0, wait_ns = 0;
+                    std::uint64_t s_wb = 0, s_mirror = 0, s_shadows = 0, s_flush = 0, s_tex = 0;
                     double secs = 0.0;
                     {
                         std::lock_guard lock(c->mutex);
                         if (completed && pass_seq > c->completed_seq) c->completed_seq = pass_seq;
                         ++c->ran;
+                        c->wb_ns += wb_ns;
+                        c->mirror_ns += mirror_ns;
+                        c->shadows_ns += shadows_ns;
+                        c->flush_ns += flush_ns;
+                        c->tex_ns += tex_ns;
                         c->in_flight = false;
                         const auto now = std::chrono::steady_clock::now();
                         secs = std::chrono::duration<double>(now - c->since).count();
-                        if (secs >= 10.0 && c->coalesced > 0) {
+                        if (secs >= 10.0 && c->ran > 0) {
                             ran = c->ran;
                             coalesced = c->coalesced;
                             waits = c->wait_count;
                             wait_ns = c->wait_ns;
+                            s_wb = c->wb_ns;
+                            s_mirror = c->mirror_ns;
+                            s_shadows = c->shadows_ns;
+                            s_flush = c->flush_ns;
+                            s_tex = c->tex_ns;
                             c->ran = c->coalesced = c->wait_count = c->wait_ns = 0;
+                            c->wb_ns = c->mirror_ns = c->shadows_ns = c->flush_ns = c->tex_ns = 0;
                             c->since = now;
                             log = true;
                         }
@@ -18844,47 +18977,52 @@ public:
                     c->cv.notify_all();
                     if (log) {
                         const std::uint64_t total = ran + coalesced;
+                        const double inv_ran = ran ? 1e-6 / double(ran) : 0.0;
+                        const double sum_ms = double(s_wb + s_mirror + s_shadows + s_flush + s_tex) * inv_ran;
                         std::fprintf(stderr,
                                      "[rt] before-execute: %llu ran, %llu coalesced (%.0f%% skipped) in %.1f s; "
-                                     "%llu single-flight waits (%.2f ms avg)\n",
+                                     "%llu single-flight waits (%.2f ms avg); leader avg %.2f ms "
+                                     "(wb %.2f, mirror %.2f, shadows %.2f, flush %.2f, tex %.2f)\n",
                                      static_cast<unsigned long long>(ran), static_cast<unsigned long long>(coalesced),
                                      total ? 100.0 * double(coalesced) / double(total) : 0.0, secs,
                                      static_cast<unsigned long long>(waits),
-                                     waits ? double(wait_ns) * 1e-6 / double(waits) : 0.0);
+                                     waits ? double(wait_ns) * 1e-6 / double(waits) : 0.0, sum_ms,
+                                     double(s_wb) * inv_ran, double(s_mirror) * inv_ran, double(s_shadows) * inv_ran,
+                                     double(s_flush) * inv_ran, double(s_tex) * inv_ran);
                     }
                 }
             } leader_guard{};
             if (use_coalesce) {
                 std::unique_lock lock(coalescer->mutex);
-                if (coalescer->completed_seq >= req_seq) {
-                    ++coalescer->coalesced;
-                    return;
-                }
-                if (coalescer->in_flight) {
+                while (coalescer->in_flight && coalescer->completed_seq < req_seq) {
                     const std::int64_t wait_start = phases::now_ns();
                     coalescer->cv.wait(lock, [&] { return !coalescer->in_flight || coalescer->completed_seq >= req_seq; });
                     const std::uint64_t waited = std::uint64_t(phases::now_ns() - wait_start);
                     phases::add_part(phases::part_lock_wait, waited);
                     ++coalescer->wait_count;
                     coalescer->wait_ns += waited;
-                    if (coalescer->completed_seq >= req_seq) {
-                        ++coalescer->coalesced;
-                        return;
-                    }
+                }
+                if (coalescer->completed_seq >= req_seq) {
+                    ++coalescer->coalesced;
+                    return;
                 }
                 coalescer->in_flight = true;
                 // Acquire current visibility epoch BEFORE scanning any CPU memory so this single pass covers
-                // every batch already enqueued (and every fence already signaled) up through pass_seq.
+                // every batch already enqueued (and every CPU fence already signaled) up through pass_seq.
                 pass_seq = (std::max)(req_seq, state_.context->current_visibility_seq());
                 leader_guard.c = coalescer.get();
                 leader_guard.pass_seq = pass_seq;
             }
+            const std::int64_t t0 = phases::now_ns();
+            std::int64_t t1 = t0, t2 = t0;
             {
                 const phases::Scope timed(phases::shadows);
                 // First, while pending_ sparse binds are empty and before any map()/upload() mutates homes or agreed
                 // sums: copy retired GPU writes back to their physical frames.
                 state_.write_back_titles();
+                t1 = phases::now_ns();
                 state_.refresh_page_mirror();  // what this submission's title-written addresses read
+                t2 = phases::now_ns();
             }
             bool full = true;
             if (per_frame) {
@@ -18912,14 +19050,22 @@ public:
             }
             // Last, once the heap refresh, the windows and the geometry copies have made what this submission reads.
             state_.update_address_guard();
+            const std::int64_t t3 = phases::now_ns();
             {
                 const phases::Scope timed(phases::shadows);
                 state_.flush_page_mirror();
             }
+            const std::int64_t t4 = phases::now_ns();
             {
                 const phases::Scope timed(phases::textures);
-                refresh_title_textures();
+                refresh_title_textures(/*mirror_just_synced=*/true);
             }
+            const std::int64_t t5 = phases::now_ns();
+            leader_guard.wb_ns = std::uint64_t(t1 - t0);
+            leader_guard.mirror_ns = std::uint64_t(t2 - t1);
+            leader_guard.shadows_ns = std::uint64_t(t3 - t2);
+            leader_guard.flush_ns = std::uint64_t(t4 - t3);
+            leader_guard.tex_ns = std::uint64_t(t5 - t4);
             leader_guard.completed = true;
         });
         {
@@ -20340,7 +20486,7 @@ public:
     // submitted before this submission's command buffers, behind all earlier work on every queue on the GPU and with
     // no CPU wait (TitleImageUpload, write_staged_title_image); this submission's draws, on whichever queue, see it.
     // Every changed texture of the pass goes in, with no budget: the planes of a video frame land together.
-    void refresh_title_textures() {
+    void refresh_title_textures(bool mirror_just_synced = false) {
         if (t_in_title_textures) return;
         using clock = std::chrono::steady_clock;
         const auto now = clock::now();
@@ -20787,6 +20933,13 @@ public:
 
             // Stage 3: ONE page_mirror.mutex lock + ONE batched parallel TitleMirror::upload() for all candidates.
             if (have_mirror && any_mirror_active) {
+                struct MirrorJustSyncedGuard {
+                    bool prev;
+                    explicit MirrorJustSyncedGuard(bool v) noexcept : prev(t_page_mirror_just_synced) {
+                        t_page_mirror_just_synced = v;
+                    }
+                    ~MirrorJustSyncedGuard() { t_page_mirror_just_synced = prev; }
+                } mirror_sync_guard{mirror_just_synced};
                 state_.page_mirror_check_batch(title_mirror_checks_, title_mirror_feed_pages_);
             }
 
@@ -21565,17 +21718,16 @@ private:
         entry->view_mip = view_mip;
         if (entry->memory.pending() && entry->readable_from <= fill_limit(*entry))
             entry->memory.retry();  // some mips do for this view
-        const bool readable = title_texture_readable(*entry);
-        if (title_fill_async()) {
-            entry->stale = true;  // filled by the fill worker (queued below, once it is in the registry)
-        } else if (readable) {
-            fill_title_texture(*entry);
-        }
+        // Defer slot-70 uploads to batched refresh_title_textures() (GPU detile + single batched vkQueueSubmit
+        // before GPU submission) instead of running a synchronous single-texture CPU upload inside CreateSRV.
+        // state_.index_texture(*entry) tracks and touches the watch since entry->stale == true.
+        entry->stale = true;
+        const bool readable = title_fill_async() && title_texture_readable(*entry);
         ++title_stats_.made;
         TitleTexture* t = entry.get();
         state_.index_texture(*entry);
         state_.title_textures[address] = std::move(entry);
-        if (title_fill_async() && readable) queue_title_fill(address);
+        if (readable) queue_title_fill(address);
         return t;
     }
 
@@ -21698,15 +21850,18 @@ private:
                               guard && !mapped);
     }
 
-    // At a slot-70 view of a texture: a texture never filled, or known changed, is filled now; any other change is
-    // the next refresh's (before the submission that samples the view), found by the watch, not by reading the bytes.
+    // At a slot-70 view of a texture: defer uploads to the batched refresh_title_textures() pass before GPU
+    // submission (setting stale = true AND touching texture_watch so the O(1) fast-path never skips it).
     void refresh_title_texture(TitleTexture& t) {
         // LEONIDA_TITLE_FILL_ASYNC=1: a view does not fill; the texture goes to the fill worker.
         if (title_fill_async()) {
             if (!t.hashed || t.stale) queue_title_fill(t.address);
             return;
         }
-        if ((!t.hashed || t.stale) && title_texture_readable(t)) fill_title_texture(t);
+        if (!t.hashed || t.stale) {
+            t.stale = true;
+            state_.texture_watch.touch(t.address);
+        }
     }
 
     // Snapshot the footprint (that of the mips the fill is for), then upload it through the title upload
