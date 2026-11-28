@@ -150,7 +150,7 @@ class EarlierStepDropsThePlanTest(unittest.TestCase):
                 disasm = os.path.join(dxbc, "disasm")
                 os.makedirs(disasm)
                 with open(os.path.join(disasm, "shader.s"), "w", encoding="utf-8", newline="\n") as f:
-                    f.write("synthetic listing\n")
+                    f.write("; synthetic listing\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n")
 
             with mock.patch.object(make_game, "py", side_effect=fake_disassemble), mock.patch.object(make_game, "need"), \
                     mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"), \

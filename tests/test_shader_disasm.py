@@ -184,6 +184,48 @@ class DisasmFailureTest(unittest.TestCase):
         self.assertIn("s_endpgm", body)
         self.assertIn("0 invalid words", body)
 
+    def test_truncated_output_retries_and_publishes_complete_listing(self):
+        counter = os.path.join(self.dir, "attempts.txt")
+        mc = self.fake(
+            "import pathlib, sys\n"
+            "probe = sys.stdin.read().strip() == %r\n"
+            "if probe:\n"
+            "    print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]')\n"
+            "else:\n"
+            "    p = pathlib.Path(%r)\n"
+            "    n = int(p.read_text(encoding='utf-8')) + 1 if p.exists() else 1\n"
+            "    p.write_text(str(n), encoding='utf-8')\n"
+            "    if n == 1:\n"
+            "        sys.stdout.write('\\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\\n\\ts_endpgm ; encod')\n"
+            "    else:\n"
+            "        sys.stdout.write(%r)\n"
+            % (PROBE, counter, ASM)
+        )
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(os.listdir(out), ["one.s"])
+        with open(counter, encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), "2")
+        with open(os.path.join(out, "one.s"), encoding="utf-8") as f:
+            self.assertIn("s_endpgm ; encoding: [0x00,0x00,0x81,0xbf]", f.read())
+
+    def test_persistent_truncated_output_fails_without_publishing(self):
+        mc = self.fake(
+            "import sys\n"
+            "probe = sys.stdin.read().strip() == %r\n"
+            "if probe:\n"
+            "    print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]')\n"
+            "else:\n"
+            "    sys.stdout.write('\\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\\n; encod')\n"
+            % PROBE
+        )
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("truncated disassembly", p.stderr)
+        self.assertEqual(os.listdir(out), [])
+
 
 class DisasmInputTest(unittest.TestCase):
     """Short blobs, bad --jobs/--limit and an empty folder end with a reason, not a traceback."""
@@ -218,8 +260,9 @@ class DisasmInputTest(unittest.TestCase):
         out = os.path.join(self.dir, "out")
         os.mkdir(out)
         kept = os.path.join(out, "kept.s")
+        kept_body = "; completed listing\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n"
         with open(kept, "w", encoding="utf-8", newline="\n") as f:
-            f.write("completed listing\n")
+            f.write(kept_body)
         open(os.path.join(out, "empty.s"), "w").close()
         open(os.path.join(out, ".disasm-abandoned.tmp"), "w").close()
 
@@ -228,7 +271,7 @@ class DisasmInputTest(unittest.TestCase):
         self.assertIn("'reused': 1", result.stdout)
         self.assertIn("'clean': 2", result.stdout)
         with open(kept, encoding="utf-8") as f:
-            self.assertEqual(f.read(), "completed listing\n")
+            self.assertEqual(f.read(), kept_body)
         for name in ("empty", "unfinished"):
             with open(os.path.join(out, name + ".s"), encoding="utf-8") as f:
                 self.assertIn("s_endpgm", f.read())
@@ -236,6 +279,53 @@ class DisasmInputTest(unittest.TestCase):
         result = self.run_tool(self.src, "--out", out, "--skip-existing")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("'reused': 3", result.stdout)
+
+    def test_skip_existing_redisassembles_truncated_listing(self):
+        for name in ("kept", "trunc"):
+            self.write(name + ".fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        os.mkdir(out)
+        kept_body = "; kept\n\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n"
+        with open(os.path.join(out, "kept.s"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(kept_body)
+        with open(os.path.join(out, "trunc.s"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("; trunc\n\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\n\ts_endpgm ; encod")
+
+        result = self.run_tool(self.src, "--out", out, "--skip-existing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("'reused': 1", result.stdout)
+        self.assertIn("'clean': 1", result.stdout)
+        with open(os.path.join(out, "trunc.s"), encoding="utf-8") as f:
+            self.assertIn("s_endpgm ; encoding: [0x00,0x00,0x81,0xbf]", f.read())
+
+    def test_listing_completeness_handles_footer_and_truncated_endpgm(self):
+        tools_dir = os.path.join(ROOT, "tools")
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        from shader_stage_manifest import listing_file_is_complete, listing_is_complete
+
+        good = "; hdr\n\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n"
+        self.assertTrue(listing_is_complete(good))
+        self.assertTrue(listing_is_complete(good + "\n; --- llvm-mc messages ---\n; warning: note\n"))
+        self.assertFalse(listing_is_complete(good.rstrip("\n")))
+        self.assertFalse(listing_is_complete("; hdr\n\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\n\ts_endpgm ; encod\n"))
+        self.assertFalse(listing_is_complete("; hdr\n\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\n\ts_endpgm\n"))
+        self.assertFalse(listing_is_complete(good + "\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\n"))
+
+        nop_line = "\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\n"
+        big_good = "; hdr\n" + (nop_line * 150) + "\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n"
+        big_footer = big_good + "\n; --- llvm-mc messages ---\n" + ("; warning: long footer line\n" * 200)
+        big_missing_enc = "; hdr\n" + (nop_line * 150) + "; padding\n" * 200 + "\ts_endpgm\n"
+        for name, text, expected in (
+            ("big_good.s", big_good, True),
+            ("big_footer.s", big_footer, True),
+            ("big_missing_enc.s", big_missing_enc, False),
+            ("cut_no_nl.s", big_good[:-1], False),
+        ):
+            p = os.path.join(self.dir, name)
+            with open(p, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            self.assertEqual(listing_file_is_complete(p), expected, name)
 
     def test_code_range_scans_a_blob_shorter_than_the_header(self):
         sys.path.insert(0, os.path.join(ROOT, "tools"))

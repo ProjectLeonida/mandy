@@ -141,7 +141,7 @@ class RecordedFlagsTest(unittest.TestCase):
             elif p == os.path.join(self.spirv, "index.json"):
                 json.dump({"shader": {"stage": "vs"}}, f)
             elif p.endswith(".s"):
-                f.write("synthetic listing\n")
+                f.write("; synthetic listing\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n")
 
     def run_stage(self, fallbacks=()):
         ran = []

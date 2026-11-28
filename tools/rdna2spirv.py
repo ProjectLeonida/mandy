@@ -20460,7 +20460,8 @@ def main():
         files = files[:a.limit]
     if shard is not None:
         files = files[shard::sn]
-    why, ok, valid = Counter(), 0, 0
+    why, why_names, ok, valid = Counter(), defaultdict(list), 0, 0
+    max_reason_examples = 5
     meta = {}
     invalid = set()
     total = len(files)
@@ -20468,6 +20469,12 @@ def main():
     last_progress = 0.0
     label = f"shard {shard}" if shard is not None else "translate"
     missing_inputs = 0
+
+    def record_why(reason: str, shader_name: str) -> None:
+        why[reason] += 1
+        names = why_names[reason]
+        if len(names) < max_reason_examples:
+            names.append(shader_name)
 
     def drop_stale(name):
         # A shader that no longer translates must not stay published from an earlier run: remove its old
@@ -20488,14 +20495,14 @@ def main():
             drop_stale(name)
             continue
         except Unsupported as e:
-            why[str(e)] += 1
+            record_why(str(e), name)
             drop_stale(name)
             continue
         except (IndexError, KeyError, ValueError, AssertionError, TypeError, AttributeError, ZeroDivisionError,
                 RecursionError) as e:
             # A translator bug on one program refuses that program and is counted; it does not end a run over a
             # whole pack (an assert in --wave64-emulate stopped make_game.py's shaders stage, #3976).
-            why[f"translator error {type(e).__name__}"] += 1
+            record_why(f"translator error {type(e).__name__}", name)
             drop_stale(name)
             continue
         ok += 1
@@ -20528,7 +20535,7 @@ def main():
                 with open(sa, "w", encoding="utf-8", newline="\n") as f:
                     f.write(asm)
             drop_stale(name)
-            why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
+            record_why("INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90], name)
         if a.no_asm and os.path.exists(sa):
             os.remove(sa)
         now = time.time()
@@ -20566,7 +20573,12 @@ def main():
         print("wave64 VS/PS/GS on 32-wide subgroups: " + ", ".join(f"tier {t}: {n}" for t, n in sorted(W64G_COUNTS.items()))
               + (" (tier C is not exact there; see wave64_graphics_reasons in the index)" if W64G_COUNTS["C"] else ""))
     for k, v in why.most_common(25):
-        print(f"  {v:6}  {k}")
+        examples = why_names.get(k, [])
+        suffix = ""
+        if examples:
+            more = f", +{v - len(examples)} more" if v > len(examples) else ""
+            suffix = f" ({', '.join(examples)}{more})"
+        print(f"  {v:6}  {k}{suffix}")
     if missing_inputs:
         print(f"{missing_inputs} of {len(files)} selected shaders missing required inputs", file=sys.stderr)
         return 1

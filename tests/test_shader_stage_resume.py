@@ -98,7 +98,7 @@ class ShaderStageResumeTest(unittest.TestCase):
                     carved = json.load(source)
                 json.dump({os.path.splitext(entry["file"])[0]: {"stage": "vs"} for entry in carved}, f)
             elif p.endswith(".s"):
-                f.write("synthetic listing\n")
+                f.write("; synthetic listing\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n")
 
     def fake_py(self, tool, *args):
         self.ran.append(tool)
@@ -262,6 +262,19 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
         self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
         self.assertGreater(os.path.getsize(listing), 0)
+        self.assertEqual(self.run_stage(), [])
+
+    def test_finished_disassembly_repairs_a_truncated_listing(self):
+        self.assertEqual(self.run_stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"])
+        listing = os.path.join(self.dxbc, "disasm", "s0.s")
+        with open(listing, "w", encoding="utf-8", newline="\n") as f:
+            f.write("; truncated\n\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\n\ts_endpgm ; encod")
+
+        self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+        self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+        with open(listing, encoding="utf-8") as f:
+            self.assertIn("s_endpgm ; encoding: [0x00,0x00,0x81,0xbf]", f.read())
+        self.assertTrue(make_game.shader_outputs_reusable(self.work, False, False))
         self.assertEqual(self.run_stage(), [])
 
     def test_deleting_every_listing_and_the_translation_disassembles_again(self):

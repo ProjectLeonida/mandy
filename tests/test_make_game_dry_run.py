@@ -397,7 +397,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         with open(os.path.join(dxbc_dir, "fssm_index.json"), "w", encoding="utf-8") as f:
             f.write('[{"name": "shader"}]')
         with open(os.path.join(dxbc_dir, "disasm", "shader.s"), "w", encoding="utf-8", newline="\n") as f:
-            f.write("synthetic listing\n")
+            f.write("; synthetic listing\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n")
         with open(os.path.join(dxbc_dir, "disasm.done"), "w", encoding="utf-8") as f:
             f.write("test llvm-mc 21\n")
         with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8") as f:
@@ -442,7 +442,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
                 disasm = os.path.join(dxbc_dir, "disasm")
                 os.makedirs(disasm, exist_ok=True)
                 with open(os.path.join(disasm, "shader.s"), "w", encoding="utf-8", newline="\n") as f:
-                    f.write("synthetic listing\n")
+                    f.write("; synthetic listing\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n")
 
         with mock.patch("make_game.py", side_effect=fake_py), \
                 mock.patch("make_game.llvm_mc_signature", return_value="test llvm-mc 21"), \

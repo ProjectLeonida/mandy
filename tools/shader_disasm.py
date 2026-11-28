@@ -19,12 +19,13 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mc_command import install_hint, mc_command, not_found  # noqa: E402
 from report_paths import path_key, same_report_path  # noqa: E402
-from shader_stage_manifest import shader_stems  # noqa: E402
+from shader_stage_manifest import listing_file_is_complete, listing_is_complete, shader_stems  # noqa: E402
 import fssm_header  # noqa: E402
 import rdna2_decode  # noqa: E402
 
@@ -32,7 +33,9 @@ TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
 DOT4_I8_OPCODE = 0x16         # VOP3P v_dot4_i32_i8
 PROBE = "0x00 0x00 0x81 0xbf"  # s_endpgm: the one instruction every shader ends with
+TRUNCATED_RETRY_ATTEMPTS = 3
 FAILED = []                    # (path, first stderr line) for shaders that produced no disassembly
+FAILED_LOCK = threading.Lock()
 
 
 MC = mc_command()
@@ -300,6 +303,12 @@ def code_range(b: bytes):
     return None, end + 4 if end >= 0 else None, "scan"
 
 
+def record_failure(path: str, reason: str) -> str:
+    with FAILED_LOCK:
+        FAILED.append((path, reason))
+    return "failed"
+
+
 def one(path, out, mcpu, backend="llvm-mc"):
     with open(path, "rb") as f:
         b = f.read()
@@ -318,10 +327,15 @@ def one(path, out, mcpu, backend="llvm-mc"):
             return "scan failed"
         start = best
     asm, bad, err = disasm(b[start:end], mcpu, backend=backend, wave32=wave32)
+    if backend == "llvm-mc":
+        for _ in range(TRUNCATED_RETRY_ATTEMPTS - 1):
+            if not asm.strip() or listing_is_complete(asm):
+                break
+            asm, bad, err = disasm(b[start:end], mcpu, backend=backend, wave32=wave32)
     if not asm.strip():  # a broken toolchain, not a shader: never report this as "clean"
-        reason = (err.strip().splitlines() or ["no output"])[0]
-        FAILED.append((path, reason))
-        return "failed"
+        return record_failure(path, (err.strip().splitlines() or ["no output"])[0])
+    if not listing_is_complete(asm):
+        return record_failure(path, "truncated disassembly (missing complete s_endpgm)")
     name = os.path.splitext(os.path.basename(path))[0]
     # Only a published listing can be reused after an interruption.
     listing = tempfile.NamedTemporaryFile(mode="w", dir=out, prefix=".disasm-", suffix=".tmp",
@@ -391,7 +405,7 @@ def main():
         pending = []
         for path in files:
             listing = output_path(path, out)
-            if not os.path.islink(listing) and os.path.isfile(listing) and os.path.getsize(listing) > 0:
+            if not os.path.islink(listing) and os.path.isfile(listing) and listing_file_is_complete(listing):
                 res["reused"] += 1
             else:
                 pending.append(path)

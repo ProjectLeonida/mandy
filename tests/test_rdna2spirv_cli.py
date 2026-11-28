@@ -559,6 +559,30 @@ class ValidatedOutput(unittest.TestCase):
         self.assertEqual(self.module.read_bytes(), b"new module")
         self.assertIn("ps_fixture", json.loads(self.index.read_text(encoding="utf-8")))
 
+    def test_summary_names_failing_shaders_by_reason(self):
+        root = self.src.parent.parent
+        base_dxbc = (root / "ps_fixture.dxbc").read_bytes()
+        for name, text in (
+            ("ps_branch_no_enc", "\ts_branch 0\n\ts_endpgm\n"),
+            *((f"ps_bar_{i}", "\ts_barrier\n\ts_endpgm\n") for i in range(6)),
+        ):
+            self.src.with_name(f"{name}.s").write_text(text, encoding="utf-8", newline="\n")
+            (root / f"{name}.dxbc").write_bytes(base_dxbc)
+
+        def spirv_tool(cmd, **kwargs):
+            if cmd[0] == "spirv-as":
+                Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        output = io.StringIO()
+        with mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), \
+                mock.patch.object(sys, "argv", [TOOL, str(self.src.parent), "--out", str(self.out)]), \
+                redirect_stdout(output):
+            rdna2spirv.main()
+        text = output.getvalue()
+        self.assertIn("branch without encoding (ps_branch_no_enc)", text)
+        self.assertIn("s_barrier outside compute (ps_bar_0, ps_bar_1, ps_bar_2, ps_bar_3, ps_bar_4, +1 more)", text)
+
 
 class EmptyShader(unittest.TestCase):
     """A .s with no tab-indented instruction parses to an empty shader.
