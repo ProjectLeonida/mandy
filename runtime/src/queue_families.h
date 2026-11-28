@@ -107,7 +107,7 @@ inline QueueSlot pick_queue_slot(std::initializer_list<std::span<const std::uint
     std::size_t p = 0;
     for (const auto users : pools) {
         for (std::size_t i = 0; i < users.size(); ++i)
-            if (users[i] < fewest) {
+            if (chosen.pool == SIZE_MAX || users[i] < fewest) {
                 fewest = users[i];
                 chosen = {p, i};
             }
