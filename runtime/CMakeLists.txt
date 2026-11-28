@@ -1436,6 +1436,8 @@ if(BUILD_TESTING)
     add_test(NAME library_loader_names
       COMMAND library_loader_names_test "$<TARGET_FILE:fixed_base_probe>"
     )
+    # Wine serves its builtin wsock32 for a wsock32.dll loaded by path; the test needs its own copy. Windows ignores this.
+    set_tests_properties(library_loader_names PROPERTIES ENVIRONMENT "WINEDLLOVERRIDES=wsock32=n,b")
 
     # The host GameInput path (docs/gameinput.md): mapped code that imports GameInputCreate from GameInput.dll, with no
     # GameInput shim linked. Needs the SDK's gameinput.lib and GameInput.h to build the fixture, and a GameInput.dll on

@@ -8,7 +8,9 @@
 //
 // The bundled loader here is a fake that records the names it is asked for. The second case uses fixed_base_probe.dll
 // (no relocations, one fixed base) copied under two names: wsock32.dll, for which this test registers a shim (the
-// shims do not own wsock32.dll, so it stays a host module), and a plain name. No game files.
+// shims do not own wsock32.dll, so it stays a host module), and a plain name. Wine serves its builtin wsock32 for a
+// wsock32.dll loaded by path, so CMake runs the test with WINEDLLOVERRIDES=wsock32=n,b (Windows ignores it), and the
+// test checks that the module it got is the copy it made (Tauwni's Wine 11 run on #2525). No game files.
 #include <windows.h>
 
 #include <cstdio>
@@ -65,6 +67,14 @@ const rt::shims::BundledModuleOps kFake{fake_find_loaded, fake_load, fake_get_pr
 template <class F>
 F shim(const char* name) {
     return reinterpret_cast<F>(rt::shims::find("kernel32.dll", name));
+}
+
+// Whether module is the file at path (not, say, a host's own DLL of the same name).
+bool is_file(HMODULE module, const std::filesystem::path& path) {
+    wchar_t got[MAX_PATH * 4];
+    const DWORD n = GetModuleFileNameW(module, got, static_cast<DWORD>(std::size(got)));
+    std::error_code ec;
+    return n && n < std::size(got) && std::filesystem::equivalent(got, path, ec);
 }
 
 bool asked_for_dot_dll() {
@@ -127,8 +137,12 @@ int main(int argc, char** argv) {
     std::filesystem::copy_file(argv[1], plain, std::filesystem::copy_options::overwrite_existing, ec);
 
     HMODULE first = load_w(shimmed.c_str());
-    check(first != nullptr, "the fixture loads as wsock32.dll");
-    if (first) {
+    const bool fixture = first && is_file(first, shimmed);
+    check(fixture, "the fixture loads as wsock32.dll");
+    if (first && !fixture)
+        std::puts("  the host served its own wsock32.dll instead of the copy (under Wine: run with "
+                  "WINEDLLOVERRIDES=wsock32=n,b, as CTest does)");
+    if (fixture) {
         check(reinterpret_cast<void*>(get_proc(first, "leonida_loader_probe")) ==
                   reinterpret_cast<void*>(&probe_export),
               "GetProcAddress on it serves wsock32.dll's shim");
