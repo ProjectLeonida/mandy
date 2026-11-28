@@ -391,7 +391,7 @@ def _material_name(gltf: dict, index: object) -> str | None:
 
 
 def _texture_name(gltf: dict, texture_index: object) -> str | None:
-    """The baseColor texture's image name, falling back to its URI then the texture name."""
+    """The texture's image name, falling back to its URI then the texture name."""
     texture = _entry(gltf, "textures", texture_index)
     if texture is None:
         return None
@@ -417,7 +417,13 @@ def _material_report(gltf: dict, index: int, material: dict) -> dict:
     pbr = _object(material.get("pbrMetallicRoughness"))
     base_color_texture = _object(pbr.get("baseColorTexture"))
     texture_index = _index(base_color_texture.get("index"))
-    return {
+    additional = {}
+    for owner, role in ((pbr, "metallicRoughnessTexture"), (material, "normalTexture"),
+                        (material, "occlusionTexture"), (material, "emissiveTexture")):
+        if role in owner:
+            ref = _index(_object(owner[role]).get("index"))
+            additional[role] = {"index": ref, "name": _texture_name(gltf, ref)}
+    report = {
         "index": index,
         "name": _text(material.get("name")),
         "base_color_factor": pbr.get("baseColorFactor"),
@@ -426,6 +432,9 @@ def _material_report(gltf: dict, index: int, material: dict) -> dict:
         "alpha_mode": material.get("alphaMode"),
         "double_sided": material.get("doubleSided"),
     }
+    if additional:
+        report["additional_textures"] = additional
+    return report
 
 
 def _primitive_mode(primitive: dict) -> tuple[int | None, str | None, bool]:
@@ -631,6 +640,8 @@ def format_report(report: dict) -> str:
             f"baseColorTexture={_show(material['base_color_texture'])} "
             f"(index {_show(material['base_color_texture_index'])}) "
             f"alphaMode={_show(material['alpha_mode'])} doubleSided={_show(material['double_sided'])}")
+        for role, texture in material.get("additional_textures", {}).items():
+            lines.append(f"    {role}={_show(texture['name'])} (index {_show(texture['index'])})")
 
     lines.append("skins:")
     if not report["skins"]:

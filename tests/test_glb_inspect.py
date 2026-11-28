@@ -699,6 +699,26 @@ class GlbInspectTests(unittest.TestCase):
             self.assertTrue(report["position_bbox_complete"])
             self.assertEqual(report["meshes"][0]["primitives"][0]["bbox"], report["position_bbox"])
 
+    def test_additional_material_textures_resolve_each_declared_binding(self):
+        doc = triangle_gltf()
+        material = doc["materials"][0]
+        material["pbrMetallicRoughness"]["metallicRoughnessTexture"] = {"index": 1}
+        material.update(normalTexture={"index": 0}, occlusionTexture={"index": 1},
+                        emissiveTexture={"index": 99})
+        doc["textures"].append({"extensions": {"EXT_texture_webp": {"source": 1}}})
+        doc["images"].append({"uri": "packed.webp"})
+        doc["materials"].append({"normalTexture": {"index": True}})
+        data = glb(doc)
+        report = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+        packed = {"index": 1, "name": "packed.webp"}
+        self.assertEqual(report["materials"][0]["additional_textures"], {
+            "metallicRoughnessTexture": packed, "normalTexture": {"index": 0, "name": "red.png"},
+            "occlusionTexture": packed, "emissiveTexture": {"index": 99, "name": None},
+        })
+        self.assertEqual(report["materials"][1]["additional_textures"],
+                         {"normalTexture": {"index": None, "name": None}})
+        self.assertIn('metallicRoughnessTexture="packed.webp" (index 1)', glb_inspect.format_report(report))
+
     def test_missing_bounds_and_material_fields_are_reported_not_guessed(self):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "missing.glb")
