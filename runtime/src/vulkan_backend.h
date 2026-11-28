@@ -6035,39 +6035,42 @@ private:
             submit_stages_.assign(semaphores.size(), kAllCmds);
             stages_ptr = submit_stages_.data();
         }
-        // Deduplicate extra_signals by VkSemaphore, keeping the highest timeline value per fence so VkSubmitInfo never
-        // names the same timeline semaphore twice (VUID-VkSubmitInfo-pSignalSemaphores-03242).
+        // Deduplicate extra_signals by VkSemaphore, keeping the highest timeline value (and max visibility_seq) per
+        // fence so VkSubmitInfo never names the same timeline semaphore twice (VUID-VkSubmitInfo-pSignalSemaphores-03242).
         PendingSignal stack_dedup[16];
         std::size_t dedup_count = 0;
         std::vector<PendingSignal> heap_dedup;
-        auto add_dedup = [&](VkSemaphore f, std::uint64_t v) {
+        auto add_dedup = [&](VkSemaphore f, std::uint64_t v, std::uint64_t vis) {
             if (!f || f == progress_) return;
             PendingSignal* data = heap_dedup.empty() ? stack_dedup : heap_dedup.data();
             const std::size_t count = heap_dedup.empty() ? dedup_count : heap_dedup.size();
             for (std::size_t i = 0; i < count; ++i) {
                 if (data[i].fence == f) {
                     if (v > data[i].value) data[i].value = v;
+                    if (vis > data[i].visibility_seq) data[i].visibility_seq = vis;
                     return;
                 }
             }
             if (heap_dedup.empty()) {
                 if (dedup_count < 16) {
-                    stack_dedup[dedup_count++] = {f, v, 0};
+                    stack_dedup[dedup_count++] = {f, v, vis};
                     return;
                 }
                 heap_dedup.assign(stack_dedup, stack_dedup + dedup_count);
             }
-            heap_dedup.push_back({f, v, 0});
+            heap_dedup.push_back({f, v, vis});
         };
         for (const PendingSignal& sig : extra_signals) {
-            add_dedup(sig.fence, sig.value);
+            add_dedup(sig.fence, sig.value, sig.visibility_seq);
         }
         const PendingSignal* const dedup_ptr = heap_dedup.empty() ? stack_dedup : heap_dedup.data();
         const std::size_t dedup_size = heap_dedup.empty() ? dedup_count : heap_dedup.size();
 
         // A signal-only submit (no command buffer) does not run before_execute_(): carry any CPU-signaled fence
-        // visibility epoch from its consumed user waits to this queue's next execute_now().
-        const std::uint64_t consumed_wait_vis = command_buffer ? 0 : exec_waits_vis_seq();
+        // visibility epoch from its consumed user waits (and any prior signal-only wait epoch on this queue) both to
+        // this queue's next execute_now() and transitively onto every signaled fence in QueueHolds.
+        const std::uint64_t consumed_wait_vis =
+            command_buffer ? 0 : (std::max)(pending_wait_vis_seq_, exec_waits_vis_seq());
         std::uint64_t mirror_bind_waited = 0;
         VkSemaphore title_upload_waited_sem = VK_NULL_HANDLE;
         std::uint64_t title_upload_waited_val = 0;
@@ -6119,16 +6122,21 @@ private:
             }
             VkSemaphore stack_signals[17]{progress_};
             std::uint64_t stack_signal_values[17]{ticket};
+            std::uint64_t stack_signal_vis[17]{0};
             VkSemaphore* signals_ptr = stack_signals;
             std::uint64_t* signal_values_ptr = stack_signal_values;
+            std::uint64_t* signal_vis_ptr = stack_signal_vis;
             std::uint32_t signal_count = 1;
             if (dedup_size + 1 > 17) {
                 submit_signals_.clear();
                 submit_signal_values_.clear();
+                submit_signal_vis_.clear();
                 submit_signals_.reserve(dedup_size + 1);
                 submit_signal_values_.reserve(dedup_size + 1);
+                submit_signal_vis_.reserve(dedup_size + 1);
                 submit_signals_.push_back(progress_);
                 submit_signal_values_.push_back(ticket);
+                submit_signal_vis_.push_back(0);
             }
             // Decided under the submit lock, so the order of the checks is the order of the submissions. A Signal
             // that is not above what was already submitted for this fence (a held Signal(F, 2) released after an
@@ -6138,18 +6146,23 @@ private:
                 const VkSemaphore f = dedup_ptr[i].fence;
                 const std::uint64_t v = dedup_ptr[i].value;
                 if (!context_.holds().would_signal(f, v)) continue;
+                const std::uint64_t sig_vis =
+                    command_buffer ? 0 : (std::max)(consumed_wait_vis, dedup_ptr[i].visibility_seq);
                 if (dedup_size + 1 > 17) {
                     submit_signals_.push_back(f);
                     submit_signal_values_.push_back(v);
+                    submit_signal_vis_.push_back(sig_vis);
                 } else {
                     stack_signals[signal_count] = f;
                     stack_signal_values[signal_count] = v;
+                    stack_signal_vis[signal_count] = sig_vis;
                 }
                 ++signal_count;
             }
             if (dedup_size + 1 > 17) {
                 signals_ptr = submit_signals_.data();
                 signal_values_ptr = submit_signal_values_.data();
+                signal_vis_ptr = submit_signal_vis_.data();
             }
             VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
             timeline.waitSemaphoreValueCount = std::uint32_t(values.size());
@@ -6200,7 +6213,7 @@ private:
             if (res == VK_SUCCESS) {
                 context_.record_submit_locked(progress_, ticket);
                 for (std::uint32_t i = 1; i < signal_count; ++i)
-                    context_.holds().signaled(signals_ptr[i], signal_values_ptr[i]);
+                    context_.holds().signaled(signals_ptr[i], signal_values_ptr[i], signal_vis_ptr[i]);
             }
         }
         if (res == VK_ERROR_DEVICE_LOST) {
@@ -6992,6 +7005,7 @@ private:
     std::vector<VkPipelineStageFlags> submit_stages_;
     std::vector<VkSemaphore> submit_signals_;
     std::vector<std::uint64_t> submit_signal_values_;
+    std::vector<std::uint64_t> submit_signal_vis_;
     EmitScratch emit_scratch_;
     std::atomic<int> held_failure_{0};                 // a ReplayResult: the first held batch that failed
 };

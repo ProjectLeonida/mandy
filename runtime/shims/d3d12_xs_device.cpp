@@ -3988,7 +3988,8 @@ public:
     }
 
     void flush() {
-        if (!group_.empty()) {
+        const bool bare = group_.empty();
+        if (!bare) {
             using ExecuteFn = void(WINAPI*)(void*, std::uint64_t, ID3D12CommandList* const*);
             reinterpret_cast<ExecuteFn>(queue_->real_vtable[kQueueExecuteCommandLists])(
                 queue_->real, static_cast<std::uint64_t>(group_.size()), group_.data());
@@ -4000,7 +4001,7 @@ public:
             const std::uint64_t value = ++values->written_value;
             if (SUCCEEDED(signal(values->written, value))) {
                 values->written->SetEventOnCompletion(value, list_values::Pump::get().wake());
-                list_values::Pump::get().add_writes(queue_->values, value, std::move(writes_));
+                list_values::Pump::get().add_writes(queue_->values, value, std::move(writes_), bare);
             } else {
                 // Nothing would ever say when they may land: dropped, as without fences.
                 list_values::bump(list_values::counters().writes_failed, writes_.size());
@@ -7079,6 +7080,8 @@ void reset_list_value_stats() {
 #define LEONIDA_RESET(name) c.name.store(0, std::memory_order_relaxed);
     LEONIDA_LIST_VALUE_COUNTERS(LEONIDA_RESET)
 #undef LEONIDA_RESET
+    c.gpu_relay_downgraded_bare.store(0, std::memory_order_relaxed);
+    c.gpu_relay_downgraded_val.store(0, std::memory_order_relaxed);
 }
 #undef LEONIDA_LIST_VALUE_COUNTERS
 

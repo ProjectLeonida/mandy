@@ -107,6 +107,29 @@ int main(int argc, char** argv) {
             std::fputs("retroactive fence_relay_wait unexpectedly signaled gate_multi\n", stderr);
             return 1;
         }
+
+        // 3. Round 10b A4: fence_relay_wait returns false when no wait was substituted yet, while retaining the
+        //    redirect entry so an in-transit Wait arriving afterwards still resolves onto writer_a without signaling
+        //    gate_race.
+        Ref<ID3D12Fence> gate_race, done_race;
+        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate_race.p))) ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done_race.p))))
+            return 1;
+        const rt::d3d12::FenceRelayTarget race_target[] = {{writer_a.p, 1}};
+        if (rt::d3d12::fence_relay_wait(gate_race.p, 1, race_target)) {
+            std::fputs("fence_relay_wait unexpectedly returned true with no waiting queue\n", stderr);
+            return 1;
+        }
+        if (FAILED(direct_a->Wait(gate_race.p, 1)) || FAILED(direct_a->Signal(done_race.p, 1)) ||
+            !wait_for(done_race.p, 1)) {
+            std::fputs("in-transit fence_relay_wait did not complete\n", stderr);
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
+        if (gate_race->GetCompletedValue() != 0) {
+            std::fputs("in-transit fence_relay_wait unexpectedly signaled gate_race\n", stderr);
+            return 1;
+        }
         std::puts("COM fence_signal_gpu_relay and retroactive fence_relay_wait completed");
     }
     return 0;

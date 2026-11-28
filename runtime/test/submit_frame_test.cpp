@@ -2730,13 +2730,14 @@ int queue_sync_and_async() {
         }
 
         // (d) Race ordering (in-transit lookup_relay): relay_wait registered BEFORE wait_sync sees (gate_race, 1).
+        //     Returns false (nothing substituted yet) while keeping the redirect entry active for lookup_relay().
         {
             context.set_before_execute({});
             VulkanFence gate_race(context, 0), written_r(context, 0), done_r(context, 0);
             EXPECT(gate_race.semaphore() && written_r.semaphore() && done_r.semaphore());
             EXPECT(compute_a.signal(written_r.semaphore(), 1));
             const QueueHolds<VkSemaphore>::Wait rep[] = {{written_r.semaphore(), 1, {}}};
-            EXPECT(context.holds().relay_wait(gate_race.semaphore(), 1, rep, /*consume_on_substitute=*/true));
+            EXPECT(!context.holds().relay_wait(gate_race.semaphore(), 1, rep, /*consume_on_substitute=*/true));
             EXPECT(context.holds().active_relay_count() == 1);  // retained until in-transit wait consumes it
 
             direct.wait(gate_race.semaphore(), 1);
@@ -2750,7 +2751,47 @@ int queue_sync_and_async() {
             EXPECT(!context.holds().has_progress());
         }
 
-        std::printf("queue r10 ws3: signal_gpu_relay vis_seq=0, retroactive relay_wait (single/multi/inbox/race) ok\n");
+        // (e) Round 10b A5: signal-only submit propagates consumed_wait_vis transitively into QueueHolds::signaled()
+        //     so a downstream queue waiting on that signal observes the upstream CPU visibility epoch.
+        {
+            before_calls.store(0, std::memory_order_release);
+            last_req_seq.store(0, std::memory_order_release);
+            context.set_before_execute([&] {
+                before_calls.fetch_add(1, std::memory_order_acq_rel);
+                last_req_seq.store(VulkanContext::current_before_execute_seq(), std::memory_order_release);
+            });
+
+            VulkanFence cpu_gate(context, 0), relay_a(context, 0), relay_b(context, 0), done_t(context, 0);
+            EXPECT(cpu_gate.semaphore() && relay_a.semaphore() && relay_b.semaphore() && done_t.semaphore());
+
+            // Consumer `direct` is held behind `relay_a` with an older enqueue visibility_seq.
+            direct.wait(relay_a.semaphore(), 1);
+            EXPECT(direct.execute({&empty_snap, 1}) == ReplayResult::success);
+            const std::uint64_t seq_old = context.current_visibility_seq();
+            EXPECT(direct.signal(done_t.semaphore(), 1));
+            EXPECT(direct.idle());
+            EXPECT(before_calls.load(std::memory_order_acquire) == 0);
+
+            // Intermediate `compute_a` waits on `cpu_gate` and issues TWO signal-only submits (no ExecuteCommandLists).
+            compute_a.wait(cpu_gate.semaphore(), 1);
+            EXPECT(compute_a.signal(relay_a.semaphore(), 1));
+            EXPECT(compute_a.signal(relay_b.semaphore(), 1));
+            EXPECT(compute_a.idle());
+
+            // CPU-signal `cpu_gate`: bumps visibility_seq past `seq_old`.
+            EXPECT(cpu_gate.signal(1));
+            const std::uint64_t cpu_vis = context.holds().signaled_vis_seq(cpu_gate.semaphore(), 1);
+            EXPECT(cpu_vis > seq_old);
+
+            EXPECT(done_t.wait(1, 5'000'000'000ull));
+            EXPECT(direct.idle() && compute_a.idle());
+            EXPECT(context.holds().signaled_vis_seq(relay_a.semaphore(), 1) >= cpu_vis);
+            EXPECT(context.holds().signaled_vis_seq(relay_b.semaphore(), 1) >= cpu_vis);
+            EXPECT(before_calls.load(std::memory_order_acquire) == 1);
+            EXPECT(last_req_seq.load(std::memory_order_acquire) >= cpu_vis);
+        }
+
+        std::printf("queue r10 ws3 + r10b a4/a5: signal_gpu_relay, relay_wait, signal-only vis_seq transitivity ok\n");
     }
 
     return 0;

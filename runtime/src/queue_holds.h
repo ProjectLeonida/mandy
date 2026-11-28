@@ -273,7 +273,9 @@ public:
     // Retroactively redirects any queued, pending, or held wait on `(gate_sem, gate_val)` to `replacements`
     // (GPU-to-GPU timeline waits, never GPU-signaling `gate_sem`), then calls pump_ready() so newly-unblocked held
     // ops release immediately. When `consume_on_substitute` is true (single-owner gate fences), the redirect entry is
-    // pruned immediately once substituted (or once consumed by an in-transit lookup_relay).
+    // pruned immediately once substituted (or once consumed by an in-transit lookup_relay). Returns true iff at least
+    // one existing wait was substituted; when no wait matched yet, the redirect entry remains registered for an
+    // in-transit lookup_relay() and this call returns false so callers preserve the fallback gate.
     bool relay_wait(Semaphore gate_sem, std::uint64_t gate_val, std::span<const Wait> replacements,
                     bool consume_on_substitute = false) {
         if (!gate_sem || !gate_val || replacements.empty()) return false;
@@ -330,7 +332,7 @@ public:
             if (any_held()) signaled_unpumped_.store(true, std::memory_order_release);
             pump_ready();
         }
-        return true;
+        return any_substituted;
     }
 
     // Checks whether `(gate_sem, gate_val)` has an active wait redirect (catching waits in transit between an async
