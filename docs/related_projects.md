@@ -143,15 +143,46 @@ lane nodes stand on polygons with both bit 8 and bit 13, and which bit or combin
 
 <https://github.com/Marvisak/VIctory>
 
-A Windows compatibility project for Xbox Series. Its GPU layer translates console command streams to host
-Direct3D 12.
+A Rust Xbox Series compatibility layer for the same game, started on 2026-11-23. Like Leonida it runs the title's
+x64 code natively and reimplements the console libraries (`crates/victory-hle`); unlike Leonida its GPU layer
+forwards D3D12.X command streams to the PC's Direct3D 12 and recompiles the RDNA2 shaders to DXIL when a pipeline is
+created. Its README (status 2026-11-23, read at commit `ffe310e`) reports a retail executable running through the
+first-boot screens, the intro video with sound, the start screen, saves and the load into the world, where the scene
+is still mostly dark at 0.5-1.8 s per frame, on one machine (Windows 11, RX 6700 XT). It does not say which package
+version that executable is from: its build table (`crates/victory-game/src/lib.rs`) is empty.
 
 **Licence:** **GPL-3.0-or-later**, as declared in the [workspace manifest][victory-workspace] and the
-[README][victory-readme]. The [GPU crate][victory-gpu] inherits the workspace licence.
+[README][victory-readme]; the [GPU crate][victory-gpu] inherits the workspace licence. That is compatible with this
+project's. As with SCARAB and SixNG, **facts first**: verify a claim, write the implementation in our style and name
+the file a fact came from in the pull request. One file is excluded outright:
+`crates/victory-formats/src/bcpack-tables.bin`, constant BCPack tables that its own asset-policy document says are
+not its work and not covered by its licence. They fall under "no game data" here: **nothing from that file, or
+derived from it, enters Leonida**, even though the missing BC6H/BC7 history tables of [textures.md](textures.md) are
+that kind of data.
 
 **What we use it for:** prior art for deferring CPU-side value writes until the recorded command-list work has
 completed, as discussed in [#622](https://github.com/ubiquitarianism/leonida/pull/622). That PR uses synthetic
 tests to verify the ordering of submissions and writes in Leonida's own implementation.
+
+It is also a second reading, made by running the retail executable, of console imports whose behaviour Leonida has
+measured only statically. Its `victory-hle` modules serve the 22 imports that
+[audio_hal_exe_calls.md](audio_hal_exe_calls.md) counts, which Leonida serves too: `AcpHal.dll`
+(`src/modules/audio.rs`: the APU heap, the SHAPE context arrays, the coprocessor's command and message queues, XMA
+decoding; here `runtime/shims/acphal.cpp`), `xapu.dll` (`apu.rs`: an Opus decode queue; here
+`runtime/shims/xapu_queue.cpp`), `chad.dll` (`dsp.rs`: the command protocol, with silent output; here
+`runtime/shims/xapu_chad.cpp`), `XCRDAPI.dll` (`dstorage.rs`; here `runtime/shims/dstorage.cpp`) and `xg_xs.dll`
+(`xg.rs`; here `runtime/shims/xg_xs.cpp`). Its signatures agree with the call-site shapes measured there:
+`ApuCreateHeap(cached, non_cached)` gets `0x226e00` as its second argument, `ApuAlloc(out, apu_address, size,
+alignment, flags)` passes a null device-address pointer and an alignment of `0x800`, and the second argument of
+`ApuIsVirtualAddressValid` is an alignment. Two calls pass one argument more than it reads (`AcpHalCreate`'s second,
+`XApuDisconnect`'s `0x20`). The `xapu.dll` layouts in `xapu_queue.cpp`, including the 24-byte first argument of
+`XApuConnect` read as an input (processing kind, 1 being Opus decoding, stream count, commands per stream, memory
+size, frames per output and options), come from `apu.rs`; [audio_hal_exe_calls.md](audio_hal_exe_calls.md) lists
+them against the shapes. Its shader counts (world mesh 8,191 of 8,506, vertex and pixel 10,617 of 12,346, compute
+1,643 of 2,539) come from its own DXIL translator and say nothing about Leonida's.
+
+A fact from it is a hypothesis until a Leonida test or run confirms it: the README reports one machine, and most of
+the repository was written within its first two days.
 
 [victory-workspace]: https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/Cargo.toml
 [victory-readme]: https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/README.md#license
