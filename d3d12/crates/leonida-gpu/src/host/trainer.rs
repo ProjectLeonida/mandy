@@ -112,8 +112,7 @@ struct Pipeline {
 fn pipeline(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Pipeline> {
     let vs = compile(windows::core::s!("vs"), windows::core::s!("vs_5_1"))?;
     let ps = compile(windows::core::s!("ps"), windows::core::s!("ps_5_1"))?;
-    // SAFETY: the blobs' own bytes (the root signature is inside them);
-    // plain object creation.
+    // SAFETY: the blobs' own bytes; plain object creation.
     unsafe {
         let ranges = [D3D12_DESCRIPTOR_RANGE1 {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,

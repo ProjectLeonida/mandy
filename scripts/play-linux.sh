@@ -1,9 +1,11 @@
 #!/bin/sh
-# Starts Leonida's D3D12 runtime (d3d12/, a Windows program) on Linux under Wine, with the VKD3D-Proton that comes in
-# the package (scripts/fetch_vkd3d_proton.py puts it in vkd3d-proton/ beside this script), so nothing else needs to be
-# downloaded for Direct3D 12. Wine itself and a Vulkan driver (Mesa or NVIDIA's) are the system's.
+# Starts Leonida's D3D12 runtime (d3d12/, a Windows program) on Linux under an installed Proton build or the system's
+# Wine, with the VKD3D-Proton that comes in the package (scripts/fetch_vkd3d_proton.py puts it in vkd3d-proton/ beside
+# this script) and DXVK's dxgi.dll (docs/linux.md says where both come from). A Vulkan driver (Mesa or NVIDIA's) is
+# the system's.
 #
-#   ./play-linux.sh /path/to/your/game_scarlett_master.exe [--series-x]
+#   ./play-linux.sh /path/to/your/game_scarlett_master.exe [--series-x] [--log]
+#   ./play-linux.sh --find-proton | --list-protons
 #
 # Leonida keeps its own Wine prefix (LEONIDA_WINEPREFIX, default ~/.local/share/leonida/prefix): the bundled
 # d3d12.dll and d3d12core.dll are installed there and preferred over Wine's (WINEDLLOVERRIDES), so no other prefix
