@@ -15525,20 +15525,25 @@ public:
             };
             leonida::mem_probe::start(std::move(facts));
         }
-        if (info.conditional_rendering) {
+        {
             const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                 info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
             const auto families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
                 info.get_instance_proc(info.instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
-            if (properties && families) {
+            std::uint32_t count = 0;
+            std::vector<VkQueueFamilyProperties> queues;
+            if (families) {
+                families(info.physical, &count, nullptr);
+                queues.resize(count);
+                families(info.physical, &count, queues.data());
+            }
+            // On every device, not only with conditional rendering: the queue keeps compute work (bindless commits,
+            // the depth24 conversion) off a copy family without compute.
+            if (info.copy_family < count && !(queues[info.copy_family].queueFlags & VK_QUEUE_COMPUTE_BIT))
+                state_.context->set_transfer_only_family(info.copy_family);
+            if (info.conditional_rendering && properties && families) {
                 VkPhysicalDeviceProperties limits{};
                 properties(info.physical, &limits);
-                std::uint32_t count = 0;
-                families(info.physical, &count, nullptr);
-                std::vector<VkQueueFamilyProperties> queues(count);
-                families(info.physical, &count, queues.data());
-                if (info.copy_family < count && !(queues[info.copy_family].queueFlags & VK_QUEUE_COMPUTE_BIT))
-                    state_.context->set_transfer_only_family(info.copy_family);
                 if (info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
                     state_.context->configure_predication(get_device, state_.memory, limits.limits.maxStorageBufferRange, info.queue_family);
                     if (info.storage_buffer_8bit) state_.context->configure_predicated_copy(get_device, limits.limits);

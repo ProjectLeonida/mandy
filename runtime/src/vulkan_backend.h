@@ -3421,6 +3421,12 @@ private:
                     }
                     return context_.depth24_->prepare(job, parts);
                 };
+            } else if (transfer_only) {
+                // The conversion is a compute dispatch with shader-stage barriers, which a transfer-only family may
+                // not record: drop the callbacks copied from context_.replay_ (enable_depth24), so its copies are
+                // refused as unsupported instead.
+                replay.depth24_prepare = {};
+                replay.depth24_run = {};
             }
             if (can_resolve_occlusion) {
                 replay.sum_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
@@ -3761,7 +3767,10 @@ private:
         close_labels(command_buffer, replay, open_labels);
         // Only flush GPU writes to the host domain when this batch actually wrote to a readback buffer.
         if (wrote_readback) {
-            const VkPipelineStageFlags2 allowed = queue_supported_stages(kind_);
+            // A copy queue on a compute-capable family runs the depth24/rgb96 conversion (depth24_prepare), whose
+            // compute writes the host must see too.
+            const VkPipelineStageFlags2 allowed =
+                queue_supported_stages(kind_) | (replay.depth24_prepare ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : 0);
             VkPipelineStageFlags2 src_stages = readback_stages & allowed;
             if (!src_stages) src_stages = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
             const bool copy_only =
