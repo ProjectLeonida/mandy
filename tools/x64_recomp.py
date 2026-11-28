@@ -1179,6 +1179,7 @@ CTX_EFLAGS = 0x00
 CTX_RES = 0x08
 CTX_A = 0x10
 CTX_B = 0x18
+CTX_DF = 0x20
 
 EF_CF, EF_PF, EF_AF, EF_ZF, EF_SF, EF_OF = 0x1, 0x4, 0x10, 0x40, 0x80, 0x800
 
@@ -1856,6 +1857,8 @@ class FunctionTranslator:
             self._mkflags(0)
             a.ldur(T0, CTX_REG, CTX_EFLAGS, size=8)
             a.orr_i(T0, T0, 2, sf=0)
+            a.ldr(T1, CTX_REG, CTX_DF, size=4)
+            a.orr_r(T0, T0, T1, sf=0, shift=0, imm6=10)
             a.str_pre(T0, rsp, -8)
         elif m == "popf":
             a.ldr_post(T0, rsp, 8)
@@ -1873,6 +1876,8 @@ class FunctionTranslator:
             a.orr_r(T1, T1, T2, sf=0)                 # V
             a.lsl(T1, T1, 28)
             a.msr_nzcv(T1)
+            a.ubfx(T2, T0, 10, 1)
+            a.str(T2, CTX_REG, CTX_DF, size=4)
         else:
             raise UnhandledInsn(ins, m)
 
@@ -2100,34 +2105,44 @@ class FunctionTranslator:
         sz = ins.strsize or 8
         if ins.rep == "f2" and m not in ("scas", "cmps"):
             raise UnhandledInsn(ins, "repne on non-compare string op")
-        if m in ("movs", "stos"):
+        if m in ("movs", "stos", "lods"):
             self._emit_movs_stos(ins, sz)
         elif m in ("scas", "cmps"):
             self._emit_scas_cmps(ins, sz)
         else:
             raise UnhandledInsn(ins, m)
 
+    def _str_step(self, sz, dst_reg):
+        """Compute signed pointer step (+sz when DF=0, -sz when DF=1) without touching NZCV."""
+        a = self.asm
+        a.ldr(T3, CTX_REG, CTX_DF, size=4)
+        a.movz(dst_reg, sz, 0)
+        a.sub_r(dst_reg, dst_reg, T3, sf=1, shift=0, imm6=sz.bit_length())
+
     def _emit_movs_stos(self, ins, sz):
         a = self.asm
         rsi, rdi, rcx = GMAP[6], GMAP[7], GMAP[1]
-        if ins.mnem == "movs":
-            load_src, store_dst = rsi, rdi
-        else:
-            load_src, store_dst = None, rdi
+        m = ins.mnem
         rep = ins.rep == "f3"
         top = self._skip_lbl()
         done = self._skip_lbl()
         if rep:
             a.cbz(rcx, done)
+        self._str_step(sz, T2)
         a.label(top)
-        if ins.mnem == "movs":
-            a.ldr(T0, load_src, 0, size=sz)
-            a.add(load_src, load_src, sz)
+        if m == "movs":
+            a.ldr(T0, rsi, 0, size=sz)
+            a.add_r(rsi, rsi, T2)
+            a.str(T0, rdi, 0, size=sz)
+            a.add_r(rdi, rdi, T2)
+        elif m == "stos":
+            self._load(ins, ("r", 0, sz), T0)
+            a.str(T0, rdi, 0, size=sz)
+            a.add_r(rdi, rdi, T2)
         else:
-            op = ("r", 0, sz)
-            self._load(ins, op, T0)
-        a.str(T0, store_dst, 0, size=sz)
-        a.add(store_dst, store_dst, sz)
+            a.ldr(T0, rsi, 0, size=sz)
+            a.add_r(rsi, rsi, T2)
+            self._store(ins, ("r", 0, sz), T0)
         if rep:
             a.sub(rcx, rcx, 1)
             a.cbnz(rcx, top)
@@ -2141,31 +2156,44 @@ class FunctionTranslator:
         done = self._skip_lbl()
         if rep:
             a.cbz(rcx, done)
+        self._str_step(sz, T2)
+        if rep:
             a.label(top)
         if ins.mnem == "scas":
             a.ldr(T0, rdi, 0, size=sz)
-            a.add(rdi, rdi, sz)
+            a.add_r(rdi, rdi, T2)
             a.mov(T1, GMAP[0], sf=0 if sz < 8 else 1)
-            if sz < 8:
+            if sz < 4:
                 sh = 32 - sz * 8
                 a.lsl(T0, T0, sh, sf=0)
                 a.lsl(T1, T1, sh, sf=0)
-            a.subs_r(31, T1, T0, 0 if sz < 8 else 1)
+            a.subs_r(T3, T1, T0, 0 if sz < 8 else 1)
         else:
             a.ldr(T0, rsi, 0, size=sz)
-            a.add(rsi, rsi, sz)
+            a.add_r(rsi, rsi, T2)
             a.ldr(T1, rdi, 0, size=sz)
-            a.add(rdi, rdi, sz)
-            if sz < 8:
+            a.add_r(rdi, rdi, T2)
+            if sz < 4:
                 sh = 32 - sz * 8
                 a.lsl(T0, T0, sh, sf=0)
                 a.lsl(T1, T1, sh, sf=0)
-            a.subs_r(31, T0, T1, 0 if sz < 8 else 1)
+            a.subs_r(T3, T0, T1, 0 if sz < 8 else 1)
         if rep:
+            done_flags = self._skip_lbl()
             a.sub(rcx, rcx, 1)
-            a.cbz(rcx, done)
+            a.cbz(rcx, done_flags)
             a.bcond("eq" if rep == "f3" else "ne", top)
+            a.label(done_flags)
+            if sz < 4:
+                a.lsr(T3, T3, 32 - sz * 8, sf=0)
+            self._stash_res(ins, T3)
+            self._maybe_mkflags(ins)
             a.label(done)
+        else:
+            if sz < 4:
+                a.lsr(T3, T3, 32 - sz * 8, sf=0)
+            self._stash_res(ins, T3)
+            self._maybe_mkflags(ins)
 
     # -- control flow ------------------------------------------------------------
     def _emit_branch(self, ins):
@@ -2252,9 +2280,10 @@ class FunctionTranslator:
             g = GMAP[ins.ops[0][1]]
             self.asm.rev(g, g, 1 if sz == 8 else 0)
         elif m == "cld":
-            pass
+            self.asm.str(31, CTX_REG, CTX_DF, size=4)
         elif m == "std":
-            raise UnhandledInsn(ins, "std/DF=1")
+            self.asm.movz(T0, 1, 0, sf=0)
+            self.asm.str(T0, CTX_REG, CTX_DF, size=4)
         elif k == "nop":
             pass
         else:
