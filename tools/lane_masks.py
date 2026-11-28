@@ -130,7 +130,7 @@ def put(state, a, k, wave64=True):
 
 def _maskable_b32(x):
     return x["k"] in ("sgpr", "imm") or (
-        x["k"] == "special" and (x.get("t", "").startswith(("exec", "vcc")) or x.get("t") == "null")
+        x["k"] == "special" and (x.get("t", "").startswith(("exec", "vcc")) or x.get("t") in ("null", "m0", "scc", "src_scc"))
     )
 
 
