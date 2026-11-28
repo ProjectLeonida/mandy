@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -873,6 +874,12 @@ struct ShaderEntry {
     std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
     // --f16-interp-fallback: param/attr index -> {low_half_location, high_half_location} (SHADER-378).
     std::map<std::uint32_t, std::array<std::uint32_t, 2>> f16_halves;
+    // --bary-fallback: input location where a pass-through GS supplies one-hot barycentrics (RT-BARY-FALLBACK-PSO).
+    std::optional<std::uint32_t> bary_fallback_location;
+    // --bary-fallback computed I/J pairs (SHADER-177): attribute (the producer's output location) -> first of the
+    // three consecutive PS input locations of its Flat vec4[3], from bary_fallback_input.per_vertex
+    // (RT-BARY-FALLBACK-PER-VERTEX). The pass-through GS writes the triangle's three values of the attribute there.
+    std::map<std::uint32_t, std::uint32_t> bary_fallback_per_vertex;
     // The S#s the shader builds from immediates (the index's literal_samplers): no heap slot names them, so a
     // pipeline that uses the shader registers them in the bindless set itself (docs/design.md, Literal samplers).
     std::vector<std::array<std::uint32_t, 4>> literal_samplers;
@@ -1299,6 +1306,33 @@ private:
                     }
                     if (!ok) continue;
                     e.f16_halves[std::uint32_t(param)] = {u32(&val.array[0]), u32(&val.array[1])};
+                }
+            }
+            if (const Json* bf = meta.find("bary_fallback_input"); bf && bf->kind == Json::Kind::object) {
+                if (const Json* loc = bf->find("location"); loc && loc->kind == Json::Kind::number &&
+                    loc->number >= 0.0 && loc->number <= 4294967295.0 &&
+                    double(std::uint32_t(loc->number)) == loc->number) {
+                    e.bary_fallback_location = std::uint32_t(loc->number);
+                }
+                // "per_vertex": {"<attribute>": <first location>, ...}. A malformed entry drops the whole map, so the
+                // GS builder refuses the PS's vec4[3] input instead of linking a partial mapping.
+                if (const Json* pv = bf->find("per_vertex"); pv && pv->kind == Json::Kind::object) {
+                    std::map<std::uint32_t, std::uint32_t> map;
+                    bool ok = true;
+                    for (const auto& [key, val] : pv->object) {
+                        std::uint64_t attr = 0;
+                        ok = !key.empty() && key.size() <= 10;
+                        for (const char c : key) {
+                            if (c < '0' || c > '9') ok = false;
+                            if (!ok) break;
+                            attr = attr * 10u + std::uint64_t(c - '0');
+                        }
+                        ok = ok && attr <= UINT32_MAX && val.kind == Json::Kind::number && val.number >= 0.0 &&
+                             val.number <= 4294967293.0 && double(std::uint32_t(val.number)) == val.number &&
+                             map.emplace(std::uint32_t(attr), std::uint32_t(val.number)).second;
+                        if (!ok) break;
+                    }
+                    if (ok) e.bary_fallback_per_vertex = std::move(map);
                 }
             }
             if (const Json* l = meta.find("literal_samplers"); l && l->kind == Json::Kind::array) {

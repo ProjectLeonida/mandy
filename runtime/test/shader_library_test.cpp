@@ -1289,6 +1289,92 @@ int main() {
 
     CHECK(huffman_lut_checks() == 0);
 
+    // bary_fallback_input.location: exact non-negative u32 parsed; absent or malformed values stay nullopt.
+    {
+        const auto dir = std::filesystem::temp_directory_path() / "leonida_shader_library_bary_test";
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        const std::string h0(64, 'a'), h1(64, 'b'), h2(64, 'c'), h3(64, 'd'), h4(64, 'e');
+        {
+            std::ofstream out(dir / "index.json", std::ios::binary | std::ios::trunc);
+            out << "{\"ps_ok\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << h0
+                << "\", \"bary_fallback_input\": {\"location\": 3}},\n"
+                   " \"ps_zero\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << h1
+                << "\", \"bary_fallback_input\": {\"location\": 0}},\n"
+                   " \"ps_neg\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << h2
+                << "\", \"bary_fallback_input\": {\"location\": -1}},\n"
+                   " \"ps_frac\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << h3
+                << "\", \"bary_fallback_input\": {\"location\": 1.5}},\n"
+                   " \"ps_none\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << h4 << "\"}}";
+        }
+        ShaderLibrary lib;
+        std::string err;
+        CHECK(lib.load(dir, &err));
+        const ShaderEntry* ok = lib.find("ps", h0);
+        const ShaderEntry* zero = lib.find("ps", h1);
+        const ShaderEntry* neg = lib.find("ps", h2);
+        const ShaderEntry* frac = lib.find("ps", h3);
+        const ShaderEntry* none = lib.find("ps", h4);
+        CHECK(ok && ok->bary_fallback_location.has_value() && *ok->bary_fallback_location == 3u);
+        CHECK(zero && zero->bary_fallback_location.has_value() && *zero->bary_fallback_location == 0u);
+        CHECK(neg && !neg->bary_fallback_location.has_value());
+        CHECK(frac && !frac->bary_fallback_location.has_value());
+        CHECK(none && !none->bary_fallback_location.has_value());
+        std::filesystem::remove_all(dir);
+    }
+
+    // bary_fallback_input.per_vertex (computed I/J pairs): attribute -> first location, both exact u32. One
+    // malformed entry drops the whole map (the location is still read), so no partial mapping reaches the GS builder.
+    {
+        const auto dir = std::filesystem::temp_directory_path() / "leonida_shader_library_bary_pv_test";
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        const std::vector<std::pair<std::string, std::string>> cases = {
+            {"pv_ok", "{\"0\": 0, \"5\": 6}"},
+            {"pv_empty", "{}"},
+            {"pv_key", "{\"0\": 0, \"x\": 3}"},
+            {"pv_signed_key", "{\"-1\": 3}"},
+            {"pv_big_key", "{\"4294967296\": 3}"},
+            {"pv_neg", "{\"0\": -1}"},
+            {"pv_frac", "{\"0\": 1.5}"},
+            {"pv_string", "{\"0\": \"3\"}"},
+            {"pv_overflow", "{\"0\": 4294967294}"},
+            {"pv_last", "{\"0\": 4294967293}"},
+            {"pv_same_attr", "{\"1\": 0, \"01\": 3}"},
+            {"pv_array", "[0, 3]"},
+        };
+        std::map<std::string, std::string> hashes;
+        {
+            std::ofstream out(dir / "index.json", std::ios::binary | std::ios::trunc);
+            out << "{";
+            for (std::size_t i = 0; i < cases.size(); ++i) {
+                const std::string hash(64, char('a' + i));
+                hashes[cases[i].first] = hash;
+                out << (i ? ",\n " : "") << "\"" << cases[i].first << "\": {\"stage\": \"ps\", \"fssm_sha256\": \""
+                    << hash << "\", \"bary_fallback_input\": {\"location\": 9, \"per_vertex\": " << cases[i].second
+                    << "}}";
+            }
+            out << "}";
+        }
+        ShaderLibrary lib;
+        std::string err;
+        CHECK(lib.load(dir, &err));
+        using PerVertex = std::map<std::uint32_t, std::uint32_t>;
+        for (const auto& [name, json] : cases) {
+            const ShaderEntry* e = lib.find("ps", hashes[name]);
+            CHECK(e && e->bary_fallback_location.has_value() && *e->bary_fallback_location == 9u);
+            PerVertex want;
+            if (name == "pv_ok") want = {{0, 0}, {5, 6}};
+            if (name == "pv_last") want = {{0, 4294967293u}};
+            if (e->bary_fallback_per_vertex != want) {
+                std::fprintf(stderr, "per_vertex case %s: %zu entries read\n", name.c_str(),
+                             e->bary_fallback_per_vertex.size());
+                return 1;
+            }
+        }
+        std::filesystem::remove_all(dir);
+    }
+
     std::printf("SHA-256, inflate (stored/fixed/dynamic), JSON, FSSM extraction, FSPX programs and index lookup OK\n");
     return 0;
 }

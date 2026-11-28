@@ -118,6 +118,9 @@ struct VulkanDeviceInfo {
     bool push_constants_need_fallback = false;
     // Top location for relocated f16 halves (0: read from device limits; non-zero: override for testing low-limit devices).
     std::uint32_t f16_half_top_location = 0;
+    // Geometry shader per-vertex interface component limits (0: read from physical device; non-zero: test override).
+    std::uint32_t max_geometry_input_components = 0;
+    std::uint32_t max_geometry_output_components = 0;
     // maxBufferSize and maxMemoryAllocationSize, which cap the GPU address arena (src/arena_size.h). 0: read from
     // the physical device when the D3D12 device is created; a test sets smaller ones to simulate a device.
     VkDeviceSize max_buffer_size = 0;
