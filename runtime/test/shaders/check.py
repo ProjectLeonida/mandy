@@ -1235,6 +1235,8 @@ def partial_wave_test(tools, spirv, name, expected_words):
             os.environ.pop("VKC_SUBGROUP_SIZE", None)
         else:
             os.environ["VKC_SUBGROUP_SIZE"] = old
+    if skip := compute_unsupported(code, out):   # the module needs a feature the device lacks (e.g. shaderInt64)
+        return skip
     if code != 0:
         return failure(code, out, 2)
     if not W64_EMULATED and not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", out)):
@@ -1553,8 +1555,9 @@ def table_fetch_test(tools, spirv):
         for mode in ("fetch-sint", "fetch-uint", "fetch-miss"):
             raw = os.path.join(tmp, mode + ".raw")
             code, output = run_readback(raw, run, tool, mode, raw, cwd=spirv)
-            if code == UNSUPPORTED:
-                return Skip(output.strip())
+            if code == UNSUPPORTED:   # vk_texture_test: the device lacks a feature this test needs
+                m = re.search(r"unsupported: .*", output)
+                return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
             if code or f"{mode}: 4096 exact pixels" not in output:
                 return failure(code, output, 3)
     return ""
@@ -1775,6 +1778,9 @@ def texture_constant_test(tools, spirv, name):
         code, out = run(os.path.join(tools, "vk_texture_test" + EXE), os.path.join(spirv, "vs_ids.spv"), shader, raw,
                         "0", "92", "c00000", "14500000", "0")
         data = raw.read_bytes() if code == 0 and raw.is_file() else b""
+    if code == UNSUPPORTED:   # vk_texture_test: the device lacks a feature this test needs (e.g. shaderInt64)
+        m = re.search(r"unsupported: .*", out)
+        return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
     if len(data) != 64 * 64 * 16:
         return failure(code, out, 3)
     wrong = sum(p != expected for p in struct.iter_unpack("<4f", data))
