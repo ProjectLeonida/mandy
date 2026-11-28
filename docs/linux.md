@@ -20,7 +20,14 @@ names; the build lists anything it can't find before it starts.
 
 ## Build the port
 
-Install the prerequisites (Ubuntu 26.04; the comment says what each is for):
+`scripts/install_deps_linux.sh` installs all of the prerequisites below with apt (Debian, Ubuntu and derivatives
+such as Parrot or Kali), dnf (Fedora) or pacman (Arch). It shows the commands and asks before running them
+(`--dry-run` only shows them, `--minimal` leaves out .NET, ffmpeg, zenity and Tk), then checks what the build needs.
+On apt it takes the newest `llvm-21` or later the system's own sources have: `llvm-22` on Debian 12 and 13 and their
+derivatives, `llvm-21` on Ubuntu 22.04 and 24.04, so apt.llvm.org isn't needed there. The check after the install
+reports a Python older than 3.12 (Debian 12 has 3.11, Ubuntu 22.04 3.10).
+
+Or install them by hand (Ubuntu 26.04; the comment says what each is for):
 
 ```sh
 sudo apt install git python3 \
