@@ -279,8 +279,10 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     if (props.apiVersion >= VK_API_VERSION_1_2) sgProps.pNext = &driver;
+    VkPhysicalDeviceSubgroupProperties sgStages{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    sgStages.pNext = &sgProps;
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-    props2.pNext = &sgProps;
+    props2.pNext = &sgStages;
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
     if (driver.driverName[0]) std::fprintf(stderr, "driver: %s\n", driver.driverName);
@@ -501,6 +503,16 @@ int main(int argc, char** argv) {
     }
     if (gs_path && !f2q.features.geometryShader) {   // MoltenVK: Metal has no geometry stage
         std::fprintf(stderr, "unsupported: no geometryShader\n");
+        return 77;
+    }
+    // A stage that uses subgroup operations has to be in the device's supportedStages. MoltenVK lists compute,
+    // fragment and tessellation control: a Metal vertex function has no SIMD-group built-ins, and the pipeline of a
+    // wave64 vertex fixture (vs_w64_*, which read SubgroupLocalInvocationId) fails there with "Subgroup builtins are
+    // not available in this type of function" (Apple M5, MoltenVK 1.4.2). argv[1] is the vertex shader of a plain
+    // draw; under VKH_MESH and VKH_MESH_COMPUTE it is the mesh shader, which is not a vertex stage.
+    if (!mesh && !mesh_compute && !(sgStages.supportedStages & VK_SHADER_STAGE_VERTEX_BIT) &&
+        leonida::vk_test::uses_subgroup_operations(read_spv(argv[1]))) {
+        std::fprintf(stderr, "unsupported: no subgroup operations in the vertex stage\n");
         return 77;
     }
     VkPhysicalDeviceFeatures feats{};

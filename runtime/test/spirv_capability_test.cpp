@@ -48,6 +48,20 @@ int main() {
     expect("Float64", declares_capability(f64, spirv_capability_float64), true);
     expect("Float64 needs no shaderInt64", needs_shader_int64(f64), false);
 
+    // A wave64 vertex fixture (vs_w64_c_lane_id): GroupNonUniform for SubgroupLocalInvocationId. vk_harness reports 77
+    // for it where the device has no subgroup operations in the vertex stage (MoltenVK).
+    constexpr std::uint32_t group_non_uniform_ballot = 64;
+    expect("GroupNonUniform", uses_subgroup_operations(module({shader, spirv_capability_group_non_uniform})), true);
+    expect("GroupNonUniformBallot alone (it implicitly declares GroupNonUniform)",
+           uses_subgroup_operations(module({shader, group_non_uniform_ballot})), true);
+    expect("GroupNonUniformQuad, the last of the eight",
+           uses_subgroup_operations(module({shader, physical_storage_buffer, spirv_capability_group_non_uniform_quad})),
+           true);
+    expect("vs_ids: no subgroup capability", uses_subgroup_operations(module({shader, physical_storage_buffer})), false);
+    expect("the neighbours of the range are not subgroup capabilities",
+           uses_subgroup_operations(module({shader, 60, 69})), false);
+    expect("an empty module uses none", uses_subgroup_operations(std::vector<std::uint32_t>{}), false);
+
     // Only the leading OpCapability run counts: a later word equal to 11 is an operand, not a capability.
     std::vector<std::uint32_t> later = module({shader});
     later.push_back(2u << 16 | 17u);
