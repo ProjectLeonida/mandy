@@ -6663,6 +6663,7 @@ struct DeviceState {
         // change list) and the counters since the last log line: pages filtered, slots that changed, the time, V#
         // halves read as written and halves deferred, and the presents in between (per-frame figures).
         bool in_place = false;
+        std::atomic<bool> in_place_work_pending{false};  // lock-free hint: deferred, mirror_ranges, or pending_changes
         std::vector<std::uint32_t> deferred;
         std::vector<std::uint8_t> deferred_mark;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> mirror_ranges;
@@ -7068,6 +7069,7 @@ struct DeviceState {
         std::uint32_t w[kDescriptorSize / 4];
         std::memcpy(w, heap.previous + slot * kDescriptorSize, kDescriptorSize);
         bool defer = false;
+        bool added_mirror_range = false;
         if (!(w[0] | w[1] | w[2] | w[3])) {
             if (count_changed) ++heap.changed[(w[4] | w[5] | w[6] | w[7]) ? 1 : 0];
             heap.records.clear(slot);  // a null slot stays null
@@ -7100,6 +7102,7 @@ struct DeviceState {
                         case FilterPageCache::Outcome::mirrored:
                             heap.records.set(slot, half, Records::none, 0, 0, 0);
                             heap.mirror_ranges.emplace_back(base, span);
+                            added_mirror_range = true;
                             ++heap.vsharps_as_written;
                             continue;
                         case FilterPageCache::Outcome::backed:
@@ -7132,6 +7135,7 @@ struct DeviceState {
                         heap.records.set(slot, half, Records::none, 0, 0, 0);
                         if (mirrored) {
                             heap.mirror_ranges.emplace_back(base, span);
+                            added_mirror_range = true;
                             if (cache) cache->put(base, span, FilterPageCache::Outcome::mirrored);
                         }
                     }
@@ -7208,6 +7212,7 @@ struct DeviceState {
             heap.deferred_mark[slot] = 1;
             heap.deferred.push_back(std::uint32_t(slot));
         }
+        if (defer || added_mirror_range) heap.in_place_work_pending.store(true, std::memory_order_release);
     }
 
     // The changes noted since the mirror last looked (and those refresh_console_heaps kept for it): the slots they
@@ -7427,6 +7432,11 @@ struct DeviceState {
     // under the lock, unless the title rewrote the slot since (then the filter has it again). console_heap_mutex held,
     // page_mirror.mutex not.
     void finish_in_place(ConsoleHeap& heap) {
+        // O(1) lock-free skip when no filter work, mirror ranges, pending_changes, or new slot_changes exist:
+        // avoids contending on page_mirror.mutex while holding console_heap_mutex on clean submissions.
+        if (!heap.in_place_work_pending.load(std::memory_order_acquire) &&
+            slot_change_count.load(std::memory_order_acquire) == 0)
+            return;
         using Records = leonida::ConsoleHeapSlotRecords;
         const VsharpPath path = (heap.scratch || heap.in_place) ? VsharpPath::scratch : VsharpPath::shadow;
         const auto wants_geometry = [path](const std::uint32_t* h, std::uint64_t span) {
@@ -7447,42 +7457,82 @@ struct DeviceState {
             // consulting heap.records.answer() for repeated V# halves.
             apply_in_place_changes(heap);
             const std::uint64_t room_gen = geometry.free_generation();
-            jobs.reserve(heap.deferred.size());
-            for (const std::uint32_t slot : heap.deferred) {
-                heap.deferred_mark[slot] = 0;
-                InPlaceJob& job = jobs.emplace_back();
-                job.slot = slot;
-                std::memcpy(job.words, heap.previous + std::size_t(slot) * kDescriptorSize, kDescriptorSize);
-                if (!(job.words[3] >> 30)) {
-                    // Batch-check reachability and existing slot records under the single mirror lock acquisition.
-                    for (unsigned half = 0; half < 2; ++half) {
-                        const std::uint32_t* h = job.words + 4 * half;
-                        if ((h[3] >> 30) || !h[2]) continue;
-                        const std::uint64_t base = std::uint64_t(h[0]) | (std::uint64_t(h[1] & 0xffff) << 32);
-                        const std::uint32_t stride = (h[1] >> 16) & 0x3fffu;
-                        const std::uint64_t span = std::uint64_t(h[2]) * (stride ? stride : 1);
-                        bool mirrored = false;
-                        std::uint64_t reach_target = 0;
-                        if (reachable_as_written(base, span, mirrored, &reach_target)) {
-                            job.reachable[half] = true;
-                            job.reachable_target[half] = reach_target;
-                            if (mirrored) heap.mirror_ranges.emplace_back(base, span);
-                            continue;
-                        }
-                        const bool copy_geometry = wants_geometry(h, span);
-                        Records::State state{};
-                        std::uint64_t target = 0;
-                        if (heap.records.answer(base, span, copy_geometry, state, target) &&
-                            !(state == Records::waiting_room && room_gen != geometry_room_seen)) {
-                            job.answered[half] = true;
-                            job.answer[half] = {state, base, span, target, copy_geometry};
-                            ++(state == Records::resolved ? heap.vsharps_answered_resolved : heap.vsharps_answered);
+            if (!heap.deferred.empty()) {
+                FilterPageCache reach_cache = make_filter_page_cache_locked();
+                jobs.reserve(heap.deferred.size());
+                for (const std::uint32_t slot : heap.deferred) {
+                    heap.deferred_mark[slot] = 0;
+                    InPlaceJob& job = jobs.emplace_back();
+                    job.slot = slot;
+                    std::memcpy(job.words, heap.previous + std::size_t(slot) * kDescriptorSize, kDescriptorSize);
+                    if (!(job.words[3] >> 30)) {
+                        // Batch-check reachability and existing slot records under the single mirror lock acquisition.
+                        for (unsigned half = 0; half < 2; ++half) {
+                            const std::uint32_t* h = job.words + 4 * half;
+                            if ((h[3] >> 30) || !h[2]) continue;
+                            const std::uint64_t base = std::uint64_t(h[0]) | (std::uint64_t(h[1] & 0xffff) << 32);
+                            const std::uint32_t stride = (h[1] >> 16) & 0x3fffu;
+                            const std::uint64_t span = std::uint64_t(h[2]) * (stride ? stride : 1);
+                            if (const FilterPageCache::Entry* cached = reach_cache.find(base, span)) {
+                                if (cached->outcome == FilterPageCache::Outcome::mirrored) {
+                                    job.reachable[half] = true;
+                                    job.reachable_target[half] = 0;
+                                    heap.mirror_ranges.emplace_back(base, span);
+                                    continue;
+                                }
+                                if (cached->outcome == FilterPageCache::Outcome::backed) {
+                                    job.reachable[half] = true;
+                                    job.reachable_target[half] = cached->target;
+                                    continue;
+                                }
+                            } else {
+                                bool mirrored = false;
+                                std::uint64_t reach_target = 0;
+                                if (reachable_as_written(base, span, mirrored, &reach_target)) {
+                                    job.reachable[half] = true;
+                                    job.reachable_target[half] = reach_target;
+                                    if (mirrored) {
+                                        heap.mirror_ranges.emplace_back(base, span);
+                                        reach_cache.put(base, span, FilterPageCache::Outcome::mirrored);
+                                    } else {
+                                        reach_cache.put(base, span, FilterPageCache::Outcome::backed, reach_target);
+                                    }
+                                    continue;
+                                }
+                                reach_cache.put(base, span, FilterPageCache::Outcome::defer);
+                            }
+                            const bool copy_geometry = wants_geometry(h, span);
+                            Records::State state{};
+                            std::uint64_t target = 0;
+                            if (heap.records.answer(base, span, copy_geometry, state, target) &&
+                                !(state == Records::waiting_room && room_gen != geometry_room_seen)) {
+                                job.answered[half] = true;
+                                job.answer[half] = {state, base, span, target, copy_geometry};
+                                ++(state == Records::resolved ? heap.vsharps_answered_resolved : heap.vsharps_answered);
+                            }
                         }
                     }
                 }
+                heap.deferred.clear();
             }
-            heap.deferred.clear();
             ranges.swap(heap.mirror_ranges);
+            heap.in_place_work_pending.store(false, std::memory_order_release);
+        }
+        if (ranges.size() > 1) {
+            // Deduplicate identical-base mirrored V# ranges (keeping the largest span per base) so repeated
+            // descriptors do not hammer title_va_aliases() and title_write_back_mutex; never merge across distinct
+            // bases because note_passive_title_write() clamps each call to the single title_memory region at `base`.
+            std::sort(ranges.begin(), ranges.end());
+            std::size_t write = 0;
+            for (std::size_t i = 0; i < ranges.size(); ++i) {
+                if (write && ranges[write - 1].first == ranges[i].first) {
+                    ranges[write - 1].second = (std::max)(ranges[write - 1].second, ranges[i].second);
+                } else {
+                    if (write != i) ranges[write] = ranges[i];
+                    ++write;
+                }
+            }
+            ranges.resize(write);
         }
         for (const auto& [base, span] : ranges) note_passive_title_write(base, span);  // gated when writes_buffer meta is complete
         if (jobs.empty()) return;
@@ -7795,12 +7845,13 @@ struct DeviceState {
     std::uint64_t heap_lock_waits = 0;
     void refresh_console_heaps() {
         const auto asked = std::chrono::steady_clock::now();
-        std::lock_guard lock(console_heap_mutex);
+        std::unique_lock lock(console_heap_mutex, std::defer_lock);
+        leonida::submit_phases::lock_timed(lock);
         {
             const double waited =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - asked).count();
             heap_lock_wait_ms += waited;
-            heap_lock_wait_max_ms = std::max(heap_lock_wait_max_ms, waited);
+            heap_lock_wait_max_ms = (std::max)(heap_lock_wait_max_ms, waited);
             ++heap_lock_waits;
         }
         const bool heap_pass = heap_gpu && console_heap_gpu_enabled();
@@ -7839,10 +7890,11 @@ struct DeviceState {
             bool pushed_in_place = false;
             for (const auto& heap : console_heaps) {
                 if (heap->in_place && mirror.owns_lock()) {
-                    const std::size_t from = std::min(heap->changes_seen, changes.size());
+                    const std::size_t from = (std::min)(heap->changes_seen, changes.size());
                     if (from < changes.size()) {
                         heap->pending_changes.insert(heap->pending_changes.end(),
                                                      changes.begin() + std::ptrdiff_t(from), changes.end());
+                        heap->in_place_work_pending.store(true, std::memory_order_release);
                         pushed_in_place = true;
                     }
                 }
@@ -18410,8 +18462,34 @@ public:
             state_.promote_passive_title_writes(ticket);
         });
         state_.context->set_after_execute([this] { state_.end_execute_write_back(); });
-        state_.context->set_before_execute([this] {
+        // Cross-queue single-flight visibility coalescer for before_execute_():
+        // Only one queue worker at a time runs the global refresh sequence (eliminating page_mirror.mutex <->
+        // console_heap_mutex <-> title_texture_mutex lock convoys across Direct + 4 Compute queues), and any
+        // concurrent or back-to-back submission whose required visibility epoch `req_seq` (captured at enqueue time
+        // and updated on any queue/CPU fence Signal) was already covered by a refresh pass that STARTED at
+        // `pass_seq >= req_seq` skips the redundant global refresh completely while keeping begin/end_execute_write_back
+        // paired for every submission. Disable with LEONIDA_BEFORE_EXECUTE_COALESCE=0.
+        struct BeforeExecuteCoalescer {
+            std::mutex mutex;
+            std::condition_variable cv;
+            bool in_flight = false;
+            std::uint64_t completed_seq = 0;
+            std::uint64_t ran = 0;
+            std::uint64_t coalesced = 0;
+            std::uint64_t wait_count = 0;
+            std::uint64_t wait_ns = 0;
+            std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+        };
+        auto before_coalescer = std::make_shared<BeforeExecuteCoalescer>();
+        state_.context->set_before_execute([this, coalescer = std::move(before_coalescer)] {
             state_.begin_execute_write_back();
+            static thread_local bool t_in_before_execute = false;  // trivially destructible (no TLS callback)
+            if (t_in_before_execute) return;
+            struct ReentryGuard {
+                bool& flag;
+                explicit ReentryGuard(bool& f) noexcept : flag(f) { flag = true; }
+                ~ReentryGuard() { flag = false; }
+            } reentry_guard{t_in_before_execute};
             namespace phases = leonida::submit_phases;
             // LEONIDA_REFRESH_PER_FRAME (for runs that only need the title to go on): 1 = the slot-133 shadows, title
             // windows and geometry copies are brought up to date only by the first submission after each present,
@@ -18423,6 +18501,77 @@ public:
                 const char* v = std::getenv("LEONIDA_REFRESH_PER_FRAME");
                 return v && *v ? std::atoi(v) : 0;
             }();
+            static const bool coalesce_enabled = [] {
+                const char* v = std::getenv("LEONIDA_BEFORE_EXECUTE_COALESCE");
+                return !(v && v[0] == '0' && v[1] == '\0');
+            }();
+            const std::uint64_t req_seq = leonida::VulkanContext::current_before_execute_seq();
+            const bool use_coalesce = coalesce_enabled && !per_frame && req_seq != 0;
+            std::uint64_t pass_seq = 0;
+            struct LeaderGuard {
+                BeforeExecuteCoalescer* c = nullptr;
+                std::uint64_t pass_seq = 0;
+                bool completed = false;
+                ~LeaderGuard() {
+                    if (!c) return;
+                    bool log = false;
+                    std::uint64_t ran = 0, coalesced = 0, waits = 0, wait_ns = 0;
+                    double secs = 0.0;
+                    {
+                        std::lock_guard lock(c->mutex);
+                        if (completed && pass_seq > c->completed_seq) c->completed_seq = pass_seq;
+                        ++c->ran;
+                        c->in_flight = false;
+                        const auto now = std::chrono::steady_clock::now();
+                        secs = std::chrono::duration<double>(now - c->since).count();
+                        if (secs >= 10.0 && c->coalesced > 0) {
+                            ran = c->ran;
+                            coalesced = c->coalesced;
+                            waits = c->wait_count;
+                            wait_ns = c->wait_ns;
+                            c->ran = c->coalesced = c->wait_count = c->wait_ns = 0;
+                            c->since = now;
+                            log = true;
+                        }
+                    }
+                    c->cv.notify_all();
+                    if (log) {
+                        const std::uint64_t total = ran + coalesced;
+                        std::fprintf(stderr,
+                                     "[rt] before-execute: %llu ran, %llu coalesced (%.0f%% skipped) in %.1f s; "
+                                     "%llu single-flight waits (%.2f ms avg)\n",
+                                     static_cast<unsigned long long>(ran), static_cast<unsigned long long>(coalesced),
+                                     total ? 100.0 * double(coalesced) / double(total) : 0.0, secs,
+                                     static_cast<unsigned long long>(waits),
+                                     waits ? double(wait_ns) * 1e-6 / double(waits) : 0.0);
+                    }
+                }
+            } leader_guard{};
+            if (use_coalesce) {
+                std::unique_lock lock(coalescer->mutex);
+                if (coalescer->completed_seq >= req_seq) {
+                    ++coalescer->coalesced;
+                    return;
+                }
+                if (coalescer->in_flight) {
+                    const std::int64_t wait_start = phases::now_ns();
+                    coalescer->cv.wait(lock, [&] { return !coalescer->in_flight || coalescer->completed_seq >= req_seq; });
+                    const std::uint64_t waited = std::uint64_t(phases::now_ns() - wait_start);
+                    phases::add_part(phases::part_lock_wait, waited);
+                    ++coalescer->wait_count;
+                    coalescer->wait_ns += waited;
+                    if (coalescer->completed_seq >= req_seq) {
+                        ++coalescer->coalesced;
+                        return;
+                    }
+                }
+                coalescer->in_flight = true;
+                // Acquire current visibility epoch BEFORE scanning any CPU memory so this single pass covers
+                // every batch already enqueued (and every fence already signaled) up through pass_seq.
+                pass_seq = (std::max)(req_seq, state_.context->current_visibility_seq());
+                leader_guard.c = coalescer.get();
+                leader_guard.pass_seq = pass_seq;
+            }
             {
                 const phases::Scope timed(phases::shadows);
                 // First, while pending_ sparse binds are empty and before any map()/upload() mutates homes or agreed
@@ -18460,8 +18609,11 @@ public:
                 const phases::Scope timed(phases::shadows);
                 state_.flush_page_mirror();
             }
-            const phases::Scope timed(phases::textures);
-            refresh_title_textures();
+            {
+                const phases::Scope timed(phases::textures);
+                refresh_title_textures();
+            }
+            leader_guard.completed = true;
         });
         {
             char text[16] = {};

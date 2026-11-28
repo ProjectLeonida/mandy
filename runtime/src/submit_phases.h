@@ -129,6 +129,7 @@ struct FrameTotals {
     std::atomic<std::uint64_t> phase_ns[kCount]{};  // title threads
     std::atomic<std::uint64_t> part_ns[kParts]{};   // title threads
     std::atomic<std::uint64_t> worker_ns[kWorkers]{};
+    std::atomic<std::uint64_t> worker_lock_wait_ns{0};  // contended lock_timed / single-flight waits on our threads
     std::atomic<std::uint64_t> submissions[3]{};    // by queue kind: direct, compute, copy
     std::atomic<std::uint64_t> frames{0};
     std::atomic<std::uint64_t> current_ns{0};       // the title threads' time since the last present
@@ -169,7 +170,10 @@ inline void note_change(Change c) { frame_totals().changes[c].fetch_add(1, std::
 // Time a title thread spent in the layer outside the phases (an outer part), or inside them (an inner part).
 inline void add_part(Part p, std::uint64_t ns) {
     ThreadState& s = thread_state();
-    if (s.worker >= 0) return;  // ours: a worker's time is its WorkerScope's
+    if (s.worker >= 0) {
+        if (p == part_lock_wait) frame_totals().worker_lock_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+        return;  // ours: a worker's time is its WorkerScope's
+    }
     FrameTotals& f = frame_totals();
     f.part_ns[p].fetch_add(ns, std::memory_order_relaxed);
     if (p < kOuterParts) f.current_ns.fetch_add(ns, std::memory_order_relaxed);
@@ -329,19 +333,22 @@ inline void frame_lines(double seconds) {
         if (p < kOuterParts) title += part[p];
     }
     for (unsigned w = 0; w < kWorkers; ++w) own += worker[w] = double(f.worker_ns[w].exchange(0, std::memory_order_relaxed)) * 1e-6 / per;
+    const double worker_lock_wait =
+        double(f.worker_lock_wait_ns.exchange(0, std::memory_order_relaxed)) * 1e-6 / per;
     const double worst = double(f.worst_ns.exchange(0, std::memory_order_relaxed)) * 1e-6;
     std::fprintf(stderr,
                  "[rt] submit frame t=%.0fs: %llu frames in %.1f s; %s: %.1f submissions (direct %.1f, compute %.1f, "
                  "copy %.1f); title threads %.2f ms: %s %.2f %s %.2f %s %.2f %s %.2f %s %.2f %s %.2f %s %.2f, %s %.2f, "
                  "%s %.2f, %s %.2f (inside these: %s %.2f, %s %.2f); worst frame %.1f ms; own threads %.2f ms: %s %.2f "
-                 "%s %.2f %s %.2f %s %.2f %s %.2f %s %.2f %s %.2f\n",
+                 "%s %.2f %s %.2f %s %.2f %s %.2f %s %.2f %s %.2f (lock waits %.2f)\n",
                  process_age(), static_cast<unsigned long long>(frames), seconds, unit,
                  double(subs[0] + subs[1] + subs[2]) / per, double(subs[0]) / per, double(subs[1]) / per,
                  double(subs[2]) / per, title, name(0), phase[0], name(1), phase[1], name(2), phase[2], name(3),
                  phase[3], name(4), phase[4], name(5), phase[5], name(6), phase[6], part_name(0), part[0],
                  part_name(1), part[1], part_name(2), part[2], part_name(3), part[3], part_name(4), part[4], worst, own,
                  worker_name(0), worker[0], worker_name(1), worker[1], worker_name(2), worker[2], worker_name(3),
-                 worker[3], worker_name(4), worker[4], worker_name(5), worker[5], worker_name(6), worker[6]);
+                 worker[3], worker_name(4), worker[4], worker_name(5), worker[5], worker_name(6), worker[6],
+                 worker_lock_wait);
     const std::uint64_t floor = f.floor_count.exchange(0, std::memory_order_relaxed);
     const std::uint64_t all = f.all_count.exchange(0, std::memory_order_relaxed);
     const double all_ms = double(f.all_ns.exchange(0, std::memory_order_relaxed)) * 1e-6;

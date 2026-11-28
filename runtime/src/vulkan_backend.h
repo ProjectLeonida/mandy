@@ -1964,6 +1964,26 @@ public:
         return it == device_fault_->pipeline_names.end() ? nullptr : it->second[0];
     }
     void set_before_execute(std::function<void()> before) { before_execute_ = std::move(before); }
+    // Monotonic visibility epoch bumped on every ExecuteCommandLists / queue Signal / CPU Fence::Signal so
+    // before_execute_() can coalesce concurrent or back-to-back cross-queue refreshes while guaranteeing every
+    // CPU write before a batch's enqueue (or before a Wait-before-Signal fence was signaled) is visible.
+    std::uint64_t next_visibility_seq() noexcept {
+        return visibility_seq_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
+    std::uint64_t current_visibility_seq() const noexcept {
+        return visibility_seq_.load(std::memory_order_acquire);
+    }
+    void note_signaled_visibility_seq(std::uint64_t seq) noexcept {
+        std::uint64_t cur = signaled_visibility_seq_.load(std::memory_order_relaxed);
+        while (seq > cur && !signaled_visibility_seq_.compare_exchange_weak(cur, seq, std::memory_order_acq_rel,
+                                                                            std::memory_order_relaxed)) {
+        }
+    }
+    std::uint64_t signaled_visibility_seq() const noexcept {
+        return signaled_visibility_seq_.load(std::memory_order_acquire);
+    }
+    // Minimum visibility epoch required by the execute_now() invoking before_execute_() on this thread (0 outside).
+    static std::uint64_t current_before_execute_seq() noexcept { return t_before_execute_seq_; }
     // The page mirror's lookup for buffer_at (src/title_mirror.h): the buffer and offset that hold a title address no
     // buffer of ours holds. Set while no replay runs (device creation and destruction).
     using MirrorBuffer = std::function<bool(std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset)>;
@@ -2514,6 +2534,9 @@ private:
     std::map<std::tuple<VkImage, VkImage, VkImageView, VkImageView, VkRenderPass>, VkFramebuffer> resolve_framebuffers_;
 
     std::function<void()> before_execute_;
+    std::atomic<std::uint64_t> visibility_seq_{0};
+    std::atomic<std::uint64_t> signaled_visibility_seq_{0};
+    static inline thread_local std::uint64_t t_before_execute_seq_ = 0;  // trivially destructible (no TLS callback)
     std::function<void()> after_execute_;
     std::function<std::uint64_t()> on_enqueue_execute_;
     std::function<void(std::uint64_t)> on_finish_execute_;
@@ -2650,6 +2673,7 @@ public:
         if (result != VK_SUCCESS) return false;
         {
             QueueHolds<VkSemaphore>::WorkGuard active(context_.holds());
+            context_.note_signaled_visibility_seq(context_.next_visibility_seq());
             context_.holds().signaled(semaphore_, value);  // queues that held a batch for this value run it now
             context_.holds().pump_ready();
         }
@@ -2836,6 +2860,15 @@ public:
         std::lock_guard lock(inbox_mutex_);
         if (!worker_.joinable()) async_depth_ = depth;
     }
+    // Async worker telemetry snapshots for unit tests.
+    std::uint64_t async_run_ns_for_test() {
+        std::lock_guard lock(inbox_mutex_);
+        return async_stats_.run_ns + async_pump_ns_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t async_room_waits_for_test() {
+        std::lock_guard lock(inbox_mutex_);
+        return async_stats_.room_waits;
+    }
 
     // Entries kept between executions. Execute only uses the first lists.size(); a larger count is retained storage,
     // not work the next submission will replay (vk_queue_test checks both halves of that contract).
@@ -3020,7 +3053,9 @@ private:
 
 public:
     ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {}) {
-        if (!skip_before_execute_.load(std::memory_order_acquire)) pipeline_wait::note_submission();  // big compute warm-ups are left to their first use while the title submits
+        const bool skip_before = skip_before_execute_.load(std::memory_order_acquire);
+        if (!skip_before) pipeline_wait::note_submission();  // big compute warm-ups are left to their first use while the title submits
+        const std::uint64_t vis_seq = skip_before ? 0 : context_.next_visibility_seq();
         auto* diagnostics = context_.device_fault();
         const auto execute_call = diagnostics ? diagnostics->next_execute_call() : 0;
         EnqueueSerial enqueue_serial = make_enqueue_serial();
@@ -3028,6 +3063,7 @@ public:
             Call call;
             call.kind = Call::Kind::execute;
             call.execute_call = execute_call;
+            call.visibility_seq = vis_seq;
             call.enqueue_serial = std::move(enqueue_serial);
             call.lists.reserve(lists.size());
             for (const CommandList* list : lists) call.lists.push_back(std::make_shared<const CommandList>(*list));
@@ -3035,13 +3071,15 @@ public:
             enqueue(std::move(call));
             return ReplayResult::success;
         }
-        return execute_sync(lists, pin, execute_call, std::move(enqueue_serial));
+        return execute_sync(lists, pin, execute_call, std::move(enqueue_serial), vis_seq);
     }
 
     // Zero-copy ExecuteCommandLists for immutable closed CommandList snapshots (used by the COM layer so Reset()
     // allocates fresh storage only while a submitted snapshot is still in flight, avoiding deep copies on submission).
     ReplayResult execute(std::span<const std::shared_ptr<const CommandList>> lists, const PinFn& pin = {}) {
-        if (!skip_before_execute_.load(std::memory_order_acquire)) pipeline_wait::note_submission();
+        const bool skip_before = skip_before_execute_.load(std::memory_order_acquire);
+        if (!skip_before) pipeline_wait::note_submission();
+        const std::uint64_t vis_seq = skip_before ? 0 : context_.next_visibility_seq();
         auto* diagnostics = context_.device_fault();
         const auto execute_call = diagnostics ? diagnostics->next_execute_call() : 0;
         EnqueueSerial enqueue_serial = make_enqueue_serial();
@@ -3049,6 +3087,7 @@ public:
             Call call;
             call.kind = Call::Kind::execute;
             call.execute_call = execute_call;
+            call.visibility_seq = vis_seq;
             call.enqueue_serial = std::move(enqueue_serial);
             call.lists.assign(lists.begin(), lists.end());
             if (pin) call.pin = pin();
@@ -3069,11 +3108,11 @@ public:
         return execute_sync_impl(
             {ptr_data, lists.size()}, pin, execute_call,
             [&lists] { return std::vector<std::shared_ptr<const CommandList>>(lists.begin(), lists.end()); },
-            {}, std::move(enqueue_serial));
+            {}, std::move(enqueue_serial), false, kUnsetEpoch, vis_seq);
     }
 
     ReplayResult execute_sync(std::span<const CommandList* const> lists, const PinFn& pin, std::uint64_t execute_call,
-                              EnqueueSerial enqueue_serial = {}) {
+                              EnqueueSerial enqueue_serial = {}, std::uint64_t vis_seq = 0) {
         return execute_sync_impl(
             lists, pin, execute_call,
             [&lists] {
@@ -3082,27 +3121,29 @@ public:
                 for (const CommandList* list : lists) copies.push_back(std::make_shared<const CommandList>(*list));
                 return copies;
             },
-            {}, std::move(enqueue_serial));
+            {}, std::move(enqueue_serial), false, kUnsetEpoch, vis_seq);
     }
 
     // ID3D12CommandQueue::Signal: the fence reaches `value` after all work submitted so far. Held behind earlier
     // held operations (or an active execution), so the fence does not run ahead of the work it follows. `pin`
     // keeps the fence object alive until the submission has completed, as D3D12 does.
     bool signal(VkSemaphore fence, std::uint64_t value, const PinFn& pin = {}) {
+        const std::uint64_t vis_seq = context_.next_visibility_seq();
         if (async_on()) {
             Call call;
             call.kind = Call::Kind::signal;
             call.fence = fence;
             call.value = value;
+            call.visibility_seq = vis_seq;
             if (pin) call.pin = pin();
             enqueue(std::move(call));
             return true;
         }
-        return signal_sync(fence, value, pin);
+        return signal_sync(fence, value, pin, {}, kUnsetEpoch, vis_seq);
     }
 
     bool signal_sync(VkSemaphore fence, std::uint64_t value, const PinFn& pin, std::shared_ptr<void> async_pin = {},
-                     std::uint64_t async_present_epoch = kUnsetEpoch) {
+                     std::uint64_t async_present_epoch = kUnsetEpoch, std::uint64_t vis_seq = 0) {
         bool ok = true;
         QueueHolds<VkSemaphore>::WorkGuard work_guard;
         std::vector<std::shared_ptr<void>> retired;
@@ -3112,6 +3153,7 @@ public:
                 Deferred op;
                 op.kind = Deferred::Kind::signal;
                 op.present_epoch = async_present_epoch;
+                op.visibility_seq = vis_seq;
                 op.fence = fence;
                 op.value = value;
                 if (async_pin) op.pins.push_back(std::move(async_pin));
@@ -3125,7 +3167,7 @@ public:
                 take_waits_to_exec_locked();
                 state.unlock();
 
-                ok = submit(VK_NULL_HANDLE, fence, value);
+                ok = submit(VK_NULL_HANDLE, fence, value, nullptr, vis_seq);
                 // As for a held Signal (release_held): the fence object, and so its semaphore, stays alive until the
                 // GPU has run the signal. Destroying a semaphore a pending submission signals is undefined
                 // (VUID-vkDestroySemaphore-semaphore-05149), and a title may release a fence right after Signal.
@@ -3525,11 +3567,13 @@ private:
     struct PendingSignal {
         VkSemaphore fence = VK_NULL_HANDLE;
         std::uint64_t value = 0;
+        std::uint64_t visibility_seq = 0;
     };
 
     ReplayResult execute_now(std::span<const CommandList* const> lists, std::uint64_t execute_call,
                              std::span<const std::size_t> batch_breaks = {},
-                             std::span<const PendingSignal> trailing_signals = {}) {
+                             std::span<const PendingSignal> trailing_signals = {},
+                             std::uint64_t visibility_seq = 0, bool from_held = false) {
         const bool skip_before = skip_before_execute_.load(std::memory_order_acquire);
         // The "submit frame" line and the floor: this submission from before its first phase to after its last.
         std::optional<submit_phases::Submission> submission;
@@ -3539,7 +3583,19 @@ private:
             if (!skip_before) waited.emplace(submit_phases::wait_room);
             if (context_.is_device_lost() || !wait_for_room()) return queue_unsupported(__LINE__);
         }
-        if (!skip_before && context_.before_execute_) context_.before_execute_();
+        if (!skip_before && context_.before_execute_) {
+            std::uint64_t req_seq = visibility_seq ? visibility_seq : context_.current_visibility_seq();
+            if (from_held || exec_user_wait_count_ > 0)
+                req_seq = (std::max)(req_seq, context_.signaled_visibility_seq());
+            struct BeforeSeqGuard {
+                std::uint64_t prev;
+                explicit BeforeSeqGuard(std::uint64_t seq) noexcept : prev(VulkanContext::t_before_execute_seq_) {
+                    VulkanContext::t_before_execute_seq_ = seq;
+                }
+                ~BeforeSeqGuard() { VulkanContext::t_before_execute_seq_ = prev; }
+            } before_seq_guard{req_seq};
+            context_.before_execute_();
+        }
         struct AfterExecute {
             VulkanContext& context;
             bool active;
@@ -4480,6 +4536,7 @@ private:
         std::uint64_t seq = 0;  // QueueHolds::next_seq(): the order operations were held in, across queues
         std::uint64_t present_epoch = kUnsetEpoch;  // immutable submit_phases::present_calls at enqueue time
         std::uint64_t execute_call = 0;  // original ExecuteCommandLists call for a held batch
+        std::uint64_t visibility_seq = 0;  // context_.next_visibility_seq() at call time
         EnqueueSerial enqueue_serial;
         std::vector<VkSemaphore> waits;
         std::vector<std::uint64_t> wait_values;
@@ -4653,7 +4710,8 @@ private:
                                    std::uint64_t execute_call, MakeHeldLists&& make_held_lists,
                                    std::shared_ptr<void> async_pin = {}, EnqueueSerial enqueue_serial = {},
                                    bool async_barrier_after = false,
-                                   std::uint64_t async_present_epoch = kUnsetEpoch) {
+                                   std::uint64_t async_present_epoch = kUnsetEpoch,
+                                   std::uint64_t vis_seq = 0) {
         ReplayResult result = ReplayResult::success;
         bool ran = false;
         bool held = false;
@@ -4667,6 +4725,7 @@ private:
             op.barrier_after = async_barrier_after;
             op.present_epoch = async_present_epoch;
             op.execute_call = execute_call;
+            op.visibility_seq = vis_seq;
             op.enqueue_serial = std::move(enqueue_serial);
             op.lists = make_held_lists();
             if (async_pin) op.pins.push_back(std::move(async_pin));
@@ -4719,7 +4778,7 @@ private:
                     take_waits_to_exec_locked();
                     state.unlock();
 
-                    result = execute_now(lists, execute_call);
+                    result = execute_now(lists, execute_call, {}, {}, vis_seq, false);
                     note_coalesced_submit(1);
                     enqueue_serial.finish();
                     if (async_pin) {
@@ -4847,18 +4906,20 @@ private:
                 exec_list_ptrs_.clear();
                 exec_batch_breaks_.clear();
                 exec_pending_signals_.clear();
+                std::uint64_t group_vis_seq = 0;
                 for (const Deferred& op : group_ops) {
                     if (op.kind == Deferred::Kind::batch) {
                         if (!exec_list_ptrs_.empty() && !op.lists.empty())
                             exec_batch_breaks_.push_back(exec_list_ptrs_.size());
                         for (const auto& list : op.lists) exec_list_ptrs_.push_back(list.get());
+                        group_vis_seq = (std::max)(group_vis_seq, op.visibility_seq);
                     } else if (op.kind == Deferred::Kind::signal) {
-                        exec_pending_signals_.push_back({op.fence, op.value});
+                        exec_pending_signals_.push_back({op.fence, op.value, op.visibility_seq});
                     }
                 }
 
-                const ReplayResult result =
-                    execute_now(exec_list_ptrs_, first.execute_call, exec_batch_breaks_, exec_pending_signals_);
+                const ReplayResult result = execute_now(exec_list_ptrs_, first.execute_call, exec_batch_breaks_,
+                                                        exec_pending_signals_, group_vis_seq, /*from_held=*/true);
                 if (result == ReplayResult::success) {
                     note_coalesced_submit(batch_count);
                     for (Deferred& op : group_ops) {
@@ -4872,7 +4933,8 @@ private:
                         if (op.kind == Deferred::Kind::batch) {
                             exec_list_ptrs_.clear();
                             for (const auto& list : op.lists) exec_list_ptrs_.push_back(list.get());
-                            const ReplayResult sub = execute_now(exec_list_ptrs_, op.execute_call);
+                            const ReplayResult sub =
+                                execute_now(exec_list_ptrs_, op.execute_call, {}, {}, op.visibility_seq, true);
                             note_coalesced_submit(1);
                             if (sub != ReplayResult::success) {
                                 int none = static_cast<int>(ReplayResult::success);
@@ -4896,7 +4958,7 @@ private:
                             exec_waits_.clear();
                             exec_wait_values_.clear();
                             exec_wait_pins_.clear();
-                            const bool ok = submit(VK_NULL_HANDLE, op.fence, op.value);
+                            const bool ok = submit(VK_NULL_HANDLE, op.fence, op.value, nullptr, op.visibility_seq);
                             if (!ok) std::fprintf(stderr, "[rt] d3d12: a held Signal failed when it was released\n");
                             retire_exec_pins(op.pins, ok ? submitted_ : 0);
                             exec_waits_ = std::move(saved_waits);
@@ -4924,7 +4986,7 @@ private:
                     exec_wait_pins_.clear();
                     for (Deferred& op : group_ops) {
                         if (op.kind == Deferred::Kind::signal && !context_.is_device_lost()) {
-                            const bool ok = submit(VK_NULL_HANDLE, op.fence, op.value);
+                            const bool ok = submit(VK_NULL_HANDLE, op.fence, op.value, nullptr, op.visibility_seq);
                             if (!ok) std::fprintf(stderr, "[rt] d3d12: a held Signal failed when it was released\n");
                             retire_exec_pins(op.pins, ok ? submitted_ : 0);
                         } else {
@@ -5002,7 +5064,7 @@ private:
             case Deferred::Kind::batch:
                 break;
             case Deferred::Kind::signal: {
-                const bool ok = submit(VK_NULL_HANDLE, op.fence, op.value);
+                const bool ok = submit(VK_NULL_HANDLE, op.fence, op.value, nullptr, op.visibility_seq);
                 if (!ok) std::fprintf(stderr, "[rt] d3d12: a held Signal failed when it was released\n");
                 retire_exec_pins(op.pins, ok ? submitted_ : 0);
                 break;
@@ -5505,9 +5567,9 @@ private:
     }
 
     bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value,
-                CheckpointSubmission* diagnostics = nullptr) {
+                CheckpointSubmission* diagnostics = nullptr, std::uint64_t visibility_seq = 0) {
         if (fence) {
-            const PendingSignal sig{fence, value};
+            const PendingSignal sig{fence, value, visibility_seq};
             return submit_multi(command_buffer, {&sig, 1}, diagnostics);
         }
         return submit_multi(command_buffer, {}, diagnostics);
@@ -5560,14 +5622,18 @@ private:
             }
             if (heap_dedup.empty()) {
                 if (dedup_count < 16) {
-                    stack_dedup[dedup_count++] = {f, v};
+                    stack_dedup[dedup_count++] = {f, v, 0};
                     return;
                 }
                 heap_dedup.assign(stack_dedup, stack_dedup + dedup_count);
             }
-            heap_dedup.push_back({f, v});
+            heap_dedup.push_back({f, v, 0});
         };
-        for (const PendingSignal& sig : extra_signals) add_dedup(sig.fence, sig.value);
+        std::uint64_t max_signal_vis_seq = 0;
+        for (const PendingSignal& sig : extra_signals) {
+            max_signal_vis_seq = (std::max)(max_signal_vis_seq, sig.visibility_seq);
+            add_dedup(sig.fence, sig.value);
+        }
         const PendingSignal* const dedup_ptr = heap_dedup.empty() ? stack_dedup : heap_dedup.data();
         const std::size_t dedup_size = heap_dedup.empty() ? dedup_count : heap_dedup.size();
 
@@ -5677,6 +5743,8 @@ private:
             if (ring) ring->end_submit(ring_at, diagnostic_ms() - submit_start, res);
             if (res == VK_SUCCESS) {
                 context_.record_submit_locked(progress_, ticket);
+                if (max_signal_vis_seq && signal_count > 1)
+                    context_.note_signaled_visibility_seq(max_signal_vis_seq);
                 for (std::uint32_t i = 1; i < signal_count; ++i)
                     context_.holds().signaled(signals_ptr[i], signal_values_ptr[i]);
             }
@@ -5752,7 +5820,7 @@ private:
         enum class Kind : std::uint8_t { execute, signal, wait, marker };
         Kind kind = Kind::execute;
         bool barrier_after = false;  // Present / after_held() arrived after this call: do not merge past it
-        std::uint64_t seq = 0, present_epoch = kUnsetEpoch, execute_call = 0, value = 0;
+        std::uint64_t seq = 0, present_epoch = kUnsetEpoch, execute_call = 0, visibility_seq = 0, value = 0;
         EnqueueSerial enqueue_serial;
         // Immutable closed CommandList snapshots (zero-copy when submitted via shared_ptr<const CommandList>).
         std::vector<std::shared_ptr<const CommandList>> lists;
@@ -5769,11 +5837,13 @@ private:
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
     };
 
-    // Counts pending coalesced submission groups (plus 1 when the worker is busy): consecutive execute calls separated
-    // only by non-barrier Signals within the same present_epoch coalesce into ONE submission, so a frame submitting
-    // 17+ direct batches + Signals does not stall title threads on room_cv_ while async_depth_ still bounds distinct
-    // submission groups (e.g. Present frames or Wait-separated phases). inbox_mutex_ held.
-    std::size_t pending_submit_groups_locked() const {
+    // Counts distinct frame / barrier groups pending in inbox_ (plus 1 when the worker is busy): intra-frame
+    // cross-queue Wait/Signal splits within the same present_epoch stay in ONE frame group so a barrier-heavy frame
+    // (25+ Direct batches separated by cross-queue Waits) does not stall the title thread on room_cv_ mid-frame
+    // (which would also delay posting cross-queue Signals needed by earlier queued Waits), while async_depth_ still
+    // bounds distinct frames (Present / after_held barriers) and max_batches bounds total queued batch memory.
+    // inbox_mutex_ held.
+    std::size_t pending_frame_groups_locked() const {
         std::size_t groups = worker_busy_ ? 1 : 0;
         bool in_group = false;
         std::uint64_t prev_epoch = kUnsetEpoch;
@@ -5786,18 +5856,11 @@ private:
                 }
                 prev_epoch = c.present_epoch;
                 prev_barrier = c.barrier_after;
-            } else if (c.kind == Call::Kind::signal) {
-                if (in_group) {
-                    if (prev_barrier || c.present_epoch != prev_epoch) {
-                        in_group = false;
-                    } else {
-                        prev_epoch = c.present_epoch;
-                        prev_barrier = c.barrier_after;
-                    }
-                }
-            } else {
+            } else if (in_group && (prev_barrier || c.present_epoch != prev_epoch)) {
                 in_group = false;
                 prev_barrier = false;
+            } else if (in_group && c.barrier_after) {
+                prev_barrier = true;
             }
         }
         return groups;
@@ -5810,11 +5873,11 @@ private:
             worker_ = std::thread([this] { async_worker(); });
             async_started_.store(true, std::memory_order_release);
         }
-        // n submission groups, with generous batch room for coalesced frames (max(8n, 32) batches, 4x calls when n >= 2;
-        // n = 1 keeps strict single-batch backpressure).
+        // n frame groups, with bounded batch headroom for multi-batch frames (max(16n, 64) batches, 4x calls when
+        // n >= 2; n = 1 keeps strict single-batch backpressure).
         const std::size_t max_batches =
             async_depth_ <= 1 ? std::size_t(async_depth_)
-                              : (std::max)(std::size_t(async_depth_) * 8, std::size_t(32));
+                              : (std::max)(std::size_t(async_depth_) * 16, std::size_t(64));
         const std::size_t max_calls = max_batches * 4;
         const auto room = [this, batch, max_batches, max_calls] {
             if (async_stop_) return true;
@@ -5822,7 +5885,7 @@ private:
             if (!batch) return true;
             if (inbox_batches_ < async_depth_) return true;
             if (async_depth_ <= 1 || inbox_batches_ >= max_batches) return false;
-            return pending_submit_groups_locked() < async_depth_;
+            return pending_frame_groups_locked() < async_depth_;
         };
         if (!room()) {
             const auto start = std::chrono::steady_clock::now();
@@ -5925,6 +5988,7 @@ private:
             // Wrap the entire worker turn (release_held, call execution, and pump_ready) so gate-released batches and
             // deferred presents running on async_worker are attributed to worker_submit, never to title threads.
             const submit_phases::WorkerScope busy(submit_phases::worker_submit);
+            const auto turn_start = std::chrono::steady_clock::now();
             DrainInfo rel_info{};
             const bool released = release && release_held(/*from_pump=*/false, &rel_info);
             if (released && have) {
@@ -5939,8 +6003,9 @@ private:
                     context_.holds().pump_ready();
                 }
             }
+            auto have_start = turn_start;
             if (have) {
-                const auto start = std::chrono::steady_clock::now();
+                have_start = std::chrono::steady_clock::now();
                 if (group_count == 1) {
                     run_call(group_calls[0]);
                 } else if (group_count > 1) {
@@ -5948,38 +6013,48 @@ private:
                 } else {
                     run_call(single_call);
                 }
-                const auto end = std::chrono::steady_clock::now();
-                const auto ran_ns =
-                    std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+            }
+            const auto turn_end = std::chrono::steady_clock::now();
+            const std::uint64_t ran_ns = (have || released)
+                ? std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(turn_end - turn_start).count())
+                : 0;
+            {
                 std::lock_guard lock(inbox_mutex_);
-                async_stats_.run_ns += ran_ns;
-                if (group_count != 0) {
-                    for (const Call& c : group_calls) {
+                async_stats_.run_ns += ran_ns + async_pump_ns_.exchange(0, std::memory_order_relaxed);
+                if (have) {
+                    if (group_count != 0) {
+                        for (const Call& c : group_calls) {
+                            const auto lag = std::uint64_t(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(have_start - c.queued_at).count());
+                            async_stats_.lag_ns += lag;
+                            async_stats_.lag_max_ns = (std::max)(async_stats_.lag_max_ns, lag);
+                        }
+                    } else {
                         const auto lag = std::uint64_t(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(start - c.queued_at).count());
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(have_start - single_call.queued_at)
+                                .count());
                         async_stats_.lag_ns += lag;
                         async_stats_.lag_max_ns = (std::max)(async_stats_.lag_max_ns, lag);
                     }
-                } else {
-                    const auto lag = std::uint64_t(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(start - single_call.queued_at).count());
-                    async_stats_.lag_ns += lag;
-                    async_stats_.lag_max_ns = (std::max)(async_stats_.lag_max_ns, lag);
                 }
-            }
-            {
-                std::lock_guard lock(inbox_mutex_);
                 running_seq_ = 0;
                 worker_busy_ = false;
                 if (exec_count != 0) --inbox_batches_;
-                if (have && room_waiters_ > 0) room_cv_.notify_all();
+                if (room_waiters_ > 0) room_cv_.notify_all();
                 idle_cv_.notify_all();
                 report_async_locked();
             }
             inbox_held_guard.release();
             single_call = Call{};
             group_calls.clear();  // the snapshots, pins, and serials go before the pump, outside the lock
-            if (have || released) context_.holds().pump_ready();
+            if (have || released) {
+                const auto pump_start = std::chrono::steady_clock::now();
+                context_.holds().pump_ready();
+                const auto pump_ns = std::uint64_t(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pump_start)
+                        .count());
+                async_pump_ns_.fetch_add(pump_ns, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -6009,6 +6084,7 @@ private:
                 Deferred op;
                 op.barrier_after = call.barrier_after;
                 op.present_epoch = call.present_epoch;
+                op.visibility_seq = call.visibility_seq;
                 if (call.kind == Call::Kind::signal) {
                     op.kind = Deferred::Kind::signal;
                     op.fence = call.fence;
@@ -6065,18 +6141,21 @@ private:
                     exec_list_ptrs_.clear();
                     exec_batch_breaks_.clear();
                     exec_pending_signals_.clear();
+                    std::uint64_t group_vis_seq = 0;
                     for (const Call& call : calls) {
                         if (call.kind == Call::Kind::execute) {
                             if (!exec_list_ptrs_.empty() && !call.lists.empty())
                                 exec_batch_breaks_.push_back(exec_list_ptrs_.size());
                             for (const auto& list : call.lists) exec_list_ptrs_.push_back(list.get());
+                            group_vis_seq = (std::max)(group_vis_seq, call.visibility_seq);
                         } else if (call.kind == Call::Kind::signal) {
-                            exec_pending_signals_.push_back({call.fence, call.value});
+                            exec_pending_signals_.push_back({call.fence, call.value, call.visibility_seq});
                         }
                     }
 
-                    const ReplayResult result = execute_now(exec_list_ptrs_, calls.front().execute_call,
-                                                            exec_batch_breaks_, exec_pending_signals_);
+                    const ReplayResult result =
+                        execute_now(exec_list_ptrs_, calls.front().execute_call, exec_batch_breaks_,
+                                    exec_pending_signals_, group_vis_seq, /*from_held=*/false);
                     if (result == ReplayResult::success) {
                         note_coalesced_submit(exec_count);
                         for (Call& call : calls) {
@@ -6091,7 +6170,8 @@ private:
                             if (call.kind == Call::Kind::execute) {
                                 exec_list_ptrs_.clear();
                                 for (const auto& list : call.lists) exec_list_ptrs_.push_back(list.get());
-                                const ReplayResult sub = execute_now(exec_list_ptrs_, call.execute_call);
+                                const ReplayResult sub =
+                                    execute_now(exec_list_ptrs_, call.execute_call, {}, {}, call.visibility_seq, false);
                                 note_coalesced_submit(1);
                                 if (sub != ReplayResult::success) {
                                     int none = static_cast<int>(ReplayResult::success);
@@ -6116,7 +6196,8 @@ private:
                                 exec_waits_.clear();
                                 exec_wait_values_.clear();
                                 exec_wait_pins_.clear();
-                                const bool ok = submit(VK_NULL_HANDLE, call.fence, call.value);
+                                const bool ok =
+                                    submit(VK_NULL_HANDLE, call.fence, call.value, nullptr, call.visibility_seq);
                                 if (!ok) {
                                     int none = static_cast<int>(ReplayResult::success);
                                     held_failure_.compare_exchange_strong(none, static_cast<int>(ReplayResult::unsupported));
@@ -6147,7 +6228,8 @@ private:
                         exec_wait_pins_.clear();
                         for (Call& call : calls) {
                             if (call.kind == Call::Kind::signal && !context_.is_device_lost()) {
-                                const bool ok = submit(VK_NULL_HANDLE, call.fence, call.value);
+                                const bool ok =
+                                    submit(VK_NULL_HANDLE, call.fence, call.value, nullptr, call.visibility_seq);
                                 if (!ok) {
                                     int none_s = static_cast<int>(ReplayResult::success);
                                     held_failure_.compare_exchange_strong(none_s, static_cast<int>(ReplayResult::unsupported));
@@ -6241,7 +6323,8 @@ private:
             const std::size_t count = call.lists.size();
             const ReplayResult result = execute_sync_impl(
                 {ptr_data, count}, {}, call.execute_call, [&call] { return std::move(call.lists); },
-                std::move(call.pin), std::move(call.enqueue_serial), call.barrier_after, call.present_epoch);
+                std::move(call.pin), std::move(call.enqueue_serial), call.barrier_after, call.present_epoch,
+                call.visibility_seq);
             if (result != ReplayResult::success) {
                 int none = static_cast<int>(ReplayResult::success);
                 held_failure_.compare_exchange_strong(none, static_cast<int>(result));
@@ -6252,7 +6335,8 @@ private:
             break;
         }
         case Call::Kind::signal:
-            if (!signal_sync(call.fence, call.value, {}, std::move(call.pin), call.present_epoch)) {
+            if (!signal_sync(call.fence, call.value, {}, std::move(call.pin), call.present_epoch,
+                             call.visibility_seq)) {
                 int none = static_cast<int>(ReplayResult::success);
                 held_failure_.compare_exchange_strong(none, static_cast<int>(ReplayResult::unsupported));
                 std::fprintf(stderr, "[rt] d3d12: a queued Signal failed on the queue's worker\n");
@@ -6335,6 +6419,7 @@ private:
     std::uint64_t running_seq_ = 0;      // oldest seq of the call(s) the worker runs now
     bool worker_busy_ = false, release_requested_ = false, async_stop_ = false;
     AsyncStats async_stats_;
+    std::atomic<std::uint64_t> async_pump_ns_{0};  // pump_ready() ns folded into async_stats_.run_ns on next lock
     unsigned async_depth_ = async_depth();
     std::atomic<bool> async_started_{false};
     bool synchronous_ = false;  // make_synchronous()
