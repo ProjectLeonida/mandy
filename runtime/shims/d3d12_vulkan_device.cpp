@@ -2588,7 +2588,8 @@ struct TextureCreateInfo {
     VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
     std::array<VkFormat, 2> view_formats{};
 
-    TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable) {
+    TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable,
+                      VkSampleCountFlags programmable_samples) {
         const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
@@ -2601,6 +2602,9 @@ struct TextureCreateInfo {
         info.mipLevels = desc.MipLevels;
         info.arrayLayers = volume ? 1 : desc.DepthOrArraySize;
         info.samples = VkSampleCountFlagBits(std::max(1u, desc.SampleDesc.Count));
+        if ((programmable_samples & info.samples) && (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+            (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+            info.flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
         info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
@@ -3080,6 +3084,8 @@ struct DeviceState {
     std::uint32_t f16_half_top_location = 29;
     float max_sampler_lod_bias = 0;
     D3D12_CONSERVATIVE_RASTERIZATION_TIER conservative_raster_tier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+    VkSampleCountFlags sample_grid_1 = 0, sample_grid_4 = 0;
+    D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER sample_positions_tier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
     bool conservative_post_depth_coverage = false;
     // VkPhysicalDeviceDepthStencilResolveProperties: the modes a depth or stencil ResolveSubresourceRegion can use.
     VkResolveModeFlags depth_resolve_modes = 0;
@@ -9518,7 +9524,7 @@ public:
     HRESULT create_sparse_image() {
         auto& vk = device_.context->vk;
         const auto format = device_.texture_format(desc_);
-        TextureCreateInfo create(desc_, format, false);
+        TextureCreateInfo create(desc_, format, false, device_.sample_grid_1);
         create.info.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
                              VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
         HRESULT support = device_.check_image_support(create.info);
@@ -9624,7 +9630,7 @@ public:
                 !desc_.DepthOrArraySize || desc_.DepthOrArraySize > slice_limit || desc_.MipLevels > mips)
                 return E_INVALIDARG;
         }
-        TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format));
+        TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format), device_.sample_grid_1);
         VkImageCreateInfo& info = create.info;
         if (!castable.empty()) {
             // D3D12 always allows a view in the resource's own format, whether or not the castable list names
@@ -9897,6 +9903,7 @@ public:
         binding.volume = volume;
         binding.line = one_d;
         binding.samples = samples;
+        binding.sample_locations_depth = (info.flags & VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT) != 0;
         binding.color_attachment = (info.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
         binding.sampled = (info.usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0;
         binding.simultaneous_access = (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0;
@@ -13023,6 +13030,8 @@ public:
         recipe_.conservative = r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
         recipe_.multisample = multisample;
         graphics_.samples = samples;
+        graphics_.sample_grid_1 = device_.sample_grid_1;
+        graphics_.sample_grid_4 = device_.sample_grid_4;
         recipe_.sample_mask = sample_mask;
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
@@ -13594,7 +13603,7 @@ private:
         // A mesh pipeline takes neither the topology nor the strides as dynamic state
         // (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065 and -07066).
         // With multiViewport enabled, VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT allow 1..16 dynamic viewports/scissors.
-        VkDynamicState dyn_list[8]{};
+        VkDynamicState dyn_list[9]{};
         std::uint32_t dyn_count = 0;
         dyn_list[dyn_count++] =
             graphics_.viewport_with_count ? VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT : VK_DYNAMIC_STATE_VIEWPORT;
@@ -13612,6 +13621,15 @@ private:
         dynamic.dynamicStateCount = dyn_count;
         dynamic.pDynamicStates = dyn_list;
 
+        VkPipelineSampleLocationsStateCreateInfoEXT custom{VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
+        if (unbound & leonida::GraphicsPipeline::custom_samples) {
+            dyn_list[dyn_count++] = VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT;
+            dynamic.dynamicStateCount = dyn_count;
+            custom.sampleLocationsEnable = VK_TRUE;
+            custom.sampleLocationsInfo.sType = VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT;
+            custom.pNext = multisample.pNext;
+            multisample.pNext = &custom;
+        }
         // A lazy pipeline's stages get their modules here, for this one call (Vulkan lets a module go once the
         // pipeline exists), so the driver holds no SPIR-V for pipelines that are not drawn.
         auto bytes = stage_bytes_;
@@ -15268,6 +15286,38 @@ public:
                 if (info.conservative_rasterization) resolve.pNext = &conservative;
                 VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &resolve};
                 get_props2(info.physical, &props);
+                if (info.sample_locations) {
+                    VkPhysicalDeviceSampleLocationsPropertiesEXT locations{
+                        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT};
+                    VkPhysicalDeviceProperties2 sample_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &locations};
+                    get_props2(info.physical, &sample_props);
+                    const auto get_grid = reinterpret_cast<PFN_vkGetPhysicalDeviceMultisamplePropertiesEXT>(
+                        info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMultisamplePropertiesEXT"));
+                    if (get_grid && props.properties.limits.standardSampleLocations && locations.variableSampleLocations && locations.sampleLocationSubPixelBits >= 4 &&
+                        locations.sampleLocationCoordinateRange[0] <= 0 && locations.sampleLocationCoordinateRange[1] >= 15.f / 16) {
+                        for (unsigned samples = 1; samples <= 16; samples *= 2) {
+                            if (!(locations.sampleLocationSampleCounts & samples)) continue;
+                            VkMultisamplePropertiesEXT grid{VK_STRUCTURE_TYPE_MULTISAMPLE_PROPERTIES_EXT};
+                            get_grid(info.physical, VkSampleCountFlagBits(samples), &grid);
+                            const auto extent = grid.maxSampleLocationGridSize;
+                            if (extent.width && extent.height) state_.sample_grid_1 |= samples;
+                            if (samples <= 4 && extent.width >= 2 && extent.height >= 2 &&
+                                extent.width % 2 == 0 && extent.height % 2 == 0) state_.sample_grid_4 |= samples;
+                        }
+                        const auto counts = (props.properties.limits.framebufferColorSampleCounts |
+                                             props.properties.limits.framebufferDepthSampleCounts |
+                                             props.properties.limits.framebufferStencilSampleCounts |
+                                             props.properties.limits.framebufferNoAttachmentsSampleCounts) & 31u;
+                        // Four repeating pixels can name at most sixteen sample locations altogether.
+                        const auto grid_counts = counts & (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT);
+                        const auto tier1_counts = counts & (VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT);
+                        if (counts && (state_.sample_grid_1 & counts) == counts &&
+                            (state_.sample_grid_4 & grid_counts) == grid_counts)
+                            state_.sample_positions_tier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_2;
+                        else if (tier1_counts && (state_.sample_grid_1 & tier1_counts) == tier1_counts)
+                            state_.sample_positions_tier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_1;
+                    }
+                }
                 state_.conservative_raster_tier = D3D12_CONSERVATIVE_RASTERIZATION_TIER(leonida::conservative_raster::tier(
                     info.conservative_rasterization, props.properties.limits.subPixelPrecisionBits,
                     conservative.primitiveOverestimationSize, conservative.degenerateTrianglesRasterized == VK_TRUE,
@@ -20393,7 +20443,7 @@ public:
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS2*>(data);
             *opts = {};
             opts->DepthBoundsTestSupported = state_.info.features.depthBounds ? TRUE : FALSE;
-            opts->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
+            opts->ProgrammableSamplePositionsTier = state_.sample_positions_tier;
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS3: {
@@ -21174,7 +21224,7 @@ private:
             return kInvalidAllocation;
         }
         VkMemoryRequirements need{};
-        const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format));
+        const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format), state_.sample_grid_1);
         if (!state_.memory_requirements(create.info, need)) return kInvalidAllocation;
         if (tiled) {
             leonida::ResourceTiling tiling;
@@ -22966,6 +23016,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
     });
+    info.sample_locations = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+        return std::strcmp(e.extensionName, VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME) == 0;
+    });
     const bool has_host_image_copy = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0;
     });
@@ -23300,6 +23353,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (trace_pipeline_compile() && !v13.core && info.pipeline_creation_feedback)
         device_extensions.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
     if (info.conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
+    if (info.sample_locations) device_extensions.push_back(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
