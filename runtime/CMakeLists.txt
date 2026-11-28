@@ -1505,6 +1505,8 @@ if(BUILD_TESTING)
     add_test(NAME xs_proxy_mock_env_slots_74 COMMAND xs_proxy_mock_test --env-slots-74)
     # LEONIDA_SLOT133_LAYOUT_WORD=1 (set by the test itself): the slot 133 stand-in reads its fourth word as a layout.
     add_test(NAME xs_proxy_mock_slot133_layout COMMAND xs_proxy_mock_test --slot133-layout)
+    # LEONIDA_UPLOAD_REWIND=0 (set by the test itself): the upload arena only advances, as before the rewind.
+    add_test(NAME xs_proxy_mock_upload_rewind_off COMMAND xs_proxy_mock_test --upload-rewind-off)
   endif()
   # Reads d3d12.h and takes MSVC options, so only where the Windows runtime is built.
   if(TARGET gta6rt)
