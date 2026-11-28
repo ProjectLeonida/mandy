@@ -9,8 +9,8 @@ Usage:
     python -I tools/valu_int_diff.py [--programs N] [--seed S] [--max-ops N] [--spirv-val]
     python -I tools/valu_int_diff.py --self-test
 
-Exit code 0 when every program matches, 1 on a mismatch (the first one is printed with its listing), 2 on a
-harness error.
+Exit code 0 when every program matches, 1 on a mismatch (the first one is printed with its listing), 2 on a usage
+error (--programs or --max-ops below 1) or a harness error.
 """
 import argparse
 import os
@@ -533,6 +533,10 @@ def main(argv=None):
     ap.add_argument("--spirv-val", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args(argv)
+    if args.programs < 1:
+        ap.error("--programs must be at least 1")
+    if args.max_ops < 1:
+        ap.error("--max-ops must be at least 1")
     if args.self_test:
         self_test()
         print("self-test OK")

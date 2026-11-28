@@ -1,4 +1,6 @@
 """Tests for tools/valu_int_diff.py: integer & packed-16bit VALU differential fuzzer (no game data, stdlib only)."""
+import contextlib
+import io
 import os
 import sys
 import unittest
@@ -11,9 +13,36 @@ if TOOLS not in sys.path:
 import valu_int_diff  # noqa: E402
 
 
+def _run_main(argv):
+    """Run valu_int_diff.main(argv) and return (rc, stdout, stderr); an argparse usage error becomes its exit code."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            rc = valu_int_diff.main(argv)
+        except SystemExit as exc:
+            rc = exc.code
+    return rc, out.getvalue(), err.getvalue()
+
+
 class ValuIntDiffTests(unittest.TestCase):
     def test_self_test_and_negative_controls(self):
         valu_int_diff.self_test()
+
+    def test_rejects_nonpositive_count_arguments(self):
+        # A usage mistake must read as a usage error (exit 2), not as a harness failure or a silent empty run.
+        for flag in ("--max-ops", "--programs"):
+            for bad in ("0", "-1"):
+                with self.subTest(flag=flag, value=bad):
+                    rc, out, err = _run_main([flag, bad])
+                    self.assertEqual(rc, 2)
+                    self.assertIn(f"{flag} must be at least 1", err)
+                    self.assertNotIn("harness error", err + out)
+                    self.assertNotIn("0 pass", out)
+
+    def test_valid_arguments_still_run(self):
+        rc, out, err = _run_main(["--programs", "1", "--max-ops", "1"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("1 programs (seed 1): 1 pass, 0 mismatch", out)
 
     def test_seeded_100_programs_match(self):
         fail = valu_int_diff.run_fuzz(programs=100, seed=11, max_ops=16, spirv_val=False)
