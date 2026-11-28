@@ -434,7 +434,7 @@ pub(crate) fn module() -> HleModule {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use opus_pure::{Application, OpusEncoder};
 
@@ -559,54 +559,23 @@ mod tests {
     }
 
     /// Counts this thread's allocations of a stereo packet's PCM or larger,
-    /// for what a packet costs. Not with the allocators the features bring.
+    /// for what a packet costs. The test binary's allocator (`test_alloc`)
+    /// tells it of each block. Not with the allocators the features bring.
     #[cfg(not(any(feature = "diagnostics", feature = "mimalloc")))]
-    mod counting {
-        use std::alloc::{GlobalAlloc, Layout, System};
+    pub(crate) mod counting {
         use std::cell::Cell;
 
         const LARGE: usize = super::MAX_FRAMES * 2 * size_of::<f32>();
 
         std::thread_local! {
-            pub(super) static COUNT: Cell<usize> = const { Cell::new(0) };
+            pub(crate) static COUNT: Cell<usize> = const { Cell::new(0) };
         }
 
-        fn note(size: usize) {
+        pub(crate) fn note(size: usize) {
             if size >= LARGE {
                 let _ = COUNT.try_with(|n| n.set(n.get() + 1));
             }
         }
-
-        struct Counting;
-
-        // SAFETY: everything goes to the system allocator as it came.
-        unsafe impl GlobalAlloc for Counting {
-            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                note(layout.size());
-                // SAFETY: the caller's contract, passed on.
-                unsafe { System.alloc(layout) }
-            }
-
-            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-                note(layout.size());
-                // SAFETY: as above.
-                unsafe { System.alloc_zeroed(layout) }
-            }
-
-            unsafe fn realloc(&self, at: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-                note(size);
-                // SAFETY: as above.
-                unsafe { System.realloc(at, layout, size) }
-            }
-
-            unsafe fn dealloc(&self, at: *mut u8, layout: Layout) {
-                // SAFETY: as above.
-                unsafe { System.dealloc(at, layout) }
-            }
-        }
-
-        #[global_allocator]
-        static HEAP: Counting = Counting;
     }
 
     /// A packet decodes into memory the connection keeps: each of the 50

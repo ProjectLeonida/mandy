@@ -1866,7 +1866,7 @@ pub(crate) fn module() -> HleModule {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
 
@@ -2474,13 +2474,12 @@ mod tests {
         assert_eq!(out, bc4_blocks());
     }
 
-    /// The test binary's allocator: the system's, counting the blocks of the
-    /// sizes a test watches (`compressed_requests_reuse_the_workers_buffers`).
-    /// Not with the features under which leonida-gpu installs an allocator
-    /// of its own, since a process has one.
+    /// Counts the blocks of the sizes a test watches
+    /// (`compressed_requests_reuse_the_workers_buffers`). The test binary's
+    /// allocator (`test_alloc`) tells it of each block. Not with the features
+    /// under which leonida-gpu installs an allocator of its own.
     #[cfg(not(any(feature = "diagnostics", feature = "mimalloc")))]
-    mod watched_blocks {
-        use std::alloc::{GlobalAlloc, Layout, System};
+    pub(crate) mod watched_blocks {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
         /// The sizes watched (0: none), and how many blocks of each were
@@ -2488,45 +2487,13 @@ mod tests {
         pub(super) static SIZES: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
         pub(super) static BLOCKS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-        fn note(size: usize) {
+        pub(crate) fn note(size: usize) {
             for (watched, blocks) in SIZES.iter().zip(&BLOCKS) {
                 if size != 0 && watched.load(Relaxed) == size {
                     blocks.fetch_add(1, Relaxed);
                 }
             }
         }
-
-        struct Counting;
-
-        // SAFETY: every call goes to the system's allocator unchanged; only
-        // counters are kept beside it.
-        unsafe impl GlobalAlloc for Counting {
-            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                note(layout.size());
-                // SAFETY: the caller's contract, passed on.
-                unsafe { System.alloc(layout) }
-            }
-
-            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-                note(layout.size());
-                // SAFETY: the caller's contract, passed on.
-                unsafe { System.alloc_zeroed(layout) }
-            }
-
-            unsafe fn dealloc(&self, at: *mut u8, layout: Layout) {
-                // SAFETY: the caller's contract, passed on.
-                unsafe { System.dealloc(at, layout) }
-            }
-
-            unsafe fn realloc(&self, at: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-                note(size);
-                // SAFETY: the caller's contract, passed on.
-                unsafe { System.realloc(at, layout, size) }
-            }
-        }
-
-        #[global_allocator]
-        static HEAP: Counting = Counting;
     }
 
     /// Compressed requests run on buffers their worker keeps: the source
