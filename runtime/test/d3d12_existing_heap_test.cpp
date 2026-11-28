@@ -4,7 +4,8 @@
 // on the host devices too. With VK_EXT_external_memory_host, OpenExistingHeapFromAddress on real host memory is
 // compared case by case with the host devices (open_cases: RTX 4090 and WARP agree), and a heap is opened on a
 // committed range; without it, the device reports EXISTING_HEAPS unsupported and answers an accepted range E_NOTIMPL.
-// No shaders or game data.
+// Each Vulkan-backed device goes with the test's last reference to it (release_device), and under
+// LEONIDA_VK_VALIDATION=1 vkDestroyDevice must find nothing left over. No shaders or game data.
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device3-openexistingheapfromaddress
 #include "../shims/title_gpu_placements.h"
 #include "../shims/xg_xs_layout.h"
@@ -2454,9 +2455,19 @@ void print_cases(const std::vector<Case>& cases, const char* who) {
                     int(c.desc.Properties.CPUPageProperty), int(c.desc.Properties.MemoryPoolPreference),
                     unsigned(c.desc.Flags));
 }
-}  // namespace
 
-int main(int argc, char** argv) {
+// The test's last reference to a device destroys it: nothing the layer made for it keeps it alive, such as the images
+// made for slot-70 views, live or retired (a retired one is released at the first refresh pass 3 s later, which a
+// device released before then never reaches). Otherwise the device and all its Vulkan objects outlive the test and
+// vkDestroyDevice reports them (VUID-vkDestroyDevice-device-05137).
+int release_device(Ref<ID3D12Device>& device, const char* who) {
+    const ULONG left = device.p->Release();
+    device.p = nullptr;
+    EXPECT(left == 0);
+    return 0;
+}
+
+int run(int argc, char** argv) {
     const bool prefix_only = argc == 2 && std::strcmp(argv[1], "--host-prefix-only") == 0;
     const bool async_plane = argc == 2 && std::strcmp(argv[1], "--mapped-plane-async") == 0;
     if (argc != 1 && !prefix_only && !async_plane) return 2;
@@ -2485,7 +2496,8 @@ int main(int argc, char** argv) {
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
         if (prefix_only) {
             if (!vk.host_pointer_alignment) return 77;
-            const int result = check_host_prefix_buffers(ours.p);
+            int result = check_host_prefix_buffers(ours.p);
+            result += release_device(ours, "vulkan device");
             return result || vk.validation_errors() ? 1 : 0;
         }
         if (async_plane) {
@@ -2496,6 +2508,8 @@ int main(int argc, char** argv) {
             Ref<ID3D12Device> staged;
             if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
             result += check_mapped_plane_first_use(staged.p);
+            result += release_device(staged, "staged device");
+            result += release_device(ours, "vulkan device");
             return result || vk.validation_errors() ? 1 : 0;
         }
         failures += check(ours.p, "vulkan");
@@ -2523,6 +2537,7 @@ int main(int argc, char** argv) {
             failures += check_shared_bc_placements(staged.p, true);
             failures += check_mapped_plane(staged.p);
             failures += check_mapped_bc_array(staged.p);
+            failures += release_device(staged, "staged device");
         }
         failures += check_written_pages_all(ours.p);
         {
@@ -2536,6 +2551,7 @@ int main(int argc, char** argv) {
                     failures += check_write_watched(ours.p, second.p, modifier);
                 failures += check_rereserved(ours.p);
             }
+            if (second.p) failures += release_device(second, "second device");
         }
         failures += check_heap_lock_faults(ours.p);
         Ref<IDXGIFactory4> factory;
@@ -2553,10 +2569,24 @@ int main(int argc, char** argv) {
                 if (vk.host_pointer_alignment) failures += compare_cases(vulkan_cases, host_cases, who.c_str());
             }
         }
+        failures += release_device(ours, "vulkan device");
     }
     if (vk.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", vk.validation_errors());
         return 1;
     }
     return failures ? 1 : 0;
+}
+}  // namespace
+
+int main(int argc, char** argv) {
+    // run's vktest::Device destroys the Vulkan device on return, so what vkDestroyDevice finds left over
+    // (VUID-vkDestroyDevice-device-05137 under LEONIDA_VK_VALIDATION=1) is counted here.
+    const int result = run(argc, argv);
+    if (result) return result;
+    if (const unsigned errors = vktest::validation_error_count()) {
+        std::fprintf(stderr, "%u validation errors at teardown\n", errors);
+        return 1;
+    }
+    return 0;
 }

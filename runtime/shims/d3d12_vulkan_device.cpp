@@ -16097,6 +16097,7 @@ public:
                 state_.context->observe_result(state_.context->vk.vkDeviceWaitIdle(state_.info.device),
                                               "vkDeviceWaitIdle");
             }
+            release_title_images();  // their Vulkan objects go to the deferred queue drained next
             state_.context->drain_deleted_resources(UINT64_MAX);
             state_.context->set_pipeline_workers(nullptr);  // before the pipeline cache is written and destroyed
             state_.context->set_bindless_release(nullptr, nullptr);
@@ -17214,6 +17215,11 @@ private:
             log_once("an image for a slot-70 texture view could not be made; HRESULT", int(hr));
             return refuse_title_view("image not created", d, address), nullptr;
         }
+        // The registry's reference keeps the image and the device keeps the registry, so the image holds no device
+        // reference: with one, a device its title (or a test) released stayed alive, with all its Vulkan objects,
+        // while an image made here was in the registry or retired and not yet released (3 s on, at a refresh pass a
+        // released device never runs). ~Device releases what is left (release_title_images).
+        r->attach_device(nullptr);
         if (!title_layout_fits(entry->layout, d, *r, why)) {
             r->Release();
             return refuse_title_view(why, d, address), nullptr;
@@ -17251,6 +17257,21 @@ private:
         retired_title_textures_.emplace_back(std::chrono::steady_clock::now(), t.resource);
         t.resource = nullptr;
         ++title_stats_.retired;
+    }
+
+    // Device teardown, after the GPU is idle: the last release of the images made for slot-70 views, those in the
+    // registry and those retired. Each destructor reaches the device state, so this comes before the context goes.
+    void release_title_images() {
+        std::vector<Resource*> release;
+        {
+            std::lock_guard lock(state_.title_texture_mutex);
+            for (auto& [address, t] : state_.title_textures)
+                if (t && t->owned && t->resource) release.push_back(std::exchange(t->resource, nullptr));
+            for (const auto& [when, r] : retired_title_textures_) release.push_back(r);
+            retired_title_textures_.clear();
+            retired_backing_ = 0;
+        }
+        for (Resource* r : release) r->Release();
     }
 
     // LEONIDA_TITLE_PARTIAL_MIPS=1 (off by default). A slot-70 2D texture whose larger mips are not readable is filled from the

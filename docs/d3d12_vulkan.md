@@ -3582,6 +3582,11 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   over the map itself would step into a freed node (measured: an access violation reading the nil flag of a null
   child, 0x19, in `Device::refresh_title_textures`). The snapshot also holds a reference to each entry, so an entry
   retired during the pass is still alive when its turn comes.
+- An image made for slot-70 views (`make_title_texture`) is held by the registry and holds no reference to the device;
+  a retired one is released by the first refresh pass 3 s later, and `~Device` releases the rest after the GPU is idle
+  (`release_title_images`). With a device reference, a device released before those passes never went: it kept every
+  Vulkan object it had (`d3d12_existing_heap`'s device without host image copies: 93 at `vkDestroyDevice` on an
+  RX 7900 XT, VUID-vkDestroyDevice-device-05137).
 - Sampled title images can use device-local memory even when Vulkan host image copies require a
   host-visible memory type. The runtime queries the same image with and without host-transfer usage.
   When only the latter permits plain device-local backing, it detiles the complete image into a reusable
