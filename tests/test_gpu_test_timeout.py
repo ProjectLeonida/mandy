@@ -36,6 +36,16 @@ class Limit(unittest.TestCase):
         self.assertEqual(self.limit(""), check.DEFAULT_GPU_TEST_TIMEOUT)
         self.assertEqual(self.limit(" 2.5 "), 2.5)
 
+    def test_platform_wait_limit_is_checked_before_launch(self):
+        self.assertEqual(self.limit("2147483"), 2147483)
+        for value in ("2147484", "1e300"):
+            with self.subTest(value=value), patch.dict(os.environ, {"LEONIDA_GPU_TEST_TIMEOUT": value}):
+                with patch.object(subprocess, "run") as launch, self.assertRaises(SystemExit) as error:
+                    run_gpu_tests.run_cmd(QUICK)
+                self.assertIn("LEONIDA_GPU_TEST_TIMEOUT", str(error.exception))
+                self.assertIn(value, str(error.exception))
+                launch.assert_not_called()
+
     def test_zero_or_negative_means_no_limit(self):
         self.assertIsNone(self.limit("0"))
         self.assertIsNone(self.limit("-1"))
