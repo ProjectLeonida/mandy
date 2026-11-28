@@ -1461,6 +1461,248 @@ int deferred_map_fill_and_on_changed() {
     return 0;
 }
 
+// Verifies:
+//  1. upload(on_changed, filter_batch) delivers exact AliasedPageJob snapshots with WorkerPool, handles per-page
+//     filter failure (zeroing + setting fresh for the next upload), and produces identical output to serial upload().
+//  2. Page-aware write-back writer:
+//     - scratch frames (frame != ref.page): bypasses pinning (begin_page reports scratch=true);
+//     - ordinary pages (frame == ref.page): calls begin_page ONCE per page with exact [first_off, first_off+span)
+//       covering multiple scattered coalesced runs, and calls ~PageGuard ONCE after all runs;
+//     - conflict-only pages: never calls begin_page;
+//     - whole_title_ok threshold lowered from 16 -> 2: 1 differing piece uses 1x256B hooks_.copy, >=2 uses 1x64KiB.
+int batched_filter_and_page_aware_write_back() {
+    constexpr std::size_t kPages = 24;
+    const VkBuffer arena = fake<VkBuffer>(0xE1);
+
+    // 1. Batched upload(on_changed, filter_batch) parity + failure recovery.
+    {
+        Fixture f;
+        TitleMirror mirror(f.hooks());
+        EXPECT(mirror.cover(kBase, kBase + (kPages + 4) * kPage));
+        mirror.alias(kBase, kBase + kPages * kPage, arena, 0);
+
+        std::vector<std::uint8_t> frames(kPages * kPage, 0x11);
+        for (std::size_t p = 0; p < kPages; ++p)
+            mirror.map(kBase + p * kPage, frames.data() + p * kPage, nullptr, 1);
+        EXPECT(mirror.flush(1));
+
+        // Mutate 3 pieces on each page (including 0xA5 sentinel bytes) and leave unchanged slots with 0xCC in copy.
+        for (std::size_t p = 0; p < kPages; ++p) {
+            std::uint8_t* copy = mirror.copy_bytes(kBase + p * kPage);
+            copy[10 * 256 + 3] = 0xCC;  // untouched slot sentinel: must NOT be clobbered!
+            frames[p * kPage + 0 * 256 + 1] = 0xA5;
+            frames[p * kPage + 64 * 256 + 2] = std::uint8_t(0x30 + p);
+            frames[p * kPage + 255 * 256 + 4] = 0xA5;
+            EXPECT(mirror.dirty(kBase + p * kPage));
+        }
+
+        std::size_t batch_calls = 0;
+        std::size_t batch_jobs = 0;
+        bool saw_pool = false;
+        const auto run_batch = [&](TitleMirror::AliasedPageJob* jobs, std::size_t count,
+                                   TitleMirror::WorkerPool* pool, std::uint8_t* ok_out) {
+            ++batch_calls;
+            batch_jobs += count;
+            if (pool) saw_pool = true;
+            const auto work = [&](std::size_t b, std::size_t e, std::size_t) {
+                for (std::size_t i = b; i < e; ++i) {
+                    if (jobs[i].va == kBase + 5 * kPage && batch_calls == 1) {
+                        ok_out[i] = 0;  // simulate filter failure on page 5
+                        continue;
+                    }
+                    // Write only changed 256B pieces from scratch into host buffer then copy into jobs[i].to.
+                    std::vector<std::uint8_t> buf(kPage);
+                    for (std::size_t k = 0; k < kPage / 256; ++k) {
+                        if (!jobs[i].fresh && !(jobs[i].mask[k >> 6] & (std::uint64_t(1) << (k & 63)))) continue;
+                        for (std::size_t j = 0; j < 256; ++j) {
+                            const std::uint8_t v = jobs[i].scratch[k * 256 + j];
+                            buf[k * 256 + j] = (v == 0xA5) ? 0x5A : v;
+                        }
+                        std::memcpy(jobs[i].to + k * 256, buf.data() + k * 256, 256);
+                    }
+                    ok_out[i] = 1;
+                }
+            };
+            if (pool) pool->run(count, 2, work);
+            else work(0, count, 0);
+        };
+
+        std::size_t on_changed_calls = 0;
+        const std::size_t uploaded =
+            mirror.upload([&](std::uint8_t*, const std::array<std::uint64_t, 4>&) { ++on_changed_calls; }, run_batch);
+        EXPECT(uploaded == kPages && on_changed_calls == kPages && batch_calls == 1 && batch_jobs == kPages);
+        EXPECT(mirror.counters().upload_failures == 1);
+        // Page 5 failed -> zeroed and marked fresh for next upload.
+        EXPECT(mirror.copy_bytes(kBase + 5 * kPage)[0] == 0);
+        // Other pages filtered changed pieces accurately AND preserved untouched piece 10!
+        for (std::size_t p = 0; p < kPages; ++p) {
+            if (p == 5) continue;
+            const std::uint8_t* copy = mirror.copy_bytes(kBase + p * kPage);
+            EXPECT(copy[0 * 256 + 1] == 0x5A);
+            EXPECT(copy[64 * 256 + 2] == std::uint8_t(0x30 + p));
+            EXPECT(copy[255 * 256 + 4] == 0x5A);
+            EXPECT(copy[10 * 256 + 3] == 0xCC);
+        }
+        // Re-uploading page 5 (even with unchanged bytes) MUST re-run filter with fresh=true!
+        bool page5_fresh = false;
+        EXPECT(mirror.dirty(kBase + 5 * kPage));
+        EXPECT(mirror.upload([](std::uint8_t*, const std::array<std::uint64_t, 4>&) {},
+                             [&](TitleMirror::AliasedPageJob* jobs, std::size_t count, TitleMirror::WorkerPool*,
+                                 std::uint8_t* ok_out) {
+                                 if (count == 1 && jobs[0].va == kBase + 5 * kPage) page5_fresh = jobs[0].fresh;
+                                 for (std::size_t i = 0; i < count; ++i) {
+                                     std::memcpy(jobs[i].to, jobs[i].scratch, kPage);
+                                     ok_out[i] = 1;
+                                 }
+                             }) == 1);
+        EXPECT(page5_fresh);
+        (void)saw_pool;
+    }
+
+    // 2. Page-aware write-back writer: scratch bypass, ordinary-page single pin batch, conflict skip, whole_title_ok>=2.
+    {
+        Fixture f;
+        auto h = f.hooks();
+        std::size_t copy_64k = 0, copy_256 = 0;
+        h.copy = [&](std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
+            if (bytes == kPage) ++copy_64k;
+            else if (bytes == 256) ++copy_256;
+            std::memcpy(to, from, bytes);
+            return true;
+        };
+
+        TitleMirror mirror(std::move(h));
+        // Allocate 4 aligned 64 KiB pages; map page 0 as "ordinary" (va == frame address!), pages 1..3 as "scratch"
+        // (va != frame address).
+        std::vector<std::uint8_t> backing(5 * kPage, 0x20);
+        const std::uintptr_t raw = reinterpret_cast<std::uintptr_t>(backing.data());
+        const std::uintptr_t aligned = (raw + kPage - 1) & ~(kPage - 1);
+        auto* const ord_frame = reinterpret_cast<std::uint8_t*>(aligned);
+        auto* const scr1_frame = ord_frame + kPage;
+        auto* const scr2_frame = ord_frame + 2 * kPage;
+        auto* const scr3_frame = ord_frame + 3 * kPage;
+
+        const std::uint64_t ord_va = static_cast<std::uint64_t>(aligned);
+        // Ensure ord_va and kBase are both covered (ord_va is a real host pointer; kBase is a high title VA).
+        EXPECT(mirror.cover(ord_va, ord_va + kPage));
+        EXPECT(mirror.cover(kBase, kBase + 4 * kPage));
+
+        mirror.map(ord_va, ord_frame, nullptr, 1);                  // frame == page_va (ordinary page)
+        mirror.map(kBase + 0 * kPage, scr1_frame, nullptr, 1);      // frame != page_va (xmem scratch, 1 piece diff)
+        mirror.map(kBase + 1 * kPage, scr2_frame, nullptr, 1);      // frame != page_va (xmem scratch, 2 pieces diff)
+        mirror.map(kBase + 2 * kPage, scr3_frame, nullptr, 1);      // frame != page_va (conflict-only page)
+        EXPECT(mirror.flush(1));
+
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges = {
+            {ord_va, ord_va + kPage},
+            {kBase, kBase + 3 * kPage},
+        };
+        const auto refs = mirror.homes_in_ranges(ranges);
+        EXPECT(refs.size() == 4);
+
+        std::vector<std::uint8_t> staged(refs.size() * kPage);
+        for (std::size_t i = 0; i < refs.size(); ++i) std::memcpy(staged.data() + i * kPage, refs[i].frame, kPage);
+
+        // Locate each ref index (sorted by page address).
+        auto idx_of = [&](std::uint64_t va) -> std::size_t {
+            for (std::size_t i = 0; i < refs.size(); ++i)
+                if (refs[i].page == va) return i;
+            return ~std::size_t(0);
+        };
+        const std::size_t i_ord = idx_of(ord_va);
+        const std::size_t i_scr1 = idx_of(kBase + 0 * kPage);
+        const std::size_t i_scr2 = idx_of(kBase + 1 * kPage);
+        const std::size_t i_scr3 = idx_of(kBase + 2 * kPage);
+        EXPECT(i_ord < 4 && i_scr1 < 4 && i_scr2 < 4 && i_scr3 < 4);
+
+        // Ordinary page: 3 scattered runs (pieces 2, 10..11, 200) -> 1 begin_page([2*256, 201*256)), 3 writes, 1 end!
+        staged[i_ord * kPage + 2 * 256 + 1] = 0xA1;
+        staged[i_ord * kPage + 10 * 256 + 1] = 0xA2;
+        staged[i_ord * kPage + 11 * 256 + 1] = 0xA3;
+        staged[i_ord * kPage + 200 * 256 + 1] = 0xA4;
+        // Scratch page 1: 1 differing piece (piece 5) -> 1x256B hooks_.copy (NOT 64 KiB!).
+        staged[i_scr1 * kPage + 5 * 256 + 1] = 0xB1;
+        // Scratch page 2: 2 differing pieces (pieces 3, 70) -> whole_title_ok threshold=2 -> 1x64 KiB hooks_.copy!
+        staged[i_scr2 * kPage + 3 * 256 + 1] = 0xC1;
+        staged[i_scr2 * kPage + 70 * 256 + 1] = 0xC2;
+        // Scratch page 3: 1 differing piece, ALSO modified by CPU -> conflict, write_count==0 -> 0 begin_page calls!
+        staged[i_scr3 * kPage + 4 * 256 + 1] = 0xD1;
+        scr3_frame[4 * 256 + 2] = 0xD2;
+
+        TitleMirror::PrehashedReadback prehashed;
+        TitleMirror::prehash_readback_slice(refs.data(), refs.size(), ranges, staged.data(), prehashed, nullptr);
+
+        copy_64k = copy_256 = 0;
+        struct PageEvent {
+            std::uint64_t page_va = 0;
+            bool scratch = false;
+            std::size_t first_off = 0;
+            std::size_t span_bytes = 0;
+            std::size_t writes = 0;
+            bool ended = false;
+        };
+        std::vector<PageEvent> events;
+        struct TestPageWriter {
+            std::vector<PageEvent>* events = nullptr;
+            struct Guard {
+                std::vector<PageEvent>* events = nullptr;
+                std::size_t idx = ~std::size_t(0);
+                Guard(std::vector<PageEvent>* ev, std::size_t i) : events(ev), idx(i) {}
+                Guard(const Guard&) = delete;
+                Guard& operator=(const Guard&) = delete;
+                Guard(Guard&& o) noexcept : events(o.events), idx(std::exchange(o.idx, ~std::size_t(0))) {}
+                ~Guard() {
+                    if (events && idx < events->size()) (*events)[idx].ended = true;
+                }
+            };
+            Guard begin_page(std::uint64_t page_va, std::uint8_t* frame, std::size_t first_off,
+                             std::size_t span_bytes) const {
+                const bool scratch = reinterpret_cast<std::uintptr_t>(frame) != static_cast<std::uintptr_t>(page_va);
+                const std::size_t idx = events->size();
+                events->push_back({page_va, scratch, first_off, span_bytes, 0, false});
+                return Guard(events, idx);
+            }
+            bool write(const Guard& g, std::uint64_t dst, const std::uint8_t* bytes, std::size_t n) const {
+                ++(*events)[g.idx].writes;
+                std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), bytes, n);
+                return true;
+            }
+        } writer{&events};
+
+        const std::uint64_t wb = mirror.write_back_prehashed(refs.data(), refs.size(), prehashed, staged.data(),
+                                                             nullptr, nullptr, writer);
+        EXPECT(wb == (4 + 1 + 2) * 256);
+        EXPECT(mirror.counters().conflicts == 1);
+        // 3 pages written (conflict-only scr3 skipped begin_page!).
+        EXPECT(events.size() == 3);
+        bool saw_ord = false, saw_scr1 = false, saw_scr2 = false;
+        for (const PageEvent& ev : events) {
+            EXPECT(ev.ended);
+            if (ev.page_va == ord_va) {
+                saw_ord = true;
+                EXPECT(!ev.scratch);
+                EXPECT(ev.first_off == 2 * 256 && ev.span_bytes == (201 - 2) * 256);
+                EXPECT(ev.writes == 3);  // 3 coalesced runs under 1 begin_page/end_page!
+            } else if (ev.page_va == kBase + 0 * kPage) {
+                saw_scr1 = true;
+                EXPECT(ev.scratch && ev.writes == 1);
+            } else if (ev.page_va == kBase + 1 * kPage) {
+                saw_scr2 = true;
+                EXPECT(ev.scratch && ev.writes == 2);
+            }
+        }
+        EXPECT(saw_ord && saw_scr1 && saw_scr2);
+        // whole_title_ok threshold = 2: ord(4 pieces) + scr2(2 pieces) = 2x64KiB copies; scr1(1) + scr3(1) = 2x256B!
+        EXPECT(copy_64k == 2 && copy_256 == 2);
+        EXPECT(ord_frame[2 * 256 + 1] == 0xA1 && ord_frame[11 * 256 + 1] == 0xA3 && ord_frame[200 * 256 + 1] == 0xA4);
+        EXPECT(scr1_frame[5 * 256 + 1] == 0xB1 && scr2_frame[70 * 256 + 1] == 0xC2 && scr3_frame[4 * 256 + 2] == 0xD2);
+    }
+
+    std::printf("batched_filter_and_page_aware_write_back: upload filter_batch, scratch bypass, ordinary batched pin, "
+                "whole_title_ok>=2 ok\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -1483,6 +1725,7 @@ int main() {
     if (coalesced_write_back_runs_and_fallback()) return 1;
     if (prehashed_readback_and_skip_masks()) return 1;
     if (deferred_map_fill_and_on_changed()) return 1;
+    if (batched_filter_and_page_aware_write_back()) return 1;
     std::printf("title_mirror_hooks_test: ok\n");
     return 0;
 }

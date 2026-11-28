@@ -2608,9 +2608,15 @@ BOOL title_free_impl(LPVOID address, SIZE_T size, DWORD free_type) {
     } else {
         result = VirtualFree(address, size, free_type);
     }
-    // A release of size 0 frees the whole reservation, whose extent is not known here: a change anywhere.
-    if (result && size) leonida::title_memory_map::changed(address, size);
-    else if (result) leonida::title_memory_map::changed();
+    // Report the exact released/decommitted extent whenever known so CellGuard::sync_known_protect() only invalidates
+    // overlapping tiles instead of wiping all cached page protections across the entire address space.
+    if (result) {
+        if (size) leonida::title_memory_map::changed(address, size);
+        else if (releases && release_end > start) leonida::title_memory_map::changed(start, release_end);
+        else if ((free_type & MEM_DECOMMIT) && decommit_end > start)
+            leonida::title_memory_map::changed(start, decommit_end);
+        else leonida::title_memory_map::changed();
+    }
     if (result && (free_type & MEM_DECOMMIT)) note_unwatched_change(address, size, 0, true);
     if (result && (free_type & MEM_RELEASE) && !(free_type & MEM_PRESERVE_PLACEHOLDER))
         leonida::title_write_watch::remove(reinterpret_cast<uintptr_t>(address));

@@ -113,20 +113,23 @@ public:
     void set(std::size_t slot, unsigned half, State state, std::uint64_t base, std::uint64_t span,
              std::uint64_t target, bool geometry = false) {
         if (slot >= slots_ || half > 1 || is_texture(state)) return;
+        const std::uint32_t key = std::uint32_t(slot * 2 + half);
         if (state == none) {
-            drop(std::uint32_t(slot * 2 + half));
+            if (halves_[key].state == none) return;
+            drop(key);
             return;
         }
         if (!span) span = 1;
         const Range ranges[2] = {range(base, span), target ? range(target, span) : Range{}};
-        place(std::uint32_t(slot * 2 + half), state, geometry ? kGeometry : 0, base, ranges);
+        place(key, state, geometry ? kGeometry : 0, base, ranges);
     }
 
     // The T# of `slot` names `address` (its base) and is bound or waits as `state` (a T# state) says. The slot's
     // second half is no V# then: its record goes.
     void set_texture(std::size_t slot, State state, std::uint64_t address) {
         if (slot >= slots_ || !is_texture(state)) return;
-        drop(std::uint32_t(slot * 2 + 1));
+        const std::uint32_t k1 = std::uint32_t(slot * 2 + 1);
+        if (halves_[k1].state != none) drop(k1);
         const Range ranges[2] = {range(address, 1), Range{}};
         place(std::uint32_t(slot * 2), state, 0, address, ranges);
     }
@@ -157,8 +160,10 @@ public:
     }
 
     void clear(std::size_t slot) {
-        set(slot, 0, none, 0, 0, 0);
-        set(slot, 1, none, 0, 0, 0);
+        if (slot >= slots_) return;
+        const std::uint32_t k0 = std::uint32_t(slot * 2);
+        if (halves_[k0].state != none) drop(k0);
+        if (halves_[k0 + 1].state != none) drop(k0 + 1);
     }
     void clear_range(std::size_t first, std::size_t end) {
         end = (std::min)(end, slots_);
@@ -306,6 +311,23 @@ private:
     void place(std::uint32_t key, State state, std::uint8_t flags, std::uint64_t base, const Range (&ranges)[2]) {
         Half& h = halves_[key];
         const State old = State(h.state);
+        if (old == state && h.flags == flags && h.base == base) {
+            bool all_same = true;
+            for (int n = 0; n < 2; ++n) {
+                const std::uint32_t group = h.group[n];
+                if (ranges[n].end == 0) {
+                    if (group != 0) {
+                        all_same = false;
+                        break;
+                    }
+                } else if (!group || groups_[group - 1].start != ranges[n].start ||
+                           groups_[group - 1].end != ranges[n].end) {
+                    all_same = false;
+                    break;
+                }
+            }
+            if (all_same) return;
+        }
         for (int n = 0; n < 2; ++n) {
             const std::uint32_t group = h.group[n];
             const bool keep = group && list_of(old, h.flags) == list_of(state, flags) &&

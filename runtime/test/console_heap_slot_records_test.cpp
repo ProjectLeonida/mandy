@@ -723,6 +723,51 @@ int waiting_source_added_and_tsharp_clear() {
     return 0;
 }
 
+// Fast-path regression: repeated none->none set()/clear() calls and repeated identical place() calls leave all
+// counts, groups, and touched() results exact without corrupting state.
+int none_to_none_and_idempotent_fast_path() {
+    using R = ConsoleHeapSlotRecords;
+    R records;
+    records.reset(1024);
+
+    // Repeated none->none on untouched slots.
+    for (std::size_t s = 0; s < 1024; ++s) {
+        records.set(s, 0, R::none, 0, 0, 0);
+        records.set(s, 1, R::none, 0, 0, 0);
+        records.clear(s);
+    }
+    EXPECT(records.recorded() == 0 && records.waiting_count() == 0 && records.textures() == 0 && records.ranges() == 0);
+
+    // Identical repeated set() and set_texture() hit place() fast path cleanly.
+    constexpr std::uint64_t kBase = 0x40000000ull, kTarget = kArena + 0x40000000ull, kTex = 0x50000000ull;
+    records.set(10, 0, R::resolved, kBase, 256, kTarget, false);
+    records.set(10, 0, R::resolved, kBase, 256, kTarget, false);
+    records.set(10, 1, R::none, 0, 0, 0);
+    records.set_texture(11, R::texture_bound, kTex);
+    records.set_texture(11, R::texture_bound, kTex);
+    EXPECT(records.recorded() == 1 && records.textures() == 1 && records.ranges() == 3);
+
+    // Changing state or clearing still drops cleanly and returns to none->none.
+    records.set(10, 0, R::waiting, kBase, 256, 0, true);
+    EXPECT(records.recorded() == 1 && records.waiting_count() == 1 && records.ranges() == 2);
+    records.set(10, 0, R::waiting, kBase, 256, 0, true);
+    EXPECT(records.recorded() == 1 && records.waiting_count() == 1 && records.ranges() == 2);
+
+    std::vector<std::uint32_t> out;
+    const SlotChange src{SlotChange::source_added, kBase, kBase + 64};
+    records.touched(&src, 1, out);
+    EXPECT(out == std::vector<std::uint32_t>({10}));
+
+    records.clear(10);
+    records.clear(10);  // second clear hits none->none fast path
+    records.clear(11);
+    records.clear(11);
+    EXPECT(records.recorded() == 0 && records.waiting_count() == 0 && records.textures() == 0 && records.ranges() == 0);
+
+    std::printf("none_to_none_and_idempotent_fast_path: ok\n");
+    return 0;
+}
+
 int main() {
     if (release_looks_at_its_slots_only()) return 1;
     if (cases()) return 1;
@@ -735,6 +780,7 @@ int main() {
     if (memory_breakdown_arena_windows()) return 1;
     if (deferred_clear_and_repeated_answers()) return 1;
     if (waiting_source_added_and_tsharp_clear()) return 1;
+    if (none_to_none_and_idempotent_fast_path()) return 1;
     std::printf("console_heap_slot_records_test: ok\n");
     return 0;
 }

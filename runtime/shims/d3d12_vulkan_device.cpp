@@ -5911,7 +5911,16 @@ struct DeviceState {
     // which in device-local memory is an uncached read over the bus (run 64w: 14.5 s for one submission's 64 MiB).
     // Written through kernel_writes, which opens and pins the page and every other address of its physical page, so
     // the readers over them take the bytes. Returns the bytes written.
-    static constexpr std::size_t kReadbackPages = 256;  // 16 MiB a copy
+    static constexpr std::size_t kReadbackPages = 1024;  // 64 MiB a copy
+    bool readback_use_copy_queue() const noexcept {
+        return !info.copy_queues.empty() && info.copy_family != UINT32_MAX;
+    }
+    std::uint32_t readback_queue_family() const noexcept {
+        return readback_use_copy_queue() ? info.copy_family : info.queue_family;
+    }
+    VkQueue readback_queue_handle() const noexcept {
+        return readback_use_copy_queue() ? info.copy_queues.back() : info.queue;
+    }
     bool make_readback_locked() {
         auto& m = page_mirror;
         if (m.readback) return true;
@@ -5930,7 +5939,7 @@ struct DeviceState {
         void* mapped = nullptr;
         VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        pool.queueFamilyIndex = info.queue_family;
+        pool.queueFamilyIndex = readback_queue_family();
         VkCommandBufferAllocateInfo commands{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         commands.commandBufferCount = 1;
         VkSemaphoreTypeCreateInfo timeline{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
@@ -6031,7 +6040,7 @@ struct DeviceState {
         {
             std::unique_lock lock(context->submit_mutex(), std::defer_lock);
             leonida::submit_phases::lock_timed(lock);
-            result = context->observe_result(vk.vkQueueSubmit(info.queue, 1, &submit, VK_NULL_HANDLE),
+            result = context->observe_result(vk.vkQueueSubmit(readback_queue_handle(), 1, &submit, VK_NULL_HANDLE),
                                              "vkQueueSubmit (page mirror write-back copy)");
         }
         if (result == VK_ERROR_DEVICE_LOST) context->mark_device_lost();
@@ -6181,9 +6190,46 @@ struct DeviceState {
         auto& m = page_mirror;
         using clock = std::chrono::steady_clock;
         constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
-        const auto write = [](std::uint64_t at, const std::uint8_t* bytes, std::size_t n) {
-            return leonida::kernel_writes::write(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)), bytes, n);
-        };
+        struct PageWriteBackWriter {
+            struct PageGuard {
+                std::uint64_t pin = 0;
+                bool scratch_frame = false;
+                bool table_fallback = false;
+                PageGuard() = default;
+                PageGuard(std::uint64_t p, bool scratch, bool fallback)
+                    : pin(p), scratch_frame(scratch), table_fallback(fallback) {}
+                PageGuard(const PageGuard&) = delete;
+                PageGuard& operator=(const PageGuard&) = delete;
+                PageGuard(PageGuard&& o) noexcept
+                    : pin(std::exchange(o.pin, 0)),
+                      scratch_frame(o.scratch_frame),
+                      table_fallback(o.table_fallback) {}
+                ~PageGuard() {
+                    if (pin) leonida::kernel_writes::end_write(pin, false);
+                }
+            };
+            PageGuard begin_page(std::uint64_t page_va, std::uint8_t* frame, std::size_t first_off,
+                                 std::size_t span_bytes) const {
+                // xmem physical-page scratch views (frame != page_va) are unguarded host-mapped scratch: bypass
+                // kernel_writes::begin_write/end_write completely and copy directly via move_guarded.
+                if (reinterpret_cast<std::uintptr_t>(frame) != static_cast<std::uintptr_t>(page_va))
+                    return PageGuard(0, true, false);
+                void* const dst = frame + first_off;
+                const auto dst_va = reinterpret_cast<std::uintptr_t>(dst);
+                if (leonida::title_frames::may_hold(dst_va, dst_va + span_bytes)) return PageGuard(0, false, true);
+                const std::uint64_t pin = leonida::kernel_writes::begin_write(dst, span_bytes, nullptr);
+                return PageGuard(pin, false, false);
+            }
+            bool write(const PageGuard& guard, std::uint64_t at, const std::uint8_t* bytes, std::size_t n) const {
+                if (!n) return true;
+                void* const dst = reinterpret_cast<void*>(static_cast<std::uintptr_t>(at));
+                if (guard.scratch_frame) return leonida::kernel_writes::detail::move_guarded(dst, bytes, n);
+                if (guard.table_fallback) return leonida::kernel_writes::write(dst, bytes, n);
+                if (leonida::kernel_writes::detail::move_guarded(dst, bytes, n)) return true;
+                return leonida::kernel_writes::reopen(dst, n) &&
+                       leonida::kernel_writes::detail::move_guarded(dst, bytes, n);
+            }
+        } write;
         while (m.readback_async.active) {
             if (!wait_blocking) {
                 bool ready = false;
@@ -6316,7 +6362,7 @@ struct DeviceState {
                         compacted.reserve(m.readback_queued_ranges.size());
                         for (const auto& [b, e] : m.readback_queued_ranges) {
                             if (!compacted.empty() && b <= compacted.back().second)
-                                compacted.back().second = std::max(compacted.back().second, e);
+                                compacted.back().second = (std::max)(compacted.back().second, e);
                             else
                                 compacted.emplace_back(b, e);
                         }
@@ -6343,7 +6389,7 @@ struct DeviceState {
                     merged.reserve(work.size());
                     for (const auto& [b, e] : work) {
                         if (!merged.empty() && b <= merged.back().second)
-                            merged.back().second = std::max(merged.back().second, e);
+                            merged.back().second = (std::max)(merged.back().second, e);
                         else
                             merged.emplace_back(b, e);
                     }
@@ -6537,12 +6583,18 @@ struct DeviceState {
         // filtered again into their homes now, before the pages written since are.
         for (ConsoleHeap* heap : m.in_place) apply_in_place_changes(*heap);
         m.in_place_pending.store(false, std::memory_order_release);
+        const auto filter_batch = [&](leonida::TitleMirror::AliasedPageJob* jobs, std::size_t count,
+                                      leonida::TitleMirror::WorkerPool* pool, std::uint8_t* ok_out) {
+            filter_heap_pages_batch_locked(jobs, count, pool, ok_out);
+        };
         if (m.readback_in_flight && !m.readback_slice_frames.empty()) {
-            m.uploads += m.mirror->upload([&](std::uint8_t* frame, const std::array<std::uint64_t, 4>& changed_pieces) {
-                note_readback_pieces_uploaded_locked(frame, changed_pieces);
-            });
+            m.uploads += m.mirror->upload(
+                [&](std::uint8_t* frame, const std::array<std::uint64_t, 4>& changed_pieces) {
+                    note_readback_pieces_uploaded_locked(frame, changed_pieces);
+                },
+                filter_batch);
         } else {
-            m.uploads += m.mirror->upload();
+            m.uploads += m.mirror->upload([](std::uint8_t*, const std::array<std::uint64_t, 4>&) {}, filter_batch);
         }
         if (m.mirror->last_upload_bytes() != 0 || !m.fed_now.empty())
             leonida::submit_phases::note_change(leonida::submit_phases::change_pages);
@@ -7314,40 +7366,188 @@ struct DeviceState {
             std::uint64_t base = 0;
             std::uint64_t span = 0;
             std::uint64_t target = 0;
+            ConsoleHeap* mirror_range_heap = nullptr;
+            std::uint32_t gen = 0;
             Outcome outcome = Outcome::empty;
         };
-        static constexpr std::size_t kSize = 64;
+        static constexpr std::size_t kSize = 1024;
         std::array<Entry, kSize> entries{};
+        std::uint32_t gen = 0;
         bool signed_vsharp = false;
         bool has_mirror = false;
         bool has_geometry = false;
         std::uint64_t arena_size = 0;
 
+        void reset() noexcept {
+            if (++gen == 0) {
+                entries = {};
+                gen = 1;
+            }
+        }
         static std::size_t bucket(std::uint64_t base, std::uint64_t span) noexcept {
             const std::uint64_t h = (base >> 4) ^ (span * 0x9e3779b97f4a7c15ull);
-            return static_cast<std::size_t>((h ^ (h >> 17)) & (kSize - 1));
+            return static_cast<std::size_t>((h ^ (h >> 17) ^ (h >> 31)) & (kSize - 1));
         }
-        const Entry* find(std::uint64_t base, std::uint64_t span) const noexcept {
-            const Entry& e = entries[bucket(base, span)];
-            return (e.outcome != Outcome::empty && e.base == base && e.span == span) ? &e : nullptr;
+        Entry* find(std::uint64_t base, std::uint64_t span) noexcept {
+            Entry& e = entries[bucket(base, span)];
+            return (e.gen == gen && e.outcome != Outcome::empty && e.base == base && e.span == span) ? &e : nullptr;
         }
-        void put(std::uint64_t base, std::uint64_t span, Outcome outcome, std::uint64_t target = 0) noexcept {
-            entries[bucket(base, span)] = {base, span, target, outcome};
+        void put(std::uint64_t base, std::uint64_t span, Outcome outcome, std::uint64_t target = 0,
+                 ConsoleHeap* mr_heap = nullptr) noexcept {
+            entries[bucket(base, span)] = {base, span, target, mr_heap, gen, outcome};
         }
     };
 
-    FilterPageCache make_filter_page_cache_locked() {
-        FilterPageCache cache;
-        cache.signed_vsharp = signed_vsharp_offsets();
-        cache.has_mirror = page_mirror.mirror != nullptr;
-        cache.has_geometry = geometry.cap() != 0;
-        cache.arena_size = arena.size;
-        if (cache.has_mirror) sync_mirror_space_locked();
-        return cache;
+    // Acquires the hoisted thread-local FilterPageCache for this DeviceState under page_mirror.mutex. A re-entrant
+    // fill triggered by page_mirror_resolve_locked() -> map() reuses the live batch cache without resetting it.
+    struct FilterCacheScope {
+        FilterPageCache* cache = nullptr;
+        std::unique_ptr<FilterPageCache> fallback;
+        bool owns_active = false;
+        const DeviceState** owner_slot = nullptr;
+
+        explicit FilterCacheScope(DeviceState& dev) {
+            thread_local std::unique_ptr<FilterPageCache> tls_cache;
+            thread_local const DeviceState* tls_owner = nullptr;
+            if (!tls_cache) tls_cache = std::make_unique<FilterPageCache>();
+            if (tls_owner == &dev) {
+                cache = tls_cache.get();
+                return;
+            }
+            if (tls_owner == nullptr) {
+                tls_owner = &dev;
+                owner_slot = &tls_owner;
+                owns_active = true;
+                cache = tls_cache.get();
+            } else {
+                fallback = std::make_unique<FilterPageCache>();
+                cache = fallback.get();
+            }
+            cache->reset();
+            cache->signed_vsharp = dev.signed_vsharp_offsets();
+            cache->has_mirror = dev.page_mirror.mirror != nullptr;
+            cache->has_geometry = dev.geometry.cap() != 0;
+            cache->arena_size = dev.arena.size;
+            if (cache->has_mirror) dev.sync_mirror_space_locked();
+        }
+        ~FilterCacheScope() {
+            if (owns_active && owner_slot) *owner_slot = nullptr;
+        }
+        FilterCacheScope(const FilterCacheScope&) = delete;
+        FilterCacheScope& operator=(const FilterCacheScope&) = delete;
+    };
+
+    // Coalesces contiguous changed 32-byte descriptor slots across a 64 KiB page (2048 slots = 32 x 64-bit mask words)
+    // from cached host RAM `out_buf` into WC PCIe BAR VRAM `to`. Never reads from `to` and never overwrites unchanged
+    // slots (preserving previously bound T#s / resolved V#s in untouched slots).
+    static void flush_written_slot_runs(std::uint8_t* to, const std::uint8_t* out_buf,
+                                        const std::array<std::uint64_t, 32>& written_slots,
+                                        std::size_t written_count) noexcept {
+        constexpr std::size_t kSlotsPerPage = leonida::TitleMirror::kPage / kDescriptorSize;
+        if (!written_count) return;
+        if (written_count == kSlotsPerPage) {
+            std::memcpy(to, out_buf, leonida::TitleMirror::kPage);
+            return;
+        }
+        std::size_t run_start = kSlotsPerPage;
+        for (std::size_t w = 0; w < 32; ++w) {
+            const std::uint64_t word = written_slots[w];
+            if (!word) {
+                if (run_start < kSlotsPerPage) {
+                    const std::size_t run_end = w * 64;
+                    std::memcpy(to + run_start * kDescriptorSize, out_buf + run_start * kDescriptorSize,
+                                (run_end - run_start) * kDescriptorSize);
+                    run_start = kSlotsPerPage;
+                }
+                continue;
+            }
+            if (word == ~std::uint64_t(0)) {
+                if (run_start == kSlotsPerPage) run_start = w * 64;
+                continue;
+            }
+            std::size_t bit = 0;
+            while (bit < 64) {
+                const std::uint64_t rem = word >> bit;
+                if (!rem) {
+                    if (run_start < kSlotsPerPage) {
+                        const std::size_t run_end = w * 64 + bit;
+                        std::memcpy(to + run_start * kDescriptorSize, out_buf + run_start * kDescriptorSize,
+                                    (run_end - run_start) * kDescriptorSize);
+                        run_start = kSlotsPerPage;
+                    }
+                    break;
+                }
+                const std::size_t zeros = std::size_t(std::countr_zero(rem));
+                if (zeros > 0) {
+                    if (run_start < kSlotsPerPage) {
+                        const std::size_t run_end = w * 64 + bit;
+                        std::memcpy(to + run_start * kDescriptorSize, out_buf + run_start * kDescriptorSize,
+                                    (run_end - run_start) * kDescriptorSize);
+                        run_start = kSlotsPerPage;
+                    }
+                    bit += zeros;
+                }
+                const std::size_t ones = std::size_t(std::countr_one(word >> bit));
+                if (run_start == kSlotsPerPage) run_start = w * 64 + bit;
+                bit += ones;
+            }
+        }
+        if (run_start < kSlotsPerPage) {
+            std::memcpy(to + run_start * kDescriptorSize, out_buf + run_start * kDescriptorSize,
+                        (kSlotsPerPage - run_start) * kDescriptorSize);
+        }
     }
 
-    // Slot `slot` of a heap read in place, from its title bytes as last filtered (`previous`), into `out` (its place
-    // in the page's home). page_mirror.mutex held.
+    // Pure read-only check equivalent to page_mirror_resolve_locked(va, bytes, /*make=*/false) after
+    // sync_mirror_space_locked(). Safe to call concurrently from parallel Phase A workers while page_mirror.mutex is
+    // held continuously by the calling thread (zero mutations to chunks_, homes_, plain, ensured, or counters).
+    bool page_mirror_is_resolved_readonly(std::uint64_t va, std::uint64_t bytes) const noexcept {
+        if (!bytes || va + bytes < va) return false;
+        constexpr std::uint64_t kChunk = leonida::TitleMirror::kChunk;
+        constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
+        const std::uint64_t end = va + bytes;
+        for (std::uint64_t c = va & ~(kChunk - 1); c < end; c += kChunk) {
+            if (!page_mirror.mirror->covers(c)) return false;
+            if (c > UINT64_MAX - kChunk) break;
+        }
+        auto it = page_mirror.plain.upper_bound(va);
+        if (it != page_mirror.plain.begin() && std::prev(it)->second > va) --it;
+        for (; it != page_mirror.plain.end() && it->first < end; ++it) {
+            const std::uint64_t from = (std::max)(it->first, va) & ~(kPage - 1);
+            const std::uint64_t to = ((std::min)(it->second, end) + kPage - 1) & ~(kPage - 1);
+            if (!ensured_covers(from, to)) return false;
+        }
+        return true;
+    }
+
+    // Reusable cached 64 KiB host scratch buffer for single-page filter writes (avoids scattered 32B WC BAR writes and
+    // avoids putting a 64 KiB array on a Windows/Wine thread stack). Falls back to heap allocation on re-entry.
+    struct OutScratchGuard {
+        std::uint8_t* ptr = nullptr;
+        std::unique_ptr<std::uint8_t[]> overflow;
+        bool* in_use = nullptr;
+        OutScratchGuard() {
+            thread_local std::unique_ptr<std::uint8_t[]> tls_buf;
+            thread_local bool tls_in_use = false;
+            if (!tls_in_use) {
+                if (!tls_buf) tls_buf.reset(new std::uint8_t[leonida::TitleMirror::kPage]);
+                tls_in_use = true;
+                in_use = &tls_in_use;
+                ptr = tls_buf.get();
+            } else {
+                overflow.reset(new std::uint8_t[leonida::TitleMirror::kPage]);
+                ptr = overflow.get();
+            }
+        }
+        ~OutScratchGuard() {
+            if (in_use) *in_use = false;
+        }
+        OutScratchGuard(const OutScratchGuard&) = delete;
+        OutScratchGuard& operator=(const OutScratchGuard&) = delete;
+    };
+
+    // Slot `slot` of a heap read in place, from its title bytes as last filtered (`previous`), into `out` (either a
+    // cached 64 KiB scratch buffer or its place in the page's home). page_mirror.mutex held.
     void filter_slot_locked(ConsoleHeap& heap, std::size_t slot, std::uint8_t* out,
                             FilterPageCache* cache = nullptr, bool count_changed = false) {
         using Records = leonida::ConsoleHeapSlotRecords;
@@ -7382,12 +7582,15 @@ struct DeviceState {
                     continue;
                 }
                 if (cache) {
-                    if (const FilterPageCache::Entry* cached = cache->find(base, span)) {
+                    if (FilterPageCache::Entry* cached = cache->find(base, span)) {
                         switch (cached->outcome) {
                         case FilterPageCache::Outcome::mirrored:
                             heap.records.set(slot, half, Records::none, 0, 0, 0);
-                            heap.mirror_ranges.emplace_back(base, span);
-                            added_mirror_range = true;
+                            if (cached->mirror_range_heap != &heap) {
+                                heap.mirror_ranges.emplace_back(base, span);
+                                cached->mirror_range_heap = &heap;
+                                added_mirror_range = true;
+                            }
                             ++heap.vsharps_as_written;
                             continue;
                         case FilterPageCache::Outcome::backed:
@@ -7421,7 +7624,7 @@ struct DeviceState {
                         if (mirrored) {
                             heap.mirror_ranges.emplace_back(base, span);
                             added_mirror_range = true;
-                            if (cache) cache->put(base, span, FilterPageCache::Outcome::mirrored);
+                            if (cache) cache->put(base, span, FilterPageCache::Outcome::mirrored, 0, &heap);
                         }
                     }
                     ++heap.vsharps_as_written;
@@ -7519,7 +7722,7 @@ struct DeviceState {
         heap.record_refixed += heap.touched_scratch.size();
         heap.pending_changes.clear();
         if (!heap.touched_scratch.empty()) {
-            FilterPageCache cache = make_filter_page_cache_locked();
+            FilterCacheScope cache_scope(*this);
             constexpr std::uint64_t kPageMask = ~(leonida::TitleMirror::kPage - 1);
             constexpr std::uint64_t kOffMask = leonida::TitleMirror::kPage - 1;
             std::uint64_t last_page = UINT64_MAX;
@@ -7535,7 +7738,7 @@ struct DeviceState {
                     last_frame = (last_copy && readback) ? page_mirror.mirror->frame_at(page_va) : nullptr;
                     if (last_frame) note_readback_frame_invalidated_locked(last_frame);
                 }
-                if (last_copy) filter_slot_locked(heap, slot, last_copy + (va & kOffMask), &cache, false);
+                if (last_copy) filter_slot_locked(heap, slot, last_copy + (va & kOffMask), cache_scope.cache, false);
                 // A page not mapped is filtered whole when it is.
             }
         }
@@ -7544,8 +7747,8 @@ struct DeviceState {
 
     // TitleMirrorHooks::filter for the pages of console heaps read in place: the title's page at `from` (shown at
     // `va`) in, the home `to` out. Each slot whose title bytes differ from what it was last filtered from (all of them
-    // on a fresh fill) is filtered (filter_slot_locked); the others keep what the home holds. The title's bytes are
-    // only read. page_mirror.mutex held.
+    // on a fresh fill) is filtered (filter_slot_locked) into a cached host scratch buffer and bulk-flushed to WC BAR
+    // VRAM in contiguous runs; the others keep what the home holds. page_mirror.mutex held.
     bool filter_heap_page(std::uint64_t va, std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool fresh) {
         ConsoleHeap* heap = nullptr;
         for (ConsoleHeap* h : page_mirror.in_place)
@@ -7569,15 +7772,26 @@ struct DeviceState {
             title = overflow.get();
         }
         if (!copy_guarded_host(title, from, bytes, false)) return false;
-        FilterPageCache cache = make_filter_page_cache_locked();
+        FilterCacheScope cache_scope(*this);
         std::size_t changed = 0;
         const std::uint64_t heap_base_va = heap->console_va;
         const std::uint64_t heap_bytes = heap->bytes;
         std::uint8_t* const heap_prev = heap->previous;
+        const bool use_scratch_flush = bytes <= leonida::TitleMirror::kPage;
+        OutScratchGuard out_guard;
+        std::array<std::uint64_t, 32> written_slots{};
+        std::size_t written_count = 0;
         for (std::size_t at = 0; at + kDescriptorSize <= bytes; at += kDescriptorSize) {
             const std::uint64_t slot_va = va + at;
+            const std::size_t page_slot = at >> 5;
             if (slot_va - heap_base_va >= heap_bytes) {  // past the heap's end on its last page: as it is
-                std::memcpy(to + at, title + at, kDescriptorSize);
+                if (use_scratch_flush) {
+                    std::memcpy(out_guard.ptr + at, title + at, kDescriptorSize);
+                    written_slots[page_slot >> 6] |= std::uint64_t(1) << (page_slot & 63);
+                    ++written_count;
+                } else {
+                    std::memcpy(to + at, title + at, kDescriptorSize);
+                }
                 continue;
             }
             const std::size_t slot = std::size_t((slot_va - heap_base_va) / kDescriptorSize);
@@ -7588,8 +7802,15 @@ struct DeviceState {
                 std::memcpy(previous, title + at, kDescriptorSize);
                 ++changed;
             }
-            filter_slot_locked(*heap, slot, to + at, &cache, !same);
+            if (use_scratch_flush) {
+                filter_slot_locked(*heap, slot, out_guard.ptr + at, cache_scope.cache, !same);
+                written_slots[page_slot >> 6] |= std::uint64_t(1) << (page_slot & 63);
+                ++written_count;
+            } else {
+                filter_slot_locked(*heap, slot, to + at, cache_scope.cache, !same);
+            }
         }
+        if (use_scratch_flush && written_count) flush_written_slot_runs(to, out_guard.ptr, written_slots, written_count);
         heap->slots_filtered += changed;
         ++heap->pages_filtered;
         heap->copied += changed * kDescriptorSize;
@@ -7601,7 +7822,8 @@ struct DeviceState {
     // TitleMirror::fill(), and `changed_pieces` (256 bits, one per 256-byte piece = 8 descriptor slots) marks the
     // pieces that changed. Pass 1 reads `scratch` and snapshots changed slots into `heap->previous` BEFORE Pass 2
     // calls filter_slot_locked(), so a re-entrant TitleMirror::fill() triggered by page_mirror_resolve_locked()
-    // cannot overwrite `scratch` while we are still reading it. page_mirror.mutex held.
+    // cannot overwrite `scratch` while we are still reading it. Filtered outputs go to a cached 64 KiB host scratch
+    // buffer and flush in coalesced runs to WC BAR VRAM `to`. page_mirror.mutex held.
     bool filter_heap_page_pieces(std::uint64_t va, std::uint8_t* to, const std::uint8_t* scratch, std::size_t bytes,
                                  bool fresh, const std::array<std::uint64_t, 4>& changed_pieces) {
         if (bytes > leonida::TitleMirror::kPage) return filter_heap_page(va, to, scratch, bytes, fresh);
@@ -7621,6 +7843,9 @@ struct DeviceState {
         const std::uint64_t heap_base_va = heap->console_va;
         const std::uint64_t heap_bytes = heap->bytes;
         std::uint8_t* const heap_prev = heap->previous;
+        OutScratchGuard out_guard;
+        std::array<std::uint64_t, 32> written_slots{};
+        std::size_t written_count = 0;
         for (std::size_t word = 0; word < 4; ++word) {
             std::uint64_t mask = fresh ? ~std::uint64_t(0) : changed_pieces[word];
             while (mask) {
@@ -7632,7 +7857,10 @@ struct DeviceState {
                 for (std::size_t at = piece_begin; at + kDescriptorSize <= piece_end; at += kDescriptorSize) {
                     const std::uint64_t slot_va = va + at;
                     if (slot_va - heap_base_va >= heap_bytes) {  // past the heap's end on its last page: as it is
-                        std::memcpy(to + at, scratch + at, kDescriptorSize);
+                        const std::size_t page_slot = at >> 5;
+                        std::memcpy(out_guard.ptr + at, scratch + at, kDescriptorSize);
+                        written_slots[page_slot >> 6] |= std::uint64_t(1) << (page_slot & 63);
+                        ++written_count;
                         continue;
                     }
                     const std::size_t slot = std::size_t((slot_va - heap_base_va) / kDescriptorSize);
@@ -7649,20 +7877,402 @@ struct DeviceState {
             }
         }
         if (to_filter_count) {
-            FilterPageCache cache = make_filter_page_cache_locked();
+            FilterCacheScope cache_scope(*this);
             for (std::size_t i = 0; i < to_filter_count; ++i) {
                 const std::uint16_t packed = to_filter[i];
-                const std::size_t at = std::size_t(packed & 0x7fffu) << 5;
+                const std::size_t page_slot = std::size_t(packed & 0x7fffu);
+                const std::size_t at = page_slot << 5;
                 const bool slot_changed = (packed & 0x8000u) != 0;
                 const std::size_t slot = std::size_t((va + at - heap_base_va) / kDescriptorSize);
-                filter_slot_locked(*heap, slot, to + at, &cache, slot_changed);
+                filter_slot_locked(*heap, slot, out_guard.ptr + at, cache_scope.cache, slot_changed);
+                written_slots[page_slot >> 6] |= std::uint64_t(1) << (page_slot & 63);
+                ++written_count;
             }
         }
+        if (written_count) flush_written_slot_runs(to, out_guard.ptr, written_slots, written_count);
         heap->slots_filtered += changed;
         ++heap->pages_filtered;
         heap->copied += changed * kDescriptorSize;
         heap->filter_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         return true;
+    }
+
+    // Batched filtered-heap refresh invoked once per TitleMirror::upload() under page_mirror.mutex:
+    //   - Hoists one 1024-entry FilterPageCache across all pages in the batch (deduping V# lookups and mirror_ranges).
+    //   - Phase A (parallel across TitleMirror::WorkerPool, 100% READ-ONLY on shared page_mirror, homes_, heap.records,
+    //     heap.deferred, heap.mirror_ranges, and heap.seen_keys): diffs disjoint 64 KiB page slices of heap->previous,
+    //     classifies null slots, T# decodes, inline arena V#s, and already-resolved read-only mirror V#s into cached
+    //     host 64 KiB scratch buffers, and flushes pages with zero Phase B misses directly to WC BAR VRAM in parallel.
+    //   - Phase B (sequential on calling thread under page_mirror.mutex): commits records/deferred/mirror_ranges, runs
+    //     filter_slot_locked() for cache misses into the same host scratch buffer, and bulk-flushes changed slot runs.
+    void filter_heap_pages_batch_locked(leonida::TitleMirror::AliasedPageJob* jobs, std::size_t count,
+                                        leonida::TitleMirror::WorkerPool* pool, std::uint8_t* ok_out) {
+        if (!count) return;
+        FilterCacheScope cache_scope(*this);
+        constexpr std::size_t kPage = leonida::TitleMirror::kPage;
+        constexpr std::size_t kPiece = 256;
+        constexpr std::size_t kMaxBufferedPages = 64;
+        if (count == 1) {
+            ok_out[0] = filter_heap_page_pieces(jobs[0].va, jobs[0].to, jobs[0].scratch, kPage, jobs[0].fresh,
+                                                jobs[0].mask)
+                            ? 1
+                            : 0;
+            return;
+        }
+        const auto batch_start = std::chrono::steady_clock::now();
+
+        struct ClearOp {
+            std::uint32_t slot = 0;
+            std::uint8_t halves = 0;  // bit 0: half 0, bit 1: half 1
+        };
+        struct PageWork {
+            ConsoleHeap* heap = nullptr;
+            std::uint8_t* out_buf = nullptr;
+            bool persistent_buf = false;
+            bool flushed = false;
+            std::array<std::uint64_t, 32> written_slots{};
+            std::size_t written_count = 0;
+            std::size_t changed = 0;
+            std::uint64_t changed_class[4] = {};
+            std::uint64_t vsharp_halves = 0;
+            std::uint64_t vsharps_as_written = 0;
+            std::uint64_t resolved = 0;
+            std::vector<ClearOp> clear_ops;
+            std::vector<std::uint32_t> defer_slots;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> mirror_ranges;
+            std::vector<std::uint16_t> phase_b_full;
+        };
+
+        // Pre-Phase A (sequential under page_mirror.mutex): resolve heaps and confirm disjoint page VAs.
+        std::vector<PageWork> work(count);
+        bool duplicate_va = false;
+        for (std::size_t p = 0; p < count; ++p) {
+            ConsoleHeap* heap = nullptr;
+            for (ConsoleHeap* h : page_mirror.in_place)
+                if (jobs[p].va - h->console_va < h->bytes) heap = h;
+            work[p].heap = heap;
+            for (std::size_t q = 0; q < p && !duplicate_va; ++q)
+                if (jobs[q].va == jobs[p].va) duplicate_va = true;
+        }
+        if (duplicate_va) {
+            for (std::size_t p = 0; p < count; ++p) {
+                ok_out[p] = filter_heap_page_pieces(jobs[p].va, jobs[p].to, jobs[p].scratch, kPage, jobs[p].fresh,
+                                                    jobs[p].mask)
+                                ? 1
+                                : 0;
+            }
+            return;
+        }
+
+        // Reusable per-page host scratch buffers (up to kMaxBufferedPages = 4 MiB) so Phase A + Phase B merge into one
+        // coalesced WC BAR VRAM write burst per page.
+        thread_local std::vector<std::uint8_t> tls_batch_bufs;
+        const std::size_t buffered_pages = (std::min)(count, kMaxBufferedPages);
+        if (tls_batch_bufs.size() < buffered_pages * kPage) tls_batch_bufs.resize(buffered_pages * kPage);
+        for (std::size_t p = 0; p < buffered_pages; ++p) {
+            work[p].out_buf = tls_batch_bufs.data() + p * kPage;
+            work[p].persistent_buf = true;
+        }
+
+        const bool signed_vsharp = cache_scope.cache->signed_vsharp;
+        const bool has_mirror = cache_scope.cache->has_mirror;
+        const std::uint64_t arena_size = cache_scope.cache->arena_size;
+        const bool has_tsharp_index = tsharp_index_words;
+
+        // Phase A (parallel when pool != nullptr, strictly read-only on all shared page_mirror / heap structures).
+        const auto run_phase_a = [&](std::size_t b, std::size_t e, std::size_t tid) {
+            using Records = leonida::ConsoleHeapSlotRecords;
+            struct LocalMirrorEntry {
+                std::uint64_t base = 0;
+                std::uint64_t span = 0;
+                std::uint32_t gen = 0;
+            };
+            std::array<LocalMirrorEntry, 64> local_mirror{};
+            std::uint32_t local_gen = 0;
+
+            std::uint8_t* const worker_fallback_buf = pool ? pool->scratch(tid) : nullptr;
+            std::unique_ptr<std::uint8_t[]> serial_fallback_buf;
+
+            for (std::size_t p = b; p < e; ++p) {
+                const auto& job = jobs[p];
+                PageWork& pw = work[p];
+                ConsoleHeap* const heap = pw.heap;
+                if (!heap) {
+                    std::memcpy(job.to, job.scratch, kPage);
+                    pw.flushed = true;
+                    continue;
+                }
+                std::uint8_t* out_buf = pw.out_buf;
+                if (!out_buf) {
+                    if (worker_fallback_buf) {
+                        out_buf = worker_fallback_buf;
+                    } else {
+                        if (!serial_fallback_buf) serial_fallback_buf.reset(new std::uint8_t[kPage]);
+                        out_buf = serial_fallback_buf.get();
+                    }
+                }
+                if (++local_gen == 0) {
+                    local_mirror = {};
+                    local_gen = 1;
+                }
+
+                const std::uint64_t heap_base_va = heap->console_va;
+                const std::uint64_t heap_bytes = heap->bytes;
+                std::uint8_t* const heap_prev = heap->previous;
+                const auto& records = heap->records;
+
+                for (std::size_t word = 0; word < 4; ++word) {
+                    std::uint64_t mask = job.fresh ? ~std::uint64_t(0) : job.mask[word];
+                    while (mask) {
+                        const unsigned bit = static_cast<unsigned>(std::countr_zero(mask));
+                        mask &= mask - 1;
+                        const std::size_t piece_begin = (word * 64 + bit) * kPiece;
+                        const std::size_t piece_end = piece_begin + kPiece;
+                        for (std::size_t at = piece_begin; at < piece_end; at += kDescriptorSize) {
+                            const std::uint64_t slot_va = job.va + at;
+                            const std::size_t page_slot = at >> 5;
+                            if (slot_va - heap_base_va >= heap_bytes) {
+                                std::memcpy(out_buf + at, job.scratch + at, kDescriptorSize);
+                                pw.written_slots[page_slot >> 6] |= std::uint64_t(1) << (page_slot & 63);
+                                ++pw.written_count;
+                                continue;
+                            }
+                            const std::size_t slot = std::size_t((slot_va - heap_base_va) / kDescriptorSize);
+                            std::uint8_t* const previous = heap_prev + slot * kDescriptorSize;
+                            const bool same = slots_equal_32(previous, job.scratch + at);
+                            if (same && !job.fresh) continue;
+                            if (!same) {
+                                std::memcpy(previous, job.scratch + at, kDescriptorSize);
+                                ++pw.changed;
+                            }
+
+                            std::uint32_t w[kDescriptorSize / 4];
+                            std::memcpy(w, job.scratch + at, kDescriptorSize);
+                            if (!(w[0] | w[1] | w[2] | w[3])) {
+                                if (!same) ++pw.changed_class[(w[4] | w[5] | w[6] | w[7]) ? 1 : 0];
+                                std::memcpy(out_buf + at, w, kDescriptorSize);
+                                pw.written_slots[page_slot >> 6] |= std::uint64_t(1) << (page_slot & 63);
+                                ++pw.written_count;
+                                const std::uint8_t clr =
+                                    (records.state(slot, 0) != Records::none ? 1u : 0u) |
+                                    (records.state(slot, 1) != Records::none ? 2u : 0u);
+                                if (clr) pw.clear_ops.push_back({std::uint32_t(slot), clr});
+                            } else if (!(w[3] >> 30)) {
+                                // Pure read-only check for both V# halves; commit Phase A only if BOTH halves resolve.
+                                bool half_ok[2] = {false, false};
+                                bool half_as_written[2] = {false, false};
+                                bool half_mirrored[2] = {false, false};
+                                bool half_resolved_new[2] = {false, false};
+                                std::uint64_t half_base[2] = {0, 0};
+                                std::uint64_t half_span[2] = {0, 0};
+                                std::uint8_t clr = 0;
+
+                                for (unsigned half = 0; half < 2; ++half) {
+                                    const std::uint32_t* const h = w + 4 * half;
+                                    if ((h[3] >> 30) || !h[2]) {
+                                        half_ok[half] = true;
+                                        if (records.state(slot, half) != Records::none)
+                                            clr |= static_cast<std::uint8_t>(1u << half);
+                                        continue;
+                                    }
+                                    const std::uint64_t base =
+                                        std::uint64_t(h[0]) | (std::uint64_t(h[1] & 0xffff) << 32);
+                                    const std::uint32_t stride = (h[1] >> 16) & 0x3fffu;
+                                    const std::uint64_t span = std::uint64_t(h[2]) * (stride ? stride : 1);
+                                    if (base && (!signed_vsharp || !(base & (1ull << 47)))) {
+                                        if (base < arena_size && (span ? span : 1) <= arena_size - base) {
+                                            half_ok[half] = true;
+                                            half_as_written[half] = true;
+                                            if (records.state(slot, half) != Records::none)
+                                                clr |= static_cast<std::uint8_t>(1u << half);
+                                            continue;
+                                        }
+                                        if (has_mirror) {
+                                            const std::size_t lb =
+                                                static_cast<std::size_t>(((base >> 4) ^ (span * 0x9e3779b97f4a7c15ull)) &
+                                                                         63u);
+                                            LocalMirrorEntry& le = local_mirror[lb];
+                                            if (le.gen == local_gen && le.base == base && le.span == span) {
+                                                half_ok[half] = true;
+                                                half_as_written[half] = true;
+                                                if (records.state(slot, half) != Records::none)
+                                                    clr |= static_cast<std::uint8_t>(1u << half);
+                                                continue;
+                                            }
+                                            if (page_mirror_is_resolved_readonly(base, span ? span : 1)) {
+                                                le = {base, span, local_gen};
+                                                half_ok[half] = true;
+                                                half_as_written[half] = true;
+                                                half_mirrored[half] = true;
+                                                half_resolved_new[half] = true;
+                                                half_base[half] = base;
+                                                half_span[half] = span;
+                                                if (records.state(slot, half) != Records::none)
+                                                    clr |= static_cast<std::uint8_t>(1u << half);
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    break;  // half missed Phase A -> defer entire slot to Phase B
+                                }
+
+                                if (half_ok[0] && half_ok[1]) {
+                                    if (!same) {
+                                        ++pw.changed_class[1];
+                                        if (w[2]) ++pw.vsharp_halves;
+                                        if (w[6]) ++pw.vsharp_halves;
+                                    }
+                                    for (unsigned half = 0; half < 2; ++half) {
+                                        if (half_as_written[half]) ++pw.vsharps_as_written;
+                                        if (half_resolved_new[half]) ++pw.resolved;
+                                        if (half_mirrored[half]) pw.mirror_ranges.emplace_back(half_base[half], half_span[half]);
+                                    }
+                                    if (clr) pw.clear_ops.push_back({std::uint32_t(slot), clr});
+                                    std::memcpy(out_buf + at, w, kDescriptorSize);
+                                    pw.written_slots[page_slot >> 6] |= std::uint64_t(1) << (page_slot & 63);
+                                    ++pw.written_count;
+                                } else {
+                                    pw.phase_b_full.push_back(
+                                        static_cast<std::uint16_t>(page_slot | (same ? 0u : 0x8000u)));
+                                }
+                            } else {
+                                leonida::gfx10::ImageWords words;
+                                std::memcpy(words.data(), w, sizeof(words));
+                                leonida::gfx10::Image image{};
+                                const bool is_img = leonida::gfx10::is_image(words);
+                                if (!same) ++pw.changed_class[is_img ? 2 : 3];
+                                if (is_img && leonida::gfx10::decode(words, image)) {
+                                    if (has_tsharp_index) w[leonida::gfx10::kTsharpIndexDword] = 0;
+                                    pw.defer_slots.push_back(std::uint32_t(slot));
+                                } else {
+                                    const std::uint8_t clr =
+                                        (records.state(slot, 0) != Records::none ? 1u : 0u) |
+                                        (records.state(slot, 1) != Records::none ? 2u : 0u);
+                                    if (clr) pw.clear_ops.push_back({std::uint32_t(slot), clr});
+                                    std::memset(w, 0, 16);
+                                }
+                                std::memcpy(out_buf + at, w, kDescriptorSize);
+                                pw.written_slots[page_slot >> 6] |= std::uint64_t(1) << (page_slot & 63);
+                                ++pw.written_count;
+                            }
+                        }
+                    }
+                }
+
+                // Pages with zero Phase B full-filter slots (or overflow pages without persistent buffers) flush their
+                // Phase A runs to WC BAR VRAM right here in parallel.
+                if (pw.written_count && (pw.phase_b_full.empty() || !pw.persistent_buf)) {
+                    flush_written_slot_runs(job.to, out_buf, pw.written_slots, pw.written_count);
+                    if (pw.phase_b_full.empty()) pw.flushed = true;
+                }
+            }
+        };
+
+        if (pool) {
+            const std::size_t workers = pool->worker_count();
+            const std::size_t chunk = (std::max)(std::size_t(1), (std::min)(std::size_t(4), count / (workers * 2)));
+            pool->run(count, chunk, run_phase_a);
+        } else {
+            run_phase_a(0, count, 0);
+        }
+
+        // Phase B (sequential on calling thread under page_mirror.mutex, in exact page order).
+        using Records = leonida::ConsoleHeapSlotRecords;
+        OutScratchGuard overflow_phase_b_guard;
+        for (std::size_t p = 0; p < count; ++p) {
+            const auto& job = jobs[p];
+            PageWork& pw = work[p];
+            ConsoleHeap* const heap = pw.heap;
+            if (!heap) {
+                ok_out[p] = 1;
+                continue;
+            }
+            heap->slots_filtered += pw.changed;
+            ++heap->pages_filtered;
+            heap->copied += pw.changed * kDescriptorSize;
+            heap->vsharps_as_written += pw.vsharps_as_written;
+            heap->vsharp_halves += pw.vsharp_halves;
+            for (int c = 0; c < 4; ++c) heap->changed[c] += pw.changed_class[c];
+            page_mirror.resolved += pw.resolved;
+
+            bool work_pending = false;
+            for (const auto& [base, span] : pw.mirror_ranges) {
+                FilterPageCache::Entry* cached = cache_scope.cache->find(base, span);
+                if (cached && cached->outcome == FilterPageCache::Outcome::mirrored) {
+                    if (cached->mirror_range_heap != heap) {
+                        heap->mirror_ranges.emplace_back(base, span);
+                        cached->mirror_range_heap = heap;
+                        work_pending = true;
+                    }
+                } else {
+                    heap->mirror_ranges.emplace_back(base, span);
+                    cache_scope.cache->put(base, span, FilterPageCache::Outcome::mirrored, 0, heap);
+                    work_pending = true;
+                }
+            }
+            for (const ClearOp& op : pw.clear_ops) {
+                if (op.halves == 3u) {
+                    heap->records.clear(op.slot);
+                } else {
+                    if (op.halves & 1u) heap->records.set(op.slot, 0, Records::none, 0, 0, 0);
+                    if (op.halves & 2u) heap->records.set(op.slot, 1, Records::none, 0, 0, 0);
+                }
+            }
+            for (const std::uint32_t slot : pw.defer_slots) {
+                if (!heap->deferred_mark[slot]) {
+                    heap->deferred_mark[slot] = 1;
+                    heap->deferred.push_back(slot);
+                }
+                work_pending = true;
+            }
+            if (work_pending) heap->in_place_work_pending.store(true, std::memory_order_release);
+
+            if (!pw.phase_b_full.empty()) {
+                const std::uint64_t heap_base_va = heap->console_va;
+                if (pw.persistent_buf) {
+                    for (const std::uint16_t packed : pw.phase_b_full) {
+                        const std::size_t page_slot = std::size_t(packed & 0x7fffu);
+                        const std::size_t at = page_slot << 5;
+                        const bool slot_changed = (packed & 0x8000u) != 0;
+                        const std::size_t slot = std::size_t((job.va + at - heap_base_va) / kDescriptorSize);
+                        filter_slot_locked(*heap, slot, pw.out_buf + at, cache_scope.cache, slot_changed);
+                        pw.written_slots[page_slot >> 6] |= std::uint64_t(1) << (page_slot & 63);
+                        ++pw.written_count;
+                    }
+                    if (pw.written_count) flush_written_slot_runs(job.to, pw.out_buf, pw.written_slots, pw.written_count);
+                } else {
+                    std::array<std::uint64_t, 32> phase_b_slots{};
+                    std::size_t phase_b_written = 0;
+                    for (const std::uint16_t packed : pw.phase_b_full) {
+                        const std::size_t page_slot = std::size_t(packed & 0x7fffu);
+                        const std::size_t at = page_slot << 5;
+                        const bool slot_changed = (packed & 0x8000u) != 0;
+                        const std::size_t slot = std::size_t((job.va + at - heap_base_va) / kDescriptorSize);
+                        filter_slot_locked(*heap, slot, overflow_phase_b_guard.ptr + at, cache_scope.cache,
+                                           slot_changed);
+                        phase_b_slots[page_slot >> 6] |= std::uint64_t(1) << (page_slot & 63);
+                        ++phase_b_written;
+                    }
+                    if (phase_b_written)
+                        flush_written_slot_runs(job.to, overflow_phase_b_guard.ptr, phase_b_slots, phase_b_written);
+                }
+                pw.flushed = true;
+            } else if (!pw.flushed && pw.written_count && pw.persistent_buf) {
+                flush_written_slot_runs(job.to, pw.out_buf, pw.written_slots, pw.written_count);
+                pw.flushed = true;
+            }
+            ok_out[p] = 1;
+        }
+        const double total_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - batch_start).count();
+        ConsoleHeap* first_heap = nullptr;
+        for (const PageWork& pw : work) {
+            if (pw.heap) {
+                first_heap = pw.heap;
+                break;
+            }
+        }
+        if (first_heap) first_heap->filter_ms += total_ms;
     }
 
     // Reusable finish_in_place() scratch storage (guarded by console_heap_mutex).

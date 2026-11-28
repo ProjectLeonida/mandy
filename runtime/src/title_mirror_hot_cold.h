@@ -33,8 +33,7 @@ public:
         geometry_writes::unsubscribe_writes(queue_);
         if (ww_reader_) title_write_watch::close_reader(ww_reader_);
         for (const auto& [page, tc] : guard_.cells) {
-            if (tc.is_hot) geometry_writes::set_hot(std::uintptr_t(page), false);
-            geometry_writes::release(std::uintptr_t(page));
+            geometry_writes::release(std::uintptr_t(page), tc.is_hot);
         }
     }
     HotColdTracking(const HotColdTracking&) = delete;
@@ -67,13 +66,13 @@ public:
         }
         const auto it = guard_.cells.find(addr);
         if (it == guard_.cells.end()) return;
-        policy_.remove(addr, addr + Policy::kPage);
-        if (it->second.is_hot) {
-            it->second.is_hot = false;
-            geometry_writes::set_hot(addr, false);
-        }
-        geometry_writes::release(addr);
+        const bool was_hot = it->second.is_hot;
+        // Erase from guard_.cells BEFORE policy_.remove() so remove()'s guard_.disarm(addr) is a 0-lock no-op
+        // instead of toggling set_hot(true) -> set_hot(false) (2 extra locks + 1 extra reopen + bogus WriteQueue push).
+        // geometry_writes::release(addr, was_hot) drops our ref (and hot count if was_hot) in a single lock hold.
         guard_.cells.erase(it);
+        policy_.remove(addr, addr + Policy::kPage);
+        geometry_writes::release(addr, was_hot);
         sync_pending_atomics();
     }
 
