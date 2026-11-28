@@ -34,6 +34,9 @@ Options:
   --device VID:DID    the Vulkan device, as MESA_VK_DEVICE_SELECT=VID:DID! (e.g. 1002:744c); without it Mesa picks
   --screenshot-every S  capture the game window into <out>/shots every S seconds (needs ImageMagick's import and
                       xprop); the shots are game content and stay local
+  --cache DIR|fresh   XDG_CACHE_HOME of the run, where the drivers keep their shader caches (NVIDIA's GLCache,
+                      Mesa's shader cache): DIR is kept from run to run, fresh is a new one in the run folder
+                      (default: the caller's XDG_CACHE_HOME when it is set, otherwise fresh)
   --lock FILE         the lock that allows one run at a time (default $XDG_RUNTIME_DIR/leonida-run-game-wine.lock,
                       or <out>/run.lock without XDG_RUNTIME_DIR)
   -h, --help          this text
@@ -103,7 +106,7 @@ if [ "${1:-}" = --inner ]; then
 fi
 
 # ---- arguments ----
-SRC= BUILD_DIR= OUT= PREFIX=${WINEPREFIX:-} LIMIT=600 VISIBLE=0 DEVICE= SHOT_EVERY=0 LOCK=
+SRC= BUILD_DIR= OUT= PREFIX=${WINEPREFIX:-} LIMIT=600 VISIBLE=0 DEVICE= SHOT_EVERY=0 LOCK= CACHE=${XDG_CACHE_HOME:-fresh}
 EXE=${LEONIDA_GAME_EXE:-} GAME=${LEONIDA_GAME_DIR:-} SHADERS=${LEONIDA_SHADERS:-}
 need() { [ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a value (see --help)"; }
 while [ $# -gt 0 ]; do
@@ -121,6 +124,7 @@ while [ $# -gt 0 ]; do
     --device) need "$@"; DEVICE=$2; shift 2 ;;
     --screenshot-every) need "$@"; SHOT_EVERY=$2; shift 2 ;;
     --lock) need "$@"; LOCK=$2; shift 2 ;;
+    --cache) need "$@"; CACHE=$2; shift 2 ;;
     --) shift; break ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
@@ -138,6 +142,10 @@ if [ -n "$DEVICE" ] && ! [[ $DEVICE =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]]; then
 fi
 [ -f "$EXE" ] || die "no game executable at $EXE"
 [ -d "$GAME" ] || die "no package folder at $GAME"
+if [ "$CACHE" != fresh ]; then
+  mkdir -p "$CACHE" || die "cannot create the cache folder $CACHE"
+  CACHE=$(readlink -f "$CACHE")
+fi
 if [ "$SHADERS" != none ]; then
   SHADERS=${SHADERS#Z:}
   [ -d "$SHADERS" ] || die "no shader library at $SHADERS"
@@ -205,9 +213,12 @@ unset LEONIDA_GAME_EXE LEONIDA_GAME_DIR  # launcher inputs; LEONIDA_GAME_DIR als
 export WINE
 export XDG_RUNTIME_DIR=$RUN/xdg
 rm -rf "$XDG_RUNTIME_DIR"; mkdir -p -m 700 "$XDG_RUNTIME_DIR"
-export XDG_CONFIG_HOME=$RUN/session/config XDG_DATA_HOME=$RUN/session/data XDG_CACHE_HOME=$RUN/session/cache \
+# The cache folder alone may outlive the run: a fresh one makes every launch compile its pipelines again in the driver.
+if [ "$CACHE" = fresh ]; then XDG_CACHE_HOME=$RUN/session/cache; else XDG_CACHE_HOME=$CACHE; fi
+export XDG_CONFIG_HOME=$RUN/session/config XDG_DATA_HOME=$RUN/session/data XDG_CACHE_HOME \
        XDG_STATE_HOME=$RUN/session/state
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
+if [ "$CACHE" = fresh ]; then echo "shader cache: fresh"; else echo "shader cache: kept in $CACHE"; fi >> "$RUN/session.txt"
 unset WAYLAND_DISPLAY WAYLAND_SOCKET DBUS_SESSION_BUS_ADDRESS
 if [ "$VISIBLE" = 1 ]; then
   if command -v xdpyinfo >/dev/null 2>&1 && ! xdpyinfo >/dev/null 2>&1; then

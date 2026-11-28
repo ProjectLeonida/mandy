@@ -98,6 +98,10 @@ What it does:
 - **Limits:** a hard time limit (`--seconds`, then SIGTERM and SIGKILL 10 s later), a lock so one run happens at a
   time (`--lock`, by default in `XDG_RUNTIME_DIR`), and teardown of Wine and the whole session on exit, time-out or
   signal.
+- **Shader cache:** the session's `XDG_CACHE_HOME`, where NVIDIA's `GLCache` and Mesa's shader cache go, is the
+  caller's when it is set, or the folder `--cache DIR` names; both are kept from run to run, so a later launch does
+  not compile every pipeline in the driver again. Without either, or with `--cache fresh`, it is a new folder in the
+  run folder, for a cold-cache run. The summary's first line says which (`shader cache: kept in DIR` or `fresh`).
 - **Traces:** `gta6rt --run` with `--trace` and `--trace-d3d12`, a fresh `--overlay` and save folder in the run
   folder. Every other `LEONIDA_*` variable reaches the runtime unchanged, so `LEONIDA_INPUT_SCRIPT=a@210,a@240`
   presses A as above. Arguments after `--` go to `gta6rt`.
