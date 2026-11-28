@@ -226,17 +226,26 @@ def parse_line(line):
         # 'exp pos0 v3, ...' / 'exp null off, ...': the target is space-separated from the first operand.
         parts = parts[0].split() + parts[1:]
     args = [operand(a) for a in parts]
+    f64_srcs = None
     if op.startswith(("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64",
                       "v_frexp_mant_f64", "v_frexp_exp_i32_f64", "v_ldexp_f64", "v_trunc_f64",
-                      "v_ceil_f64", "v_rndne_f64", "v_floor_f64")):
-        for src, spelling in zip(args[1:], parts[1:]):
+                      "v_ceil_f64", "v_rndne_f64", "v_floor_f64", "v_div_fixup_f64",
+                      "v_div_fmas_f64")):
+        f64_srcs = zip(args[1:], parts[1:])
+    elif op.startswith(("v_cmp_class_f64", "v_cmpx_class_f64")) and len(args) >= 2:
+        # Only src0 is binary64; the trailing operand is the 10-bit integer class mask.
+        f64_srcs = ((args[-2], parts[-2]),)
+    elif op.startswith(("v_cmp_", "v_cmpx_")) and (op.endswith("_f64") or "_f64_" in op) and len(args) >= 2:
+        f64_srcs = zip(args[-2:], parts[-2:])
+    if f64_srcs is not None:
+        for src, spelling in f64_srcs:
             # LLVM prints inline integers in decimal and the separate literal dword in hex,
             # even for two sources with the same numeric value (e.g. 0x1 and 1).
-            if src["k"] == "imm" and ("0x" in spelling or not -16 <= src["v"] <= 64):
+            if src["k"] == "imm" and ("0x" in spelling.lower() or not -16 <= src["v"] <= 64):
                 src["f64_literal"] = True
                 # The hex digits are the operand's printed width: LLVM pads nothing, so a value that
                 # fits one literal dword prints in at most 8 of them (docs/design.md, f64 literal sources).
-                m = re.search(r"0x([0-9a-fA-F]+)", spelling)
+                m = re.search(r"0[xX]([0-9a-fA-F]+)", spelling)
                 if m:
                     src["literal_hex_digits"] = len(m.group(1))
     return {"op": op, "args": args, "mods": mods, "enc": enc.hex() if enc else None}

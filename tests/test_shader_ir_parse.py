@@ -61,6 +61,42 @@ class ShaderIRParseTests(unittest.TestCase):
 
         f64 = shader_ir.parse_line("\tv_add_f64 v[0:1], v[2:3], 0x1")
         self.assertTrue(f64["args"][2].get("f64_literal"))
+        self.assertEqual(f64["args"][2].get("literal_hex_digits"), 1)
+
+    def test_f64_literal_tagging_on_div_and_cmp_ops(self):
+        fix = shader_ir.parse_line("\tv_div_fixup_f64 v[0:1], 0x3ff00000, 1, 0x0000000012345678")
+        self.assertTrue(fix["args"][1].get("f64_literal"))
+        self.assertEqual(fix["args"][1].get("literal_hex_digits"), 8)
+        self.assertNotIn("f64_literal", fix["args"][2])
+        self.assertTrue(fix["args"][3].get("f64_literal"))
+        self.assertEqual(fix["args"][3].get("literal_hex_digits"), 16)
+
+        fmas = shader_ir.parse_line("\tv_div_fmas_f64 v[0:1], 0x1, v[2:3], 0x40000000")
+        self.assertTrue(fmas["args"][1].get("f64_literal"))
+        self.assertEqual(fmas["args"][1].get("literal_hex_digits"), 1)
+        self.assertTrue(fmas["args"][3].get("f64_literal"))
+        self.assertEqual(fmas["args"][3].get("literal_hex_digits"), 8)
+
+        cmp3 = shader_ir.parse_line("\tv_cmp_lt_f64_e64 s4, 0x1, 0x000000003ff00000")
+        self.assertTrue(cmp3["args"][1].get("f64_literal"))
+        self.assertEqual(cmp3["args"][1].get("literal_hex_digits"), 1)
+        self.assertTrue(cmp3["args"][2].get("f64_literal"))
+        self.assertEqual(cmp3["args"][2].get("literal_hex_digits"), 16)
+
+        cmpx2 = shader_ir.parse_line("\tv_cmpx_eq_f64_e32 0x1, 1")
+        self.assertTrue(cmpx2["args"][0].get("f64_literal"))
+        self.assertEqual(cmpx2["args"][0].get("literal_hex_digits"), 1)
+        self.assertNotIn("f64_literal", cmpx2["args"][1])
+
+        cls3 = shader_ir.parse_line("\tv_cmp_class_f64_e64 s4, 0x1, 0x80")
+        self.assertTrue(cls3["args"][1].get("f64_literal"))
+        self.assertEqual(cls3["args"][1].get("literal_hex_digits"), 1)
+        self.assertNotIn("f64_literal", cls3["args"][2])
+
+        clx2 = shader_ir.parse_line("\tv_cmpx_class_f64_e32 0x000000003ff00000, 0x80")
+        self.assertTrue(clx2["args"][0].get("f64_literal"))
+        self.assertEqual(clx2["args"][0].get("literal_hex_digits"), 16)
+        self.assertNotIn("f64_literal", clx2["args"][1])
 
 
 if __name__ == "__main__":

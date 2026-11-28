@@ -2277,20 +2277,7 @@ class Gen:
             return t
 
         def read_f64_words(sv):
-            if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
-                lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-            elif sv["k"] == "fimm":
-                bits = struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
-                lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-            elif sv["k"] == "imm":
-                v = sv["v"]
-                if sv.get("literal") or (not (-16 <= v <= 64) and -0x80000000 <= v <= 0xFFFFFFFF):
-                    lo, hi = self.cu(0), self.cu(v & 0xFFFFFFFF)
-                else:
-                    bits = v & 0xFFFFFFFFFFFFFFFF
-                    lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-            else:
-                raise Unsupported(op + " operand")
+            lo, hi = self.f64_source_words(sv, op)
             if sv.get("abs"):
                 hi = emit_b(f"OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
             if sv.get("neg"):
@@ -5053,21 +5040,7 @@ class Gen:
             if any(m.startswith("op_sel") for m in mods):
                 raise Unsupported("v_cmp_class_f64 op_sel")
             sv = a[-2]
-            if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
-                lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-            elif sv["k"] == "fimm":
-                bits = struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
-                lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-            elif sv["k"] == "imm":
-                v = sv["v"]
-                if -16 <= v <= 64:
-                    v64 = v & 0xFFFFFFFFFFFFFFFF
-                    lo, hi = self.cu(v64 & 0xFFFFFFFF), self.cu(v64 >> 32)
-                else:
-                    # 32-bit literal dword on a 64-bit float operand occupies the upper 32 bits (RDNA2 ISA).
-                    lo, hi = self.cu(0), self.cu(v & 0xFFFFFFFF)
-            else:
-                raise Unsupported("v_cmp_class_f64 operand")
+            lo, hi = self.f64_source_words(sv, "v_cmp_class_f64")
             if sv.get("abs"):
                 t = self.tmp()
                 self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
@@ -5137,21 +5110,7 @@ class Gen:
         src0, mask_op = a[-2], a[-1]
         if mask_op.get("n", 1) != 1 or mask_op.get("abs") or mask_op.get("neg"):
             raise Unsupported(op + " mask")
-        if src0["k"] in ("vgpr", "sgpr") and src0.get("n") == 2:
-            lo, hi = self.load_reg(src0["k"], src0["r"]), self.load_reg(src0["k"], src0["r"] + 1)
-        elif src0["k"] == "fimm":
-            bits = struct.unpack("<Q", struct.pack("<d", float(src0["v"])))[0]
-            lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-        elif src0["k"] == "imm":
-            v = src0["v"]
-            # RDNA2 ISA: inline integers (-16..64) sign-extend to 64 bits; a 32-bit literal occupies bits [63:32].
-            if src0.get("literal") or (not (-16 <= v <= 64) and -0x80000000 <= v <= 0xFFFFFFFF):
-                lo, hi = self.cu(0), self.cu(v & 0xFFFFFFFF)
-            else:
-                bits = v & 0xFFFFFFFFFFFFFFFF
-                lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-        else:
-            raise Unsupported(op + " operand")
+        lo, hi = self.f64_source_words(src0, op)
         if src0.get("abs"):
             t = self.tmp()
             self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
@@ -10612,14 +10571,7 @@ class Gen:
                 if d["k"] != "vgpr" or d.get("n") != 2:
                     raise Unsupported(op + " destination")
                 def d64_words(sv):
-                    if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
-                        lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-                    elif sv["k"] in ("imm", "fimm"):
-                        bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
-                                if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
-                        lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-                    else:
-                        raise Unsupported(op + " operand")
+                    lo, hi = self.f64_source_words(sv, op)
                     if sv.get("abs"):
                         t = self.tmp()
                         self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
@@ -11004,14 +10956,7 @@ class Gen:
                 self.dst(a[0], self.tou(r))
             else:
                 def f64(sv):
-                    if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
-                        lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-                    elif sv["k"] in ("imm", "fimm"):
-                        bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
-                                if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
-                        lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-                    else:
-                        raise Unsupported(op + " operand")
+                    lo, hi = self.f64_source_words(sv, op)
                     v2, d = self.tmp(), self.tmp()
                     self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {lo} {hi}")
                     self.emit(f"{d} = OpBitcast %double {v2}")
