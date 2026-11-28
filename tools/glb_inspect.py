@@ -106,6 +106,33 @@ def _text(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _scene_report(gltf: dict, index: int, scene: dict) -> dict:
+    roots = []
+    issues = []
+    seen = set()
+    child_nodes = {
+        child
+        for parent in _array(gltf.get("nodes"))
+        if isinstance(parent, dict)
+        for child in _array(parent.get("children"))
+        if _entry(gltf, "nodes", child) is not None
+    }
+    if "nodes" in scene and not _array(scene["nodes"]):
+        issues.append("nodes must be a non-empty array when present")
+    for slot, ref in enumerate(_array(scene.get("nodes"))):
+        node = _entry(gltf, "nodes", ref)
+        roots.append({"node": _index(ref), "name": _text(node.get("name")) if node is not None else None})
+        if node is None:
+            issues.append(f"nodes[{slot}] does not reference a node")
+        elif ref in seen:
+            issues.append(f"nodes[{slot}] repeats root node {ref}")
+        else:
+            seen.add(ref)
+            if ref in child_nodes:
+                issues.append(f"nodes[{slot}] references child node {ref} as a scene root")
+    return {"index": index, "name": _text(scene.get("name")), "roots": roots, "issues": issues}
+
+
 def _reject_json_constant(value: str) -> None:
     raise GlbError(f"malformed JSON chunk: {value} is not a JSON number")
 
@@ -523,7 +550,7 @@ def build_report(glb: dict, file_bytes: int) -> dict:
     position_primitives = sum(1 for mesh in meshes for primitive in mesh["primitives"]
                               if primitive["position_accessor"] is not None)
     invalid_counts = {}
-    for key in ("meshes", "materials", "skins", "animations"):
+    for key in ("scenes", "meshes", "materials", "skins", "animations"):
         count = sum(1 for entry in _array(gltf.get(key)) if not isinstance(entry, dict))
         if count:
             invalid_counts[key] = count
@@ -544,6 +571,9 @@ def build_report(glb: dict, file_bytes: int) -> dict:
             "animations": _count(gltf, "animations"),
         },
         "chunks": glb["chunks"],
+        "default_scene": _index(gltf.get("scene")),
+        "scenes": [_scene_report(gltf, i, scene) for i, scene in enumerate(_array(gltf.get("scenes")))
+                   if isinstance(scene, dict)],
         "position_bbox": _merge_bbox(boxes),
         "position_bbox_complete": bool(boxes) and len(boxes) == position_primitives,
         "meshes": meshes,
@@ -551,6 +581,8 @@ def build_report(glb: dict, file_bytes: int) -> dict:
         "skins": skins,
         "animations": animations,
     }
+    if "scene" in gltf and _entry(gltf, "scenes", gltf["scene"]) is None:
+        report["scene_issue"] = "default scene does not reference a scene"
     if any(invalid_counts.values()):
         report["invalid_counts"] = invalid_counts
     if invalid_types:
@@ -601,6 +633,16 @@ def format_report(report: dict) -> str:
     suffix = (" (partial: some POSITION accessors have no min/max)"
               if bbox is not None and not report["position_bbox_complete"] else "")
     lines.append(f"POSITION bbox: {_bbox_text(bbox)}{suffix}")
+
+    lines.append(f"scenes: default={_show(report['default_scene'])}")
+    if "scene_issue" in report:
+        lines.append(f"  issue: {report['scene_issue']}")
+    for scene in report["scenes"]:
+        lines.append(f"  [{scene['index']}] name={_show(scene['name'])}")
+        for root in scene["roots"]:
+            lines.append(f"    root node={_show(root['node'])} name={_show(root['name'])}")
+        for issue in scene["issues"]:
+            lines.append(f"    issue: {issue}")
 
     lines.append("meshes:")
     if not report["meshes"]:
