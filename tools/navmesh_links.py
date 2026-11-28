@@ -18,13 +18,18 @@ import mmap
 import os
 import struct
 import sys
+import tempfile
 
 try:
     from tools import navmesh_decode as nd
+    from tools.file_mode import published_mode
+    from tools.replace_retry import replace as replace_retry
     from tools.report_paths import same_report_path
 except ImportError:  # pragma: no cover - direct script execution
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import navmesh_decode as nd
+    from file_mode import published_mode
+    from replace_retry import replace as replace_retry
     from report_paths import same_report_path
 
 
@@ -380,7 +385,7 @@ def verify_tile(b, stats):
                             endpoints_ok = False
                             break
                         p0, p1, s0, s1 = struct.unpack_from("<HHII", b, la + 32 * li + 12)
-                        if not ((p0 == gpi or p1 == gpi) and (s0 == c8 or s1 == c8)):
+                        if not ((s0 == c8 and p0 == gpi) or (s1 == c8 and p1 == gpi)):
                             endpoints_ok = False
                             break
                         by_li.setdefault(li, set()).add(gpi)
@@ -503,8 +508,16 @@ def _iter_resources(path, start=0, limit=None):
                 yield bytes(buf)
 
 
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def scan(path, start=0, limit=None, *, reciprocity=False, endpoint_agreement=False, relative_winding=False,
          coplanar_winding=False):
+    if not _is_int(start) or start < 0:
+        raise ValueError(f"start must be an integer >= 0, got {start!r}")
+    if limit is not None and (not _is_int(limit) or limit < 1):
+        raise ValueError(f"limit must be an integer >= 1, got {limit!r}")
     relative_winding = relative_winding or coplanar_winding
     stats = new_stats()
     if endpoint_agreement or relative_winding:
@@ -558,6 +571,29 @@ def scan(path, start=0, limit=None, *, reciprocity=False, endpoint_agreement=Fal
     }
 
 
+def _write_json_atomic(path, doc):
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target) or "."
+    os.makedirs(parent, exist_ok=True)
+    payload = (json.dumps(doc, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    fd, tmp_path = tempfile.mkstemp(prefix=".navmesh_links_", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+        os.chmod(tmp_path, published_mode(target))
+        replace_retry(tmp_path, target)
+    except BaseException:
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("input", help="Path to navmeshes.rpf or a directory of carved .bin streams")
@@ -587,31 +623,30 @@ def main(argv=None):
     if os.path.isdir(args.input) and (args.start != 0 or args.limit is not None):
         sys.stderr.write("error: --start and --limit only apply to RPF9 archive files\n")
         return 2
-    if args.out is not None:
-        if os.path.isdir(args.out):
-            sys.stderr.write(f"error: --out path is a directory: {args.out}\n")
-            return 2
-        if same_report_path(args.out, args.input):
-            sys.stderr.write("error: --out must not overwrite the input path\n")
-            return 2
-        if os.path.isdir(args.input):
-            for fname in os.listdir(args.input):
-                if fname.endswith(".bin") and same_report_path(args.out, os.path.join(args.input, fname)):
-                    sys.stderr.write("error: --out must not overwrite a carved input stream\n")
-                    return 2
+    try:
+        if args.out is not None:
+            if os.path.isdir(args.out):
+                sys.stderr.write(f"error: --out path is a directory: {args.out}\n")
+                return 2
+            if same_report_path(args.out, args.input):
+                sys.stderr.write("error: --out must not overwrite the input path\n")
+                return 2
+            if os.path.isdir(args.input):
+                for fname in os.listdir(args.input):
+                    if fname.endswith(".bin") and same_report_path(args.out, os.path.join(args.input, fname)):
+                        sys.stderr.write("error: --out must not overwrite a carved input stream\n")
+                        return 2
 
-    doc = scan(args.input, start=args.start, limit=args.limit, reciprocity=args.reciprocity,
-               endpoint_agreement=args.endpoint_agreement, relative_winding=args.relative_winding,
-               coplanar_winding=args.coplanar_winding)
-    if args.out is not None:
-        parent = os.path.dirname(os.path.abspath(args.out))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(doc, fh, indent=2)
-            fh.write("\n")
+        doc = scan(args.input, start=args.start, limit=args.limit, reciprocity=args.reciprocity,
+                   endpoint_agreement=args.endpoint_agreement, relative_winding=args.relative_winding,
+                   coplanar_winding=args.coplanar_winding)
+        if args.out is not None:
+            _write_json_atomic(args.out, doc)
+    except OSError as exc:
+        sys.stderr.write(f"error: {exc.strerror or exc}\n")
+        return 2
     if not args.quiet:
-        print(json.dumps(doc, indent=2))
+        print(json.dumps(doc, indent=2, allow_nan=False))
     return 0
 
 

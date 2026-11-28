@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Unit tests for tools/navmesh_links.py using synthetic navmesh tiles only."""
 
+import contextlib
+import io
 import json
 import os
 import struct
@@ -8,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -473,6 +476,89 @@ class NavmeshLinksTest(unittest.TestCase):
                 self.assertEqual(nl.main([rpf, "--out", rpf_upper]), 2)
                 with open(rpf, "rb") as fh:
                     self.assertEqual(fh.read(4), b"9FPR")
+
+    def test_cross_tile_link_rejects_local_poly_matching_remote_endpoint_id(self):
+        sector = (260 << 9) | 250
+        # Cross-tile link 1 connects remote poly 1 (sector+1) and local poly 2 (sector).
+        # Even when local poly 2 also lists link 1, local poly 1 must NOT be accepted as
+        # an endpoint of link 1 because polygon ID 1 belongs to sector+1, not sector.
+        cases = (
+            ("remote_s0", (110, 210, 310, 410, 510, 610, 1, 2, sector + 1, sector, 0x0400, 0x0040, 127, 0)),
+            ("remote_s1", (110, 210, 310, 410, 510, 610, 2, 1, sector, sector + 1, 0x0400, 0x0040, 127, 0)),
+        )
+        for label, bad_link in cases:
+            with self.subTest(case=label):
+                tile = build_tile(
+                    sector=sector,
+                    links=[
+                        (100, 200, 300, 400, 500, 600, 0, 2, sector, sector, 0x0200, 0x0050, 63, 0),
+                        bad_link,
+                    ],
+                    # poly 0 -> [0], poly 1 -> [1] (spurious!), poly 2 -> [0, 1]
+                    link_indices=[0, 1, 0, 1],
+                    poly_link_counts=(1, 1, 2),
+                )[0]
+                st = nl.new_stats()
+                chk = nl.verify_tile(tile, st)
+                self.assertTrue(chk["special_links_valid"])
+                self.assertTrue(chk["poly_link_chain"])
+                self.assertFalse(chk["link_indices_endpoints"])
+
+    def test_scan_validates_start_and_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "nav.rpf")
+            make_rpf(rpf, build_tile())
+            for kwargs in (
+                {"start": -1},
+                {"start": True},
+                {"start": False},
+                {"limit": 0},
+                {"limit": -5},
+                {"limit": True},
+                {"limit": False},
+            ):
+                with self.subTest(kwargs=kwargs):
+                    with self.assertRaises(ValueError):
+                        nl.scan(rpf, **kwargs)
+
+    def test_atomic_out_write_preserves_existing_report_on_failure_and_reports_oserror(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "nav.rpf")
+            make_rpf(rpf, build_tile())
+            out = os.path.join(tmp, "report.json")
+            with open(out, "wb") as fh:
+                fh.write(b'{"previous": true}\n')
+
+            err = io.StringIO()
+            with mock.patch.object(nl, "replace_retry", side_effect=OSError("disk full")):
+                with contextlib.redirect_stderr(err):
+                    rc = nl.main([rpf, "--out", out, "--quiet"])
+            self.assertEqual(rc, 2)
+            self.assertIn("error:", err.getvalue())
+            # Existing report stays intact and no temporary file is left behind.
+            with open(out, "rb") as fh:
+                self.assertEqual(fh.read(), b'{"previous": true}\n')
+            leftovers = [f for f in os.listdir(tmp) if f.endswith(".tmp")]
+            self.assertEqual(leftovers, [])
+
+            # Unwritable parent (blocked by regular file) exits 2 with one error line, no traceback.
+            blocker = os.path.join(tmp, "blocker")
+            with open(blocker, "wb") as fh:
+                fh.write(b"x")
+            proc = subprocess.run(
+                [sys.executable, "-I", TOOL, rpf, "--out", os.path.join(blocker, "out.json"), "--quiet"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("error:", proc.stderr)
+            self.assertNotIn("Traceback", proc.stderr)
+
+            # Strict JSON rejects NaN in both --out and stdout.
+            with self.assertRaises(ValueError):
+                nl._write_json_atomic(os.path.join(tmp, "nan.json"), {"bad": float("nan")})
+            with mock.patch.object(nl, "scan", return_value={"bad": float("nan")}):
+                with self.assertRaises(ValueError):
+                    nl.main([rpf])
 
 
 if __name__ == "__main__":
