@@ -5,7 +5,7 @@
 `tests/test_docs_repo_paths.py` checks the paths the docs name; this checks the options. A renamed or removed
 argparse option leaves `python -I tools/x.py --old` in a README or guide that no longer runs. Three checks:
 
-1. a `--flag` anywhere in a Markdown page appears as a string in some tracked non-Markdown source file;
+1. a `--flag` anywhere in a Markdown page occurs in tracked source, literally or as a clap long option;
 2. in a fenced command that starts `python [-I] tools/x.py` (or `scripts/`, or `make_game.py`), every flag appears in
    that script (a script that builds flags as `"--" + name` is skipped; `--help` is argparse's own);
 3. in a fenced command running a PowerShell script (`scripts/` or `tools/`), every flag appears in that script's
@@ -21,7 +21,13 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FLAG = re.compile(r"(?<![\w-])(--[a-z][\w-]*)")
 SOURCE_SUFFIXES = (".py", ".ps1", ".cpp", ".cc", ".c", ".h", ".hpp", ".cmake", ".txt", ".cs", ".cjs", ".js", ".html",
-                   ".bat", ".sh", ".yml", ".yaml", ".csproj")
+                   ".bat", ".sh", ".yml", ".yaml", ".csproj", ".rs")
+CLAP_FIELD = re.compile(
+    r'#\[arg\(\s*long\b(?:\s*=\s*"([\w-]+)")?\s*(?:,[^\]]*)?\)\]\s*(\w+)\s*:'
+)
+# Options belonging to external tools discussed on these pages.
+PAGE_FLAGS = {"docs/port_plan.md": {"--no-rt", "--rt-static-bvh"},  # VIctory
+              "d3d12/docs/asset-policy.md": {"--invert-paths"}}     # git-filter-repo
 # Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md), argparse itself, and
 # the spirv-opt passes docs/embedded_shaders.md tried on one module.
 FOREIGN = {"--search", "--state", "--index-url", "--help",
@@ -129,13 +135,21 @@ def extract_ps1_params(content):
     return params
 
 
-def unknown_flags(pages, code):
-    """[(page:line, flag)] for flags in `pages` ({name: text}) that do not occur in `code` (one string)."""
+def source_flags(path, source):
+    flags = set(FLAG.findall(source))
+    if path.endswith(".rs"):
+        for explicit, field in CLAP_FIELD.findall(source):
+            flags.add("--" + (explicit or field.replace("_", "-")))
+    return flags
+
+
+def unknown_flags(pages, flags):
+    """[(page:line, flag)] for documented flags without a known source."""
     out = []
     for page, text in sorted(pages.items()):
         for n, line in enumerate(text.split("\n"), 1):
             for flag in sorted(set(FLAG.findall(line))):
-                if flag not in FOREIGN and flag not in code:
+                if flag not in FOREIGN and flag not in PAGE_FLAGS.get(page, ()) and flag not in flags:
                     out.append((f"{page}:{n}", flag))
     return out
 
@@ -234,7 +248,7 @@ class DocsCliFlags(unittest.TestCase):
     def test_checkers_report_only_the_missing_flag(self):
         pages = {"docs/a.md": "Use `--real` or `--gone`, and `gh --search`.\n"
                               "```\npython -I tools/x.py --real --old \\\n    --more\npython -I tools/y.py --old\n```\n"}
-        self.assertEqual(unknown_flags(pages, '"--real" "--more" "--old"'), [("docs/a.md:1", "--gone")])
+        self.assertEqual(unknown_flags(pages, {"--real", "--more", "--old"}), [("docs/a.md:1", "--gone")])
         sources = {"tools/x.py": 'add("--real") add("--more")', "tools/y.py": 'add("--old")'}
         self.assertEqual(tool_flag_mismatches(pages, sources), [("docs/a.md:3", "tools/x.py", "--old")])
         sources["tools/x.py"] += ' "--" + name'
@@ -244,12 +258,24 @@ class DocsCliFlags(unittest.TestCase):
         ps1_sources = {"scripts/test.ps1": "param([string]$ValidParam)"}
         self.assertEqual(ps1_flag_mismatches(ps1_pages, ps1_sources), [("docs/b.md:2", "scripts/test.ps1", "-BadParam")])
 
+    def test_clap_long_options(self):
+        source = ('#[arg(long, default_value_t = 1)]\nview_count: u32,\n'
+                  '#[arg(long = "fast")]\nquick_mode: bool,\n'
+                  '#[arg(short)]\nslow_mode: bool,\n')
+        flags = source_flags("cli.rs", source)
+        self.assertEqual(flags, {"--view-count", "--fast"})
+        self.assertEqual(unknown_flags({"guide.md": "Try --view or --view-count."}, flags),
+                         [("guide.md:1", "--view")])
+
     def test_docs_name_existing_flags(self):
         files = tracked_files()
-        code = "\n".join(read(p) for p in files if p.endswith(SOURCE_SUFFIXES) and not p.startswith("docs/"))
+        flags = set()
+        for path in files:
+            if path.endswith(SOURCE_SUFFIXES) and not path.startswith("docs/") and path != "tests/test_docs_cli_flags.py":
+                flags.update(source_flags(path, read(path)))
         pages = {p: read(p) for p in files if p.endswith(".md") and p not in OTHER_PROJECTS}
-        self.assertTrue(code and pages)
-        missing = unknown_flags(pages, code)
+        self.assertTrue(flags and pages)
+        missing = unknown_flags(pages, flags)
         self.assertEqual(missing, [], "flags in the docs that no source file mentions: " +
                          "; ".join(f"{where} {flag}" for where, flag in missing))
 
