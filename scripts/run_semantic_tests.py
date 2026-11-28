@@ -44,6 +44,9 @@ import threading
 import time
 
 MAX_TIMEOUT_SECONDS = 24 * 60 * 60
+# The repository's own tests folder. Its other files run under pytest or as scripts in CI (.github/workflows/ci.yml),
+# not through this runner, so a run pointed there reports dozens of files as failed that CI never runs this way.
+REPO_TESTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests")
 
 # The child processes running right now: on SIGINT / Ctrl+C, the main thread terminates them so no orphans linger.
 _active_processes = set()
@@ -277,6 +280,14 @@ def run_module(directory, module, verbose, timeout=None):
     return code, count or 0, out
 
 
+def is_repo_tests(directory):
+    """True when `directory` is this repository's tests folder, under any spelling of it."""
+    try:
+        return os.path.isdir(directory) and os.path.samefile(directory, REPO_TESTS)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("directory", help="the suite's folder, tests/semantic")
@@ -288,6 +299,10 @@ def main(argv=None):
                          "subprocess, or for the whole discover subprocess with -j 1 (default: no limit)")
     a = ap.parse_args(argv)
     directory = os.path.abspath(a.directory)
+    if is_repo_tests(directory):
+        ap.error(f"{a.directory} is the repository's tests folder; the translator suite is its semantic subfolder "
+                 f"({os.path.join(a.directory, 'semantic')}). The other files in tests/ run under pytest or as "
+                 "scripts in CI (.github/workflows/ci.yml), not through this runner")
     modules = test_modules(directory, a.pattern)
     if not modules:
         print(f"no {a.pattern} files in {directory}")

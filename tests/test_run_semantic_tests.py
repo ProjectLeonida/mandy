@@ -170,6 +170,17 @@ class RunnerTest(unittest.TestCase):
             self.assertIn(tmp, result.stderr)
             self.assertNotIn("Traceback", result.stdout + result.stderr)
 
+    def test_the_repository_tests_folder_is_refused_before_running_anything(self):
+        # tests/ holds files CI runs under pytest or as scripts; this runner reported them as failed.
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                result = cli(os.path.join(ROOT, "tests"), "-j", str(jobs))
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("translator suite is its semantic subfolder", result.stderr)
+                self.assertNotIn("FAILED", result.stdout + result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(r.is_repo_tests(os.path.join(ROOT, "tests", "semantic")))
+
     def test_timeout_requires_positive_finite_seconds(self):
         for value in ("0", "-1", "nan", "inf", "-inf"):
             with self.subTest(value=value):
