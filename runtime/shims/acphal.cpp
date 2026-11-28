@@ -236,6 +236,9 @@ struct ApuRegion {
         const uintptr_t b = reinterpret_cast<uintptr_t>(base);
         if (p < b || p >= b + size) return false;
         if (alignment == 0) alignment = 1;
+        // The mask test below holds only for a power of two (with 6, offset 2 would pass and offset 6 fail);
+        // ApuAlloc refuses any other alignment too.
+        if ((alignment & (alignment - 1)) != 0) return false;
         return ((p - b) & (static_cast<uintptr_t>(alignment) - 1)) == 0;
     }
 
@@ -1266,21 +1269,19 @@ HRESULT __stdcall ApuAlloc(void** virtualAddress, uint32_t* physicalAddress,
     const bool prefer_noncached = (flags == 2);
     ApuRegion* target = prefer_noncached ? &g_noncached_heap : &g_cached_heap;
 
+    // No non-cached heap: the cached one serves (PC memory is unified and cache-coherent).
+    if (!target->base && prefer_noncached) target = &g_cached_heap;
     if (!target->base) {
-        if (!prefer_noncached) {
-            if (g_apu_heap_created) return E_OUTOFMEMORY;
-            // Lazy default cached heap if ApuCreateHeap wasn't called yet
-            constexpr uint32_t kDefaultHeapSize = 64 * 1024 * 1024;
-            target->base = VirtualAlloc(nullptr, kDefaultHeapSize,
-                                        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-            if (!target->base) return E_OUTOFMEMORY;
-            target->size = kDefaultHeapSize;
-            g_apu_heap_created = true;
-        } else {
-            // Fall back to cached heap
-            target = &g_cached_heap;
-            if (!target->base) return E_OUTOFMEMORY;
-        }
+        // Configured by ApuCreateHeap without this heap: it stays unavailable.
+        if (g_apu_heap_created) return E_OUTOFMEMORY;
+        // Lazy default cached heap if ApuCreateHeap wasn't called yet, whichever heap the first call asks for
+        // (flags=2 included: it falls back to the cached heap above).
+        constexpr uint32_t kDefaultHeapSize = 64 * 1024 * 1024;
+        target->base = VirtualAlloc(nullptr, kDefaultHeapSize,
+                                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!target->base) return E_OUTOFMEMORY;
+        target->size = kDefaultHeapSize;
+        g_apu_heap_created = true;
     }
 
     uint32_t offset = 0;
@@ -1324,6 +1325,7 @@ void __stdcall ApuFree(void* virtualAddress) {
 BOOL __stdcall ApuIsVirtualAddressValid(void* virtualAddress, uint32_t alignment) {
     if (!virtualAddress) return FALSE;
     if (alignment == 0) alignment = 1;
+    if ((alignment & (alignment - 1)) != 0) return FALSE;  // as ApuAlloc: a power of two, or 0 for 1
     std::lock_guard lock(g_apu_mutex);
     if (g_cached_heap.is_valid_address(virtualAddress, alignment)) return TRUE;
     if (g_noncached_heap.is_valid_address(virtualAddress, alignment)) return TRUE;

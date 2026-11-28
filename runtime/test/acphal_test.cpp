@@ -242,7 +242,26 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Heap configuration is process-wide, so CTest exercises this mode separately.
+    // Heap configuration is process-wide, so CTest exercises these modes separately.
+    // --lazy-noncached (kevincommits' finding, #1608 batch 18 item 4): before any ApuCreateHeap, ApuAlloc with
+    // flags=2 gets the lazy default heap, as flags=0 and 1 do; it was E_OUTOFMEMORY.
+    if (argc == 2 && std::strcmp(argv[1], "--lazy-noncached") == 0) {
+        void* first = nullptr;
+        uint32_t first_address = 0;
+        check(alloc(&first, &first_address, 0x1000, 0x800, 2) == S_OK && first != nullptr && first_address != 0,
+              "ApuAlloc flags=2 before ApuCreateHeap gets the lazy default heap");
+        void* second = nullptr;
+        uint32_t second_address = 0;
+        check(alloc(&second, &second_address, 0x1000, 0x800, 1) == S_OK && second != nullptr && second != first,
+              "ApuAlloc flags=1 after it uses the same default heap");
+        check(is_valid(first, 0x800) == TRUE && map_apu(first_address) == first,
+              "The flags=2 block is valid and mapped");
+        check(create_heap(0x10000, 0x10000) != S_OK, "ApuCreateHeap after the lazy heap fails (already created)");
+        free_mem(second);
+        free_mem(first);
+        std::printf("acphal_test complete: %d checks, %d failures\n", g_checks, g_failures);
+        return g_failures != 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--noncached-only") == 0) {
         check(create_heap(0, 0x6000u) == S_OK, "Create only the non-cached APU heap");
         void* noncached = nullptr;
@@ -348,6 +367,15 @@ int main(int argc, char** argv) {
     check(is_valid(nullptr, 0x800) == FALSE, "ApuIsVirtualAddressValid(nullptr) returns FALSE");
     check(is_valid(reinterpret_cast<void*>(0x1234), 0x800) == FALSE,
           "ApuIsVirtualAddressValid(bogus) returns FALSE");
+    // kevincommits' finding (#1608 batch 18 item 4): an alignment that is not a power of two is invalid, as ApuAlloc
+    // treats it. Before, the mask test passed offset 2 for alignment 6 (2 & 5 == 0) and failed offset 6.
+    check(is_valid(static_cast<char*>(va_c) + 2, 6) == FALSE,
+          "ApuIsVirtualAddressValid refuses alignment 6 (unaligned offset 2)");
+    check(is_valid(static_cast<char*>(va_c) + 6, 6) == FALSE && is_valid(va_c, 3) == FALSE,
+          "ApuIsVirtualAddressValid refuses any alignment that is not a power of two");
+    check(is_valid(static_cast<char*>(va_c) + 2, 2) == TRUE && is_valid(static_cast<char*>(va_c) + 2, 4) == FALSE &&
+              is_valid(va_c, 0) == TRUE,
+          "ApuIsVirtualAddressValid keeps power-of-two alignments (and 0 as 1)");
 
     // Round-trip mapping
     check(map_virtual(va_nc) == apu_nc, "ApuMapVirtualAddress matches apu_nc");
