@@ -97,6 +97,52 @@ int check(ID3D12Device* device, bool worker) {
     return 0;
 }
 
+// This process's CPU time (all threads), in ms.
+double process_cpu_ms() {
+    FILETIME created, exited, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0.0;
+    const auto ticks = [](const FILETIME& t) { return (std::uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
+    return double(ticks(kernel) + ticks(user)) / 10000.0;
+}
+
+// A worker whose queue's front still waits goes idle. It used to re-arm its own release request from its pump on
+// every pass, so a front waiting on an unsignalled fence kept the worker busy (a core's worth of CPU) for as long as
+// the fence stayed unsignalled. With the release worker only.
+int check_blocked_front_idles(ID3D12Device* device) {
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    Ref<ID3D12CommandQueue> q;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&q.p))));
+    Ref<ID3D12Fence> gate1, gate2, other, f;
+    for (ID3D12Fence** fence : {&gate1.p, &gate2.p, &other.p, &f.p})
+        EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence))));
+    EXPECT(SUCCEEDED(q->Wait(gate1.p, 1)));
+    EXPECT(SUCCEEDED(q->Signal(f.p, 1)));
+    EXPECT(SUCCEEDED(q->Wait(gate2.p, 1)));
+    EXPECT(SUCCEEDED(q->Signal(f.p, 2)));
+
+    // The first part runs on the worker (which starts for it); the front then waits on gate2, never signalled yet.
+    Event first, second;
+    EXPECT(SUCCEEDED(f->SetEventOnCompletion(1, first.h)));
+    EXPECT(SUCCEEDED(gate1->Signal(1)));
+    EXPECT(first.set_within(20000));
+    EXPECT(SUCCEEDED(other->Signal(1)));  // a Signal nothing waits on: a pass over the holds, as any would make
+    Sleep(200);                           // let the worker finish what that pass asked of it
+
+    const double cpu_before = process_cpu_ms();
+    const auto start = std::chrono::steady_clock::now();
+    Sleep(1000);
+    const double cpu_ms = process_cpu_ms() - cpu_before, wall_ms = ms_since(start);
+    std::printf("blocked front: %.0f ms of CPU in %.0f ms while the front waits\n", cpu_ms, wall_ms);
+    EXPECT(cpu_ms < 0.3 * wall_ms);
+    EXPECT(f->GetCompletedValue() == 1);
+
+    EXPECT(SUCCEEDED(f->SetEventOnCompletion(2, second.h)));
+    EXPECT(SUCCEEDED(gate2->Signal(1)));
+    EXPECT(second.set_within(20000));
+    EXPECT(f->GetCompletedValue() == 2);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -123,6 +169,7 @@ int main() {
     Ref<ID3D12Device> device;
     device.p = raw;
     EXPECT(check(device.p, worker) == 0);
+    if (worker) EXPECT(check_blocked_front_idles(device.p) == 0);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;

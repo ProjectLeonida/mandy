@@ -51,6 +51,7 @@
 #include <shared_mutex>
 #include <span>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -4034,6 +4035,10 @@ private:
         // takes its request on its next pass, right after the pump.
         const bool on_worker = t_worker_of_ == this;
         if (on_worker || async_started_.load(std::memory_order_acquire) || start_release_worker()) {
+            // Only when the front can run: asking for a front that still waits re-armed the worker from its own pump
+            // on every pass, a busy loop for as long as its fence stayed unsignalled, and kept flush_async waiting
+            // for an idle that never came.
+            if (!front_may_run(on_worker)) return false;
             bool asked = false;
             {
                 std::lock_guard lock(inbox_mutex_);
@@ -4046,6 +4051,17 @@ private:
             // The worker is stopping (the queue is being destroyed) and takes no more requests: released here.
         }
         return release_held();
+    }
+
+    // Whether the held front can run now, for release_ready. The signalling thread does not wait for the state lock: a
+    // release (or another call) holding it may take as long as its pipeline builds, which is what the worker is for,
+    // so a busy lock is answered with a request (one more pass, once per Signal). The worker does not re-arm itself
+    // on a busy lock: what holds it is another thread's call, and a front that a Signal makes ready meanwhile is asked
+    // for by that Signal's own pass.
+    bool front_may_run(bool on_worker) {
+        std::unique_lock state(state_mutex_, std::try_to_lock);
+        if (!state.owns_lock()) return !on_worker;
+        return !held_.empty() && (context_.is_device_lost() || ready(held_.front()));
     }
 
     // LEONIDA_RELEASE_WORKER=1: the queue's worker is started for its held work on the first release. Unset (the
@@ -4063,7 +4079,11 @@ private:
         std::lock_guard lock(inbox_mutex_);
         if (async_stop_) return false;
         if (!worker_.joinable()) {
-            worker_ = std::thread([this] { async_worker(); });
+            try {
+                worker_ = std::thread([this] { async_worker(); });
+            } catch (const std::system_error&) {
+                return false;  // no thread: released on the signalling thread, as without the setting
+            }
             async_started_.store(true, std::memory_order_release);
         }
         return true;
@@ -4082,6 +4102,10 @@ private:
 
     bool release_held() {
         std::vector<std::shared_ptr<void>> retired;
+        // The operations that ran (or were skipped on a lost device) go after the state lock: one may hold the last
+        // pin of a fence, whose destruction (remove_fence) takes the holds' pump lock and asks every queue, this one
+        // included, to drop what waits on it, which takes this queue's state lock again.
+        std::vector<Deferred> done;
         bool released = false;
         {
             std::lock_guard state(state_mutex_);
@@ -4101,6 +4125,7 @@ private:
                 }
                 if (held_run_delay_ms()) std::this_thread::sleep_for(std::chrono::milliseconds(held_run_delay_ms()));
                 if (!context_.is_device_lost()) run(op);
+                done.push_back(std::move(op));
                 // Only now: until it has run, the operation still counts as the oldest held one.
                 held_front_seq_.store(held_.empty() ? 0 : held_.front().seq, std::memory_order_release);
                 released = true;
@@ -4877,9 +4902,18 @@ private:
             worker_.join();
             return;
         }
-        // A worker stuck for a minute holds this queue's objects: it is left running rather than joined forever
-        // (only at teardown; the process is ending or the device is gone).
-        std::fprintf(stderr, "[rt] d3d12: a queue's worker did not finish; it is detached at the queue's destruction\n");
+        // A worker still busy after flush_async's minute is waited for: it runs this queue's objects, and a release
+        // can legitimately take longer than that (one held batch's cold pipeline builds are tens of seconds each), so
+        // detaching it would let it use the queue after its destruction. Only on a lost device, where a release runs
+        // nothing, is a worker that is still stuck left running.
+        if (!context_.is_device_lost()) {
+            std::fprintf(stderr, "[rt] d3d12: a queue's worker is still busy at the queue's destruction; waiting for "
+                                 "it\n");
+            worker_.join();
+            return;
+        }
+        std::fprintf(stderr, "[rt] d3d12: a queue's worker did not finish on a lost device; it is detached at the "
+                             "queue's destruction\n");
         worker_.detach();
     }
 

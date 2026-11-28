@@ -66,9 +66,8 @@ public:
         if (held_.load(std::memory_order_acquire) == 0 || in_pump()) return;
         {
             std::lock_guard pump(pump_mutex_);
-            in_pump() = true;  // what is dropped may release other fences: they must not wait for this lock
+            PumpScope scope;  // what is dropped may release other fences: they must not wait for this lock
             for (Holder* holder : snapshot()) holder->discard_waiting_on(semaphore);
-            in_pump() = false;
         }
         pump_ready();
     }
@@ -172,16 +171,17 @@ public:
         for (;;) {
             std::unique_lock pump(pump_mutex_, std::try_to_lock);
             if (!pump) return;  // another thread is releasing and will see dirty_
-            in_pump() = true;
-            while (dirty_.exchange(false, std::memory_order_acq_rel)) {
-                bool progress = true;
-                while (progress) {
-                    progress = false;
-                    for (Holder* holder : snapshot()) progress |= holder->release_ready();
+            {
+                PumpScope scope;
+                while (dirty_.exchange(false, std::memory_order_acq_rel)) {
+                    bool progress = true;
+                    while (progress) {
+                        progress = false;
+                        for (Holder* holder : snapshot()) progress |= holder->release_ready();
+                    }
+                    run_barriers();
                 }
-                run_barriers();
             }
-            in_pump() = false;
             pump.unlock();
             if (!dirty_.load(std::memory_order_acquire)) return;
         }
@@ -197,7 +197,7 @@ public:
         if (in_pump()) return;
         {
             std::lock_guard pump(pump_mutex_);
-            in_pump() = true;
+            PumpScope scope;
             dirty_.store(false, std::memory_order_release);
             bool progress = true;
             while (progress) {
@@ -205,7 +205,6 @@ public:
                 for (Holder* holder : snapshot()) progress |= holder->release_ready();
             }
             run_barriers();
-            in_pump() = false;
         }
         if (dirty_.load(std::memory_order_acquire)) pump_ready();
     }
@@ -221,6 +220,14 @@ private:
         static thread_local bool pumping = false;
         return pumping;
     }
+    // Marks this thread as inside a pass for its scope, and clears the mark however the scope ends (an exception
+    // from a holder would otherwise leave every later pass on this thread skipped).
+    struct PumpScope {
+        PumpScope() { in_pump() = true; }
+        ~PumpScope() { in_pump() = false; }
+        PumpScope(const PumpScope&) = delete;
+        PumpScope& operator=(const PumpScope&) = delete;
+    };
 
     std::vector<Holder*> snapshot() const {
         std::lock_guard lock(mutex_);
