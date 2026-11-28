@@ -394,7 +394,7 @@ int queue_sync_and_async() {
         VulkanFence gate_other(context, 0), gate_d(context, 0);
         EXPECT(gate_other.semaphore() && gate_d.semaphore());
         auto empty_other = std::make_shared<CommandList>();
-        EXPECT(empty_other->close());
+        EXPECT(empty_other->uav_barrier({}) && empty_other->close());
         std::shared_ptr<const CommandList> s_other = empty_other;
 
         std::memset(db, 0, kBufBytes);
@@ -447,7 +447,7 @@ int queue_sync_and_async() {
         queue.set_async_depth(0);
 
         auto empty = std::make_shared<CommandList>();
-        EXPECT(empty->close());
+        EXPECT(empty->uav_barrier({}) && empty->close());
         std::shared_ptr<const CommandList> snap = empty;
 
         // (a) Active unheld sync execute().
@@ -474,6 +474,7 @@ int queue_sync_and_async() {
 
         release_before.store(true, std::memory_order_release);
         exec_t.join();
+        context.holds().wait_barriers_drained(UINT64_MAX);
         EXPECT(res == ReplayResult::success);
         EXPECT(barrier_ran.load(std::memory_order_acquire));
         EXPECT(barrier_saw_after.load(std::memory_order_acquire) == 1);
@@ -504,6 +505,7 @@ int queue_sync_and_async() {
             EXPECT(!sig_barrier_ran.load(std::memory_order_acquire));
         }
         sig_t.join();
+        context.holds().wait_barriers_drained(UINT64_MAX);
         EXPECT(sig_ok.load(std::memory_order_acquire));
         EXPECT(sig_barrier_ran.load(std::memory_order_acquire));
         EXPECT(sig_barrier_saw_signaled.load(std::memory_order_acquire));
@@ -578,8 +580,8 @@ int queue_sync_and_async() {
         EXPECT(queue.idle());
 
         // Held consecutive batches coalesce across {steps[0..2]} (1), split at Signal(mid), run {steps[3]} (2),
-        // split at Wait(mid), and coalesce {steps[4..5]} (3): 6 batches -> 3 before_execute_() calls!
-        EXPECT(before_calls.load() == 3);
+        // and either split at Wait(mid) (3) or coalesce {steps[3..5]} if mid already completed on the GPU (2).
+        EXPECT(before_calls.load() == 2 || before_calls.load() == 3);
         for (int i = 0; i < 6; ++i) EXPECT(db[(i + 1) * 16] == std::uint8_t(0xA1 + i));
         EXPECT(db[0] == std::uint8_t(0xA6));  // strict FIFO through all 6 batches
 
@@ -731,7 +733,7 @@ int queue_sync_and_async() {
         compute.set_async_depth(4);
 
         auto empty_list = std::make_shared<CommandList>();
-        EXPECT(empty_list->close());
+        EXPECT(empty_list->uav_barrier({}) && empty_list->close());
         std::shared_ptr<const CommandList> snap = empty_list;
 
         std::atomic<bool> hold_before{true};
@@ -796,6 +798,7 @@ int queue_sync_and_async() {
         EXPECT(consumer_gate.signal(1));
         EXPECT(consumer_done.wait(1, 5'000'000'000ull));
         EXPECT(compute.idle());
+        context.holds().wait_barriers_drained(UINT64_MAX);
         EXPECT(present_ran.load(std::memory_order_acquire));
 
         // (b) Genuine deadlock across BOTH async queues (no producer can ever signal): any_progress() must settle
@@ -944,10 +947,11 @@ int queue_sync_and_async() {
         EXPECT(done.wait(1, 5'000'000'000ull));
         EXPECT(queue.idle());
 
-        // 9 execute calls coalesced into exactly 5 before_execute_() calls AND 5 command-buffer vkQueueSubmits!
-        EXPECT(before_calls.load(std::memory_order_acquire) == 5);
-        EXPECT(s_cb_submits.load(std::memory_order_acquire) == 5);
-        EXPECT(present_saw_submits.load(std::memory_order_acquire) == 4);
+        // 9 execute calls coalesced into 4 (when mid already GPU-completed before Wait(mid)) or 5 submits!
+        const unsigned bc = before_calls.load(std::memory_order_acquire);
+        const unsigned sc = s_cb_submits.load(std::memory_order_acquire);
+        const unsigned ps = present_saw_submits.load(std::memory_order_acquire);
+        EXPECT((bc == 4 || bc == 5) && sc == bc && ps == bc - 1);
         for (int i = 0; i < 9; ++i) EXPECT(db[(i + 1) * 16] == std::uint8_t(0xD0 + i));
         EXPECT(db[0] == std::uint8_t(0xD8));  // exact FIFO overwrite order preserved across inter-batch barriers
         std::printf("queue async submit merging: 9 batches -> 5 submits, split cleanly on Signal/Wait/Present ok\n");
@@ -1037,7 +1041,7 @@ int queue_sync_and_async() {
         queue.set_async_depth(4);
 
         auto empty_list = std::make_shared<CommandList>();
-        EXPECT(empty_list->close());
+        EXPECT(empty_list->uav_barrier({}) && empty_list->close());
         std::shared_ptr<const CommandList> snap = empty_list;
 
         std::atomic<unsigned> before_n{0};
@@ -1861,7 +1865,7 @@ int queue_sync_and_async() {
         compute.set_async_depth(4);
 
         auto empty = std::make_shared<CommandList>();
-        EXPECT(empty->close());
+        EXPECT(empty->uav_barrier({}) && empty->close());
         std::shared_ptr<const CommandList> snap = empty;
 
         // (a) 24 Wait-separated batches within a single present_epoch on depth=4: zero room_cv_ stalls!
@@ -2035,7 +2039,7 @@ int queue_sync_and_async() {
         compute.set_async_depth(4);
 
         auto empty = std::make_shared<CommandList>();
-        EXPECT(empty->close());
+        EXPECT(empty->uav_barrier({}) && empty->close());
         std::shared_ptr<const CommandList> snap = empty;
 
         // GPU-only queue Signal must NOT bump visibility_seq_.
@@ -2116,11 +2120,14 @@ int queue_sync_and_async() {
 
         // (b) Unlocked QueueHolds::run_barriers(): strict FIFO order + concurrent pump_ready() unblocked + cancel_after.
         context.set_before_execute({});
+        auto empty_13b = std::make_shared<CommandList>();
+        EXPECT(empty_13b->close());
+        std::shared_ptr<const CommandList> snap_13b = empty_13b;
         VulkanFence hold_b1(context, 0), hold_comp(context, 0), comp_b_done(context, 0);
         EXPECT(hold_b1.semaphore() && hold_comp.semaphore() && comp_b_done.semaphore());
 
         direct.wait(hold_b1.semaphore(), 1);
-        EXPECT(direct.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(direct.execute({&snap_13b, 1}) == ReplayResult::success);
         EXPECT(direct.idle());
 
         std::mutex fifo_m;
@@ -2141,7 +2148,7 @@ int queue_sync_and_async() {
 
         // Hold an independent compute batch behind hold_comp.
         compute.wait(hold_comp.semaphore(), 1);
-        EXPECT(compute.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(compute.execute({&snap_13b, 1}) == ReplayResult::success);
         EXPECT(compute.signal(comp_b_done.semaphore(), 1));
         EXPECT(compute.idle());
 
@@ -2168,6 +2175,7 @@ int queue_sync_and_async() {
         release_b1.store(true, std::memory_order_release);
         sig_b1.join();
         canceller.join();
+        context.holds().wait_barriers_drained(UINT64_MAX);
         EXPECT(direct.idle());
         EXPECT(cancel_done.load(std::memory_order_acquire));
         EXPECT(!b3_ran.load(std::memory_order_acquire));
@@ -2275,6 +2283,254 @@ int queue_sync_and_async() {
         }
         EXPECT(q_dir.idle() && q_cmp.idle());
         std::printf("queue r7 sync-tex: per-fence vis_seq, unlocked run_barriers FIFO, lazy title_upload wait & unlocked record ok\n");
+    }
+
+    // 14. Round 8 WS3:
+    //     (a) Empty-batch before_execute_() / after_execute_() / visibility_seq_ skip + mandatory guardrail that
+    //         pending_wait_vis_seq_ is NEVER cleared and carries exec_waits_vis_seq() forward to the next non-empty
+    //         execute_now();
+    //     (b) Coalescing past already-GPU-completed Waits in BOTH async_worker inbox_ and drain_held_while_executing(),
+    //         merging holds().signaled_vis_seq() into group_vis_seq so CPU Fence::Signal visibility edges are preserved;
+    //     (c) Dedicated QueueHolds barrier-drain thread: gate.signal() returns immediately without blocking on Present,
+    //         active_work_ / any_progress() stays true while barrier runs, and post-barrier Frame N+1 GPU commands wait
+    //         via wait_barriers_drained() before running.
+    {
+        static PFN_vkQueueSubmit s_r8_real_submit = nullptr;
+        static std::atomic<unsigned> s_r8_cb_submits{0};
+        struct R8HookSubmit {
+            static VKAPI_ATTR VkResult VKAPI_CALL call(VkQueue q, std::uint32_t count, const VkSubmitInfo* infos,
+                                                       VkFence fence) {
+                for (std::uint32_t i = 0; i < count; ++i)
+                    if (infos[i].commandBufferCount > 0) s_r8_cb_submits.fetch_add(1, std::memory_order_relaxed);
+                return s_r8_real_submit(q, count, infos, fence);
+            }
+        };
+
+        VulkanContext context(d.device_proc, d.device, true);
+        EXPECT(context.loaded());
+        s_r8_real_submit = context.vk.vkQueueSubmit;
+        s_r8_cb_submits.store(0, std::memory_order_relaxed);
+        context.vk.vkQueueSubmit = &R8HookSubmit::call;
+
+        VulkanQueue direct(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
+        EXPECT(direct.ok());
+        direct.set_async_depth(4);
+
+        void* src_map = nullptr;
+        void* dst_map = nullptr;
+        VkBuffer src = d.buffer(kBufBytes, usage, &src_map);
+        VkBuffer dst = d.buffer(kBufBytes, usage, &dst_map);
+        EXPECT(src && dst);
+        auto* sb = static_cast<std::uint8_t*>(src_map);
+        auto* db = static_cast<std::uint8_t*>(dst_map);
+        std::memset(sb, 0, kBufBytes);
+        std::memset(db, 0, kBufBytes);
+        sb[0] = 0x81;
+        sb[16] = 0x82;
+        sb[32] = 0x83;
+        ResourceBinding r_src{}, r_dst{};
+        r_src.buffer = src;
+        r_src.size = kBufBytes;
+        r_dst.buffer = dst;
+        r_dst.size = kBufBytes;
+        r_dst.host_readable = true;
+        context.add_resource(1, r_src);
+        context.add_resource(2, r_dst);
+
+        auto empty_list = std::make_shared<CommandList>();
+        EXPECT(empty_list->close());
+        std::shared_ptr<const CommandList> empty_snap = empty_list;
+
+        auto make_step = [&](int idx) -> std::shared_ptr<const CommandList> {
+            auto l = std::make_shared<CommandList>();
+            if (!l->copy_buffer({2, std::uint64_t((idx + 1) * 16), 1, std::uint64_t(idx * 16), 1}) ||
+                !l->copy_buffer({2, 0, 1, std::uint64_t(idx * 16), 1}) || !l->close())
+                return {};
+            return l;
+        };
+        std::shared_ptr<const CommandList> b0 = make_step(0), b1 = make_step(1), b2 = make_step(2);
+        EXPECT(b0 && b1 && b2);
+
+        // (a) Empty-batch skip + pending_wait_vis_seq_ preservation across empty execute.
+        std::atomic<unsigned> before_calls{0}, after_calls{0};
+        std::atomic<std::uint64_t> last_req_seq{0};
+        context.set_before_execute([&] {
+            before_calls.fetch_add(1, std::memory_order_acq_rel);
+            last_req_seq.store(VulkanContext::current_before_execute_seq(), std::memory_order_release);
+        });
+        context.set_after_execute([&] { after_calls.fetch_add(1, std::memory_order_acq_rel); });
+
+        const std::uint64_t vis0 = context.current_visibility_seq();
+        EXPECT(direct.execute({&empty_snap, 1}) == ReplayResult::success);
+        EXPECT(direct.idle());
+        EXPECT(context.current_visibility_seq() == vis0);
+        EXPECT(before_calls.load(std::memory_order_acquire) == 0);
+        EXPECT(after_calls.load(std::memory_order_acquire) == 0);
+
+        // Wait on a CPU-signaled fence (vis_seq V), consume it with an EMPTY list (skips before_execute_()), then run
+        // a non-empty list: the non-empty list's before_execute_() MUST still observe req_seq >= V!
+        VulkanFence cpu_f(context, 0), done_a(context, 0);
+        EXPECT(cpu_f.semaphore() && done_a.semaphore());
+        EXPECT(cpu_f.signal(1));
+        const std::uint64_t cpu_vis = context.holds().signaled_vis_seq(cpu_f.semaphore(), 1);
+        EXPECT(cpu_vis > vis0);
+
+        // Also advance visibility_seq_ on a dummy batch so empty_list has vis_seq == 0 while b0 gets a later vis_seq;
+        // verify specifically when b0 is enqueued BEFORE cpu_f.signal(2) (held behind cpu_f2)!
+        VulkanFence cpu_f2(context, 0);
+        EXPECT(cpu_f2.semaphore());
+        direct.wait(cpu_f2.semaphore(), 1);
+        EXPECT(direct.execute({&empty_snap, 1}) == ReplayResult::success);  // held behind cpu_f2; vis_seq == 0
+        EXPECT(direct.execute({&b0, 1}) == ReplayResult::success);          // held behind empty; enqueued BEFORE signal
+        EXPECT(direct.signal(done_a.semaphore(), 1));
+        EXPECT(direct.idle());
+        EXPECT(before_calls.load(std::memory_order_acquire) == 0);
+
+        // Signal cpu_f2 AFTER b0 was enqueued: cpu_f2's vis_seq is strictly higher than b0's enqueue vis_seq!
+        EXPECT(cpu_f2.signal(1));
+        const std::uint64_t cpu_vis2 = context.holds().signaled_vis_seq(cpu_f2.semaphore(), 1);
+        EXPECT(done_a.wait(1, 5'000'000'000ull));
+        EXPECT(direct.idle());
+        EXPECT(before_calls.load(std::memory_order_acquire) == 1);
+        EXPECT(after_calls.load(std::memory_order_acquire) == 1);
+        EXPECT(last_req_seq.load(std::memory_order_acquire) >= cpu_vis2);
+        EXPECT(db[16] == 0x81);
+
+        // (b1) Coalescing past already-GPU-completed Wait in async_worker inbox_ + CPU Fence::Signal vis_seq merge.
+        before_calls.store(0, std::memory_order_release);
+        s_r8_cb_submits.store(0, std::memory_order_release);
+        last_req_seq.store(0, std::memory_order_release);
+        std::memset(db, 0, kBufBytes);
+        std::atomic<bool> in_lead{false}, go_lead{false};
+        context.set_before_execute([&] {
+            const unsigned n = before_calls.fetch_add(1, std::memory_order_acq_rel) + 1;
+            last_req_seq.store(VulkanContext::current_before_execute_seq(), std::memory_order_release);
+            if (n == 1) {
+                in_lead.store(true, std::memory_order_release);
+                while (!go_lead.load(std::memory_order_acquire)) std::this_thread::yield();
+            }
+        });
+
+        VulkanFence done_wait_f(context, 0), done_b1(context, 0);
+        EXPECT(done_wait_f.semaphore() && done_b1.semaphore());
+
+        EXPECT(direct.execute({&b0, 1}) == ReplayResult::success);  // pauses in before_execute_()
+        while (!in_lead.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        // Enqueue b1, then Wait(done_wait_f, 1) (already CPU-signaled with a HIGHER vis_seq!), then b2.
+        EXPECT(direct.execute({&b1, 1}) == ReplayResult::success);
+        EXPECT(done_wait_f.signal(1));  // GPU counter is already 1 AND carries a fresh CPU vis_seq!
+        const std::uint64_t done_wait_vis = context.holds().signaled_vis_seq(done_wait_f.semaphore(), 1);
+        direct.wait(done_wait_f.semaphore(), 1);
+        EXPECT(direct.execute({&b2, 1}) == ReplayResult::success);
+        EXPECT(direct.signal(done_b1.semaphore(), 1));
+
+        go_lead.store(true, std::memory_order_release);
+        EXPECT(done_b1.wait(1, 5'000'000'000ull));
+        EXPECT(direct.idle());
+
+        // {b0} (1) + coalesced {b1, completed Wait, b2} (2) = exactly 2 submits, and req_seq >= done_wait_vis!
+        EXPECT(before_calls.load(std::memory_order_acquire) == 2);
+        EXPECT(s_r8_cb_submits.load(std::memory_order_acquire) == 2);
+        EXPECT(last_req_seq.load(std::memory_order_acquire) >= done_wait_vis);
+        EXPECT(db[16] == 0x81 && db[32] == 0x82 && db[48] == 0x83 && db[0] == 0x83);
+
+        // (b2) Coalescing past already-GPU-completed Wait in drain_held_while_executing() + CPU vis_seq merge.
+        before_calls.store(0, std::memory_order_release);
+        s_r8_cb_submits.store(0, std::memory_order_release);
+        last_req_seq.store(0, std::memory_order_release);
+        std::memset(db, 0, kBufBytes);
+        context.set_before_execute([&] {
+            before_calls.fetch_add(1, std::memory_order_acq_rel);
+            last_req_seq.store(VulkanContext::current_before_execute_seq(), std::memory_order_release);
+        });
+
+        VulkanFence hold_gate(context, 0), held_cpu_f(context, 0), done_b2(context, 0);
+        EXPECT(hold_gate.semaphore() && held_cpu_f.semaphore() && done_b2.semaphore());
+
+        direct.wait(hold_gate.semaphore(), 1);
+        EXPECT(direct.execute({&b1, 1}) == ReplayResult::success);
+        direct.wait(held_cpu_f.semaphore(), 1);  // unsignaled when queued -> lands in b2.waits in held_
+        EXPECT(direct.execute({&b2, 1}) == ReplayResult::success);
+        EXPECT(direct.signal(done_b2.semaphore(), 1));
+        EXPECT(direct.idle());  // both b1 and b2 are now in held_
+        EXPECT(before_calls.load(std::memory_order_acquire) == 0);
+
+        // Signal held_cpu_f from CPU first (now GPU-completed with a newer vis_seq), THEN release hold_gate!
+        EXPECT(held_cpu_f.signal(1));
+        const std::uint64_t held_cpu_vis = context.holds().signaled_vis_seq(held_cpu_f.semaphore(), 1);
+        EXPECT(hold_gate.signal(1));
+        EXPECT(done_b2.wait(1, 5'000'000'000ull));
+        EXPECT(direct.idle());
+
+        // Held {b1, completed Wait(held_cpu_f), b2} coalesced into ONE submit & preserved held_cpu_vis!
+        EXPECT(before_calls.load(std::memory_order_acquire) == 1);
+        EXPECT(s_r8_cb_submits.load(std::memory_order_acquire) == 1);
+        EXPECT(last_req_seq.load(std::memory_order_acquire) >= held_cpu_vis);
+        EXPECT(db[32] == 0x82 && db[48] == 0x83 && db[0] == 0x83);
+
+        // (c) Dedicated QueueHolds barrier-drain thread: releaser returns immediately while barrier blocks,
+        //     any_progress() stays true, post-barrier Frame N+1 strictly waits for barrier completion OUTSIDE
+        //     pump_mutex_, and an independent compute queue's held work still pumps and completes while direct's
+        //     Frame N+1 is waiting on blocked Present N!
+        VulkanQueue compute_c(context, d.queue, d.family, VulkanQueue::QueueKind::compute);
+        EXPECT(compute_c.ok());
+        compute_c.set_async_depth(4);
+
+        before_calls.store(0, std::memory_order_release);
+        std::memset(db, 0, kBufBytes);
+        context.set_before_execute([&] { before_calls.fetch_add(1, std::memory_order_acq_rel); });
+
+        VulkanFence f_gate(context, 0), f_done_c(context, 0), comp_gate_c(context, 0), comp_done_c(context, 0);
+        EXPECT(f_gate.semaphore() && f_done_c.semaphore() && comp_gate_c.semaphore() && comp_done_c.semaphore());
+
+        direct.wait(f_gate.semaphore(), 1);
+        EXPECT(direct.execute({&b0, 1}) == ReplayResult::success);  // Frame N
+        EXPECT(direct.idle());
+
+        std::atomic<bool> in_present{false}, release_present{false};
+        std::atomic<unsigned> present_saw_before{0};
+        int present_owner = 0;
+        context.holds().after_held(&present_owner, [&] {
+            present_saw_before.store(before_calls.load(std::memory_order_acquire), std::memory_order_release);
+            in_present.store(true, std::memory_order_release);
+            while (!release_present.load(std::memory_order_acquire)) std::this_thread::yield();
+        });
+
+        EXPECT(direct.execute({&b1, 1}) == ReplayResult::success);  // Frame N+1 (must wait for Present N!)
+        EXPECT(direct.signal(f_done_c.semaphore(), 1));
+        EXPECT(direct.idle());
+
+        // Hold independent work on compute_c behind comp_gate_c.
+        compute_c.wait(comp_gate_c.semaphore(), 1);
+        EXPECT(compute_c.execute({&empty_snap, 1}) == ReplayResult::success);
+        EXPECT(compute_c.signal(comp_done_c.semaphore(), 1));
+        EXPECT(compute_c.idle());
+
+        // Releaser signals f_gate: MUST return immediately without stalling on blocked Present N!
+        EXPECT(f_gate.signal(1));
+        while (!in_present.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        // While Present N is blocked on the barrier thread AND direct's async_worker is waiting in
+        // wait_barriers_drained() for Frame N+1:
+        //   - any_progress() == true;
+        //   - Frame N+1 (b1) has NOT run yet;
+        //   - pump_mutex_ MUST be free so comp_gate_c.signal(1) pumps compute_c and completes comp_done_c immediately!
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        EXPECT(queue_holds::any_progress());
+        EXPECT(before_calls.load(std::memory_order_acquire) == 1);  // only Frame N (b0) ran; b1 waits for Present N!
+        EXPECT(present_saw_before.load(std::memory_order_acquire) == 1);
+        EXPECT(comp_gate_c.signal(1));
+        EXPECT(comp_done_c.wait(1, 2'000'000'000ull));
+        EXPECT(compute_c.idle());
+        EXPECT(before_calls.load(std::memory_order_acquire) == 1);  // b1 STILL waits for Present N!
+
+        release_present.store(true, std::memory_order_release);
+        EXPECT(f_done_c.wait(1, 5'000'000'000ull));
+        EXPECT(direct.idle());
+        EXPECT(before_calls.load(std::memory_order_acquire) == 2);
+        EXPECT(db[16] == 0x81 && db[32] == 0x82 && db[0] == 0x82);
+        std::printf("queue r8 ws3: empty-batch skip+vis carry, completed-wait coalescing, dedicated barrier thread ok\n");
     }
 
     return 0;

@@ -1675,6 +1675,9 @@ public:
     void add_pipeline(std::uintptr_t id, const ComputePipeline& pipeline, const char* shader = nullptr) {
         std::unique_lock lock(pipeline_mutex_);
         pipelines_[id] = pipeline;
+        if (!pipeline.pipeline && pipeline.build && pipeline.built && !pipeline.async_build && !pipeline.skipped &&
+            !pipeline.built(pipeline.build_context))
+            note_unbuilt_sync_pipeline();
         if (shader && device_fault_) device_fault_->pipeline_names[id] = {shader};
         if (shader && gpu_profile::enabled()) profile_names_[id] = {shader};
     }
@@ -1689,8 +1692,43 @@ public:
                                const CheckpointShaders* shaders = nullptr) {
         std::unique_lock lock(pipeline_mutex_);
         graphics_pipelines_[id] = pipeline;
+        if (!pipeline.async_build && pipeline.variant && pipeline.built && !pipeline.pipeline && !pipeline.built(0))
+            note_unbuilt_sync_pipeline();
         if (shaders && device_fault_) device_fault_->pipeline_names[id] = *shaders;
         if (shaders && gpu_profile::enabled()) profile_names_[id] = *shaders;
+    }
+    // Tracks whether any registered synchronous pipeline may still need pre-pass compilation so warm runs skip
+    // collect_unbuilt_pipelines() in O(1) (pass-0 prepare() remains as a safe fallback for late variants or
+    // previously-unused PSOs).
+    void note_unbuilt_sync_pipeline() noexcept {
+        sync_pipeline_gen_.fetch_add(1, std::memory_order_acq_rel);
+        warm_empty_pipeline_scans_.store(0, std::memory_order_relaxed);
+        unbuilt_sync_pipelines_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    std::uint64_t sync_pipeline_gen() const noexcept { return sync_pipeline_gen_.load(std::memory_order_acquire); }
+    bool has_unbuilt_sync_pipelines() const noexcept {
+        return unbuilt_sync_pipelines_.load(std::memory_order_acquire) != 0;
+    }
+    void note_sync_pipelines_built(std::size_t count) noexcept {
+        warm_empty_pipeline_scans_.store(0, std::memory_order_relaxed);
+        std::uint64_t cur = unbuilt_sync_pipelines_.load(std::memory_order_acquire);
+        while (cur > 0) {
+            const std::uint64_t next = cur > count ? cur - count : 0;
+            if (unbuilt_sync_pipelines_.compare_exchange_weak(cur, next, std::memory_order_acq_rel)) break;
+        }
+    }
+    void note_empty_pipeline_scan(std::uint64_t gen_before_scan) noexcept {
+        if (sync_pipeline_gen_.load(std::memory_order_acquire) != gen_before_scan) return;
+        constexpr std::uint32_t kWarmEmptyScans = 16;
+        if (warm_empty_pipeline_scans_.fetch_add(1, std::memory_order_relaxed) + 1 >= kWarmEmptyScans) {
+            if (sync_pipeline_gen_.load(std::memory_order_acquire) == gen_before_scan) {
+                unbuilt_sync_pipelines_.store(0, std::memory_order_release);
+                // Re-arm if a pipeline was registered concurrently between the gen check and store.
+                if (sync_pipeline_gen_.load(std::memory_order_acquire) != gen_before_scan) {
+                    unbuilt_sync_pipelines_.fetch_add(1, std::memory_order_acq_rel);
+                }
+            }
+        }
     }
     // Workers for the pipelines a submission needs and that are not built yet. Null (the default): compiled serially on
     // the submitting thread once resource_mutex_ is released. Replacing it waits for submissions that are compiling, and
@@ -2599,6 +2637,9 @@ private:
     std::unordered_map<ResourceId, std::shared_ptr<SparseResource>> sparse_resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
+    std::atomic<std::uint64_t> unbuilt_sync_pipelines_{0};
+    std::atomic<std::uint64_t> sync_pipeline_gen_{0};
+    std::atomic<std::uint32_t> warm_empty_pipeline_scans_{0};
     std::unique_ptr<PipelineWorkers> pipeline_workers_;
     BatchCompileFn batch_compile_runner_;
     std::function<std::uint64_t()> large_compile_budget_;
@@ -3151,9 +3192,16 @@ private:
 
 public:
     ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {}) {
+        bool all_empty = true;
+        for (const CommandList* list : lists) {
+            if (list && !list->commands().empty()) {
+                all_empty = false;
+                break;
+            }
+        }
         const bool skip_before = skip_before_execute_.load(std::memory_order_acquire);
         if (!skip_before) pipeline_wait::note_submission();  // big compute warm-ups are left to their first use while the title submits
-        const std::uint64_t vis_seq = skip_before ? 0 : context_.next_visibility_seq();
+        const std::uint64_t vis_seq = (skip_before || all_empty) ? 0 : context_.next_visibility_seq();
         auto* diagnostics = context_.device_fault();
         const auto execute_call = diagnostics ? diagnostics->next_execute_call() : 0;
         EnqueueSerial enqueue_serial = make_enqueue_serial();
@@ -3175,9 +3223,16 @@ public:
     // Zero-copy ExecuteCommandLists for immutable closed CommandList snapshots (used by the COM layer so Reset()
     // allocates fresh storage only while a submitted snapshot is still in flight, avoiding deep copies on submission).
     ReplayResult execute(std::span<const std::shared_ptr<const CommandList>> lists, const PinFn& pin = {}) {
+        bool all_empty = true;
+        for (const auto& list : lists) {
+            if (list && !list->commands().empty()) {
+                all_empty = false;
+                break;
+            }
+        }
         const bool skip_before = skip_before_execute_.load(std::memory_order_acquire);
         if (!skip_before) pipeline_wait::note_submission();
-        const std::uint64_t vis_seq = skip_before ? 0 : context_.next_visibility_seq();
+        const std::uint64_t vis_seq = (skip_before || all_empty) ? 0 : context_.next_visibility_seq();
         auto* diagnostics = context_.device_fault();
         const auto execute_call = diagnostics ? diagnostics->next_execute_call() : 0;
         EnqueueSerial enqueue_serial = make_enqueue_serial();
@@ -3879,7 +3934,31 @@ private:
             if (!skip_before) waited.emplace(submit_phases::wait_room);
             if (context_.is_device_lost() || !wait_for_room()) return queue_unsupported(__LINE__);
         }
-        if (!skip_before && context_.before_execute_) {
+        std::size_t total_commands = 0;
+        std::uint64_t captures = 0;
+        bool runs_shaders = false;
+        bool has_rt_ds_clear = false;
+        for (const auto* list : lists) {
+            if (!list) continue;
+            const auto& cmds = list->commands();
+            total_commands += cmds.size();
+            if (list->closed()) {
+                captures += list->predication_captures();
+                runs_shaders = runs_shaders || list->runs_shaders();
+                has_rt_ds_clear = has_rt_ds_clear || list->has_rt_ds_clear();
+            } else {
+                for (const auto& command : cmds) {
+                    if (std::holds_alternative<ClearRenderTarget>(command) ||
+                        std::holds_alternative<ClearDepthStencil>(command))
+                        has_rt_ds_clear = true;
+                    if (const auto* p = std::get_if<Predication>(&command); p && p->buffer) ++captures;
+                    runs_shaders |= std::holds_alternative<Dispatch>(command) || draw_command(command).state ||
+                                    std::holds_alternative<ExecuteIndirect>(command);
+                }
+            }
+        }
+        const bool run_before_after = !skip_before && total_commands != 0;
+        if (run_before_after && context_.before_execute_) {
             std::uint64_t req_seq = visibility_seq ? visibility_seq : context_.current_visibility_seq();
             const std::uint64_t wait_vis = (std::max)(pending_wait_vis_seq_, exec_waits_vis_seq());
             if (wait_vis > req_seq) req_seq = wait_vis;
@@ -3892,6 +3971,11 @@ private:
             } before_seq_guard{req_seq};
             context_.before_execute_();
             pending_wait_vis_seq_ = 0;
+        } else if (!skip_before) {
+            // Empty-command batch skipped before_execute_(): NEVER clear pending_wait_vis_seq_, and carry forward any
+            // CPU Fence::Signal visibility edges from this batch's waits (including coalesced completed waits).
+            const std::uint64_t wait_vis = (std::max)(visibility_seq, exec_waits_vis_seq());
+            pending_wait_vis_seq_ = (std::max)(pending_wait_vis_seq_, wait_vis);
         }
         struct AfterExecute {
             VulkanContext& context;
@@ -3899,7 +3983,7 @@ private:
             ~AfterExecute() {
                 if (active && context.after_execute_) context.after_execute_();
             }
-        } after_execute{context_, !skip_before};
+        } after_execute{context_, run_before_after};
         // The rest of this call is the replay phase; the submission is counted when it returns, however it returns.
         struct Replayed {
             bool active;
@@ -3914,22 +3998,7 @@ private:
         if (!skip_before && context_.input_probe_)
             context_.input_probe_(lists, execute_call, kind_ == QueueKind::direct ? "direct" :
                                                       kind_ == QueueKind::compute ? "compute" : "copy");
-        std::size_t total_commands = 0;
-        std::uint64_t captures = 0;
-        bool runs_shaders = false;
-        for (const auto* list : lists) {
-            const auto& cmds = list->commands();
-            total_commands += cmds.size();
-            for (const auto& command : cmds) {
-                if (kind_ != QueueKind::direct &&
-                    (std::holds_alternative<ClearRenderTarget>(command) ||
-                     std::holds_alternative<ClearDepthStencil>(command)))
-                    return queue_unsupported(__LINE__);
-                if (const auto* p = std::get_if<Predication>(&command); p && p->buffer) ++captures;
-                runs_shaders |= std::holds_alternative<Dispatch>(command) || draw_command(command).state ||
-                                std::holds_alternative<ExecuteIndirect>(command);
-            }
-        }
+        if (kind_ != QueueKind::direct && has_rt_ds_clear) return queue_unsupported(__LINE__);
         const bool transfer_only = family_ == context_.transfer_only_family_;
         const bool skip_shader_prep = transfer_only || (skip_before && !runs_shaders);
         // Fast path for empty command-list batches (0 commands across all lists, no GPU profiler): skips copying the
@@ -4136,8 +4205,10 @@ private:
         bool has_prior_compiles = false;
         // Fast pre-pass before acquiring resource_mutex_ or running prepare(): collect all unique unbuilt synchronous
         // graphics (pipeline, unbound_mask) and compute pipelines across the batch and compile them concurrently so
-        // prepare() completes in one pass with zero wasted transient allocations or skipped draws.
-        if (has_parallel_compiler && runs_shaders) {
+        // prepare() completes in one pass with zero wasted transient allocations or skipped draws. Skipped in O(1) on
+        // warm runs when no unbuilt synchronous pipelines remain (pass-0 prepare() below remains as a safe fallback).
+        if (has_parallel_compiler && runs_shaders && context_.has_unbuilt_sync_pipelines()) {
+            const std::uint64_t gen_before = context_.sync_pipeline_gen();
             PipelineCompiles pre_compiles;
             collect_unbuilt_pipelines(lists, context_.replay_, pre_compiles);
             if (!pre_compiles.empty()) {
@@ -4146,8 +4217,11 @@ private:
                 if (context_.large_compile_demand_ && pre_compiles.any_large()) demand = context_.large_compile_demand_();
                 pre_compiles.build(run_compiles, context_.large_compile_budget_);
                 demand.reset();
+                context_.note_sync_pipelines_built(pre_compiles.size());
                 prior_compiles = std::move(pre_compiles);
                 has_prior_compiles = true;
+            } else {
+                context_.note_empty_pipeline_scan(gen_before);
             }
         }
         for (int pass = 0;; ++pass) {
@@ -4233,6 +4307,7 @@ private:
                 demand.reset();
                 const ReplayResult compile_result = check_compiled_pipelines(compiles, prepare_result);
                 if (compile_result != ReplayResult::success) return compile_result;
+                if (!has_prior_compiles && compiles.size() >= 2) context_.note_unbuilt_sync_pipeline();
                 prior_compiles = std::move(compiles);
                 has_prior_compiles = true;
                 continue;
@@ -4507,9 +4582,9 @@ private:
             if (execute_call && i < diagnostics.lists.size()) {
                 const CheckpointRecorder recorder{checkpoint, diagnostics, context_.device_fault()->pipeline_names, i};
                 emit_commands<true>(list, command_buffer, replay, &next_tracker, &open_labels, &recorder,
-                                    &replay_state);
+                                    &replay_state, &emit_scratch_);
             } else {
-                emit(list, command_buffer, replay, &next_tracker, &open_labels, &replay_state);
+                emit(list, command_buffer, replay, &next_tracker, &open_labels, &replay_state, &emit_scratch_);
             }
             wrote_readback |= list.wrote_readback;
             readback_stages |= list.readback_src_stages;
@@ -4711,10 +4786,48 @@ private:
         update_held_front_seq_locked();
     }
 
+    // Waits for any satisfied barriers registered strictly before `op_seq` to finish executing on QueueHolds' barrier
+    // thread before running post-barrier GPU commands (strictly ordering Frame N Present blit before Frame N+1 writes).
+    // Empty-command batches execute no GPU commands or resource transitions and do not block on unrelated barriers.
+    // Called outside state_mutex_ by the thread owning executing_ == true.
+    void wait_for_preceding_barriers(std::uint64_t op_seq, std::span<const CommandList* const> lists) {
+        if (!op_seq) return;
+        bool has_cmds = false;
+        for (const CommandList* list : lists) {
+            if (list && !list->commands().empty()) {
+                has_cmds = true;
+                break;
+            }
+        }
+        if (has_cmds) {
+            context_.holds().wait_barriers_drained(op_seq - 1);
+        }
+    }
+
     bool waits_pending(const std::vector<VkSemaphore>& semaphores, const std::vector<std::uint64_t>& values) const {
         for (std::size_t i = 0; i < semaphores.size(); ++i)
             if (context_.holds().pending(semaphores[i], values[i])) return true;
         return false;
+    }
+
+    // True when a Wait(fence, value) is already satisfied on the GPU (no pending QueueHolds signal AND the Vulkan
+    // timeline semaphore counter has already reached `value`), so coalescing can safely merge past it while still
+    // preserving its CPU Fence::Signal visibility edge via holds().signaled_vis_seq().
+    bool wait_already_completed(VkSemaphore fence, std::uint64_t value) const {
+        if (!fence || value == 0) return true;
+        if (context_.is_device_lost()) return false;
+        if (context_.holds().pending(fence, value)) return false;
+        std::uint64_t done = 0;
+        return context_.vk.vkGetSemaphoreCounterValue(context_.device(), fence, &done) == VK_SUCCESS && done >= value;
+    }
+
+    bool all_waits_already_completed(std::span<const VkSemaphore> semaphores,
+                                     std::span<const std::uint64_t> values) const {
+        const std::size_t n = (std::min)(semaphores.size(), values.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!wait_already_completed(semaphores[i], values[i])) return false;
+        }
+        return true;
     }
 
     // The next batch or Signal has to be held: something is held ahead of it (queue order), or a Wait it carries
@@ -4903,10 +5016,12 @@ private:
                     hold_batch_locked();
                     if (barrier_before_me) pause_release_for_barrier_.store(true, std::memory_order_release);
                 } else {
-                    set_active_seq_locked(async_seq_ ? async_seq_ : context_.holds().next_seq());
+                    const std::uint64_t my_seq = async_seq_ ? async_seq_ : context_.holds().next_seq();
+                    set_active_seq_locked(my_seq);
                     take_waits_to_exec_locked();
                     state.unlock();
 
+                    wait_for_preceding_barriers(my_seq, lists);
                     result = execute_now(lists, execute_call, {}, {}, vis_seq, false);
                     note_coalesced_submit(1);
                     enqueue_serial.finish();
@@ -4974,11 +5089,10 @@ private:
                 bool stop_after_signal = false;
                 while (!group_ops.back().barrier_after && !held_.empty()) {
                     const Deferred& next = held_.front();
-                    if (!next.waits.empty()) break;
                     if (crosses_barrier(group_ops.back().seq, next.seq, group_ops.back().present_epoch,
                                         next.present_epoch, bseq))
                         break;
-                    if (!ready(next)) break;
+                    if (!next.waits.empty() && !all_waits_already_completed(next.waits, next.wait_values)) break;
                     if (next.kind == Deferred::Kind::batch) {
                         if (stop_after_signal) break;
                         group_ops.push_back(std::move(held_.front()));
@@ -5036,17 +5150,33 @@ private:
                 exec_batch_breaks_.clear();
                 exec_pending_signals_.clear();
                 std::uint64_t group_vis_seq = 0;
+                for (std::size_t gi = 1; gi < group_ops.size(); ++gi) {
+                    Deferred& op = group_ops[gi];
+                    if (!op.waits.empty()) {
+                        const std::size_t wn = (std::min)(op.waits.size(), op.wait_values.size());
+                        for (std::size_t wi = 0; wi < wn; ++wi) {
+                            const std::uint64_t w_vis =
+                                context_.holds().signaled_vis_seq(op.waits[wi], op.wait_values[wi]);
+                            op.visibility_seq = (std::max)(op.visibility_seq, w_vis);
+                        }
+                        context_.note_waits_removed(op.waits, op.wait_values);
+                        retire_exec_pins(op.wait_pins, 0);
+                        op.waits.clear();
+                        op.wait_values.clear();
+                    }
+                }
                 for (const Deferred& op : group_ops) {
+                    group_vis_seq = (std::max)(group_vis_seq, op.visibility_seq);
                     if (op.kind == Deferred::Kind::batch) {
                         if (!exec_list_ptrs_.empty() && !op.lists.empty())
                             exec_batch_breaks_.push_back(exec_list_ptrs_.size());
                         for (const auto& list : op.lists) exec_list_ptrs_.push_back(list.get());
-                        group_vis_seq = (std::max)(group_vis_seq, op.visibility_seq);
                     } else if (op.kind == Deferred::Kind::signal) {
                         exec_pending_signals_.push_back({op.fence, op.value, op.visibility_seq});
                     }
                 }
 
+                wait_for_preceding_barriers(first.seq, exec_list_ptrs_);
                 const ReplayResult result = execute_now(exec_list_ptrs_, first.execute_call, exec_batch_breaks_,
                                                         exec_pending_signals_, group_vis_seq, /*from_held=*/true);
                 if (result == ReplayResult::success) {
@@ -5087,6 +5217,7 @@ private:
                             exec_waits_.clear();
                             exec_wait_values_.clear();
                             exec_wait_pins_.clear();
+                            if (op.visibility_seq > pending_wait_vis_seq_) pending_wait_vis_seq_ = op.visibility_seq;
                             const bool ok = submit(VK_NULL_HANDLE, op.fence, op.value, nullptr, op.visibility_seq);
                             if (!ok) std::fprintf(stderr, "[rt] d3d12: a held Signal failed when it was released\n");
                             retire_exec_pins(op.pins, ok ? submitted_ : 0);
@@ -5115,6 +5246,7 @@ private:
                     exec_wait_pins_.clear();
                     for (Deferred& op : group_ops) {
                         if (op.kind == Deferred::Kind::signal && !context_.is_device_lost()) {
+                            if (op.visibility_seq > pending_wait_vis_seq_) pending_wait_vis_seq_ = op.visibility_seq;
                             const bool ok = submit(VK_NULL_HANDLE, op.fence, op.value, nullptr, op.visibility_seq);
                             if (!ok) std::fprintf(stderr, "[rt] d3d12: a held Signal failed when it was released\n");
                             retire_exec_pins(op.pins, ok ? submitted_ : 0);
@@ -5234,14 +5366,23 @@ private:
     bool ready(const Deferred& op) const { return !waits_pending(op.waits, op.wait_values); }
 
     // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held).
-    // With LEONIDA_SUBMIT_ASYNC another thread does not run this queue's held work: it asks the queue's worker,
-    // which releases it and then pumps the holds itself (so a Present behind it still runs after it).
+    // With LEONIDA_SUBMIT_ASYNC, never run release_held() inline under QueueHolds::pump_mutex_ (even when called from
+    // our own async_worker): schedule a worker turn so pump_ready() collects barriers and releases pump_mutex_ before
+    // post-barrier work waits in wait_barriers_drained(), keeping cross-queue pump_ready() unblocked during Present.
     bool release_ready() override {
-        if (async_started_.load(std::memory_order_acquire) && t_worker_of_ != this) {
+        if (async_started_.load(std::memory_order_acquire)) {
+            const bool paused_for_barrier = pause_release_for_barrier_.exchange(false, std::memory_order_acq_rel);
             // Fast path: do not touch inbox_mutex_ or stamp barrier_after when this queue has no held operations.
             // barrier_after is stamped ONLY by real after_held() barriers (oldest_held_seq() / present_epoch),
             // never by cross-queue Signal() pump_ready() calls.
             if (!has_held_.load(std::memory_order_acquire)) return false;
+            // On our own worker's trailing pump_ready(), avoid scheduling a redundant wakeup if the front held op is
+            // still blocked on an unmet wait (we only need another turn when paused at a barrier or when front became
+            // ready).
+            if (t_worker_of_ == this && !paused_for_barrier) {
+                std::lock_guard state(state_mutex_);
+                if (held_.empty() || (!context_.is_device_lost() && !ready(held_.front()))) return false;
+            }
             bool wake = false;
             {
                 std::lock_guard lock(inbox_mutex_);
@@ -5258,7 +5399,7 @@ private:
             return false;
         }
         // If an earlier drain stopped at a barrier boundary outside pump_ready(), yield once so pump_ready()
-        // runs run_barriers() (Present / after_held()) BEFORE we drain post-barrier held work on the next pass.
+        // runs collect_ready_barriers() (Present / after_held()) BEFORE we drain post-barrier held work on the next pass.
         if (pause_release_for_barrier_.exchange(false, std::memory_order_acq_rel)) return true;
         return release_held(/*from_pump=*/true);
     }
@@ -6133,6 +6274,11 @@ private:
                                 ++consumed_work;
                                 if (context_.has_unsatisfied_waiter(group_calls.back().fence, group_calls.back().value))
                                     stop_after_signal = true;
+                            } else if (next.kind == Call::Kind::wait && !stop_after_signal &&
+                                       wait_already_completed(next.fence, next.value)) {
+                                group_calls.push_back(std::move(inbox_.front()));
+                                inbox_.pop_front();
+                                ++consumed_work;
                             } else {
                                 break;
                             }
@@ -6178,9 +6324,10 @@ private:
                 const std::uint64_t bseq = barrier_seq_.load(std::memory_order_acquire);
                 if (rel_info.stopped_for_barrier ||
                     crosses_barrier(rel_info.last_seq, next_seq, rel_info.last_epoch, next_epoch, bseq)) {
-                    // Pre-barrier held work finished; pump now so any satisfied Present / after_held() runs before
-                    // post-barrier inbox calls execute.
+                    // Pre-barrier held work finished; pump now and wait for satisfied pre-barrier Presents /
+                    // after_held() callbacks to finish on the barrier thread before post-barrier inbox calls execute.
                     context_.holds().pump_ready();
+                    if (next_seq) context_.holds().wait_barriers_drained(next_seq - 1);
                 }
             }
             auto have_start = turn_start;
@@ -6260,6 +6407,12 @@ private:
         std::vector<EnqueueSerial> dropped_serials;
         auto hold_all_locked = [&] {
             for (Call& call : calls) {
+                if (call.kind == Call::Kind::wait) {
+                    waits_.push_back(call.fence);
+                    wait_values_.push_back(call.value);
+                    if (call.pin) wait_pins_.push_back(std::move(call.pin));
+                    continue;
+                }
                 async_seq_ = call.seq;
                 Deferred op;
                 op.barrier_after = call.barrier_after;
@@ -6290,6 +6443,7 @@ private:
             }
             if (context_.is_device_lost()) {
                 for (Call& call : calls) {
+                    if (call.kind == Call::Kind::wait) context_.note_wait_removed(call.fence, call.value);
                     if (call.pin) retired.push_back(std::move(call.pin));
                     if (call.enqueue_serial.value) dropped_serials.push_back(std::move(call.enqueue_serial));
                 }
@@ -6307,6 +6461,7 @@ private:
                                      calls.front().present_epoch, bseq_now));
                 if (context_.is_device_lost()) {
                     for (Call& call : calls) {
+                        if (call.kind == Call::Kind::wait) context_.note_wait_removed(call.fence, call.value);
                         if (call.pin) retired.push_back(std::move(call.pin));
                         if (call.enqueue_serial.value) dropped_serials.push_back(std::move(call.enqueue_serial));
                     }
@@ -6330,15 +6485,25 @@ private:
                             group_vis_seq = (std::max)(group_vis_seq, call.visibility_seq);
                         } else if (call.kind == Call::Kind::signal) {
                             exec_pending_signals_.push_back({call.fence, call.value, call.visibility_seq});
+                        } else if (call.kind == Call::Kind::wait) {
+                            // Preserve CPU Fence::Signal visibility edge across coalesced completed waits.
+                            const std::uint64_t w_vis = context_.holds().signaled_vis_seq(call.fence, call.value);
+                            group_vis_seq = (std::max)(group_vis_seq, w_vis);
                         }
                     }
 
+                    wait_for_preceding_barriers(calls.front().seq, exec_list_ptrs_);
                     const ReplayResult result =
                         execute_now(exec_list_ptrs_, calls.front().execute_call, exec_batch_breaks_,
                                     exec_pending_signals_, group_vis_seq, /*from_held=*/false);
                     if (result == ReplayResult::success) {
                         note_coalesced_submit(exec_count);
                         for (Call& call : calls) {
+                            if (call.kind == Call::Kind::wait) {
+                                context_.note_wait_removed(call.fence, call.value);
+                                if (call.pin) exec_retired_pins_.push_back(std::move(call.pin));
+                                continue;
+                            }
                             if (call.pin) {
                                 if (submitted_) exec_ticketed_pins_.push_back({submitted_, std::move(call.pin)});
                                 else exec_retired_pins_.push_back(std::move(call.pin));
@@ -6393,6 +6558,11 @@ private:
                                 exec_wait_values_ = std::move(saved_values);
                                 exec_wait_pins_ = std::move(saved_pins);
                                 exec_user_wait_count_ = saved_user;
+                            } else if (call.kind == Call::Kind::wait) {
+                                const std::uint64_t w_vis = context_.holds().signaled_vis_seq(call.fence, call.value);
+                                pending_wait_vis_seq_ = (std::max)(pending_wait_vis_seq_, w_vis);
+                                context_.note_wait_removed(call.fence, call.value);
+                                if (call.pin) exec_retired_pins_.push_back(std::move(call.pin));
                             }
                         }
                     } else {
@@ -6422,6 +6592,7 @@ private:
                                         exec_retired_pins_.push_back(std::move(call.pin));
                                 }
                             } else {
+                                if (call.kind == Call::Kind::wait) context_.note_wait_removed(call.fence, call.value);
                                 if (call.pin) exec_retired_pins_.push_back(std::move(call.pin));
                                 call.enqueue_serial.finish();
                             }
@@ -6648,6 +6819,7 @@ private:
     std::vector<VkPipelineStageFlags> submit_stages_;
     std::vector<VkSemaphore> submit_signals_;
     std::vector<std::uint64_t> submit_signal_values_;
+    EmitScratch emit_scratch_;
     std::atomic<int> held_failure_{0};                 // a ReplayResult: the first held batch that failed
 };
 

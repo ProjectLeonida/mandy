@@ -5209,6 +5209,15 @@ inline void close_labels(VkCommandBuffer command_buffer, const ReplayFunctions& 
     open_labels = 0;
 }
 
+// Reusable scratch vectors for emit_commands(), hoisted onto VulkanQueue so steady-state submissions avoid per-list
+// heap allocations for multi-piece image barriers, depth24 copy regions, and acceleration-structure build arrays.
+struct EmitScratch {
+    std::vector<VkImageMemoryBarrier2> many_barriers;
+    std::vector<VkBufferImageCopy> converted_copies;
+    std::vector<VkAccelerationStructureGeometryKHR> as_geoms;
+    std::vector<VkAccelerationStructureBuildRangeInfoKHR> as_ranges;
+};
+
 // Writes a prepared list. With a tracker, barriers start from the tracked layouts and update them.
 // `open_labels` counts the debug labels begun and not yet ended in this command buffer: an EndEvent with none open
 // is dropped (Vulkan requires a matching begin), and the caller ends what is still open before it ends the buffer
@@ -5216,7 +5225,7 @@ inline void close_labels(VkCommandBuffer command_buffer, const ReplayFunctions& 
 template<bool Checkpoints>
 inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
                           LayoutTracker* tracker, std::uint32_t* open_labels, const CheckpointRecorder* checkpoints,
-                          ReplayStateCache* state_cache = nullptr) {
+                          ReplayStateCache* state_cache = nullptr, EmitScratch* emit_scratch = nullptr) {
     ReplayStateCache own_state;
     ReplayStateCache& cache = state_cache ? *state_cache : own_state;
     std::uint32_t own_labels = 0;
@@ -5228,11 +5237,13 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
     const bool predicates = vk.begin_conditional_rendering != nullptr;
     VkConditionalRenderingBeginInfoEXT predicate{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
     std::size_t next_query = 0;
-    // Reusable scratch vectors hoisted out of the command loop to avoid per-command heap churn.
-    std::vector<VkImageMemoryBarrier2> many_barriers;
-    std::vector<VkBufferImageCopy> converted_copies;
-    std::vector<VkAccelerationStructureGeometryKHR> as_geoms;
-    std::vector<VkAccelerationStructureBuildRangeInfoKHR> as_ranges;
+    // Reusable scratch vectors hoisted out of the command loop (and onto VulkanQueue when `emit_scratch` is given).
+    EmitScratch own_scratch;
+    EmitScratch& scratch = emit_scratch ? *emit_scratch : own_scratch;
+    auto& many_barriers = scratch.many_barriers;
+    auto& converted_copies = scratch.converted_copies;
+    auto& as_geoms = scratch.as_geoms;
+    auto& as_ranges = scratch.as_ranges;
     // A dispatch honours conditional rendering and a copy does not (the layer runs copies unpredicated), so the
     // conversion around a copy must run whatever the predicate says: end it for the dispatch and begin it again.
     const auto run_depth24 = [&](const Depth24Job& job) {
@@ -6454,8 +6465,8 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
 
 inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
                  LayoutTracker* tracker = nullptr, std::uint32_t* open_labels = nullptr,
-                 ReplayStateCache* state_cache = nullptr) {
-    emit_commands<false>(prepared, command_buffer, vk, tracker, open_labels, nullptr, state_cache);
+                 ReplayStateCache* state_cache = nullptr, EmitScratch* emit_scratch = nullptr) {
+    emit_commands<false>(prepared, command_buffer, vk, tracker, open_labels, nullptr, state_cache, emit_scratch);
 }
 
 // prepare + emit for one list. A failed replay leaves the command buffer and the tracker untouched.

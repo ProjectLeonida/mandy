@@ -20251,7 +20251,9 @@ public:
             },
             &state_);
         state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer) {
+            if (!state_.bindless->needs_prepare()) return true;
             std::unique_lock lock(state_.descriptor_mutex);
+            if (!state_.bindless->needs_prepare()) return true;
             if (!state_.bindless->fallbacks_ready()) state_.bindless->record_fallback_init(command_buffer);
             auto& context = *state_.context;
             if (state_.bindless_legacy_idle && state_.bindless->flush_replaces_table()) {
@@ -20325,8 +20327,7 @@ public:
             return flushed;
         });
         state_.context->set_bindless_current([this]() {
-            std::lock_guard lock(state_.descriptor_mutex);
-            return state_.bindless ? state_.bindless->set() : VK_NULL_HANDLE;
+            return state_.bindless ? state_.bindless->current_set() : VK_NULL_HANDLE;
         });
         {
             char text[8] = {};
@@ -20335,6 +20336,7 @@ public:
                                           text[0] != '0';
         }
         state_.context->set_bindless_commit([this](bool submitted) {
+            if (!state_.bindless || !state_.bindless->needs_commit()) return;
             std::lock_guard lock(state_.descriptor_mutex);
             if (state_.bindless) state_.bindless->table_upload_result(submitted);
         });
