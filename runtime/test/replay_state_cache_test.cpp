@@ -23,12 +23,17 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -1209,12 +1214,570 @@ void test_gpu_live_validation() {
     CHECK(dev.validation_errors() == 0);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Part 4: Batch-parallel synchronous pipeline compile (collect_unbuilt_pipelines + set_batch_compile_runner +
+//         closed/cancel teardown race safety)
+
+struct MiniCompilePool {
+    struct Entry {
+        const void* owner = nullptr;
+        std::function<void()> fn;
+    };
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::condition_variable done_cv;
+    std::deque<Entry> queue;
+    std::vector<const void*> running_owners;
+    std::vector<std::thread> threads;
+    bool closed = false;
+
+    explicit MiniCompilePool(std::size_t n) {
+        threads.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            threads.emplace_back([this] {
+                for (;;) {
+                    Entry entry;
+                    {
+                        std::unique_lock lock(mutex);
+                        cv.wait(lock, [&] { return closed || !queue.empty(); });
+                        if (queue.empty()) return;
+                        entry = std::move(queue.front());
+                        queue.pop_front();
+                        running_owners.push_back(entry.owner);
+                    }
+                    entry.fn();
+                    {
+                        std::lock_guard lock(mutex);
+                        const auto it = std::find(running_owners.begin(), running_owners.end(), entry.owner);
+                        if (it != running_owners.end()) running_owners.erase(it);
+                    }
+                    done_cv.notify_all();
+                }
+            });
+        }
+    }
+    ~MiniCompilePool() {
+        close_and_drop();
+        for (auto& t : threads)
+            if (t.joinable()) t.join();
+    }
+    bool submit(const void* owner, std::function<void()> fn) {
+        std::lock_guard lock(mutex);
+        if (closed) return false;
+        queue.push_back({owner, std::move(fn)});
+        cv.notify_one();
+        return true;
+    }
+    // Mirrors PipelineCompiler::cancel(owner): drops unstarted queued jobs for `owner` outside the lock and waits
+    // only if `owner` is currently running (never waits on unrelated busy workers).
+    std::size_t cancel(const void* owner) {
+        std::vector<Entry> dropped;
+        {
+            std::unique_lock lock(mutex);
+            for (;;) {
+                std::deque<Entry> kept;
+                for (auto& e : queue) {
+                    if (e.owner == owner) dropped.push_back(std::move(e));
+                    else kept.push_back(std::move(e));
+                }
+                queue.swap(kept);
+                if (std::find(running_owners.begin(), running_owners.end(), owner) == running_owners.end()) break;
+                done_cv.wait(lock);
+            }
+        }
+        return dropped.size();  // destroys dropped captures outside the lock
+    }
+    void close_and_drop() {
+        std::deque<Entry> dropped;
+        {
+            std::lock_guard lock(mutex);
+            closed = true;
+            dropped.swap(queue);
+        }
+        cv.notify_all();
+        dropped.clear();  // mirrors PipelineCompiler::drop_locked(): destroys queued lambdas without running them
+    }
+    void drop_queued() {
+        std::deque<Entry> dropped;
+        {
+            std::lock_guard lock(mutex);
+            dropped.swap(queue);
+        }
+        dropped.clear();
+    }
+};
+
+// Mirrors the exact work-stealing BatchState + RAII HelperDone + WaitHelpers (with cancel) runner used by Device.
+VulkanContext::BatchCompileFn make_pool_batch_runner(MiniCompilePool& pool, std::size_t max_helpers) {
+    return [&pool, max_helpers](std::size_t count, const std::function<void(std::size_t)>& job) {
+        if (!count) return;
+        if (count == 1) {
+            job(0);
+            return;
+        }
+        struct BatchState {
+            std::atomic<std::size_t> next{0};
+            std::size_t count = 0;
+            const std::function<void(std::size_t)>* job = nullptr;
+            std::vector<std::uint8_t> owner_tags;
+            std::mutex mutex;
+            std::condition_variable cv;
+            std::size_t pending_helpers = 0;
+        };
+        auto run_work = [](BatchState& s) {
+            for (;;) {
+                const std::size_t i = s.next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= s.count) break;
+                (*s.job)(i);
+            }
+        };
+        struct HelperDone {
+            std::shared_ptr<BatchState> state;
+            explicit HelperDone(std::shared_ptr<BatchState> s) : state(std::move(s)) {
+                std::lock_guard lock(state->mutex);
+                ++state->pending_helpers;
+            }
+            ~HelperDone() {
+                if (!state) return;
+                std::lock_guard lock(state->mutex);
+                if (--state->pending_helpers == 0) state->cv.notify_all();
+            }
+        };
+        auto state = std::make_shared<BatchState>();
+        state->count = count;
+        state->job = &job;
+        const std::size_t helpers = (std::min)(count - 1, max_helpers);
+        state->owner_tags.resize(helpers, 0);
+        {
+            struct WaitHelpers {
+                MiniCompilePool& pool;
+                std::shared_ptr<BatchState> state;
+                std::size_t submitted_helpers = 0;
+                ~WaitHelpers() {
+                    for (std::size_t k = 0; k < submitted_helpers; ++k)
+                        pool.cancel(&state->owner_tags[k]);
+                    std::unique_lock lock(state->mutex);
+                    state->cv.wait(lock, [&] { return state->pending_helpers == 0; });
+                }
+            } wait_guard{pool, state, 0};
+            for (std::size_t k = 0; k < helpers; ++k) {
+                auto done = std::make_shared<HelperDone>(state);
+                if (!pool.submit(&state->owner_tags[k], [done = std::move(done), run_work] { run_work(*done->state); }))
+                    break;
+                ++wait_guard.submitted_helpers;
+            }
+            run_work(*state);
+        }
+    };
+}
+
+void test_batch_parallel_sync_pipeline_compile() {
+    // 4a: collect_unbuilt_pipelines() deduplicates graphics (pso, unbound_mask, rectangle_stage) and compute across lists.
+    {
+        MockEnv env;
+        GraphicsPipeline unbuilt_a = env.gfx[1];
+        unbuilt_a.pipeline = VK_NULL_HANDLE;
+        unbuilt_a.color_formats = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
+        unbuilt_a.depth_format = VK_FORMAT_D32_SFLOAT;
+        unbuilt_a.variant = [](std::uint32_t) { return fake_handle<VkPipeline>(0x910); };
+        unbuilt_a.built = [](std::uint32_t) -> VkPipeline { return VK_NULL_HANDLE; };
+        env.gfx[10] = unbuilt_a;
+
+        GraphicsPipeline unbuilt_b = env.gfx[1];
+        unbuilt_b.pipeline = VK_NULL_HANDLE;
+        unbuilt_b.rectangle_variant_topology = 35u;
+        unbuilt_b.variant = [](std::uint32_t) { return fake_handle<VkPipeline>(0x911); };
+        unbuilt_b.built = [](std::uint32_t) -> VkPipeline { return VK_NULL_HANDLE; };
+        env.gfx[11] = unbuilt_b;
+
+        ComputePipeline unbuilt_c = env.comp[1];
+        unbuilt_c.pipeline = VK_NULL_HANDLE;
+        unbuilt_c.build = +[](void*) { return fake_handle<VkPipeline>(0x912); };
+        unbuilt_c.built = +[](void*) -> VkPipeline { return VK_NULL_HANDLE; };
+        env.comp[10] = unbuilt_c;
+
+        CommandList l1, l2;
+        // Already-built pipeline (id=1): must NOT be collected.
+        CHECK(l1.draw(env.base_draw(1, false)));
+        // Unbuilt PSO 10 with slot 0 bound, slot 1 unbound, depth unbound -> flags = (1<<1) | unbound_depth = 0x102.
+        Draw da1 = env.base_draw(10, false);
+        CHECK(l1.draw(da1));
+        CHECK(l1.draw(da1));  // duplicate in same list -> deduplicated
+        // Unbuilt PSO 10 with both color slots bound, depth unbound -> flags = unbound_depth = 0x100.
+        Draw da2 = env.base_draw(10, false);
+        auto views2 = std::make_shared<DrawViews>(*da2.views);
+        views2->render_targets[1] = {MockEnv::kColor, 0, 0, 1};
+        views2->render_target_count = 2;
+        da2.views = std::move(views2);
+        CHECK(l1.draw(da2));
+        // Unbuilt PSO 11 with rectangle-list variant topology -> flags = rectangle_stage.
+        Draw db = env.base_draw(11, false);
+        db.topology = 35u;
+        CHECK(l2.draw(db));
+        CHECK(l2.draw(da1));  // duplicate across second list -> deduplicated
+        // Unbuilt compute pipeline 10 (twice -> deduplicated).
+        Dispatch c{};
+        c.pipeline = 10;
+        c.x = c.y = c.z = 1;
+        CHECK(l2.dispatch(c));
+        CHECK(l2.dispatch(c));
+        CHECK(l1.close() && l2.close());
+
+        const CommandList* batch[2] = {&l1, &l2};
+        PipelineCompiles compiles;
+        collect_unbuilt_pipelines(batch, env.vk, compiles);
+        CHECK(compiles.size() == 4);  // 3 graphics variants + 1 compute
+        VkPipeline out = VK_NULL_HANDLE;
+        CHECK(!compiles.lookup(&env.gfx[1], nullptr, 0u, out));
+        CHECK(compiles.lookup(&env.gfx[10], nullptr, (1u << 1) | GraphicsPipeline::unbound_depth, out));
+        CHECK(compiles.lookup(&env.gfx[10], nullptr, GraphicsPipeline::unbound_depth, out));
+        CHECK(compiles.lookup(&env.gfx[11], nullptr, GraphicsPipeline::rectangle_stage, out));
+        CHECK(compiles.lookup(nullptr, &env.comp[10], 0u, out));
+    }
+
+    // 4b: Closed pool and mid-batch cancel/drop_queued race safety (zero deadlocks, 100% job completion).
+    {
+        // Closed pool: every submit returns false -> calling thread finishes all jobs cleanly.
+        MiniCompilePool closed_pool(4);
+        closed_pool.close_and_drop();
+        auto closed_runner = make_pool_batch_runner(closed_pool, 4);
+        constexpr std::size_t kClosedJobs = 32;
+        std::array<std::atomic<unsigned>, kClosedJobs> closed_hits{};
+        for (auto& h : closed_hits) h.store(0, std::memory_order_relaxed);
+        closed_runner(kClosedJobs, [&](std::size_t i) { closed_hits[i].fetch_add(1, std::memory_order_relaxed); });
+        for (std::size_t i = 0; i < kClosedJobs; ++i) CHECK(closed_hits[i].load() == 1);
+
+        // Concurrent mid-batch drop_queued / close_and_drop while helpers are active: zero deadlocks, exact-once runs.
+        for (int iter = 0; iter < 50; ++iter) {
+            MiniCompilePool pool(4);
+            auto runner = make_pool_batch_runner(pool, 4);
+            constexpr std::size_t kJobs = 48;
+            std::array<std::atomic<unsigned>, kJobs> hits{};
+            for (auto& h : hits) h.store(0, std::memory_order_relaxed);
+            std::atomic<bool> started{false};
+            std::thread dropper([&] {
+                while (!started.load(std::memory_order_acquire)) std::this_thread::yield();
+                if (iter % 2 == 0) pool.drop_queued();
+                else pool.close_and_drop();
+            });
+            runner(kJobs, [&](std::size_t i) {
+                started.store(true, std::memory_order_release);
+                hits[i].fetch_add(1, std::memory_order_relaxed);
+                if (i < 4) std::this_thread::sleep_for(std::chrono::microseconds(50));
+            });
+            dropper.join();
+            for (std::size_t i = 0; i < kJobs; ++i) CHECK(hits[i].load() == 1);
+        }
+
+        // 4b-busy: All pool workers blocked on unrelated long jobs — calling thread must finish all batch jobs and
+        //          cancel unstarted queued helpers immediately without stalling behind the busy workers!
+        {
+            MiniCompilePool busy_pool(2);
+            std::mutex gate_mu;
+            std::condition_variable gate_cv;
+            bool release_unrelated = false;
+            std::atomic<unsigned> blocked_workers{0};
+            int unrelated_owner_a = 0, unrelated_owner_b = 0;
+            const auto blocker = [&] {
+                blocked_workers.fetch_add(1, std::memory_order_acq_rel);
+                std::unique_lock lock(gate_mu);
+                gate_cv.wait(lock, [&] { return release_unrelated; });
+            };
+            CHECK(busy_pool.submit(&unrelated_owner_a, blocker));
+            CHECK(busy_pool.submit(&unrelated_owner_b, blocker));
+            while (blocked_workers.load(std::memory_order_acquire) < 2) std::this_thread::yield();
+
+            auto runner = make_pool_batch_runner(busy_pool, 4);
+            constexpr std::size_t kFastJobs = 8;
+            std::array<std::atomic<unsigned>, kFastJobs> fast_hits{};
+            for (auto& h : fast_hits) h.store(0, std::memory_order_relaxed);
+            const auto t0 = std::chrono::steady_clock::now();
+            runner(kFastJobs, [&](std::size_t i) { fast_hits[i].fetch_add(1, std::memory_order_relaxed); });
+            const auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+            for (std::size_t i = 0; i < kFastJobs; ++i) CHECK(fast_hits[i].load() == 1);
+            CHECK(elapsed_ms < 250);
+
+            {
+                std::lock_guard lock(gate_mu);
+                release_unrelated = true;
+            }
+            gate_cv.notify_all();
+        }
+    }
+
+    // 4c: Live VulkanQueue::execute() batch-parallel pre-compile of 4 unbuilt graphics PSOs (with duplicates):
+    //     compiles concurrently (max_in_flight >= 2), builds each PSO once, executes all draws with zero skips.
+    {
+        vktest::Device dev;
+        const auto status = dev.initialize();
+        if (status == vktest::DeviceStatus::unavailable) {
+            std::puts("SKIP: no Vulkan device for live batch-parallel pipeline compile test");
+            return;
+        }
+        CHECK(status == vktest::DeviceStatus::ready);
+        if (status != vktest::DeviceStatus::ready) return;
+
+        const auto vkCreateShaderModule = dev.fn<PFN_vkCreateShaderModule>("vkCreateShaderModule");
+        const auto vkDestroyShaderModule = dev.fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
+        const auto vkCreatePipelineLayout = dev.fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout");
+        const auto vkDestroyPipelineLayout = dev.fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
+        const auto vkCreateGraphicsPipelines = dev.fn<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines");
+        const auto vkDestroyPipeline = dev.fn<PFN_vkDestroyPipeline>("vkDestroyPipeline");
+
+        constexpr std::uint32_t kW = 8, kH = 8, kPitch = 256;
+        const VkImage color_img =
+            dev.image(VK_FORMAT_R8G8B8A8_UNORM, kW, kH, 1,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                          VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        void* rb_pixels = nullptr;
+        const VkBuffer rb_buf = dev.buffer(kH * kPitch, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &rb_pixels);
+        void* vb_mapped = nullptr;
+        const VkBuffer vb = dev.buffer(256, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &vb_mapped);
+        CHECK(color_img && rb_buf && rb_pixels && vb && vb_mapped);
+        if (!color_img || !rb_buf || !vb) return;
+        std::memset(rb_pixels, 0, kH * kPitch);
+        const float verts[12] = {-1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f};
+        std::memcpy(vb_mapped, verts, sizeof(verts));
+
+        const VkPushConstantRange gfx_pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                          sizeof(ShaderUserData)};
+        VkPipelineLayoutCreateInfo gpl_ci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        gpl_ci.pushConstantRangeCount = 1;
+        gpl_ci.pPushConstantRanges = &gfx_pcr;
+        VkPipelineLayout gfx_layout = VK_NULL_HANDLE;
+        CHECK(vkCreatePipelineLayout(dev.device, &gpl_ci, nullptr, &gfx_layout) == VK_SUCCESS);
+
+        const auto vs_spv = build_vs_spirv();
+        const auto fs_spv = build_fs_spirv();
+        const auto make_mod = [&](const std::vector<std::uint32_t>& spv) {
+            VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            ci.codeSize = spv.size() * sizeof(std::uint32_t);
+            ci.pCode = spv.data();
+            VkShaderModule m = VK_NULL_HANDLE;
+            CHECK(vkCreateShaderModule(dev.device, &ci, nullptr, &m) == VK_SUCCESS);
+            return m;
+        };
+        const VkShaderModule vs_mod = make_mod(vs_spv);
+        const VkShaderModule fs_mod = make_mod(fs_spv);
+
+        const auto build_real_gfx_pipe = [&]() -> VkPipeline {
+            VkPipelineShaderStageCreateInfo stages[2]{
+                {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+            };
+            stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+            stages[0].module = vs_mod;
+            stages[0].pName = "main";
+            stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            stages[1].module = fs_mod;
+            stages[1].pName = "main";
+
+            VkVertexInputBindingDescription vbind{0, 8, VK_VERTEX_INPUT_RATE_VERTEX};
+            VkVertexInputAttributeDescription vattr{0, 0, VK_FORMAT_R32G32_SFLOAT, 0};
+            VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+            vi.vertexBindingDescriptionCount = 1;
+            vi.pVertexBindingDescriptions = &vbind;
+            vi.vertexAttributeDescriptionCount = 1;
+            vi.pVertexAttributeDescriptions = &vattr;
+
+            VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+            vp.viewportCount = 1;
+            vp.scissorCount = 1;
+            VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
+            rs.cullMode = VK_CULL_MODE_NONE;
+            rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
+            rs.lineWidth = 1.0f;
+            VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            VkPipelineColorBlendAttachmentState cba{};
+            cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                                 VK_COLOR_COMPONENT_A_BIT;
+            VkPipelineColorBlendStateCreateInfo cb_state{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+            cb_state.attachmentCount = 1;
+            cb_state.pAttachments = &cba;
+            const VkDynamicState dyn_states[] = {
+                VK_DYNAMIC_STATE_VIEWPORT,           VK_DYNAMIC_STATE_SCISSOR,
+                VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
+                VK_DYNAMIC_STATE_STENCIL_REFERENCE,  VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
+            };
+            VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+            dyn.dynamicStateCount = static_cast<std::uint32_t>(std::size(dyn_states));
+            dyn.pDynamicStates = dyn_states;
+            const VkFormat color_fmt = VK_FORMAT_R8G8B8A8_UNORM;
+            VkPipelineRenderingCreateInfo rend{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+            rend.colorAttachmentCount = 1;
+            rend.pColorAttachmentFormats = &color_fmt;
+            VkGraphicsPipelineCreateInfo gp_ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rend};
+            gp_ci.stageCount = 2;
+            gp_ci.pStages = stages;
+            gp_ci.pVertexInputState = &vi;
+            gp_ci.pInputAssemblyState = &ia;
+            gp_ci.pViewportState = &vp;
+            gp_ci.pRasterizationState = &rs;
+            gp_ci.pMultisampleState = &ms;
+            gp_ci.pColorBlendState = &cb_state;
+            gp_ci.pDynamicState = &dyn;
+            gp_ci.layout = gfx_layout;
+            VkPipeline pipe = VK_NULL_HANDLE;
+            CHECK(vkCreateGraphicsPipelines(dev.device, VK_NULL_HANDLE, 1, &gp_ci, nullptr, &pipe) == VK_SUCCESS);
+            return pipe;
+        };
+
+        std::array<VkPipeline, 4> created_pipes{};
+        {
+            VulkanContext ctx(dev.device_proc, dev.device, true, dev.conditional_rendering, dev.buffer_device_address);
+            CHECK(ctx.loaded());
+            MiniCompilePool pool(4);
+            ctx.set_batch_compile_runner(make_pool_batch_runner(pool, 4));
+
+            constexpr ResourceId kRtId = 1, kVbId = 2, kRbId = 3;
+            constexpr std::uint64_t kVbVa = 0x10000ull;
+            ResourceBinding rt_b{};
+            rt_b.image = color_img;
+            rt_b.format = VK_FORMAT_R8G8B8A8_UNORM;
+            rt_b.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+            rt_b.width = kW;
+            rt_b.height = kH;
+            rt_b.color_attachment = true;
+            ctx.add_resource(kRtId, rt_b, VK_IMAGE_LAYOUT_UNDEFINED);
+
+            ResourceBinding vb_b{};
+            vb_b.buffer = vb;
+            vb_b.size = 256;
+            vb_b.va = kVbVa;
+            ctx.add_resource(kVbId, vb_b);
+
+            ResourceBinding rb_b{};
+            rb_b.buffer = rb_buf;
+            rb_b.size = kH * kPitch;
+            rb_b.host_readable = true;
+            ctx.add_resource(kRbId, rb_b);
+
+            std::atomic<unsigned> in_flight{0};
+            std::atomic<unsigned> max_in_flight{0};
+            std::array<std::atomic<unsigned>, 4> compile_calls{};
+            for (auto& c : compile_calls) c.store(0, std::memory_order_relaxed);
+            std::mutex pipe_mu;
+
+            for (std::size_t idx = 0; idx < 4; ++idx) {
+                GraphicsPipeline gp{};
+                gp.pipeline = VK_NULL_HANDLE;
+                gp.layout = gfx_layout;
+                gp.push_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+                gp.color_formats = {VK_FORMAT_R8G8B8A8_UNORM};
+                gp.vertex_slots = 0b1;
+                gp.built = [&, idx](std::uint32_t) -> VkPipeline {
+                    std::lock_guard lock(pipe_mu);
+                    return created_pipes[idx];
+                };
+                gp.variant = [&, idx](std::uint32_t) -> VkPipeline {
+                    compile_calls[idx].fetch_add(1, std::memory_order_relaxed);
+                    const unsigned cur = in_flight.fetch_add(1, std::memory_order_acq_rel) + 1;
+                    unsigned prev = max_in_flight.load(std::memory_order_relaxed);
+                    while (cur > prev && !max_in_flight.compare_exchange_weak(prev, cur, std::memory_order_acq_rel)) {}
+                    // Brief wait so at least 2 threads overlap concurrently inside variant().
+                    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+                    while (max_in_flight.load(std::memory_order_acquire) < 2 &&
+                           std::chrono::steady_clock::now() < until)
+                        std::this_thread::yield();
+                    VkPipeline p = build_real_gfx_pipe();
+                    {
+                        std::lock_guard lock(pipe_mu);
+                        created_pipes[idx] = p;
+                    }
+                    in_flight.fetch_sub(1, std::memory_order_acq_rel);
+                    return p;
+                };
+                ctx.add_graphics_pipeline(300 + idx, gp);
+            }
+
+            VulkanQueue queue(ctx, dev.queue, dev.family, VulkanQueue::QueueKind::direct);
+            CHECK(queue.ok());
+
+            auto make_quad = [&](std::uintptr_t pso, float r, float g, float b, std::int32_t x0, std::int32_t y0,
+                                 std::int32_t x1, std::int32_t y1) {
+                Draw d{};
+                d.pipeline = pso;
+                auto views = std::make_shared<DrawViews>();
+                views->render_targets[0] = {kRtId, 0, 0, 1};
+                views->render_target_count = 1;
+                views->vertex_buffers[0] = {kVbVa, 256, 8};
+                d.views = std::move(views);
+                d.indexed = false;
+                d.topology = 4;
+                d.viewport = {0.0f, 0.0f, float(kW), float(kH), 0.0f, 1.0f};
+                d.scissor = {x0, y0, x1, y1};
+                d.blend_factor = {1, 1, 1, 1};
+                d.count = 6;
+                d.instances = 1;
+                d.user_data[0] = float_bits(r);
+                d.user_data[1] = float_bits(g);
+                d.user_data[2] = float_bits(b);
+                d.user_data[3] = float_bits(1.0f);
+                d.user_data[8] = float_bits(1.0f);
+                return d;
+            };
+
+            // Two lists across one execute() batch using all 4 unbuilt PSOs (with duplicate draws).
+            CommandList list1, list2;
+            CHECK(list1.transition({kRtId, all_subresources, d3d12_state::common, d3d12_state::render_target}));
+            CHECK(list1.draw(make_quad(300, 1.0f, 0.0f, 0.0f, 0, 0, 4, 4)));
+            CHECK(list1.draw(make_quad(300, 1.0f, 0.0f, 0.0f, 0, 0, 4, 4)));  // duplicate PSO 300
+            CHECK(list1.draw(make_quad(301, 0.0f, 1.0f, 0.0f, 4, 0, 8, 4)));
+            CHECK(list1.close());
+
+            CHECK(list2.draw(make_quad(302, 0.0f, 0.0f, 1.0f, 0, 4, 4, 8)));
+            CHECK(list2.draw(make_quad(303, 1.0f, 1.0f, 0.0f, 4, 4, 8, 8)));
+            CHECK(list2.draw(make_quad(301, 0.0f, 1.0f, 0.0f, 4, 0, 8, 4)));  // duplicate across list boundary
+            CHECK(list2.transition({kRtId, all_subresources, d3d12_state::render_target, d3d12_state::copy_source}));
+            CopyTexture readback{};
+            readback.dst = {kRbId, true, 0, 0, kW, kH, 1, kPitch};
+            readback.src = {kRtId, false, 0, 0, 0, 0, 0, 0};
+            CHECK(list2.copy_texture(readback));
+            CHECK(list2.close());
+
+            const CommandList* batch[2] = {&list1, &list2};
+            CHECK(queue.execute(batch) == ReplayResult::success);
+            CHECK(queue.idle());
+
+            CHECK(max_in_flight.load(std::memory_order_acquire) >= 2);
+            for (std::size_t idx = 0; idx < 4; ++idx) CHECK(compile_calls[idx].load() == 1);
+
+            const auto* px = static_cast<const std::uint8_t*>(rb_pixels);
+            const auto check_px = [&](std::uint32_t x, std::uint32_t y, std::uint8_t r, std::uint8_t g, std::uint8_t b,
+                                      std::uint8_t a) {
+                const std::size_t off = std::size_t(y) * kPitch + std::size_t(x) * 4;
+                CHECK(px[off] == r && px[off + 1] == g && px[off + 2] == b && px[off + 3] == a);
+            };
+            check_px(1, 1, 255, 0, 0, 255);
+            check_px(6, 1, 0, 255, 0, 255);
+            check_px(1, 6, 0, 0, 255, 255);
+            check_px(6, 6, 255, 255, 0, 255);
+            ctx.set_batch_compile_runner({});
+        }
+
+        for (VkPipeline p : created_pipes)
+            if (p) vkDestroyPipeline(dev.device, p, nullptr);
+        if (vs_mod) vkDestroyShaderModule(dev.device, vs_mod, nullptr);
+        if (fs_mod) vkDestroyShaderModule(dev.device, fs_mod, nullptr);
+        if (gfx_layout) vkDestroyPipelineLayout(dev.device, gfx_layout, nullptr);
+        CHECK(dev.validation_errors() == 0);
+        std::puts("batch-parallel sync pipeline compile (collect_unbuilt, concurrency, closed/drop race, GPU): ok");
+    }
+}
+
 }  // namespace
 
 int main() {
     test_cpu_elision_and_invalidation();
     test_throughput_5000_draws();
     test_gpu_live_validation();
+    test_batch_parallel_sync_pipeline_compile();
     if (g_failures) {
         std::fprintf(stderr, "replay_state_cache_test: %d failure(s)\n", g_failures);
         return 1;

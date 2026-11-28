@@ -3167,6 +3167,69 @@ inline ReplayResult build_pipelines_serial(PipelineCompiles& compiles, std::span
     return finish_compiled_pipelines(compiles, lists, result, prior);
 }
 
+// Computes the GraphicsPipeline::variant() flags for a Draw command without resolving resources or image views:
+// bit i is set when the PSO declares a color format for slot i and the draw leaves slot i unbound, unbound_depth
+// when the PSO declares a depth format and the draw leaves depth unbound, and rectangle_stage when the draw uses
+// the PSO's rectangle-list topology.
+inline std::uint32_t draw_unbound_mask(const GraphicsPipeline& pipeline, const Draw& draw) noexcept {
+    std::uint32_t unbound = 0;
+    if (pipeline.rectangle_variant_topology && draw.topology == pipeline.rectangle_variant_topology)
+        unbound |= GraphicsPipeline::rectangle_stage;
+    const std::uint32_t render_target_count = draw.views ? draw.views->render_target_count : 0;
+    const std::size_t color_count = pipeline.color_formats.size();
+    for (std::size_t slot = 0; slot < color_count; ++slot) {
+        if (pipeline.color_formats[slot] == VK_FORMAT_UNDEFINED) continue;
+        const bool bound = slot < render_target_count && draw.views->render_targets[slot].resource != 0;
+        if (!bound) unbound |= 1u << slot;
+    }
+    if (pipeline.depth_format != VK_FORMAT_UNDEFINED && !draw.depth.resource)
+        unbound |= GraphicsPipeline::unbound_depth;
+    return unbound;
+}
+
+// Fast pre-pass over a batch of command lists that collects every unique unbuilt synchronous graphics (pipeline,
+// unbound_mask) and compute pipeline into `compiles` BEFORE prepare() acquires resource/tracker locks or allocates
+// transient replay state. Pipelines configured for async_build, skipped compute pipelines, or indirect draws that
+// prepare_draw() skips (nonunit vertex divisor / indirect rectangle-list variant) are omitted.
+inline void collect_unbuilt_pipelines(std::span<const CommandList* const> lists, const ReplayFunctions& vk,
+                                      PipelineCompiles& compiles) {
+    for (const CommandList* list : lists) {
+        if (!list) continue;
+        for (const Command& command : list->commands()) {
+            if (const auto draw = draw_command(command); draw.state) {
+                if (!vk.graphics_pipeline) continue;
+                const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.state->pipeline);
+                if (!pipeline || pipeline->async_build || !pipeline->variant || !pipeline->built) continue;
+                if (pipeline->mesh != draw.state->mesh) continue;
+                if (pipeline->color_formats.size() > detail::max_render_targets) continue;
+                if (draw.arguments && pipeline->nonunit_vertex_divisor) continue;
+                const std::uint32_t unbound = draw_unbound_mask(*pipeline, *draw.state);
+                if (!unbound && pipeline->pipeline) continue;
+                if (draw.arguments && (unbound & GraphicsPipeline::rectangle_stage)) continue;
+                if (!pipeline->built(unbound)) compiles.add(*pipeline, unbound);
+            } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
+                if (!vk.compute_pipeline) continue;
+                const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
+                if (!pipeline || pipeline->pipeline || !pipeline->build || !pipeline->built ||
+                    pipeline->async_build || pipeline->skipped)
+                    continue;
+                if (pipeline->bindless_set && !vk.bind_descriptor_sets) continue;
+                if (!pipeline->built(pipeline->build_context))
+                    compiles.add(*pipeline, PipelineCompiles::User::dispatch);
+            } else if (const auto* indirect = std::get_if<ExecuteIndirect>(&command)) {
+                if (indirect->kind != IndirectKind::dispatch || !indirect->max_count || !vk.compute_pipeline) continue;
+                const ComputePipeline* pipeline = vk.compute_pipeline(indirect->pipeline);
+                if (!pipeline || pipeline->pipeline || !pipeline->build || !pipeline->built ||
+                    pipeline->async_build || pipeline->skipped)
+                    continue;
+                if (pipeline->bindless_set && !vk.bind_descriptor_sets) continue;
+                if (!pipeline->built(pipeline->build_context))
+                    compiles.add(*pipeline, PipelineCompiles::User::indirect_dispatch);
+            }
+        }
+    }
+}
+
 inline ReplayResult plan_occlusion_segments(PreparedList& out) {
     // Active logical queries cover a contiguous range of physical slots. A Begin or End closes the old
     // slot and opens a new one if any query remains active. Each shared interval is recorded only once.

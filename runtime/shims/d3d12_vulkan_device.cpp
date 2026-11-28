@@ -129,6 +129,9 @@
 #include <cwchar>
 #include <intrin.h>
 #include <smmintrin.h>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include <vector>
 
 namespace rt::d3d12 {
@@ -6907,6 +6910,44 @@ struct DeviceState {
         }
     }
 
+    static constexpr std::size_t kSeenKeysMask = 511u;  // 512 entries (8 KiB): fits in L1d instead of thrashing 1 MiB L2/L3
+
+    static bool slots_equal_32(const std::uint8_t* a, const std::uint8_t* b) noexcept {
+#if defined(__AVX2__)
+        const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a));
+        const __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b));
+        const __m256i diff = _mm256_xor_si256(va, vb);
+        return _mm256_testz_si256(diff, diff) != 0;
+#else
+        std::uint64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        std::uint64_t b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+        std::memcpy(&a0, a + 0, 8);
+        std::memcpy(&a1, a + 8, 8);
+        std::memcpy(&a2, a + 16, 8);
+        std::memcpy(&a3, a + 24, 8);
+        std::memcpy(&b0, b + 0, 8);
+        std::memcpy(&b1, b + 8, 8);
+        std::memcpy(&b2, b + 16, 8);
+        std::memcpy(&b3, b + 24, 8);
+        return ((a0 ^ b0) | (a1 ^ b1) | (a2 ^ b2) | (a3 ^ b3)) == 0;
+#endif
+    }
+
+    static void note_changed_vsharp_words(ConsoleHeap& heap, const std::uint32_t* w) {
+        ++heap.changed[1];
+        if (heap.seen_keys.size() != kSeenKeysMask + 1) heap.seen_keys.assign(kSeenKeysMask + 1, {});
+        for (int half = 0; half < 2; ++half) {
+            const std::uint32_t* k = w + 4 * half;
+            if (!k[2]) continue;  // no records: nothing to translate
+            ++heap.vsharp_halves;
+            std::uint32_t h = 2166136261u;
+            for (int i = 0; i < 4; ++i) h = (h ^ k[i]) * 16777619u;
+            auto& entry = heap.seen_keys[h & kSeenKeysMask];
+            if (entry[0] == k[0] && entry[1] == k[1] && entry[2] == k[2] && entry[3] == k[3]) ++heap.vsharp_repeats;
+            else entry = {k[0], k[1], k[2], k[3]};
+        }
+    }
+
     // Diagnostics only: the class of a changed slot, and whether its V# halves were seen before (ConsoleHeap::changed).
     static void note_changed_slot(ConsoleHeap& heap, const std::uint8_t* bytes) {
         std::uint32_t w[8];
@@ -6921,18 +6962,7 @@ struct DeviceState {
             ++heap.changed[leonida::gfx10::is_image(words) ? 2 : 3];
             return;
         }
-        ++heap.changed[1];
-        if (heap.seen_keys.empty()) heap.seen_keys.resize(65536);
-        for (int half = 0; half < 2; ++half) {
-            const std::uint32_t* k = w + 4 * half;
-            if (!k[2]) continue;  // no records: nothing to translate
-            ++heap.vsharp_halves;
-            std::uint32_t h = 2166136261u;
-            for (int i = 0; i < 4; ++i) h = (h ^ k[i]) * 16777619u;
-            auto& entry = heap.seen_keys[h & 0xffffu];
-            if (entry[0] == k[0] && entry[1] == k[1] && entry[2] == k[2] && entry[3] == k[3]) ++heap.vsharp_repeats;
-            else entry = {k[0], k[1], k[2], k[3]};
-        }
+        note_changed_vsharp_words(heap, w);
     }
 
     // The slots on [offset, offset + bytes) of a heap copy's mirror, just brought up to date: each that differs from
@@ -7036,16 +7066,65 @@ struct DeviceState {
     // - a V# the mirror does not hold resolved as before, a T# bound - is finish_in_place's, in the heap's refresh
     // (console_heap_mutex held), outside the mirror's lock, its result written into the home under it.
 
+    // Per-page stack-local cache used while page_mirror.mutex is continuously held across filter_heap_page /
+    // filter_heap_page_pieces / apply_in_place_changes. Deduplicates repeated V# (base, span) classifications within
+    // the same page fill so repeated descriptors avoid redundant backing_mutex / title_va_aliases / TitleMirror lookups
+    // while preserving 100% exact ConsoleHeapSlotRecords state (every cached resolved/waiting/deferred slot still
+    // updates heap.records / heap.deferred, so concurrent SlotChanges refilter all of them in apply_in_place_changes).
+    struct FilterPageCache {
+        enum class Outcome : std::uint8_t { empty = 0, mirrored, backed, waiting, defer };
+        struct Entry {
+            std::uint64_t base = 0;
+            std::uint64_t span = 0;
+            std::uint64_t target = 0;
+            Outcome outcome = Outcome::empty;
+        };
+        static constexpr std::size_t kSize = 64;
+        std::array<Entry, kSize> entries{};
+        bool signed_vsharp = false;
+        bool has_mirror = false;
+        bool has_geometry = false;
+        std::uint64_t arena_size = 0;
+
+        static std::size_t bucket(std::uint64_t base, std::uint64_t span) noexcept {
+            const std::uint64_t h = (base >> 4) ^ (span * 0x9e3779b97f4a7c15ull);
+            return static_cast<std::size_t>((h ^ (h >> 17)) & (kSize - 1));
+        }
+        const Entry* find(std::uint64_t base, std::uint64_t span) const noexcept {
+            const Entry& e = entries[bucket(base, span)];
+            return (e.outcome != Outcome::empty && e.base == base && e.span == span) ? &e : nullptr;
+        }
+        void put(std::uint64_t base, std::uint64_t span, Outcome outcome, std::uint64_t target = 0) noexcept {
+            entries[bucket(base, span)] = {base, span, target, outcome};
+        }
+    };
+
+    FilterPageCache make_filter_page_cache_locked() {
+        FilterPageCache cache;
+        cache.signed_vsharp = signed_vsharp_offsets();
+        cache.has_mirror = page_mirror.mirror != nullptr;
+        cache.has_geometry = geometry.cap() != 0;
+        cache.arena_size = arena.size;
+        if (cache.has_mirror) sync_mirror_space_locked();
+        return cache;
+    }
+
     // Slot `slot` of a heap read in place, from its title bytes as last filtered (`previous`), into `out` (its place
     // in the page's home). page_mirror.mutex held.
-    void filter_slot_locked(ConsoleHeap& heap, std::size_t slot, std::uint8_t* out) {
+    void filter_slot_locked(ConsoleHeap& heap, std::size_t slot, std::uint8_t* out,
+                            FilterPageCache* cache = nullptr, bool count_changed = false) {
         using Records = leonida::ConsoleHeapSlotRecords;
         std::uint32_t w[kDescriptorSize / 4];
         std::memcpy(w, heap.previous + slot * kDescriptorSize, kDescriptorSize);
         bool defer = false;
         if (!(w[0] | w[1] | w[2] | w[3])) {
+            if (count_changed) ++heap.changed[(w[4] | w[5] | w[6] | w[7]) ? 1 : 0];
             heap.records.clear(slot);  // a null slot stays null
         } else if (!(w[3] >> 30)) {
+            if (count_changed) note_changed_vsharp_words(heap, w);
+            const bool signed_vsharp = cache ? cache->signed_vsharp : signed_vsharp_offsets();
+            const std::uint64_t arena_size = cache ? cache->arena_size : arena.size;
+            const bool has_geometry = cache ? cache->has_geometry : (geometry.cap() != 0);
             // A buffer V# and its UAV counter: each read as written when heap_base + its base holds its bytes, else
             // null until finish_in_place resolves it (recorded as waiting meanwhile, so a change finds it).
             for (unsigned half = 0; half < 2; ++half) {
@@ -7057,12 +7136,54 @@ struct DeviceState {
                 const std::uint64_t base = std::uint64_t(h[0]) | (std::uint64_t(h[1] & 0xffff) << 32);
                 const std::uint32_t stride = (h[1] >> 16) & 0x3fffu;
                 const std::uint64_t span = std::uint64_t(h[2]) * (stride ? stride : 1);
+                // Fast inline arena hit: skips reachable_as_written(), mirror lookups, and cache hashing.
+                if (base && (!signed_vsharp || !(base & (1ull << 47))) && base < arena_size &&
+                    (span ? span : 1) <= arena_size - base) {
+                    heap.records.set(slot, half, Records::none, 0, 0, 0);
+                    ++heap.vsharps_as_written;
+                    continue;
+                }
+                if (cache) {
+                    if (const FilterPageCache::Entry* cached = cache->find(base, span)) {
+                        switch (cached->outcome) {
+                        case FilterPageCache::Outcome::mirrored:
+                            heap.records.set(slot, half, Records::none, 0, 0, 0);
+                            heap.mirror_ranges.emplace_back(base, span);
+                            ++heap.vsharps_as_written;
+                            continue;
+                        case FilterPageCache::Outcome::backed:
+                            heap.records.set(slot, half, Records::resolved, base, span, cached->target, false);
+                            ++heap.vsharps_as_written;
+                            continue;
+                        case FilterPageCache::Outcome::waiting:
+                            heap.records.set(slot, half, Records::waiting, base, span, 0, true);
+                            h[0] = h[1] = h[2] = h[3] = 0;
+                            ++heap.vsharps_rejected;
+                            continue;
+                        case FilterPageCache::Outcome::defer:
+                            heap.records.set(slot, half, Records::none, 0, 0, 0);
+                            h[0] = h[1] = h[2] = h[3] = 0;
+                            ++heap.vsharps_deferred;
+                            defer = true;
+                            continue;
+                        default:
+                            break;
+                        }
+                    }
+                }
                 bool mirrored = false;
                 std::uint64_t target = 0;
                 if (reachable_as_written(base, span, mirrored, &target)) {
-                    if (target) heap.records.set(slot, half, Records::resolved, base, span, target, false);
-                    else heap.records.set(slot, half, Records::none, 0, 0, 0);
-                    if (mirrored) heap.mirror_ranges.emplace_back(base, span);
+                    if (target) {
+                        heap.records.set(slot, half, Records::resolved, base, span, target, false);
+                        if (cache) cache->put(base, span, FilterPageCache::Outcome::backed, target);
+                    } else {
+                        heap.records.set(slot, half, Records::none, 0, 0, 0);
+                        if (mirrored) {
+                            heap.mirror_ranges.emplace_back(base, span);
+                            if (cache) cache->put(base, span, FilterPageCache::Outcome::mirrored);
+                        }
+                    }
                     ++heap.vsharps_as_written;
                     continue;
                 }
@@ -7084,8 +7205,8 @@ struct DeviceState {
                         std::uint64_t alias_to = 0, alias_room = 0;
                         has_alias = aliases.range_of(base, alias_to, alias_room);
                         if (!has_alias) {
-                            is_gpu_view = geometry.cap() && leonida::title_gpu_views::to_cpu(base, span) != base;
-                            if (!is_gpu_view && base < arena.size) permanent_impossible = true;
+                            is_gpu_view = has_geometry && leonida::title_gpu_views::to_cpu(base, span) != base;
+                            if (!is_gpu_view && base < arena_size) permanent_impossible = true;
                         }
                     }
                 }
@@ -7100,6 +7221,7 @@ struct DeviceState {
                     // `geometry = true` is exact and lets answer() serve both geometry=true/false queries until a
                     // SlotChange::source_added refilters this slot.
                     heap.records.set(slot, half, Records::waiting, base, span, 0, true);
+                    if (cache) cache->put(base, span, FilterPageCache::Outcome::waiting);
                     h[0] = h[1] = h[2] = h[3] = 0;  // null whole: no three words of four
                     ++heap.vsharps_rejected;
                     continue;
@@ -7107,6 +7229,7 @@ struct DeviceState {
                 // Clear any stale record before deferring so finish_in_place's record-answer lookup never mistakes a
                 // placeholder for a resolved or settled waiting record.
                 heap.records.set(slot, half, Records::none, 0, 0, 0);
+                if (cache) cache->put(base, span, FilterPageCache::Outcome::defer);
                 h[0] = h[1] = h[2] = h[3] = 0;  // null whole: no three words of four (a stride or format left over)
                 ++heap.vsharps_deferred;
                 defer = true;
@@ -7115,7 +7238,9 @@ struct DeviceState {
             leonida::gfx10::ImageWords words;
             std::memcpy(words.data(), w, sizeof(words));
             leonida::gfx10::Image image{};
-            if (leonida::gfx10::is_image(words) && leonida::gfx10::decode(words, image)) {
+            const bool is_img = leonida::gfx10::is_image(words);
+            if (count_changed) ++heap.changed[is_img ? 2 : 3];
+            if (is_img && leonida::gfx10::decode(words, image)) {
                 // As the title wrote it, bound by finish_in_place, which writes its bindless index into dword 6
                 // (gfx10_descriptors.h, tsharp_index_word; the entry's index needs descriptor_mutex, not taken under
                 // the mirror's lock). Until then dword 6 is 0, the fallback: the title's own dword 6 (compression
@@ -7152,17 +7277,26 @@ struct DeviceState {
         heap.record_looked += heap.records.looked_at() - looked;
         heap.record_refixed += heap.touched_scratch.size();
         heap.pending_changes.clear();
-        for (const std::uint32_t slot : heap.touched_scratch) {
-            const std::uint64_t va = heap.console_va + std::uint64_t(slot) * kDescriptorSize;
-            if (std::uint8_t* copy = page_mirror.mirror->copy_bytes(va)) {
-                filter_slot_locked(heap, slot, copy + (va & (leonida::TitleMirror::kPage - 1)));
-                if (page_mirror.readback_in_flight) {
-                    if (std::uint8_t* frame =
-                            page_mirror.mirror->frame_at(va & ~(leonida::TitleMirror::kPage - 1)))
-                        page_mirror.readback_invalidated.insert(frame);
+        if (!heap.touched_scratch.empty()) {
+            FilterPageCache cache = make_filter_page_cache_locked();
+            constexpr std::uint64_t kPageMask = ~(leonida::TitleMirror::kPage - 1);
+            constexpr std::uint64_t kOffMask = leonida::TitleMirror::kPage - 1;
+            std::uint64_t last_page = UINT64_MAX;
+            std::uint8_t* last_copy = nullptr;
+            std::uint8_t* last_frame = nullptr;
+            const bool readback = page_mirror.readback_in_flight;
+            for (const std::uint32_t slot : heap.touched_scratch) {
+                const std::uint64_t va = heap.console_va + std::uint64_t(slot) * kDescriptorSize;
+                const std::uint64_t page_va = va & kPageMask;
+                if (page_va != last_page) {
+                    last_page = page_va;
+                    last_copy = page_mirror.mirror->copy_bytes(page_va);
+                    last_frame = (last_copy && readback) ? page_mirror.mirror->frame_at(page_va) : nullptr;
+                    if (last_frame) page_mirror.readback_invalidated.insert(last_frame);
                 }
+                if (last_copy) filter_slot_locked(heap, slot, last_copy + (va & kOffMask), &cache, false);
+                // A page not mapped is filtered whole when it is.
             }
-            // A page not mapped is filtered whole when it is.
         }
         heap.record_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
@@ -7194,23 +7328,26 @@ struct DeviceState {
             title = overflow.get();
         }
         if (!copy_guarded_host(title, from, bytes, false)) return false;
+        FilterPageCache cache = make_filter_page_cache_locked();
         std::size_t changed = 0;
+        const std::uint64_t heap_base_va = heap->console_va;
+        const std::uint64_t heap_bytes = heap->bytes;
+        std::uint8_t* const heap_prev = heap->previous;
         for (std::size_t at = 0; at + kDescriptorSize <= bytes; at += kDescriptorSize) {
             const std::uint64_t slot_va = va + at;
-            if (slot_va - heap->console_va >= heap->bytes) {  // past the heap's end on its last page: as it is
+            if (slot_va - heap_base_va >= heap_bytes) {  // past the heap's end on its last page: as it is
                 std::memcpy(to + at, title + at, kDescriptorSize);
                 continue;
             }
-            const std::size_t slot = std::size_t((slot_va - heap->console_va) / kDescriptorSize);
-            std::uint8_t* previous = heap->previous + slot * kDescriptorSize;
-            const bool same = !std::memcmp(previous, title + at, kDescriptorSize);
+            const std::size_t slot = std::size_t((slot_va - heap_base_va) / kDescriptorSize);
+            std::uint8_t* previous = heap_prev + slot * kDescriptorSize;
+            const bool same = slots_equal_32(previous, title + at);
             if (same && !fresh) continue;
             if (!same) {
                 std::memcpy(previous, title + at, kDescriptorSize);
-                note_changed_slot(*heap, previous);
                 ++changed;
             }
-            filter_slot_locked(*heap, slot, to + at);
+            filter_slot_locked(*heap, slot, to + at, &cache, !same);
         }
         heap->slots_filtered += changed;
         ++heap->pages_filtered;
@@ -7236,9 +7373,13 @@ struct DeviceState {
         }
         const auto start = std::chrono::steady_clock::now();
         constexpr std::size_t kPiece = 256;
+        // Pack offset (bits 0..14) + changed flag (bit 15): kPage = 65536 is 32-byte aligned, so `at >> 5` fits in 11 bits.
         std::array<std::uint16_t, leonida::TitleMirror::kPage / kDescriptorSize> to_filter;
         std::size_t to_filter_count = 0;
         std::size_t changed = 0;
+        const std::uint64_t heap_base_va = heap->console_va;
+        const std::uint64_t heap_bytes = heap->bytes;
+        std::uint8_t* const heap_prev = heap->previous;
         for (std::size_t word = 0; word < 4; ++word) {
             std::uint64_t mask = fresh ? ~std::uint64_t(0) : changed_pieces[word];
             while (mask) {
@@ -7246,30 +7387,35 @@ struct DeviceState {
                 mask &= mask - 1;
                 const std::size_t piece_begin = (word * 64 + bit) * kPiece;
                 if (piece_begin >= bytes) break;
-                const std::size_t piece_end = std::min(piece_begin + kPiece, bytes);
+                const std::size_t piece_end = (std::min)(piece_begin + kPiece, bytes);
                 for (std::size_t at = piece_begin; at + kDescriptorSize <= piece_end; at += kDescriptorSize) {
                     const std::uint64_t slot_va = va + at;
-                    if (slot_va - heap->console_va >= heap->bytes) {  // past the heap's end on its last page: as it is
+                    if (slot_va - heap_base_va >= heap_bytes) {  // past the heap's end on its last page: as it is
                         std::memcpy(to + at, scratch + at, kDescriptorSize);
                         continue;
                     }
-                    const std::size_t slot = std::size_t((slot_va - heap->console_va) / kDescriptorSize);
-                    std::uint8_t* previous = heap->previous + slot * kDescriptorSize;
-                    const bool same = !std::memcmp(previous, scratch + at, kDescriptorSize);
+                    const std::size_t slot = std::size_t((slot_va - heap_base_va) / kDescriptorSize);
+                    std::uint8_t* previous = heap_prev + slot * kDescriptorSize;
+                    const bool same = slots_equal_32(previous, scratch + at);
                     if (same && !fresh) continue;
                     if (!same) {
                         std::memcpy(previous, scratch + at, kDescriptorSize);
-                        note_changed_slot(*heap, previous);
                         ++changed;
                     }
-                    to_filter[to_filter_count++] = static_cast<std::uint16_t>(at);
+                    to_filter[to_filter_count++] =
+                        static_cast<std::uint16_t>((at >> 5) | (same ? 0u : 0x8000u));
                 }
             }
         }
-        for (std::size_t i = 0; i < to_filter_count; ++i) {
-            const std::size_t at = to_filter[i];
-            const std::size_t slot = std::size_t((va + at - heap->console_va) / kDescriptorSize);
-            filter_slot_locked(*heap, slot, to + at);
+        if (to_filter_count) {
+            FilterPageCache cache = make_filter_page_cache_locked();
+            for (std::size_t i = 0; i < to_filter_count; ++i) {
+                const std::uint16_t packed = to_filter[i];
+                const std::size_t at = std::size_t(packed & 0x7fffu) << 5;
+                const bool slot_changed = (packed & 0x8000u) != 0;
+                const std::size_t slot = std::size_t((va + at - heap_base_va) / kDescriptorSize);
+                filter_slot_locked(*heap, slot, to + at, &cache, slot_changed);
+            }
         }
         heap->slots_filtered += changed;
         ++heap->pages_filtered;
@@ -7278,6 +7424,52 @@ struct DeviceState {
         return true;
     }
 
+    // Reusable finish_in_place() scratch storage (guarded by console_heap_mutex).
+    struct InPlaceJob {
+        std::uint32_t slot = 0;
+        std::uint32_t words[kDescriptorSize / 4]{};
+        bool reachable[2] = {false, false};
+        std::uint64_t reachable_target[2] = {0, 0};
+        bool answered[2] = {false, false};
+        VsharpRecord answer[2]{};
+    };
+    struct InPlaceDone {
+        std::uint32_t out[kDescriptorSize / 4]{};
+        VsharpRecord halves[2]{};
+        leonida::ConsoleHeapSlotRecords::State texture = leonida::ConsoleHeapSlotRecords::none;
+        std::uint64_t texture_address = 0;
+    };
+    struct InPlaceVsharpKey {
+        std::uint64_t base = 0, span = 0;
+        bool geometry = false;
+        bool operator==(const InPlaceVsharpKey&) const = default;
+    };
+    struct InPlaceVsharpKeyHash {
+        std::size_t operator()(const InPlaceVsharpKey& k) const noexcept {
+            std::size_t h = std::hash<std::uint64_t>{}(k.base);
+            h ^= std::hash<std::uint64_t>{}(k.span) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            return h ^ std::size_t(k.geometry);
+        }
+    };
+    struct InPlaceTsharpKeyHash {
+        std::size_t operator()(const leonida::gfx10::ImageWords& w) const noexcept {
+            std::uint64_t h = 14695981039346656037ull;
+            for (const std::uint32_t x : w) h = (h ^ x) * 1099511628211ull;
+            return static_cast<std::size_t>(h);
+        }
+    };
+    struct InPlaceTsharpCached {
+        TitleImage result = TitleImage::not_tsharp;
+        const char* why = nullptr;
+        std::uint64_t texture_address = 0;
+        std::uint32_t index_word = 0;
+    };
+    std::vector<InPlaceJob> in_place_jobs_scratch;
+    std::vector<InPlaceDone> in_place_done_scratch;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> in_place_ranges_scratch;
+    std::unordered_map<InPlaceVsharpKey, VsharpRecord, InPlaceVsharpKeyHash> in_place_vsharp_cache;
+    std::unordered_map<leonida::gfx10::ImageWords, InPlaceTsharpCached, InPlaceTsharpKeyHash> in_place_tsharp_cache;
+
     // What the filter left to do, done outside the mirror's lock: the V#s the mirror does not hold resolved as a
     // copied slot's were (an interim, until every title allocation is in the mirror; they read null meanwhile), the
     // T#s bound, and the write-back noted for the mirror ranges the heap's V#s name. Each result goes into the home
@@ -7285,14 +7477,6 @@ struct DeviceState {
     // page_mirror.mutex not.
     void finish_in_place(ConsoleHeap& heap) {
         using Records = leonida::ConsoleHeapSlotRecords;
-        struct Job {
-            std::uint32_t slot;
-            std::uint32_t words[kDescriptorSize / 4];
-            bool reachable[2] = {false, false};
-            std::uint64_t reachable_target[2] = {0, 0};
-            bool answered[2] = {false, false};
-            VsharpRecord answer[2]{};
-        };
         const VsharpPath path = (heap.scratch || heap.in_place) ? VsharpPath::scratch : VsharpPath::shadow;
         const auto wants_geometry = [path](const std::uint32_t* h, std::uint64_t span) {
             const leonida::gfx10::BufferWords words{h[0], h[1], h[2], h[3]};
@@ -7301,8 +7485,10 @@ struct DeviceState {
                    (path != VsharpPath::scratch || span <= kTitleWindowMax ||
                     (desc.format && leonida::gfx10::encode(desc) == words));
         };
-        std::vector<Job> jobs;
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        auto& jobs = in_place_jobs_scratch;
+        auto& ranges = in_place_ranges_scratch;
+        jobs.clear();
+        ranges.clear();
         {
             std::unique_lock lock(page_mirror.mutex, std::defer_lock);
             leonida::submit_phases::lock_timed(lock);
@@ -7313,7 +7499,7 @@ struct DeviceState {
             jobs.reserve(heap.deferred.size());
             for (const std::uint32_t slot : heap.deferred) {
                 heap.deferred_mark[slot] = 0;
-                Job& job = jobs.emplace_back();
+                InPlaceJob& job = jobs.emplace_back();
                 job.slot = slot;
                 std::memcpy(job.words, heap.previous + std::size_t(slot) * kDescriptorSize, kDescriptorSize);
                 if (!(job.words[3] >> 30)) {
@@ -7350,25 +7536,10 @@ struct DeviceState {
         for (const auto& [base, span] : ranges) note_passive_title_write(base, span);  // gated when writes_buffer meta is complete
         if (jobs.empty()) return;
         const auto start = std::chrono::steady_clock::now();
-        struct Done {
-            std::uint32_t out[kDescriptorSize / 4];
-            VsharpRecord halves[2];
-            Records::State texture = Records::none;
-            std::uint64_t texture_address = 0;
-        };
-        struct BatchKey {
-            std::uint64_t base, span;
-            bool geometry;
-            bool operator==(const BatchKey&) const = default;
-        };
-        struct BatchKeyHash {
-            std::size_t operator()(const BatchKey& k) const noexcept {
-                std::size_t h = std::hash<std::uint64_t>{}(k.base);
-                h ^= std::hash<std::uint64_t>{}(k.span) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
-                return h ^ std::size_t(k.geometry);
-            }
-        };
-        std::unordered_map<BatchKey, VsharpRecord, BatchKeyHash> batch_answers;
+        auto& batch_answers = in_place_vsharp_cache;
+        auto& tsharp_cache = in_place_tsharp_cache;
+        if (!batch_answers.empty()) batch_answers.clear();
+        if (!tsharp_cache.empty()) tsharp_cache.clear();
         const auto apply_answer = [&](std::uint32_t* h, const VsharpRecord& rec, VsharpRecord& out_rec) {
             out_rec = rec;
             if (rec.state == Records::resolved) {
@@ -7387,7 +7558,8 @@ struct DeviceState {
                 ++heap.unbacked;
             }
         };
-        std::vector<Done> done(jobs.size());
+        auto& done = in_place_done_scratch;
+        done.assign(jobs.size(), InPlaceDone{});
         for (std::size_t i = 0; i < jobs.size(); ++i) {
             std::uint32_t* w = done[i].out;
             std::memcpy(w, jobs[i].words, kDescriptorSize);
@@ -7402,7 +7574,7 @@ struct DeviceState {
                     const std::uint64_t base = std::uint64_t(h[0]) | (std::uint64_t(h[1] & 0xffff) << 32);
                     const std::uint32_t stride = (h[1] >> 16) & 0x3fffu;
                     const std::uint64_t span = std::uint64_t(h[2]) * (stride ? stride : 1);
-                    const BatchKey key{base, span, wants_geometry(h, span)};
+                    const InPlaceVsharpKey key{base, span, wants_geometry(h, span)};
                     if (const auto it = batch_answers.find(key); it != batch_answers.end()) {
                         ++(it->second.state == Records::resolved ? heap.vsharps_answered_resolved
                                                                  : heap.vsharps_answered);
@@ -7420,6 +7592,27 @@ struct DeviceState {
             } else {
                 leonida::gfx10::ImageWords words;
                 std::memcpy(words.data(), w, sizeof(words));
+                if (const auto cached = tsharp_cache.find(words); cached != tsharp_cache.end()) {
+                    const InPlaceTsharpCached& entry = cached->second;
+                    const bool unbound = entry.result == TitleImage::unknown || entry.result == TitleImage::refused;
+                    if (unbound) {
+                        note_refused_tsharp(heap, std::size_t(jobs[i].slot) * kDescriptorSize, words, entry.why);
+                        ++heap.refused_reasons[entry.why ? entry.why : "?"];
+                        ++heap.texture_waits;
+                    }
+                    ++heap.images[unsigned(entry.result)];
+                    if (entry.result == TitleImage::not_tsharp) {
+                        std::memset(w, 0, 16);
+                    } else {
+                        done[i].texture_address = entry.texture_address;
+                        done[i].texture = !unbound ? Records::texture_bound
+                                          : entry.why == kTsharpArrayFull || entry.why == kTsharpStorageFull
+                                              ? Records::texture_waiting_room
+                                              : Records::texture_waiting;
+                        if (tsharp_index_words) w[leonida::gfx10::kTsharpIndexDword] = entry.index_word;
+                    }
+                    continue;
+                }
                 if (leonida::gfx10::is_image(words)) {
                     const char* why = nullptr;
                     const TitleImage result = bind_title_image(*this, words, &why);
@@ -7430,12 +7623,14 @@ struct DeviceState {
                         ++heap.texture_waits;
                     }
                     ++heap.images[unsigned(result)];
+                    InPlaceTsharpCached entry{result, why, 0, 0};
                     if (result == TitleImage::not_tsharp) {
                         std::memset(w, 0, 16);
                     } else {
                         leonida::gfx10::Image image{};
                         leonida::gfx10::decode(words, image);
-                        done[i].texture_address = tsharp_texture_key(image.address);
+                        entry.texture_address = tsharp_texture_key(image.address);
+                        done[i].texture_address = entry.texture_address;
                         done[i].texture = !unbound ? Records::texture_bound
                                           : why == kTsharpArrayFull || why == kTsharpStorageFull
                                               ? Records::texture_waiting_room
@@ -7444,25 +7639,44 @@ struct DeviceState {
                         // texture coming, going or replaced at its address touches the slot (apply_in_place_changes),
                         // which is filtered and finished again, so the word follows the texture the T# names. The heap
                         // copy's write (fix_console_slot) is for heaps not read in place.
-                        if (tsharp_index_words)
-                            w[leonida::gfx10::kTsharpIndexDword] = unbound ? 0u : tsharp_index_word(words);
+                        if (tsharp_index_words) {
+                            entry.index_word = unbound ? 0u : tsharp_index_word(words);
+                            w[leonida::gfx10::kTsharpIndexDword] = entry.index_word;
+                        }
                     }
+                    tsharp_cache.emplace(words, entry);
                 } else {
                     ++heap.images[unsigned(TitleImage::not_tsharp)];
                     std::memset(w, 0, 16);
+                    tsharp_cache.emplace(words, InPlaceTsharpCached{TitleImage::not_tsharp, nullptr, 0, 0});
                 }
             }
         }
         std::unique_lock lock(page_mirror.mutex, std::defer_lock);
         leonida::submit_phases::lock_timed(lock);
+        constexpr std::uint64_t kPageMask = ~(leonida::TitleMirror::kPage - 1);
+        constexpr std::uint64_t kOffMask = leonida::TitleMirror::kPage - 1;
+        std::uint64_t last_page = UINT64_MAX;
+        std::uint8_t* last_home = nullptr;
+        const bool has_mirror = page_mirror.mirror != nullptr;
+        const bool readback = page_mirror.readback_in_flight;
         for (std::size_t i = 0; i < jobs.size(); ++i) {
             const std::uint32_t slot = jobs[i].slot;
-            if (std::memcmp(heap.previous + std::size_t(slot) * kDescriptorSize, jobs[i].words, kDescriptorSize))
+            if (!slots_equal_32(heap.previous + std::size_t(slot) * kDescriptorSize,
+                                reinterpret_cast<const std::uint8_t*>(jobs[i].words)))
                 continue;  // rewritten since: filtered again, and deferred again if it needs this
             const std::uint64_t va = heap.console_va + std::uint64_t(slot) * kDescriptorSize;
-            std::uint8_t* home = page_mirror.mirror ? page_mirror.mirror->copy_bytes(va) : nullptr;
-            if (!home) continue;
-            const Done& d = done[i];
+            const std::uint64_t page_va = va & kPageMask;
+            if (page_va != last_page) {
+                last_page = page_va;
+                last_home = has_mirror ? page_mirror.mirror->copy_bytes(page_va) : nullptr;
+                if (last_home && readback) {
+                    if (std::uint8_t* frame = page_mirror.mirror->frame_at(page_va))
+                        page_mirror.readback_invalidated.insert(frame);
+                }
+            }
+            if (!last_home) continue;
+            const InPlaceDone& d = done[i];
             if (d.texture != Records::none) {
                 if (Records::is_waiting(heap.records.state(slot, 0)) && heap.records.base(slot, 0) == d.texture_address &&
                     d.texture == Records::texture_bound)
@@ -7491,12 +7705,7 @@ struct DeviceState {
                     }
                 }
             }
-            std::memcpy(home + (va & (leonida::TitleMirror::kPage - 1)), d.out, kDescriptorSize);
-            if (page_mirror.readback_in_flight) {
-                if (std::uint8_t* frame =
-                        page_mirror.mirror->frame_at(va & ~(leonida::TitleMirror::kPage - 1)))
-                    page_mirror.readback_invalidated.insert(frame);
-            }
+            std::memcpy(last_home + (va & kOffMask), d.out, kDescriptorSize);
         }
         heap.deferred_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
@@ -18320,8 +18529,96 @@ public:
             if (!threads.valid)
                 std::fprintf(stderr, "[rt] d3d12: LEONIDA_PIPELINE_THREADS=%s is not a number; using %u\n", text,
                              threads.count);
-            if (threads.count)
-                state_.context->set_pipeline_workers(std::make_unique<leonida::PipelineWorkers>(threads.count));
+            if (present) {
+                if (threads.count)
+                    state_.context->set_pipeline_workers(std::make_unique<leonida::PipelineWorkers>(threads.count));
+            } else {
+                // Default (LEONIDA_PIPELINE_THREADS unset): fan out batch-parallel synchronous pipeline compiles
+                // concurrently onto PipelineCompiler::instance() worker threads (with work-stealing on the calling
+                // thread and deadlock-free RAII fallback if PipelineCompiler::closed() or cancel()/stop_for_exit()
+                // races), avoiding an extra idle thread pool while giving full multi-core cold-compile scaling.
+                state_.context->set_batch_compile_runner(
+                    [device_key = static_cast<const void*>(&state_)](std::size_t count,
+                                                                     const std::function<void(std::size_t)>& job) {
+                        if (!count) return;
+                        auto& compiler = PipelineCompiler::instance();
+                        if (count == 1 || compiler.closed()) {
+                            for (std::size_t i = 0; i < count; ++i) job(i);
+                            return;
+                        }
+                        struct BatchState {
+                            std::atomic<std::size_t> next{0};
+                            std::size_t count = 0;
+                            const std::function<void(std::size_t)>* job = nullptr;
+                            std::vector<std::uint8_t> owner_tags;
+                            std::mutex mutex;
+                            std::condition_variable cv;
+                            std::size_t pending_helpers = 0;
+                            std::exception_ptr error{};
+                            std::size_t error_index = SIZE_MAX;
+                        };
+                        auto run_work = [](BatchState& s) {
+                            for (;;) {
+                                const std::size_t i = s.next.fetch_add(1, std::memory_order_relaxed);
+                                if (i >= s.count) break;
+                                try {
+                                    (*s.job)(i);
+                                } catch (...) {
+                                    std::lock_guard lock(s.mutex);
+                                    if (!s.error || i < s.error_index) {
+                                        s.error = std::current_exception();
+                                        s.error_index = i;
+                                    }
+                                }
+                            }
+                        };
+                        struct HelperDone {
+                            std::shared_ptr<BatchState> state;
+                            explicit HelperDone(std::shared_ptr<BatchState> s) : state(std::move(s)) {
+                                std::lock_guard lock(state->mutex);
+                                ++state->pending_helpers;
+                            }
+                            ~HelperDone() {
+                                if (!state) return;
+                                std::lock_guard lock(state->mutex);
+                                if (--state->pending_helpers == 0) state->cv.notify_all();
+                            }
+                        };
+                        auto state = std::make_shared<BatchState>();
+                        state->count = count;
+                        state->job = &job;
+                        const std::size_t helpers =
+                            (std::min)(count - 1, std::size_t(leonida::PipelineWorkers::kMaxThreads));
+                        state->owner_tags.resize(helpers, 0);
+                        {
+                            struct WaitHelpers {
+                                PipelineCompiler& compiler;
+                                std::shared_ptr<BatchState> state;
+                                std::size_t submitted_helpers = 0;
+                                ~WaitHelpers() {
+                                    // Drop any unstarted helper lambdas immediately so we never stall behind unrelated
+                                    // long compiles in PipelineCompiler::jobs_; only wait on helpers already running
+                                    // a job from this batch.
+                                    for (std::size_t k = 0; k < submitted_helpers; ++k)
+                                        compiler.cancel(&state->owner_tags[k]);
+                                    std::unique_lock lock(state->mutex);
+                                    state->cv.wait(lock, [&] { return state->pending_helpers == 0; });
+                                }
+                            } wait_guard{compiler, state, 0};
+                            for (std::size_t k = 0; k < helpers; ++k) {
+                                auto done = std::make_shared<HelperDone>(state);
+                                const bool queued = compiler.submit(
+                                    &state->owner_tags[k], device_key, 0,
+                                    [done = std::move(done), run_work] { run_work(*done->state); },
+                                    /*graphics=*/true, /*large=*/false);
+                                if (!queued) break;
+                                ++wait_guard.submitted_helpers;
+                            }
+                            run_work(*state);
+                        }
+                        if (state->error) std::rethrow_exception(state->error);
+                    });
+            }
             if (big_compiles() == BigCompiles::budget)
                 state_.context->set_large_compiles(
                     [] { return big_compile_gate().budget(); },
@@ -19226,6 +19523,7 @@ public:
         // cache checkpoint may also be queued or running. cancel() drops what is queued and waits for both. The last
         // device then stops and joins the compiler's thread.
         {
+            if (state_.context) state_.context->set_batch_compile_runner({});
             auto& compiler = PipelineCompiler::instance();
             if (compiler.running_here(&state_)) {
                 // A build job of this device released the device's last reference from inside the build, which
