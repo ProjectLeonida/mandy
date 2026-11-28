@@ -9288,6 +9288,16 @@ public:
         };
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
+        // On GPUs where UNIFORM_BUFFER_BIT rounds requirements.size past `bytes` (e.g. above minImportedHostPointerAlignment),
+        // D3D12 CBVs need 256-byte address and size alignment anyway and the layer encodes CBVs as raw V#s, so drop
+        // UNIFORM_BUFFER_BIT when the UBO size rounding exceeds the imported host range.
+        if (requirements.size > bytes) {
+            vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
+            buffer_ = VK_NULL_HANDLE;
+            info.usage &= ~VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+            if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return decline(E_OUTOFMEMORY);
+            vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
+        }
         VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         if (device_.get_host_pointer_properties(device_.info.device,
                                                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, base_address,
