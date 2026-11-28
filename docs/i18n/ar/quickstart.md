@@ -34,6 +34,9 @@ Leonida مشروع لإعادة ترجمة إصدار Xbox Series من Grand The
 - Visual Studio 2022 مع حزمة **Desktop development with C++** وWindows SDK بالإصدار `10.0.26100` أو أحدث لبناء مكوّن التشغيل.
 - [ffmpeg](https://ffmpeg.org/download.html) ضمن `PATH`، وهو اختياري لفك ترميز XMA2 ومطلوب عند استخدام `--wav`.
 
+**هل جهازك كافٍ؟** أداة [Can I Run Leonida](https://assttro.github.io/can-i-run-leonida/) فاحص خفيف في المتصفح
+يقارن جهازك بملفات تعريف مرجعية. إنها تقدير تقريبي، وليست اختبار أداء.
+
 ## البناء على Windows
 
 بعد تثبيت المتطلبات، استنسخ المستودع مع وحدته الفرعية.
