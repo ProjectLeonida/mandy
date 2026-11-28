@@ -136,6 +136,26 @@ test('a download that finishes or fails after a later click does not replace the
     assert.deepEqual(studio.alerts, []);
 });
 
+test('a completed model timer leaves the next model loading bar visible', () => {
+    const studio = loadStudio();
+    const timers = [];
+    studio.context.setTimeout = callback => timers.push(callback);
+
+    studio.run("loadModel('/models/a.glb', 'a.glb', '', 1);");
+    studio.loads[0].onLoad({ scene: fakeModel() });
+    studio.run("loadModel('/models/b.glb', 'b.glb', '', 1);");
+
+    const bar = studio.elements.get('loading-bar');
+    assert.equal(bar.style.transform, 'scaleX(0.4)');
+    timers[0]();
+    assert.equal(bar.style.transform, 'scaleX(0.4)');
+
+    studio.loads[1].onLoad({ scene: fakeModel() });
+    assert.equal(bar.style.transform, 'scaleX(1)');
+    timers[1]();
+    assert.equal(bar.style.transform, 'scaleX(0)');
+});
+
 test('switching models in clay mode disposes the old model\'s geometry, material and texture, not the clay', () => {
     const studio = loadStudio();
     const [modelA, modelB] = [fakeModel(), fakeModel()];

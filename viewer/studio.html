@@ -741,7 +741,9 @@ function loadModel(url, name, category, size) {
   loader.load(url, (gltf) => {
     if (loadId !== modelLoadId) return;
     bar.style.transform = 'scaleX(1)';
-    setTimeout(() => { bar.style.transform = 'scaleX(0)'; }, 250);
+    setTimeout(() => {
+      if (loadId === modelLoadId) bar.style.transform = 'scaleX(0)';
+    }, 250);
 
     if (currentMesh) {
       scene.remove(currentMesh);
