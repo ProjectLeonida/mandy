@@ -419,7 +419,7 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
-/// host copies of textures the title fills).
+/// host copies of textures the title fills, idle host lists nobody took).
 /// `LEONIDA_SWEEP=0` keeps everything, as before.
 fn sweep() {
     // The in-place probe and census, if asked for (`LEONIDA_INPLACE_PROBE`).
@@ -446,6 +446,7 @@ fn sweep() {
         trim_spare_backs();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
+    crate::list::trim_idle();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
