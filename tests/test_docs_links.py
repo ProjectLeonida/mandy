@@ -28,6 +28,18 @@ LINK = re.compile(
     \)""",
     re.VERBOSE,
 )
+REFERENCE_LABEL = r"(?:\\[^\r\n]|[^\\\[\]\r\n])"
+REFERENCE_DEFINITION = re.compile(
+    # GFM footnote definitions start with [^ and name note text, not a link destination.
+    rf"""^[ ]{{0,3}}\[(?!\^)({REFERENCE_LABEL}+)\]:[ \t]*(?:\r?\n[ \t]*)?
+    (?:<([^<>\r\n]*)>|([^\s<>]+))
+    (?:[ \t]+(?:
+        "(?:\\.|[^"\\])*" | '(?:\\.|[^'\\])*' | \((?:\\.|[^()\\])*\)
+    ))?[ \t]*\r?$""",
+    re.MULTILINE | re.VERBOSE,
+)
+REFERENCE_USE = re.compile(rf"(?<!\\)(?:\\\\)*\[(?!\^)({REFERENCE_LABEL}*)\](?:\[(?!\^)({REFERENCE_LABEL}*)\])?")
+INLINE_CODE = re.compile(r"(?<!`)(`+)(?!`)[^\r\n]*?(?<!`)\1(?!`)")
 HTML = re.compile(r'(?:href|src)\s*=\s*"([^"]+)"')
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$", re.M)
 EXTERNAL = ("http://", "https://", "mailto:", "tel:", "data:")
@@ -94,11 +106,38 @@ def anchors(path):
     return found
 
 
+def reference_links(text):
+    """Resolve simple Markdown reference links and images; unused definitions are not rendered links."""
+    definitions = {}
+
+    # Labels match without regard to case or redundant whitespace; the first definition wins.
+    def label_key(label):
+        return " ".join(label.split()).casefold()
+
+    def remember(match):
+        label, angle, bare = match.groups()
+        definitions.setdefault(label_key(label), angle if angle is not None else bare)
+        return ""
+
+    text = REFERENCE_DEFINITION.sub(remember, text)
+    if not definitions:
+        return []
+    # Do not mistake the labels of existing inline links, or text in a code span, for shortcut references.
+    text = LINK.sub(" ", INLINE_CODE.sub(" ", text))
+    found = []
+    for match in REFERENCE_USE.finditer(text):
+        label = label_key(match.group(2) or match.group(1))
+        if label in definitions:
+            found.append(definitions[label])
+    return found
+
+
 def links(text):
-    """Markdown link/image targets and HTML href/src values, fenced code excluded."""
+    """Markdown inline/reference link and image targets and HTML href/src values, fenced code excluded."""
     text = strip_fences(text)
     found = [m.group(1) or m.group(2) for m in LINK.finditer(text)]
     found.extend(HTML.findall(text))
+    found.extend(reference_links(text))
     return found
 
 
@@ -212,6 +251,49 @@ class StripFencesTest(unittest.TestCase):
 
 
 class RepositoryLinksTest(unittest.TestCase):
+    def test_checks_referenced_definitions_but_not_unused_ones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = os.path.join(tmp, "page.md")
+            target = os.path.join(tmp, "other page.md")
+            with open(target, "w", encoding="utf-8", newline="\n") as f:
+                f.write("# Existing\n")
+            with open(page, "w", encoding="utf-8", newline="\n") as f:
+                f.write("# Here\n"
+                        "[Missing file][Some  Guide]\n"
+                        "[Missing anchor][]\n"
+                        "[shortcut][^note]\n"
+                        "![Sample image][image]\n"
+                        "[Valid][valid] and [same page][here] and [external][web]\n"
+                        "[shadow](<other page.md>)\n"
+                        "`[code]`\n"
+                        r"\[escaped]" "\n"
+                        "An explanation.[^note]\n"
+                        "```md\n[unused]\n```\n\n"
+                        "[some guide]: missing.md \"Optional title\"\n"
+                        "[missing anchor]: <other page.md#gone> 'Another title'\n"
+                        "[shortcut]:\n  absent.md\n"
+                        "[image]: absent.png\n"
+                        "[valid]: <other page.md#existing> (A title)\n"
+                        "[VALID]: ignored-duplicate.md\n"
+                        "[here]: #here\n"
+                        "[web]: https://example.org/guide\n"
+                        "[shadow]: ignored-inline.md\n"
+                        "[code]: ignored-code.md\n"
+                        "[escaped]: ignored-escape.md\n"
+                        "[unused]: ignored-unused.md\n"
+                        "[^note]: Explanation\n")
+            with open(page, encoding="utf-8") as f:
+                self.assertEqual(links(f.read()), [
+                    "other page.md", "missing.md", "other page.md#gone", "absent.md", "absent.png",
+                    "other page.md#existing", "#here", "https://example.org/guide",
+                ])
+            self.assertEqual(broken_links(tmp, [page]), [
+                ("page.md", "missing.md", "missing file"),
+                ("page.md", "other page.md#gone", "anchor not found"),
+                ("page.md", "absent.md", "missing file"),
+                ("page.md", "absent.png", "missing file"),
+            ])
+
     def test_checks_links_with_commonmark_title_delimiters(self):
         with tempfile.TemporaryDirectory() as tmp:
             page = os.path.join(tmp, "page.md")
