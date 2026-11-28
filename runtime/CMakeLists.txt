@@ -4737,6 +4737,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(indirect_dispatch_count_alloc_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME indirect_dispatch_count_alloc COMMAND indirect_dispatch_count_alloc_test)
+    # The predicate reducer's and the present composer's memory types (memory_type_order, allocate_first_fitting; no GPU).
+    add_executable(predicate_memory_type_test test/predicate_memory_type_test.cpp)
+    target_link_libraries(predicate_memory_type_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(predicate_memory_type_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME predicate_memory_type COMMAND predicate_memory_type_test)
     # IndirectArgumentClamp queue-family sharing, bind-retry cleanup, slot zeroing, offset alignment, and concurrency (no GPU).
     add_executable(indirect_clamp_safety_test test/indirect_clamp_safety_test.cpp)
     target_link_libraries(indirect_clamp_safety_test PRIVATE Vulkan::Headers Threads::Threads)

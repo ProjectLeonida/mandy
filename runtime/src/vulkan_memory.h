@@ -56,6 +56,20 @@ inline std::vector<std::uint32_t> memory_type_order(const VkPhysicalDeviceMemory
     return order;
 }
 
+// Allocates `info.allocationSize` bytes from the first type of `order` (memory_type_order) the driver takes: a type
+// whose heap is big enough can still be full, so a failed vkAllocateMemory moves on to the next. `info`'s
+// memoryTypeIndex is set for each try; VK_NULL_HANDLE when no type took it.
+inline VkDeviceMemory allocate_first_fitting(PFN_vkAllocateMemory allocate, VkDevice device, VkMemoryAllocateInfo info,
+                                             const std::vector<std::uint32_t>& order) {
+    if (!allocate) return VK_NULL_HANDLE;
+    for (const std::uint32_t type : order) {
+        info.memoryTypeIndex = type;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        if (allocate(device, &info, nullptr, &memory) == VK_SUCCESS && memory) return memory;
+    }
+    return VK_NULL_HANDLE;
+}
+
 // The size of the blocks that textures share (image_memory.h): 64 MiB, or a sixteenth of a small heap, such as the BAR
 // window of a GPU without Resizable BAR. A texture larger than an eighth of a block has its own allocation.
 inline VkDeviceSize image_block_bytes(VkDeviceSize heap) {
