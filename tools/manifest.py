@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from report_paths import same_report_path  # noqa: E402
+from report_paths import path_key, same_report_path  # noqa: E402
 
 CHUNK = 8 * 1024 * 1024
 DEFAULT = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.json")
@@ -91,23 +91,33 @@ def sha256(path: str, *, expected_size: int | None = None) -> str:
     return _hash_file(path, expected_size=expected_size)[1]
 
 
+def _inside(parent: str, child: str) -> bool:
+    """True when `child` is `parent` or a file inside it, including another case spelling of that folder."""
+    try:
+        folder = path_key(parent)
+        target = path_key(child)
+    except OSError:
+        return False
+    if target == folder:
+        return True
+    prefix = folder if folder.endswith(os.sep) else folder + os.sep
+    return target.startswith(prefix)
+
+
 def walk(game_dir: str, *, exclude=None):
     def scan_failed(error: OSError) -> None:
         raise error
 
-    excluded_dir = excluded_name = None
-    if exclude is not None:
-        directory, name = os.path.split(os.path.abspath(exclude))
-        excluded_dir = os.path.normcase(os.path.realpath(directory))
-        excluded_name = os.path.normcase(name)
+    # path_key folds case on a volume that ignores it. normcase(realpath()) keeps the typed case on macOS, so
+    # Game/manifest.json and game/manifest.json used to stay in the scan.
+    excluded = path_key(exclude) if exclude is not None else None
 
     # os.walk otherwise treats missing or unreadable directories as empty.
     for root, _, files in os.walk(game_dir, onerror=scan_failed):
-        contains_manifest = excluded_dir is not None and os.path.normcase(os.path.realpath(root)) == excluded_dir
         for name in sorted(files):
-            if contains_manifest and os.path.normcase(name) == excluded_name:
-                continue
             p = os.path.join(root, name)
+            if excluded is not None and path_key(p) == excluded:
+                continue
             rel = os.path.relpath(p, game_dir)
             if os.sep != "/":
                 rel = rel.replace(os.sep, "/")
@@ -124,12 +134,7 @@ def create(game_dir: str, out: str, jobs: int = 1) -> int:
     if os.path.isdir(out):
         raise ManifestError(f"--out is a folder, not a manifest file: {out}")
     if os.path.isfile(out):
-        try:
-            inside = os.path.normcase(os.path.commonpath(
-                [os.path.realpath(game_dir), os.path.realpath(out)])) == os.path.normcase(os.path.realpath(game_dir))
-        except ValueError:
-            inside = False
-        if inside:
+        if _inside(game_dir, out):
             try:
                 load_manifest(out)
             except (ManifestError, OSError):

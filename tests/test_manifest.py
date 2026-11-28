@@ -109,6 +109,49 @@ class ManifestWalkTest(unittest.TestCase):
             self.assertTrue(os.path.isabs(abs_path))
             self.assertTrue(os.path.exists(abs_path))
 
+    def _case_insensitive(self, folder):
+        probe = os.path.join(folder, "Probe.tmp")
+        with open(probe, "wb"):
+            pass
+        folded = os.path.exists(os.path.join(folder, "probe.tmp"))
+        os.remove(probe)
+        return folded
+
+    def test_walk_excludes_another_case_of_the_manifest(self):
+        # normcase(realpath()) keeps the typed case on macOS, so PKG/Manifest.json stayed in a scan of pkg.
+        if not self._case_insensitive(self.pkg):
+            self.skipTest("volume keeps case")
+        with open(os.path.join(self.pkg, "Manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("{}\n")
+        other = os.path.join(self.tmp.name, "PKG", "Manifest.json")
+        rels = [rel for rel, _ in manifest.walk(self.pkg, exclude=other)]
+        self.assertNotIn("Manifest.json", rels)
+        self.assertIn("root.dat", rels)
+
+    def test_create_replaces_a_manifest_under_another_case_and_verify_ignores_it(self):
+        if not self._case_insensitive(self.pkg):
+            self.skipTest("volume keeps case")
+        other = os.path.join(self.tmp.name, "PKG", "Manifest.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(manifest.create(self.pkg, other, jobs=1), 0)
+            self.assertEqual(manifest.create(self.pkg, other, jobs=1), 0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(manifest.verify(self.pkg, other, jobs=1), 0)
+        self.assertEqual(out.getvalue(), "OK\n")
+        self.assertNotIn("Manifest.json", manifest.load_manifest(other))
+
+    def test_create_refuses_another_case_of_a_hashed_file(self):
+        if not self._case_insensitive(self.pkg):
+            self.skipTest("volume keeps case")
+        target = os.path.join(self.tmp.name, "PKG", "ROOT.DAT")
+        with open(os.path.join(self.pkg, "root.dat"), "rb") as f:
+            before = f.read()
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(manifest.ManifestError):
+            manifest.create(self.pkg, target, jobs=1)
+        with open(os.path.join(self.pkg, "root.dat"), "rb") as f:
+            self.assertEqual(f.read(), before)
+
     def test_walk_reports_an_unreadable_subdirectory(self):
         blocked = os.path.join(self.pkg, "sub", "deep")
         scandir = os.scandir
