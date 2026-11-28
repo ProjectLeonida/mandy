@@ -407,9 +407,10 @@ public:
     ShadowPages(const ShadowPages&) = delete;
     ShadowPages& operator=(const ShadowPages&) = delete;
 
-    // What the GPU writes into the copies of [from, to) goes back to the title's pages. Returns the bytes written.
-    // Called before the next refresh, so a page the title writes again is copied forward over the result, as on a GPU
-    // that shares the memory.
+    // What the GPU writes into the copies of the ranges [first, second) goes back to the title's pages: `count` of
+    // them, sorted by start. Returns the bytes written, and in `reached` (when given) how many of the ranges wrote
+    // any. Called before the next refresh, so a page the title writes again is copied forward over the result, as on
+    // a GPU that shares the memory.
     //
     // Only the bytes a copy holds differently from the title's page go back, and only on a page known unchanged since
     // it was copied: guarded (read-only since that copy), or write-watched and found unwritten by an asking made here.
@@ -419,11 +420,29 @@ public:
     // where opening them for a whole copy lost a write made between the opening and the copy; and of two copies of
     // the same bytes only the one that differs is written, where the last one won.
     //
+    // All the finished ranges over this tracker come in one call, and which pages are held is decided once for all of
+    // them, before the first copy. One call per range made the first range that differed reopen its page (kProtected
+    // gone), and every later range on that page then read as written by the title and was dropped, though only this
+    // write-back had written there (73N1X, #1608: of 130 four-byte ranges 256 bytes apart, 9 went back). A page
+    // opened here is open to the title until the next refresh guards it again, as it was for the pieces of one range
+    // after the first.
+    //
     // `only` (a retired window's copy, when it is freed): that copy alone goes back, where no live copy changed the
     // bytes; the live copies' own results wait for their submissions' batches.
-    std::size_t write_back(std::uintptr_t from, std::uintptr_t to, const std::uint8_t* only = nullptr) {
-        from = std::max(from, first_), to = std::min(to, last_);
-        if (from >= to) return 0;
+    std::size_t write_back(const std::pair<std::uintptr_t, std::uintptr_t>* ranges, std::size_t count,
+                           std::size_t* reached = nullptr, const std::uint8_t* only = nullptr) {
+        if (reached) *reached = 0;
+        std::uintptr_t lo = last_, hi = first_;  // the pages the ranges cover
+        for (std::size_t r = 0; r < count; ++r) {
+            const std::uintptr_t from = std::max(ranges[r].first, first_), to = std::min(ranges[r].second, last_);
+            if (from >= to) continue;
+            lo = std::min(lo, from & ~(kPage - 1));
+            hi = std::max(hi, (to + kPage - 1) & ~(kPage - 1));
+        }
+        if (lo >= hi) return 0;
+        // Sized before lock_ is taken: a thread that faults on a guarded page waits on lock_ in reopen(), and may hold
+        // the heap's lock while it does. Only write_back uses it, and one write_back runs at a time (shadow_mutex).
+        held_pages_.resize((hi - lo) / kPage);
         AcquireSRWLockExclusive(&lock_);
         // The copies below can fault on a page another guard (the geometry watch, another view's shadow) keeps
         // read-only. The fault handler asks this tracker too (reopen), and must not take lock_ again on this thread:
@@ -445,101 +464,122 @@ public:
             ReleaseSRWLockExclusive(&lock_);
             return 0;
         }
-        leonida::kernel_writes::for_each_pin(from, to, [&](std::uintptr_t a, std::uintptr_t b) {
-            for (std::uintptr_t p = std::max(a, from) & ~(kPage - 1); p < std::min(b, to); p += kPage)
-                state_[(p - first_) / kPage] |= kPinned;
-            pinned_ = true;
-        });
+        for (std::size_t r = 0; r < count; ++r) {
+            const std::uintptr_t from = std::max(ranges[r].first, first_), to = std::min(ranges[r].second, last_);
+            if (from >= to) continue;
+            leonida::kernel_writes::for_each_pin(from, to, [&](std::uintptr_t a, std::uintptr_t b) {
+                for (std::uintptr_t p = std::max(a, from) & ~(kPage - 1); p < std::min(b, to); p += kPage)
+                    state_[(p - first_) / kPage] |= kPinned;
+                pinned_ = true;
+            });
+        }
         ask_written_locked();
         // A page the title wrote since it was last copied holds the newer bytes already: its GPU result is dropped and
         // the refresh's own copy carries the title's. So is a page whose mapping changed, one a kernel write may be
         // filling, and one xmem maps at another address too (a write there is seen by no guard and no watch here).
-        // Decided for every page before the first copy: a copy below can fault on another guard, and the handler then
-        // reopens the whole 64 KiB tile here on this thread (reopen_range), which clears kClean and kProtected there.
-        // Read live, that made the later runs in the tile count as written by the title, and their GPU results were
-        // dropped from a batch already taken off the queue. A page the title wrote before this point is held still.
-        const std::size_t p0 = (from - first_) / kPage, p1 = (to - first_ + kPage - 1) / kPage;
-        held_pages_.resize(p1 - p0);
-        for (std::size_t i = p0; i < p1; ++i) {
-            const std::uint8_t s = state_[i];
-            held_pages_[i - p0] = (s & (kZero | kRequery | kPinned | kAliased)) || (!(s & kProtected) && !(s & kClean));
+        // Decided for every page of every range before the first copy (#2468, RT-WRITEBACK-TILE-REOPEN, and this
+        // call's other ranges): a copy below can fault on another guard, and the handler then reopens the whole 64 KiB
+        // tile here on this thread (reopen_range), which clears kClean and kProtected there; and a range that differs
+        // reopens its pages itself. Read live, either made the later runs on those pages count as written by the
+        // title, and their GPU results were dropped from a batch already taken off the queue. A page the title wrote
+        // before this point is held still.
+        const std::size_t p0 = (lo - first_) / kPage;
+        for (std::size_t r = 0; r < count; ++r) {
+            const std::uintptr_t from = std::max(ranges[r].first, first_), to = std::min(ranges[r].second, last_);
+            if (from >= to) continue;
+            for (std::size_t i = (from - first_) / kPage, i1 = (to - first_ + kPage - 1) / kPage; i < i1; ++i) {
+                const std::uint8_t s = state_[i];
+                held_pages_[i - p0] =
+                    (s & (kZero | kRequery | kPinned | kAliased)) || (!(s & kProtected) && !(s & kClean));
+            }
         }
         const auto held = [&](std::size_t i) { return held_pages_[i - p0] != 0; };
         constexpr std::uintptr_t kPiece = 256;  // compared and copied in pieces this size
         std::size_t written = 0;
-        for (std::uintptr_t at = from & ~(kPage - 1); at < ((to + kPage - 1) & ~(kPage - 1));) {
-            std::size_t pages = 0;
-            while (at + (pages + 1) * kPage <= ((to + kPage - 1) & ~(kPage - 1)) &&
-                   held((at - first_) / kPage + pages) == held((at - first_) / kPage))
-                ++pages;
-            if (!held((at - first_) / kPage)) {
-                const std::uintptr_t a = std::max(at, from), b = std::min(at + pages * kPage, to);
-                bool opened = false;
-                Vector<const Target*> over;    // the targets with bytes in [a, b)
-                for (const Target& t : targets_)
-                    if (t.shadow && std::max(a, t.begin) < std::min(b, t.end)) over.push_back(&t);
-                // Piece by piece, against the title's bytes as they were before any copy went back here: a copy goes
-                // back on the bytes it holds differently from those, so one that still holds them is not written over
-                // another's result. A retired window's copy (retire_target) goes back only on bytes no live copy
-                // changed: what a submission wrote in it is older than what a live copy holds (the range that
-                // replaced it serves every submission recorded since). Byte by byte, as two copies can share a piece
-                // with disjoint bytes each.
-                for (std::uintptr_t c = a; c < b && !over.empty();) {
-                    const std::uintptr_t e = std::min(b, (c + kPiece) & ~(kPiece - 1));
-                    std::uint8_t before[kPiece];
-                    bool live[kPiece];  // the bytes a live copy changed, once `saved`
-                    bool saved = false;
-                    for (int pass = 0; pass < 2; ++pass)
-                        for (const Target* t : over) {
-                            if (t->retired != (pass == 1) || (only && pass == 1 && t->shadow != only)) continue;
-                            const std::uintptr_t x = std::max(c, t->begin), y = std::min(e, t->end);
-                            if (x >= y) continue;
-                            const std::uint8_t* copy = t->shadow + (x - t->begin);
-                            const void* now = saved ? static_cast<const void*>(before + (x - c))
-                                                    : reinterpret_cast<const void*>(x);
-                            if (std::memcmp(now, copy, y - x) == 0) continue;
-                            if (!saved) {
-                                std::memcpy(before, reinterpret_cast<const void*>(c), e - c);
-                                std::fill_n(live, e - c, false);
-                                saved = true;
-                            }
-                            const auto goes = [&](std::uintptr_t v) {
-                                return copy[v - x] != before[v - c] && !(pass == 1 && live[v - c]);
-                            };
-                            for (std::uintptr_t i = x; i < y;) {
-                                if (!goes(i)) {
-                                    ++i;
-                                    continue;
+        for (std::size_t r = 0; r < count; ++r) {
+            const std::uintptr_t from = std::max(ranges[r].first, first_), to = std::min(ranges[r].second, last_);
+            if (from >= to) continue;
+            const std::size_t range_written = written;
+            const std::uintptr_t end = (to + kPage - 1) & ~(kPage - 1);
+            for (std::uintptr_t at = from & ~(kPage - 1); at < end;) {
+                std::size_t pages = 0;
+                while (at + (pages + 1) * kPage <= end &&
+                       held((at - first_) / kPage + pages) == held((at - first_) / kPage))
+                    ++pages;
+                if (!held((at - first_) / kPage)) {
+                    const std::uintptr_t a = std::max(at, from), b = std::min(at + pages * kPage, to);
+                    bool opened = false;
+                    Vector<const Target*> over;    // the targets with bytes in [a, b)
+                    for (const Target& t : targets_)
+                        if (t.shadow && std::max(a, t.begin) < std::min(b, t.end)) over.push_back(&t);
+                    // Piece by piece, against the title's bytes as they were before any copy went back here: a copy goes
+                    // back on the bytes it holds differently from those, so one that still holds them is not written over
+                    // another's result. A retired window's copy (retire_target) goes back only on bytes no live copy
+                    // changed: what a submission wrote in it is older than what a live copy holds (the range that
+                    // replaced it serves every submission recorded since). Byte by byte, as two copies can share a piece
+                    // with disjoint bytes each.
+                    for (std::uintptr_t c = a; c < b && !over.empty();) {
+                        const std::uintptr_t e = std::min(b, (c + kPiece) & ~(kPiece - 1));
+                        std::uint8_t before[kPiece];
+                        bool live[kPiece];  // the bytes a live copy changed, once `saved`
+                        bool saved = false;
+                        for (int pass = 0; pass < 2; ++pass)
+                            for (const Target* t : over) {
+                                if (t->retired != (pass == 1) || (only && pass == 1 && t->shadow != only)) continue;
+                                const std::uintptr_t x = std::max(c, t->begin), y = std::min(e, t->end);
+                                if (x >= y) continue;
+                                const std::uint8_t* copy = t->shadow + (x - t->begin);
+                                const void* now = saved ? static_cast<const void*>(before + (x - c))
+                                                        : reinterpret_cast<const void*>(x);
+                                if (std::memcmp(now, copy, y - x) == 0) continue;
+                                if (!saved) {
+                                    std::memcpy(before, reinterpret_cast<const void*>(c), e - c);
+                                    std::fill_n(live, e - c, false);
+                                    saved = true;
                                 }
-                                std::uintptr_t j = i + 1;
-                                while (j < y && goes(j)) ++j;
-                                if (pass == 0) std::fill(live + (i - c), live + (j - c), true);
-                                if (pass == 1 || !only) {  // `only`: the live copies' results wait for their batches
-                                    if (!opened) {
-                                        reopen_locked(at, at + pages * kPage);
-                                        opened = true;
+                                const auto goes = [&](std::uintptr_t v) {
+                                    return copy[v - x] != before[v - c] && !(pass == 1 && live[v - c]);
+                                };
+                                for (std::uintptr_t i = x; i < y;) {
+                                    if (!goes(i)) {
+                                        ++i;
+                                        continue;
                                     }
-                                    std::memcpy(reinterpret_cast<void*>(i), copy + (i - x), j - i);
-                                    written += j - i;
+                                    std::uintptr_t j = i + 1;
+                                    while (j < y && goes(j)) ++j;
+                                    if (pass == 0) std::fill(live + (i - c), live + (j - c), true);
+                                    if (pass == 1 || !only) {  // `only`: the live copies' results wait for their batches
+                                        if (!opened) {
+                                            // An earlier range on these pages may have reopened them already.
+                                            const std::size_t i0 = (at - first_) / kPage;
+                                            if (std::any_of(state_.begin() + i0, state_.begin() + i0 + pages,
+                                                            [](std::uint8_t page) { return page & kProtected; }))
+                                                reopen_locked(at, at + pages * kPage);
+                                            opened = true;
+                                        }
+                                        std::memcpy(reinterpret_cast<void*>(i), copy + (i - x), j - i);
+                                        written += j - i;
+                                    }
+                                    // A retired copy's bytes are the title's now: the copies that held the older ones
+                                    // take them too, as the next refresh would, so one read before it (the range that
+                                    // replaced the window, when the window is freed after this submission's refresh)
+                                    // is not behind the title. A copy that changed a byte keeps its own.
+                                    if (pass == 1)
+                                        for (const Target* o : over) {
+                                            if (o == t) continue;
+                                            for (std::uintptr_t v = std::max(i, o->begin); v < std::min(j, o->end); ++v)
+                                                if (o->shadow[v - o->begin] == before[v - c])
+                                                    o->shadow[v - o->begin] = copy[v - x];
+                                        }
+                                    i = j;
                                 }
-                                // A retired copy's bytes are the title's now: the copies that held the older ones
-                                // take them too, as the next refresh would, so one read before it (the range that
-                                // replaced the window, when the window is freed after this submission's refresh)
-                                // is not behind the title. A copy that changed a byte keeps its own.
-                                if (pass == 1)
-                                    for (const Target* o : over) {
-                                        if (o == t) continue;
-                                        for (std::uintptr_t v = std::max(i, o->begin); v < std::min(j, o->end); ++v)
-                                            if (o->shadow[v - o->begin] == before[v - c])
-                                                o->shadow[v - o->begin] = copy[v - x];
-                                    }
-                                i = j;
                             }
-                        }
-                    c = e;
+                        c = e;
+                    }
                 }
+                at += pages * kPage;
             }
-            at += pages * kPage;
+            if (reached && written != range_written) ++*reached;
         }
         writer_.store(0, std::memory_order_relaxed);
         ReleaseSRWLockExclusive(&lock_);
@@ -1493,7 +1533,7 @@ private:
     std::uintptr_t first_ = 0, last_ = 0;  // the pages covered
     SRWLOCK lock_ = SRWLOCK_INIT;          // state_, cover_, the targets, and the protection of the pages
     std::atomic<DWORD> writer_{0};         // the thread in write_back, which holds lock_ while it copies into the title
-    Vector<std::uint8_t> held_pages_;      // write_back's per-page decision, taken before its copies (under lock_)
+    Vector<std::uint8_t> held_pages_;      // write_back's per-page decision, taken before its copies
     Vector<std::uint8_t> state_;           // per 4 KiB page
     Vector<std::uint32_t> cover_;          // per 4 KiB page: the targets that read it
     Vector<Target> targets_;               // by start
@@ -3168,8 +3208,9 @@ struct DeviceState {
         for (auto it = shadows.begin(); it != shadows.end(); ++it) {
             ShadowPages& s = **it;
             if (!s.has_target(mapped)) continue;
-            title_write_back_total += s.write_back(static_cast<std::uintptr_t>(start),
-                                                   static_cast<std::uintptr_t>(start + size), mapped);
+            const std::pair<std::uintptr_t, std::uintptr_t> range{static_cast<std::uintptr_t>(start),
+                                                                  static_cast<std::uintptr_t>(start + size)};
+            title_write_back_total += s.write_back(&range, 1, nullptr, mapped);
             s.remove_target(mapped);
             if (!s.targets()) shadows.erase(it);
             return;
@@ -3801,14 +3842,21 @@ struct DeviceState {
                          1);
         }
         if (finished.empty()) return;
+        // Each shadow takes all the ranges over it in one call, in address order (batches can overlap), and decides
+        // which of its pages are held once for all of them (ShadowPages::write_back).
+        std::sort(finished.begin(), finished.end());
         std::uint64_t written = 0, ranges = 0;
-        for (const auto& [begin, end] : finished)
-            for (const ShadowPagesPtr& s : shadows)
-                if (end > s->first() && begin < s->last()) {
-                    const std::uint64_t bytes = s->write_back(begin, end);
-                    written += bytes;
-                    ranges += bytes != 0;
-                }
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> over;
+        for (const ShadowPagesPtr& s : shadows) {
+            over.clear();
+            for (const auto& [begin, end] : finished)
+                if (end > s->first() && begin < s->last())
+                    over.push_back({static_cast<std::uintptr_t>(begin), static_cast<std::uintptr_t>(end)});
+            if (over.empty()) continue;
+            std::size_t reached = 0;
+            written += s->write_back(over.data(), over.size(), &reached);
+            ranges += reached;
+        }
         title_write_back_total += written;
         if (!written) return;
         if (++title_write_back_calls <= 4 || !(title_write_back_calls & (title_write_back_calls - 1)))

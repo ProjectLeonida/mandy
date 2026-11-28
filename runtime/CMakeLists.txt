@@ -4051,6 +4051,10 @@ if(TARGET Vulkan::Headers)
       # The same fault with a later run of the write-back in the tile it reopened: that run's GPU words go back too.
       add_test(NAME d3d12_title_window_write_back_fault_tile COMMAND d3d12_title_va_test --window-writeback-fault-tile)
       set_tests_properties(d3d12_title_window_write_back_fault_tile PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+      # Disjoint write-back ranges on one guarded page: every one of them reaches the page, not only the first
+      # (RT-TITLE-WRITEBACK-SAME-PAGE-RANGES).
+      add_test(NAME d3d12_title_window_write_back_ranges COMMAND d3d12_title_va_test --window-writeback-ranges)
+      set_tests_properties(d3d12_title_window_write_back_ranges PROPERTIES SKIP_RETURN_CODE 77)
       # The same return copy for a slot-133 buffer's shadow (the write-back of a compute result the title reads again).
       add_test(NAME d3d12_placed_write_back COMMAND d3d12_title_va_test --placed-writeback)
       set_tests_properties(d3d12_placed_write_back PROPERTIES SKIP_RETURN_CODE 77)
