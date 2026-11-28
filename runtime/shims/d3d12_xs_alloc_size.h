@@ -171,13 +171,16 @@ inline UINT64 console_depth_stencil_size(const D3D12_RESOURCE_DESC& desc) {
 
 // The console's size and alignment of a texture nothing renders or stores to (no render-target, depth-stencil or
 // unordered-access flag): XG's layout of the description (xg_xs_layout.h; the default swizzle mode when the layout
-// word names none). False when XG's model does not take the description: the PC answer then stands.
+// word names none). False when XG's model does not take the description: the PC answer then stands. `title_layout` is
+// the layout word as the title wrote it (row-major 1, or 0x100 | swizzle mode), which the PC form of the description
+// (pc_resource_desc) has lost.
 //
 // Why exact: the title keeps this size in its streaming tables and reads exactly that many bytes of the texture
 // from its archives through DirectStorage; a compressed chunk must be read whole, and the title stops on an int3
 // when the size it was given is smaller than the chunk. Measured with a debugger at that int3: a
 // request of 0x2000 bytes for a chunk that spans 0x4000, the PC answer for the texture being half the console's.
-inline bool console_texture_layout(const D3D12_RESOURCE_DESC& desc, UINT64& size, UINT64& alignment) {
+inline bool console_texture_layout(const D3D12_RESOURCE_DESC& desc, UINT title_layout, UINT64& size,
+                                   UINT64& alignment) {
     constexpr UINT gpu_written = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
@@ -190,6 +193,7 @@ inline bool console_texture_layout(const D3D12_RESOURCE_DESC& desc, UINT64& size
     xg.alignment = 0;
     xg.quality = 0;
     xg.flags = 0;
+    xg.layout = title_layout;
     if (xg.layout != 1 && (xg.layout & ~0x1fu) != rt::xg_xs::kSwizzled) xg.layout = 0;  // XG's default mode
     static thread_local rt::xg_xs::Texture texture;  // 7 KiB: not on a title thread's stack
     texture = {};
@@ -250,20 +254,20 @@ inline UINT64 align_up_saturating(UINT64 value, UINT64 to) {
 // descriptions laid out in that way.
 //
 // `title_descs` is the title's own array when `descs` is its PC form, for the layout words the PC form drops
-// (console_unordered_access_size); null when `descs` is the title's array.
+// (console_texture_layout, console_unordered_access_size); null when `descs` is the title's array.
 template <class PcOne>
 bool console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, PcOne pc_one,
                        D3D12_RESOURCE_ALLOCATION_INFO& total, D3D12_RESOURCE_ALLOCATION_INFO1* each,
                        const D3D12_RESOURCE_DESC* title_descs = nullptr) {
     if (!descs) return false;
-    const auto unordered_access = [&](UINT i) {
-        return console_unordered_access_size(descs[i], static_cast<UINT>((title_descs ? title_descs : descs)[i].Layout));
-    };
+    const auto title_layout = [&](UINT i) { return static_cast<UINT>((title_descs ? title_descs : descs)[i].Layout); };
+    const auto unordered_access = [&](UINT i) { return console_unordered_access_size(descs[i], title_layout(i)); };
     bool any_target = false;
     for (UINT i = 0; i < count && !any_target; ++i) {
         UINT64 xg_size = 0, xg_alignment = 0;
         any_target = console_render_target_size(descs[i]) != 0 || console_depth_stencil_size(descs[i]) != 0 ||
-                     console_texture_layout(descs[i], xg_size, xg_alignment) || unordered_access(i) != 0;
+                     console_texture_layout(descs[i], title_layout(i), xg_size, xg_alignment) ||
+                     unordered_access(i) != 0;
     }
     if (!any_target) return false;
     // Two passes when `each` is wanted: the first decides, the second writes, so a refusal or a list that does not
@@ -277,7 +281,8 @@ bool console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, PcOne pc_on
             if (one.SizeInBytes == UINT64_MAX || !one.Alignment) return false;
             UINT64 size = one.SizeInBytes;
             // A texture only the CPU fills takes XG's size and alignment, whichever way they differ.
-            if (UINT64 xg_size = 0, xg_alignment = 0; console_texture_layout(descs[i], xg_size, xg_alignment)) {
+            if (UINT64 xg_size = 0, xg_alignment = 0;
+                console_texture_layout(descs[i], title_layout(i), xg_size, xg_alignment)) {
                 if (xg_size != size || xg_alignment != one.Alignment) grows = true;
                 size = xg_size;
                 one.Alignment = xg_alignment;

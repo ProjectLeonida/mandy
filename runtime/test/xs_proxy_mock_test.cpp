@@ -3047,6 +3047,60 @@ int check_render_target_sizes() {
     unknown_mode.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x11b);  // SW_64KB_R_X
     EXPECT(ask(&unknown_mode, 1).SizeInBytes == 0x30000);
 
+    // A texture only the CPU fills (no render-target, depth-stencil or unordered-access flag) takes XG's size and
+    // alignment in the swizzle mode the title's layout word names, though the PC form of the description has lost
+    // the word. A 64 x 64 BC7 texture in 0x109 (SW_64KB_S) is one 64 KiB block; with the mode left to XG it would be
+    // 4 KiB. A 32 x 32 RGBA8 texture in 0x100 (linear) is 32 rows of 256 bytes, 8 KiB at 256 bytes; left to XG, 4 KiB.
+    D3D12_RESOURCE_DESC streamed{};
+    streamed.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    streamed.Width = 64;
+    streamed.Height = 64;
+    streamed.DepthOrArraySize = 1;
+    streamed.MipLevels = 1;
+    streamed.Format = DXGI_FORMAT_BC7_UNORM;
+    streamed.SampleDesc.Count = 1;
+    streamed.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x109);
+    info = ask(&streamed, 1);
+    EXPECT(info.SizeInBytes == 65536 && info.Alignment == 65536);
+    D3D12_RESOURCE_DESC streamed_default = streamed;
+    streamed_default.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    info = ask(&streamed_default, 1);
+    EXPECT(info.SizeInBytes == 4096 && info.Alignment == 4096);
+    D3D12_RESOURCE_DESC linear{};
+    linear.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    linear.Width = 32;
+    linear.Height = 32;
+    linear.DepthOrArraySize = 1;
+    linear.MipLevels = 1;
+    linear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    linear.SampleDesc.Count = 1;
+    linear.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x100);
+    info = ask(&linear, 1);
+    EXPECT(info.SizeInBytes == 8192 && info.Alignment == 256);
+    D3D12_RESOURCE_DESC linear_default = linear;
+    linear_default.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    info = ask(&linear_default, 1);
+    EXPECT(info.SizeInBytes == 4096 && info.Alignment == 4096);
+    // Slot 108 (GetResourceAllocationInfo2, on a device with PC slot 68) gives the same per-description answer.
+    {
+        Mock* mock8 = nullptr;
+        void* device8 = make_device(mock8, 9, true);
+        EXPECT(device8);
+        using Info2Fn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
+                                                                 const D3D12_RESOURCE_DESC*,
+                                                                 D3D12_RESOURCE_ALLOCATION_INFO1*);
+        const auto get_info2 =
+            reinterpret_cast<Info2Fn>((*reinterpret_cast<void* const* const*>(device8))[108]);
+        for (const D3D12_RESOURCE_DESC* d : {&streamed, &linear}) {
+            D3D12_RESOURCE_ALLOCATION_INFO total{};
+            D3D12_RESOURCE_ALLOCATION_INFO1 one{};
+            const D3D12_RESOURCE_ALLOCATION_INFO want = ask(d, 1);
+            EXPECT(get_info2(&total, device8, 0, 1, d, &one) == &total);
+            EXPECT(one.SizeInBytes == want.SizeInBytes && one.Alignment == want.Alignment && one.Offset == 0);
+        }
+        EXPECT(release(device8) == 0 && mock8->refs == 0);
+    }
+
     // The PC form (this in RCX, the buffer in RDX) is not the title's call: it gets the PC device's own size, 127
     // units of 64 KiB for the mock, so code that compares the proxy with the PC device still agrees.
     D3D12_RESOURCE_ALLOCATION_INFO pc{};
