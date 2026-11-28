@@ -670,7 +670,19 @@ private:
             if (splash_capture_only_) {
                 splash_capture_only_ = false;
                 capture_ = false;
-                release_capture();
+                if (present_dump::should_release_capture_after_splash(true, dump_.enabled())) {
+                    // Wait for every ring slot before freeing the shared capture buffer: finish_startup_frame()
+                    // waited only on `frame.done`, while the other frame may still be copying into it.
+                    bool idle = true;
+                    for (const Frame& pending : frames_) {
+                        if (pending.done &&
+                            context_.observe_result(vkWaitForFences_(device, 1, &pending.done, VK_TRUE, UINT64_MAX),
+                                                    "vkWaitForFences (splash release capture)") != VK_SUCCESS) {
+                            idle = false;
+                        }
+                    }
+                    if (idle) release_capture();
+                }
             }
         }
         if (submitted != VK_SUCCESS) return give_back(frame, submitted);
@@ -684,7 +696,9 @@ private:
             if (dump_.due(shown - 1)) {
                 // Presentation is already queued and the queue/tracker locks are released. A sampled frame
                 // may stall here for its transfer fence and a private CPU copy. PNG and disk I/O run on a worker.
-                if (vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX) == VK_SUCCESS)
+                if (!capture_ptr_ || !capture_size_)
+                    dump_.disable("present dump capture buffer unavailable");
+                else if (vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX) == VK_SUCCESS)
                     dump_.save(shown, extent_, format_, dump_pq_, capture_ptr_, size_t(capture_size_));
                 else
                     dump_.disable("present dump fence wait failed");
@@ -1383,7 +1397,10 @@ private:
         info.size = capture_size_;
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        if (vk.vkCreateBuffer(device, &info, nullptr, &capture_buffer_) != VK_SUCCESS) return false;
+        if (vk.vkCreateBuffer(device, &info, nullptr, &capture_buffer_) != VK_SUCCESS) {
+            capture_size_ = 0;
+            return false;
+        }
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device, capture_buffer_, &requirements);
         VkPhysicalDeviceMemoryProperties memory{};
@@ -1417,6 +1434,7 @@ private:
         if (capture_buffer_) vk.vkDestroyBuffer(device, capture_buffer_, nullptr);
         capture_memory_ = VK_NULL_HANDLE;
         capture_buffer_ = VK_NULL_HANDLE;
+        capture_size_ = 0;
         capture_ptr_ = nullptr;
         captured_ = false;
     }

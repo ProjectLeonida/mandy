@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <string_view>
 
 #define EXPECT(condition) do { \
@@ -30,7 +31,7 @@ int main(int argc, char** argv) {
     testfiles::ScratchDir scratch("leonida_present_dump");
     const fs::path dir = scratch.path() / "frames";
     const std::string_view mode = argc == 2 ? argv[1] : "";
-    EXPECT(mode.empty() || mode == "--default" || mode == "--invalid");
+    EXPECT(mode.empty() || mode == "--default" || mode == "--invalid" || mode == "--splash");
     const int interval = mode == "--default" ? 60 : 2;
     const auto setting = dir.wstring() + (mode == "--default" ? L"" : mode == "--invalid" ? L",0" : L",2");
     EXPECT(_wputenv_s(L"LEONIDA_PRESENT_DUMP", setting.c_str()) == 0);
@@ -60,10 +61,17 @@ int main(int argc, char** argv) {
     back.image = d.image(back.format, 2, 2, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     EXPECT(back.image);
     context.add_resource(1, back, VK_IMAGE_LAYOUT_UNDEFINED);
+    ResourceBinding splash = back;
+    splash.image = d.image(splash.format, 2, 2, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    EXPECT(splash.image);
+    context.add_resource(2, splash, VK_IMAGE_LAYOUT_UNDEFINED);
     CommandList commands;
     EXPECT(commands.transition({1, 0, d3d12_state::common, d3d12_state::render_target}));
     EXPECT(commands.clear_render_target({1, 0, 0, 1}, {1.0f, 0.4f, 0.0f, 1.0f}));
     EXPECT(commands.transition({1, 0, d3d12_state::render_target, d3d12_state::common}));
+    EXPECT(commands.transition({2, 0, d3d12_state::common, d3d12_state::render_target}));
+    EXPECT(commands.clear_render_target({2, 0, 0, 1}, {0.0f, 0.0f, 1.0f, 1.0f}));
+    EXPECT(commands.transition({2, 0, d3d12_state::render_target, d3d12_state::common}));
     EXPECT(commands.close());
     const CommandList* list = &commands;
     EXPECT(queue.execute({&list, 1}) == ReplayResult::success);
@@ -78,13 +86,27 @@ int main(int argc, char** argv) {
         VulkanPresenter presenter(context, d.instance_proc, d.instance, d.physical, d.queue, d.family, surface,
                                   false, [] { return VkExtent2D{width, height}; });
         EXPECT(presenter.ok());
-        EXPECT(presenter.present(1, true) == VK_SUCCESS);
-        for (int i = 1; i < interval; ++i) EXPECT(presenter.present_blank(true) == VK_SUCCESS);
-        PresentPlanes planes;
-        planes.plane[0].source = 1;
-        planes.plane[0].dest[3] = 0.5f;
-        EXPECT(presenter.present_planes(planes, true) == VK_SUCCESS);
-        EXPECT(presenter.presented() == unsigned(interval + 1) && presenter.composed_presents() == 1);
+        if (mode == "--splash") {
+            // Launch splash enables capture only for splash handoff; dismissing it on a non-black title frame
+            // must keep the capture buffer alive while LEONIDA_PRESENT_DUMP is active.
+            EXPECT(presenter.present_splash(2, std::make_shared<int>(1)));  // frame 1 (due: blue splash)
+            EXPECT(presenter.present_blank(true) == VK_SUCCESS);            // frame 2 (splash stays up)
+            EXPECT(presenter.present(1, true) == VK_SUCCESS);               // frame 3 (handoff + due: orange)
+            EXPECT(presenter.present_blank(true) == VK_SUCCESS);            // frame 4
+            PresentPlanes planes;
+            planes.plane[0].source = 1;
+            planes.plane[0].dest[3] = 0.5f;
+            EXPECT(presenter.present_planes(planes, true) == VK_SUCCESS);   // frame 5 (post-handoff due: composed)
+            EXPECT(presenter.presented() == 5 && presenter.composed_presents() == 1);
+        } else {
+            EXPECT(presenter.present(1, true) == VK_SUCCESS);
+            for (int i = 1; i < interval; ++i) EXPECT(presenter.present_blank(true) == VK_SUCCESS);
+            PresentPlanes planes;
+            planes.plane[0].source = 1;
+            planes.plane[0].dest[3] = 0.5f;
+            EXPECT(presenter.present_planes(planes, true) == VK_SUCCESS);
+            EXPECT(presenter.presented() == unsigned(interval + 1) && presenter.composed_presents() == 1);
+        }
     }
     DestroyWindow(window);
     EXPECT(d.validation_errors() == 0);
@@ -94,20 +116,31 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (mode == "--default") EXPECT(fs::file_size(sentinel) == 1 && std::ifstream(sentinel).get() == 'X');
-    for (bool composed : {false, true}) {
-        const auto* name = !composed ? "present_000001.png" : interval == 2 ? "present_000003.png" : "present_000061.png";
+    const auto verify_png = [&](const char* name, std::array<std::uint8_t, 4> top, std::array<std::uint8_t, 4> bottom) {
         PixelSurface png;
         EXPECT(ReadPngFile(dir / name, png));
         EXPECT(png.width == width && png.height == height);
         for (int y = 0; y < height; ++y) {
-            const bool black = composed && y >= height / 2;
-            const std::array<std::uint8_t, 4> expected = black ? std::array<std::uint8_t, 4>{0, 0, 0, 255}
-                                                               : std::array<std::uint8_t, 4>{255, 102, 0, 255};
+            const auto expected = y >= height / 2 ? bottom : top;
             for (int x = 0; x < width; ++x)
                 EXPECT(std::equal(expected.begin(), expected.end(), png.At(x, y)));
         }
+        return 0;
+    };
+    constexpr std::array<std::uint8_t, 4> orange{255, 102, 0, 255};
+    constexpr std::array<std::uint8_t, 4> blue{0, 0, 255, 255};
+    constexpr std::array<std::uint8_t, 4> black{0, 0, 0, 255};
+    if (mode == "--splash") {
+        if (verify_png("present_000001.png", blue, blue) != 0) return 1;
+        if (verify_png("present_000003.png", orange, orange) != 0) return 1;
+        if (verify_png("present_000005.png", orange, black) != 0) return 1;
+        EXPECT(std::distance(fs::directory_iterator(dir), fs::directory_iterator{}) == 3);
+    } else {
+        if (verify_png("present_000001.png", orange, orange) != 0) return 1;
+        const auto* composed_name = interval == 2 ? "present_000003.png" : "present_000061.png";
+        if (verify_png(composed_name, orange, black) != 0) return 1;
+        EXPECT(std::distance(fs::directory_iterator(dir), fs::directory_iterator{}) == 2);
     }
-    EXPECT(std::distance(fs::directory_iterator(dir), fs::directory_iterator{}) == 2);
     CoUninitialize();
     return 0;
 }

@@ -33,6 +33,22 @@ inline unsigned texel_size(VkFormat format) {
     }
 }
 
+// Whether dismissing the launch splash should free the presenter's capture buffer:
+// only when the splash itself enabled capture and LEONIDA_PRESENT_DUMP is not keeping the buffer alive.
+inline constexpr bool should_release_capture_after_splash(bool splash_capture_only, bool dump_enabled) {
+    return splash_capture_only && !dump_enabled;
+}
+
+// Validates that `src` holds at least `extent.width * extent.height * texel_size(format)` bytes without overflow.
+inline bool valid_frame_buffer(VkExtent2D extent, VkFormat format, const std::uint8_t* src, size_t size,
+                               size_t* needed = nullptr) {
+    const unsigned stride = texel_size(format);
+    if (!src || !stride || !extent.width || !extent.height) return false;
+    if (size / stride / extent.width < extent.height) return false;
+    if (needed) *needed = size_t(extent.width) * extent.height * stride;
+    return true;
+}
+
 inline std::uint8_t unorm8(float v) {
     return v > 0 ? std::uint8_t(std::min(v, 1.0f) * 255 + 0.5f) : 0;
 }
@@ -199,10 +215,15 @@ public:
             // Bound memory to one outstanding write even at N=1. Teardown joins the final writer.
             if (writer_.joinable()) writer_.join();
             if (!enabled()) return;
+            size_t needed = 0;
+            if (!valid_frame_buffer(extent, format, src, size, &needed)) {
+                disable("present dump buffer is missing or smaller than the frame");
+                return;
+            }
             char name[48];
             std::snprintf(name, sizeof(name), "present_%06llu.png", static_cast<unsigned long long>(frame));
             writer_ = std::jthread([this, frame, extent, format, pq, path = dir_ / name,
-                                    bytes = std::vector<std::uint8_t>(src, src + size)] {
+                                    bytes = std::vector<std::uint8_t>(src, src + needed)] {
                 try {
                     if (publish(path, extent, format, pq, bytes.data())) {
                         const auto utf8 = path.u8string();
