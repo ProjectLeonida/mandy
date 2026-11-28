@@ -18512,22 +18512,40 @@ _FLOAT_ONLY_IMAGE_OPS = frozenset({"image_load", "image_load_mip", "image_sample
 # VALU ops whose VGPR source operands are strictly IEEE binary32 float (never raw integer/bitfield ops).
 _F32_ONLY_CONSUMERS = frozenset({
     "v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32", "v_mul_legacy_f32",
-    "v_mac_f32", "v_fmac_f32", "v_fma_f32", "v_mad_f32", "v_mad_legacy_f32", "v_madak_f32", "v_madmk_f32",
-    "v_min_f32", "v_max_f32", "v_med3_f32", "v_rcp_f32", "v_rcp_iflag_f32", "v_rsq_f32", "v_sqrt_f32",
+    "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f32", "v_fma_f32", "v_fma_legacy_f32",
+    "v_fmaak_f32", "v_fmamk_f32", "v_mad_f32", "v_mad_legacy_f32", "v_madak_f32", "v_madmk_f32",
+    "v_min_f32", "v_max_f32", "v_min3_f32", "v_max3_f32", "v_med3_f32",
+    "v_rcp_f32", "v_rcp_iflag_f32", "v_rsq_f32", "v_sqrt_f32",
     "v_log_f32", "v_exp_f32", "v_sin_f32", "v_cos_f32", "v_floor_f32", "v_ceil_f32", "v_trunc_f32",
     "v_rndne_f32", "v_fract_f32", "v_cvt_f16_f32", "v_cvt_pkrtz_f16_f32", "v_cvt_pknorm_i16_f32",
-    "v_cvt_pknorm_u16_f32", "v_cvt_pk_u8_f32", "v_cvt_u32_f32", "v_cvt_i32_f32", "v_cvt_f64_f32",
+    "v_cvt_pknorm_u16_f32", "v_cvt_u32_f32", "v_cvt_i32_f32", "v_cvt_f64_f32",
     "v_cvt_rpi_i32_f32", "v_cvt_flr_i32_f32", "v_frexp_mant_f32", "v_frexp_exp_i32_f32",
+    "v_cubema_f32", "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32",
+    "v_div_fixup_f32", "v_div_fmas_f32", "v_div_scale_f32",
 })
 
 # VALU ops whose VGPR source operands are strictly IEEE binary16 float (packed or scalar f16).
 _F16_ONLY_CONSUMERS = frozenset({
-    "v_add_f16", "v_sub_f16", "v_subrev_f16", "v_mul_f16", "v_fma_f16", "v_fmac_f16",
-    "v_min_f16", "v_max_f16", "v_med3_f16", "v_rcp_f16", "v_rsq_f16", "v_sqrt_f16",
+    "v_add_f16", "v_sub_f16", "v_subrev_f16", "v_mul_f16",
+    "v_fma_f16", "v_fmac_f16", "v_fmaak_f16", "v_fmamk_f16",
+    "v_min_f16", "v_max_f16", "v_min3_f16", "v_max3_f16", "v_med3_f16",
+    "v_rcp_f16", "v_rsq_f16", "v_sqrt_f16",
     "v_log_f16", "v_exp_f16", "v_sin_f16", "v_cos_f16", "v_floor_f16", "v_ceil_f16",
-    "v_trunc_f16", "v_rndne_f16", "v_fract_f16", "v_pk_add_f16", "v_pk_mul_f16", "v_pk_fma_f16",
-    "v_pk_fmac_f16", "v_pk_min_f16", "v_pk_max_f16", "v_cvt_f32_f16", "v_cvt_u16_f16", "v_cvt_i16_f16",
+    "v_trunc_f16", "v_rndne_f16", "v_fract_f16",
+    "v_pk_add_f16", "v_pk_mul_f16", "v_pk_fma_f16", "v_pk_fmac_f16", "v_pk_min_f16", "v_pk_max_f16",
+    "v_cvt_f32_f16", "v_cvt_u16_f16", "v_cvt_i16_f16",
+    "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16", "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16",
+    "v_div_fixup_f16", "v_frexp_mant_f16", "v_frexp_exp_i16_f16",
 })
+
+
+def _arg_vgprs(arg):
+    """Set of VGPR indices named by a single parsed operand."""
+    if arg["k"] == "vgpr":
+        return set(range(arg["r"], arg["r"] + arg.get("n", 1)))
+    if arg["k"] == "vlist":
+        return set(arg["r"])
+    return set()
 
 
 def _is_ds_dst_only(bop):
@@ -18536,22 +18554,41 @@ def _is_ds_dst_only(bop):
             or "_rtn" in bop)
 
 
+def _permlane_preserves_dst(bop, mods):
+    """Whether v_permlane16_b32 / v_permlanex16_b32 may preserve vdst (FI=0 and BOUND_CTRL=0)."""
+    if bop not in ("v_permlane16_b32", "v_permlanex16_b32"):
+        return False
+    if "fi:1" in mods or "bound_ctrl:1" in mods:
+        return False
+    sel = next((m for m in mods if m.startswith("op_sel:")), None)
+    if sel is not None:
+        try:
+            bits = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")]
+        except (IndexError, ValueError):
+            return True
+        if (len(bits) >= 1 and bits[0]) or (len(bits) >= 2 and bits[1]):
+            return False
+    return True
+
+
 def _vgpr_reads_of(ins):
     """Set of VGPR indices read by instruction `ins` (matches read_before_write_vgprs + atomics/DS)."""
     a, op = ins["args"], ins["op"]
     if not a:
         return set()
     bop = base_op(op)
+    mods = ins.get("mods", ())
     reads_all = (op.startswith(VGPR_READ_ONLY_PREFIXES)
                  or bop.startswith(("buffer_atomic_", "image_atomic_", "flat_atomic_", "global_atomic_"))
+                 or (bop.startswith(("buffer_load", "tbuffer_load")) and "lds" in mods)
                  or (bop.startswith("ds_") and not _is_ds_dst_only(bop)))
     regs = set()
-    for x in (a if reads_all or sdwa_reads_dst(op, ins.get("mods", [])) else a[1:]):
+    for x in (a if reads_all or sdwa_reads_dst(op, mods) else a[1:]):
         if x["k"] == "vgpr":
             regs.update(range(x["r"], x["r"] + x.get("n", 1)))
         elif x["k"] == "vlist":
             regs.update(x["r"])
-    if (bop in DST_ALSO_READ or
+    if (bop in DST_ALSO_READ or _permlane_preserves_dst(bop, mods) or
             (op.startswith(("global_load_", "buffer_load_")) and "_d16" in op and "format" not in op)) and \
             a[0]["k"] == "vgpr":
         regs.add(a[0]["r"])
@@ -18564,24 +18601,52 @@ def _vgpr_full_writes_of(ins):
     if not a or op.endswith(("_sdwa", "_dpp")):
         return set()
     bop = base_op(op)
-    if bop == "v_writelane_b32":
+    mods = ins.get("mods", ())
+    if bop == "v_writelane_b32" or _permlane_preserves_dst(bop, mods):
         return set()
     if bop.startswith(("buffer_atomic_", "image_atomic_", "flat_atomic_", "global_atomic_")):
+        return set()
+    if bop.startswith(("buffer_load", "tbuffer_load")) and "lds" in mods:
         return set()
     if bop.startswith("ds_") and not _is_ds_dst_only(bop):
         return set()
     reads_all = op.startswith(VGPR_READ_ONLY_PREFIXES)
     if reads_all or a[0]["k"] != "vgpr":
         return set()
-    if "_d16" in op or "d16" in ins.get("mods", ()):
+    if "_d16" in op or "d16" in mods:
         return set()
+    if bop.startswith("image_"):
+        dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
+        try:
+            ncomp = bin(int(dm.split(":")[1], 0)).count("1")
+        except ValueError:
+            return set()
+        if ncomp <= 0:
+            return set()
+        return set(range(a[0]["r"], a[0]["r"] + min(ncomp, a[0].get("n", 1))))
     # Scalar 16-bit VALU ops preserve the unwritten 16-bit half of a[0], so never kill the full 32-bit VGPR.
     if (any(s in bop for s in ("_f16", "_u16", "_i16", "_b16"))
-            and not bop.startswith("v_pk_")
-            and not bop.startswith(("v_cvt_f32_", "v_cvt_u32_", "v_cvt_i32_", "v_pack_b32_",
-                                    "v_dot2", "v_dot4", "v_dot8"))):
+            and not bop.startswith(("v_pk_", "v_cvt_pk", "v_cvt_f32_", "v_cvt_u32_", "v_cvt_i32_",
+                                    "v_pack_b32_", "v_dot2", "v_dot4", "v_dot8"))):
         return set()
     return set(vgpr_dest_registers(ins))
+
+
+def _exec_monotone_widen(ins):
+    """Whether a writes_exec instruction only turns ON lanes (EXEC_new >= EXEC_old)."""
+    bop = base_op(ins["op"])
+    a = ins["args"]
+    if bop in ("s_or_saveexec_b32", "s_or_saveexec_b64"):
+        return True
+    if bop in ("s_or_b32", "s_or_b64") and len(a) >= 3 and a[0]["k"] == "special":
+        dst_t = a[0].get("t", "")
+        if dst_t in ("exec", "exec_lo", "exec_hi"):
+            return any(x["k"] == "special" and x.get("t") == dst_t for x in a[1:3])
+    if bop in ("s_wqm_b32", "s_wqm_b64") and len(a) >= 2 and a[0]["k"] == "special" and a[1]["k"] == "special":
+        dst_t = a[0].get("t", "")
+        if dst_t in ("exec", "exec_lo", "exec_hi") and a[1].get("t") == dst_t:
+            return True
+    return False
 
 
 def _is_float_consumer_of(ins, regs, d16):
@@ -18590,43 +18655,105 @@ def _is_float_consumer_of(ins, regs, d16):
     if raw_op.endswith("_sdwa"):
         return False
     bop = base_op(raw_op)
+    a = ins["args"]
+    mods = ins.get("mods", ())
+    if bop in ("v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16"):
+        selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
+        try:
+            hb = ([int(x) for x in selhi.split("[")[1].rstrip("]").split(",")] + [0, 0, 0])[:3]
+        except (IndexError, ValueError):
+            return False
+        f16_srcs, f32_srcs = set(), set()
+        for i in range(3):
+            if 1 + i < len(a):
+                (f16_srcs if hb[i] else f32_srcs).update(_arg_vgprs(a[1 + i]))
+        want, other = (f16_srcs, f32_srcs) if d16 else (f32_srcs, f16_srcs)
+        return bool(regs) and regs <= want and not (regs & other)
     if d16:
         if bop in _F16_ONLY_CONSUMERS:
             return True
-        if (bop.startswith(("v_cmp_", "v_cmpx_")) and bop.endswith("_f16") and "_class_" not in bop):
-            return True
+        if bop.startswith(("v_cmp_", "v_cmpx_")) and bop.endswith("_f16"):
+            if "_class_" not in bop:
+                return True
+            src0_idx = 0 if (bop.startswith("v_cmpx_") or len(a) == 2) else 1
+            s0 = _arg_vgprs(a[src0_idx]) if src0_idx < len(a) else set()
+            s1 = _arg_vgprs(a[src0_idx + 1]) if src0_idx + 1 < len(a) else set()
+            return bool(regs) and regs <= s0 and not (regs & s1)
+        if bop == "v_ldexp_f16":
+            s0 = _arg_vgprs(a[1]) if len(a) > 1 else set()
+            s1 = _arg_vgprs(a[2]) if len(a) > 2 else set()
+            return bool(regs) and regs <= s0 and not (regs & s1)
         if bop in ("v_dot2_f32_f16", "v_dot2c_f32_f16"):
             # src0 (a[1]) and src1 (a[2]) are f16x2; accumulator (a[3] / a[0]) is f32.
-            a = ins["args"]
-            f16_srcs = set()
-            for idx in (1, 2):
-                if idx < len(a) and a[idx]["k"] == "vgpr":
-                    f16_srcs.update(range(a[idx]["r"], a[idx]["r"] + a[idx].get("n", 1)))
+            f16_srcs = (_arg_vgprs(a[1]) if len(a) > 1 else set()) | (_arg_vgprs(a[2]) if len(a) > 2 else set())
             acc_idx = 3 if bop == "v_dot2_f32_f16" else 0
-            acc_regs = (set(range(a[acc_idx]["r"], a[acc_idx]["r"] + a[acc_idx].get("n", 1)))
-                        if acc_idx < len(a) and a[acc_idx]["k"] == "vgpr" else set())
+            acc_regs = _arg_vgprs(a[acc_idx]) if acc_idx < len(a) else set()
             return bool(regs) and regs <= f16_srcs and not (regs & acc_regs)
+        if bop == "v_pack_b32_f16" and not raw_op.endswith("_dpp") and len(a) >= 3:
+            # Plain v_pack_b32_f16 without sign/abs modifiers is also used to pack integer 16-bit halves
+            # (handled by transitive copy propagation below); with neg/abs it is strictly IEEE f16 sign/abs.
+            hit = [src for src in a[1:3] if _arg_vgprs(src) & regs]
+            return bool(hit) and all(src.get("neg") or src.get("abs") for src in hit)
         return False
     if bop in _F32_ONLY_CONSUMERS:
         return True
-    if (bop.startswith(("v_cmp_", "v_cmpx_")) and bop.endswith("_f32") and "_class_" not in bop):
-        return True
+    if bop.startswith(("v_cmp_", "v_cmpx_")) and bop.endswith("_f32"):
+        if "_class_" not in bop:
+            return True
+        src0_idx = 0 if (bop.startswith("v_cmpx_") or len(a) == 2) else 1
+        s0 = _arg_vgprs(a[src0_idx]) if src0_idx < len(a) else set()
+        s1 = _arg_vgprs(a[src0_idx + 1]) if src0_idx + 1 < len(a) else set()
+        return bool(regs) and regs <= s0 and not (regs & s1)
+    if bop == "v_ldexp_f32":
+        s0 = _arg_vgprs(a[1]) if len(a) > 1 else set()
+        s1 = _arg_vgprs(a[2]) if len(a) > 2 else set()
+        return bool(regs) and regs <= s0 and not (regs & s1)
+    if bop == "v_cvt_pk_u8_f32":
+        # src0 (a[1]) is f32; src1 (a[2], byte index) and src2 (a[3], packed u32) are integer.
+        s0 = _arg_vgprs(a[1]) if len(a) > 1 else set()
+        other = (_arg_vgprs(a[2]) if len(a) > 2 else set()) | (_arg_vgprs(a[3]) if len(a) > 3 else set())
+        return bool(regs) and regs <= s0 and not (regs & other)
     if bop in ("v_dot2_f32_f16", "v_dot2c_f32_f16"):
-        a = ins["args"]
         acc_idx = 3 if bop == "v_dot2_f32_f16" else 0
-        acc_regs = (set(range(a[acc_idx]["r"], a[acc_idx]["r"] + a[acc_idx].get("n", 1)))
-                    if acc_idx < len(a) and a[acc_idx]["k"] == "vgpr" else set())
-        f16_srcs = set()
-        for idx in (1, 2):
-            if idx < len(a) and a[idx]["k"] == "vgpr":
-                f16_srcs.update(range(a[idx]["r"], a[idx]["r"] + a[idx].get("n", 1)))
+        acc_regs = _arg_vgprs(a[acc_idx]) if acc_idx < len(a) else set()
+        f16_srcs = (_arg_vgprs(a[1]) if len(a) > 1 else set()) | (_arg_vgprs(a[2]) if len(a) > 2 else set())
         return bool(regs) and regs <= acc_regs and not (regs & f16_srcs)
+    if not raw_op.endswith("_dpp") and not mods:
+        # VOP3 float sign/abs modifiers (-v / |v|) on v_mov_b32 / v_cndmask_b32 interpret f32 sign bit.
+        if bop == "v_mov_b32" and len(a) >= 2 and (_arg_vgprs(a[1]) & regs):
+            return bool(a[1].get("neg") or a[1].get("abs"))
+        if bop == "v_cndmask_b32" and len(a) >= 3:
+            hit = [src for src in a[1:3] if _arg_vgprs(src) & regs]
+            return bool(hit) and all(src.get("neg") or src.get("abs") for src in hit)
     return False
+
+
+def _copy_prop_dst(ins, regs, d16):
+    """If `ins` is a pure register copy/select/pack forwarding `regs` into a single VGPR, return that dst VGPR."""
+    raw_op = ins["op"]
+    if raw_op.endswith(("_sdwa", "_dpp")):
+        return None
+    bop = base_op(raw_op)
+    a = ins["args"]
+    mods = ins.get("mods", ())
+    if not a or a[0]["k"] != "vgpr" or a[0].get("n", 1) != 1:
+        return None
+    if bop == "v_mov_b32" and not mods and len(a) >= 2 and a[1]["k"] == "vgpr" and a[1].get("n", 1) == 1:
+        if not a[1].get("neg") and not a[1].get("abs"):
+            return a[0]["r"]
+        return None
+    if bop == "v_cndmask_b32" and not mods and len(a) >= 3:
+        if d16 and any((src.get("neg") or src.get("abs")) for src in a[1:3] if _arg_vgprs(src) & regs):
+            return None
+        return a[0]["r"]
+    if d16 and bop == "v_pack_b32_f16" and len(a) >= 3:
+        return a[0]["r"]
+    return None
 
 
 def float_only_image_ops(blocks, succ):
     """Set of id(ins) for image_load/image_sample ops whose dest VGPRs are consumed solely by float ops."""
-    any_writes_exec = any(writes_exec(ins) for blk in blocks for ins in blk)
+    nb = len(blocks)
     out = set()
     for b_idx, blk in enumerate(blocks):
         for i_idx, ins in enumerate(blk):
@@ -18647,44 +18774,65 @@ def float_only_image_ops(blocks, succ):
             nregs = (ncomp + 1) // 2 if d16 else ncomp
             if nregs <= 0:
                 continue
-            dst_regs = frozenset(range(a[0]["r"], a[0]["r"] + nregs))
-            # BFS over reachable CFG paths from (b_idx, i_idx + 1).
-            work = [(b_idx, i_idx + 1, dst_regs)]
-            visited = set()
+            dst_regs = set(range(a[0]["r"], a[0]["r"] + nregs))
+            # Monotone forward dataflow from (b_idx, i_idx + 1):
+            #   in_live[b]: union of tracked VGPRs (including transitive copies) reaching block b
+            #   in_exec_sup[b]: True iff EVERY reaching path preserved EXEC >= EXEC_at_image_load
+            in_live = [None] * nb
+            in_exec_sup = [None] * nb
             saw_float = False
             ok = True
-            while work and ok:
-                cb, ci, live_fs = work.pop()
-                live = set(live_fs)
-                cur_blk = blocks[cb]
+
+            def _scan(cb, start_i, live, exec_sup):
+                nonlocal saw_float, ok
                 ended = False
-                for u in cur_blk[ci:]:
+                for u in blocks[cb][start_i:]:
                     ubop = base_op(u["op"])
                     if ubop == "s_endpgm":
                         ended = True
                         break
-                    if (ubop.startswith(("v_movrels", "v_movreld", "v_movrelsd"))
+                    if (ubop.startswith(("v_movrels", "v_movreld", "v_movrelsd", "v_swaprel"))
                             or ubop in ("s_swappc_b64", "s_setpc_b64", "s_call_b64")):
                         ok = False
-                        break
+                        return
                     r_used = live & _vgpr_reads_of(u)
+                    copied_dst = None
                     if r_used:
-                        if not _is_float_consumer_of(u, r_used, d16):
-                            ok = False
-                            break
-                        saw_float = True
-                    if not any_writes_exec:
+                        if _is_float_consumer_of(u, r_used, d16):
+                            saw_float = True
+                        else:
+                            copied_dst = _copy_prop_dst(u, r_used, d16)
+                            if copied_dst is None:
+                                ok = False
+                                return
+                    if writes_exec(u) and not _exec_monotone_widen(u):
+                        exec_sup = False
+                    if copied_dst is not None:
+                        live.add(copied_dst)
+                    elif exec_sup:
                         live -= _vgpr_full_writes_of(u)
                         if not live:
                             ended = True
                             break
                 if ok and not ended and live:
-                    next_fs = frozenset(live)
                     for nxt in succ[cb]:
-                        key = (nxt, next_fs)
-                        if key not in visited:
-                            visited.add(key)
-                            work.append((nxt, 0, next_fs))
+                        if in_live[nxt] is None:
+                            in_live[nxt] = set(live)
+                            in_exec_sup[nxt] = exec_sup
+                            work.append(nxt)
+                        else:
+                            new_live = in_live[nxt] | live
+                            new_sup = in_exec_sup[nxt] and exec_sup
+                            if len(new_live) != len(in_live[nxt]) or new_sup != in_exec_sup[nxt]:
+                                in_live[nxt] = new_live
+                                in_exec_sup[nxt] = new_sup
+                                work.append(nxt)
+
+            work = []
+            _scan(b_idx, i_idx + 1, set(dst_regs), True)
+            while work and ok:
+                cb = work.pop()
+                _scan(cb, 0, set(in_live[cb]), in_exec_sup[cb])
             if ok and saw_float:
                 out.add(id(ins))
     return out
@@ -19702,17 +19850,70 @@ def _symbolic_origin(tag):
     return tag
 
 
+def _root_origin(tag):
+    """Unwrap an arithmetic-offset wrapper ('off', root) to its underlying symbolic root origin."""
+    if tag is not None and tag[0] == "off":
+        return tag[1]
+    return tag
+
+
+def _as_offset_origin(tag):
+    """Mark a symbolic pointer tag as having an untracked arithmetic offset (preserving code/rodata)."""
+    if tag is None or tag[0] in ("const", "code", "off"):
+        return tag
+    return ("off", tag)
+
+
+def _origin_depth(tag):
+    """Nesting depth of a symbolic ('load'/'load_dyn', base, ...) origin tag."""
+    d = 0
+    cur = _root_origin(tag)
+    while cur is not None and cur[0] in ("load", "load_dyn"):
+        d += 1
+        cur = _root_origin(cur[1])
+    return d
+
+
+def _merge_sym_tag(v1, v2):
+    """Join two symbolic provenance tags at a CFG merge or conditional select."""
+    if v1 == v2:
+        return v1
+    if v1 is None or v2 is None:
+        return None
+    r1, r2 = _root_origin(v1), _root_origin(v2)
+    if r1 is not None and r1 == r2 and r1[0] != "const":
+        return _as_offset_origin(r1)
+    if r1 is not None and r2 is not None and r1[0] in ("load", "load_dyn") and r2[0] in ("load", "load_dyn") and r1[1] == r2[1]:
+        return ("load_dyn", r1[1])
+    return None
+
+
 def _origins_may_alias(o1, o2):
     """Conservative alias check between two symbolic descriptor/pointer origins."""
     if o1 is None or o2 is None:
         return True
-    if o1 == o2:
+    r1, r2 = _root_origin(o1), _root_origin(o2)
+    if r1 is None or r2 is None:
         return True
-    # Dynamic offset load from the same base table may hit a static offset slot in that table.
-    if o1[0] == "load" and o2[0] == "load_dyn" and o1[1] == o2[1]:
+    if r1 == r2:
         return True
-    if o2[0] == "load" and o1[0] == "load_dyn" and o1[1] == o2[1]:
-        return True
+    if r1[0] == "code" or r2[0] == "code":
+        return False
+    if r1[0] == "load" and r2[0] == "load":
+        return r1[2] == r2[2] and _origins_may_alias(r1[1], r2[1])
+    # Dynamic offset load from an aliasing base table may hit any static/dynamic slot in that table.
+    if r1[0] in ("load", "load_dyn") and r2[0] in ("load", "load_dyn"):
+        return _origins_may_alias(r1[1], r2[1])
+    return False
+
+
+def _origin_chain_aliases_known(origin, known_writes):
+    """Whether `origin` or any ancestor table pointer in its load chain aliases a write origin in `known_writes`."""
+    cur = _root_origin(origin)
+    while cur is not None:
+        if any(_origins_may_alias(cur, wo) for wo in known_writes):
+            return True
+        cur = _root_origin(cur[1]) if cur[0] in ("load", "load_dyn") else None
     return False
 
 
@@ -19782,11 +19983,30 @@ def _sload_static_offset(ins, sym, is_sbuf):
     return (reg_const + imm) if reg_const is not None else imm
 
 
+def _read_scalar_tag(sym, arg):
+    """Read a 32-bit constant or symbolic provenance tag for a single scalar operand."""
+    if arg["k"] == "imm":
+        return ("const", arg["v"] & 0xFFFFFFFF)
+    if arg["k"] == "special" and arg.get("t") == "null":
+        return ("const", 0)
+    slots = _scalar_operand_slots(arg)
+    if slots and len(slots) == 1:
+        return sym.get(slots[0])
+    return None
+
+
+def _const_lane(sym, arg):
+    """Constant lane index (0..63) for v_writelane_b32 / v_readlane_b32, or None if dynamic."""
+    t = _read_scalar_tag(sym, arg)
+    return t[1] & 63 if t is not None and t[0] == "const" else None
+
+
 def _step_scalar_provenance(sym, ins, desc_src=None):
-    """Advance forward SGPR/VCC provenance state across one instruction.
+    """Advance forward SGPR/VCC/spill-VGPR provenance state across one instruction.
 
     When `desc_src` is given (slot -> frozenset of s_load instruction ids), also propagates which s_load
-    instructions originated each slot's value (through copies only) so descriptor-only loads can be verified."""
+    instructions originated each slot's value (through copies, selects, and VGPR spill lanes) so descriptor-only
+    loads can be verified."""
     op = base_op(ins["op"])
     a = ins["args"]
     if op in ("s_swappc_b64", "s_setpc_b64", "s_call_b64") or op.startswith("s_movreld"):
@@ -19798,14 +20018,7 @@ def _step_scalar_provenance(sym, ins, desc_src=None):
         return
 
     def read_tag(arg):
-        if arg["k"] == "imm":
-            return ("const", arg["v"] & 0xFFFFFFFF)
-        if arg["k"] == "special" and arg.get("t") == "null":
-            return ("const", 0)
-        slots = _scalar_operand_slots(arg)
-        if slots and len(slots) == 1:
-            return sym.get(slots[0])
-        return None
+        return _read_scalar_tag(sym, arg)
 
     def clear_slots(slots):
         if slots:
@@ -19813,6 +20026,63 @@ def _step_scalar_provenance(sym, ins, desc_src=None):
                 sym.pop(s, None)
                 if desc_src is not None:
                     desc_src.pop(s, None)
+
+    def clear_vgpr_lanes(vregs):
+        if not vregs:
+            return
+        for k in [k for k in sym if isinstance(k, tuple) and k[1] in vregs]:
+            del sym[k]
+        if desc_src is not None:
+            for k in [k for k in desc_src if isinstance(k, tuple) and k[1] in vregs]:
+                del desc_src[k]
+
+    if op.startswith(("v_movreld", "v_movrelsd", "v_swaprel")):
+        for k in [k for k in sym if isinstance(k, tuple)]:
+            del sym[k]
+        if desc_src is not None:
+            for k in [k for k in desc_src if isinstance(k, tuple)]:
+                del desc_src[k]
+        return
+
+    if op == "v_writelane_b32" and len(a) >= 3 and a[0]["k"] == "vgpr":
+        vr = a[0]["r"]
+        lane = _const_lane(sym, a[2])
+        if lane is None:
+            clear_vgpr_lanes({vr})
+            return
+        key = ("v", vr, lane)
+        t = read_tag(a[1])
+        if t is not None:
+            sym[key] = t
+        else:
+            sym.pop(key, None)
+        if desc_src is not None:
+            src = _scalar_operand_slots(a[1])
+            if src and len(src) == 1 and src[0] in desc_src:
+                desc_src[key] = desc_src[src[0]]
+            else:
+                desc_src.pop(key, None)
+        return
+
+    if op == "v_readlane_b32":
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 1 and len(a) >= 3 and a[1]["k"] == "vgpr":
+            lane = _const_lane(sym, a[2])
+            if lane is not None:
+                key = ("v", a[1]["r"], lane)
+                t = sym.get(key)
+                if t is not None:
+                    sym[dst[0]] = t
+                else:
+                    sym.pop(dst[0], None)
+                if desc_src is not None:
+                    if key in desc_src:
+                        desc_src[dst[0]] = desc_src[key]
+                    else:
+                        desc_src.pop(dst[0], None)
+                return
+        clear_slots(dst)
+        return
 
     if op == "s_mov_b32" and len(a) >= 2:
         dst = _scalar_operand_slots(a[0])
@@ -19828,6 +20098,32 @@ def _step_scalar_provenance(sym, ins, desc_src=None):
                     desc_src[dst[0]] = desc_src[src[0]]
                 else:
                     desc_src.pop(dst[0], None)
+        return
+    if op == "s_movk_i32" and len(a) >= 2 and a[1]["k"] == "imm":
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 1:
+            v = a[1]["v"] & 0xFFFF
+            if v & 0x8000:
+                v |= 0xFFFF0000
+            sym[dst[0]] = ("const", v & 0xFFFFFFFF)
+            if desc_src is not None:
+                desc_src.pop(dst[0], None)
+        return
+    if op in ("s_addk_i32", "s_mulk_i32") and len(a) >= 2 and a[1]["k"] == "imm":
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 1:
+            v = a[1]["v"] & 0xFFFF
+            if v & 0x8000:
+                v -= 0x10000
+            cur = sym.get(dst[0])
+            if cur is not None and cur[0] == "const":
+                sym[dst[0]] = ("const", ((cur[1] + v) if op == "s_addk_i32" else (cur[1] * v)) & 0xFFFFFFFF)
+            elif op == "s_addk_i32" and _symbolic_origin(cur) is not None:
+                sym[dst[0]] = cur if v == 0 else _as_offset_origin(cur)
+            else:
+                sym.pop(dst[0], None)
+            if desc_src is not None:
+                desc_src.pop(dst[0], None)
         return
     if op == "s_mov_b64" and len(a) >= 2:
         dst = _scalar_operand_slots(a[0])
@@ -19857,6 +20153,56 @@ def _step_scalar_provenance(sym, ins, desc_src=None):
                 else:
                     clear_slots(dst)
         return
+    if op in ("s_cselect_b32", "s_cmov_b32") and len(a) >= (3 if op == "s_cselect_b32" else 2):
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 1:
+            x_arg, y_arg = (a[1], a[2]) if op == "s_cselect_b32" else (a[1], a[0])
+            merged = _merge_sym_tag(read_tag(x_arg), read_tag(y_arg))
+            if merged is not None:
+                sym[dst[0]] = merged
+            else:
+                sym.pop(dst[0], None)
+            if desc_src is not None:
+                sx = _scalar_operand_slots(x_arg)
+                sy = _scalar_operand_slots(y_arg)
+                dx = desc_src.get(sx[0]) if sx and len(sx) == 1 else None
+                dy = desc_src.get(sy[0]) if sy and len(sy) == 1 else None
+                union = (dx or frozenset()) | (dy or frozenset())
+                if union:
+                    desc_src[dst[0]] = union
+                else:
+                    desc_src.pop(dst[0], None)
+        return
+    if op in ("s_cselect_b64", "s_cmov_b64") and len(a) >= (3 if op == "s_cselect_b64" else 2):
+        dst = _scalar_operand_slots(a[0])
+        if dst and len(dst) == 2:
+            x_arg, y_arg = (a[1], a[2]) if op == "s_cselect_b64" else (a[1], a[0])
+
+            def _pair_tags(arg):
+                if arg["k"] == "imm":
+                    v = arg["v"]
+                    return [("const", v & 0xFFFFFFFF), ("const", (v >> 32) & 0xFFFFFFFF)], [None, None]
+                s = _scalar_operand_slots(arg)
+                if s and len(s) == 2:
+                    return ([sym.get(s[0]), sym.get(s[1])],
+                            [desc_src.get(s[0]), desc_src.get(s[1])] if desc_src is not None else [None, None])
+                return [None, None], [None, None]
+
+            xt, xd = _pair_tags(x_arg)
+            yt, yd = _pair_tags(y_arg)
+            for i, d in enumerate(dst):
+                merged = _merge_sym_tag(xt[i], yt[i])
+                if merged is not None:
+                    sym[d] = merged
+                else:
+                    sym.pop(d, None)
+                if desc_src is not None:
+                    union = (xd[i] or frozenset()) | (yd[i] or frozenset())
+                    if union:
+                        desc_src[d] = union
+                    else:
+                        desc_src.pop(d, None)
+        return
     if op == "s_getpc_b64":
         dst = _scalar_operand_slots(a[0])
         if dst and len(dst) == 2:
@@ -19867,15 +20213,19 @@ def _step_scalar_provenance(sym, ins, desc_src=None):
                 desc_src.pop(dst[1], None)
         return
     if op in ("s_add_u32", "s_add_i32", "s_addc_u32", "s_sub_u32", "s_sub_i32", "s_subb_u32",
-              "s_and_b32", "s_or_b32", "s_lshl1_add_u32", "s_lshl2_add_u32",
-              "s_lshl3_add_u32", "s_lshl4_add_u32") and len(a) >= 3:
+              "s_and_b32", "s_or_b32", "s_xor_b32", "s_lshl_b32", "s_lshr_b32", "s_mul_i32",
+              "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32") and len(a) >= 3:
         dst = _scalar_operand_slots(a[0])
         if dst and len(dst) == 1:
             t0, t1 = read_tag(a[1]), read_tag(a[2])
             c0_flag = t0 is not None and t0[0] == "const"
             c1_flag = t1 is not None and t1[0] == "const"
+            s0_slots = _scalar_operand_slots(a[1])
+            s1_slots = _scalar_operand_slots(a[2])
             out = None
             if op == "s_and_b32" and (t0 == ("const", 0) or t1 == ("const", 0)):
+                out = ("const", 0)
+            elif op in ("s_xor_b32", "s_sub_u32", "s_sub_i32") and s0_slots and s0_slots == s1_slots:
                 out = ("const", 0)
             elif c0_flag and c1_flag:
                 c0, c1 = t0[1], t1[1]
@@ -19887,22 +20237,34 @@ def _step_scalar_provenance(sym, ins, desc_src=None):
                     out = ("const", c0 & c1)
                 elif op == "s_or_b32":
                     out = ("const", c0 | c1)
+                elif op == "s_xor_b32":
+                    out = ("const", c0 ^ c1)
+                elif op == "s_lshl_b32":
+                    out = ("const", (c0 << (c1 & 31)) & 0xFFFFFFFF)
+                elif op == "s_lshr_b32":
+                    out = ("const", (c0 >> (c1 & 31)) & 0xFFFFFFFF)
+                elif op == "s_mul_i32":
+                    out = ("const", (c0 * c1) & 0xFFFFFFFF)
                 elif op.startswith("s_lshl"):
                     sh = int(op[6])
                     out = ("const", ((c0 << sh) + c1) & 0xFFFFFFFF)
-            else:
+            elif op not in ("s_xor_b32", "s_lshl_b32", "s_lshr_b32", "s_mul_i32"):
                 s0, s1 = _symbolic_origin(t0), _symbolic_origin(t1)
                 if op.startswith("s_lshl"):
                     # (S0 << sh) + S1: shifting a base pointer left does not preserve its origin;
-                    # only propagate S1 when the shifted index S0 is a known constant.
+                    # only propagate S1 when the shifted index S0 is a known constant (marking as offset if non-zero).
                     if c0_flag and s1 is not None:
-                        out = s1
+                        out = s1 if t0[1] == 0 else _as_offset_origin(s1)
                 elif s0 is not None and c1_flag:
-                    out = s0
+                    noop = (op in ("s_add_u32", "s_add_i32", "s_sub_u32", "s_sub_i32", "s_or_b32") and t1[1] == 0) \
+                        or (op == "s_and_b32" and t1[1] == 0xFFFFFFFF)
+                    out = s0 if noop else _as_offset_origin(s0)
                 elif s1 is not None and c0_flag and op not in ("s_sub_u32", "s_sub_i32", "s_subb_u32"):
-                    out = s1
-                elif op in ("s_and_b32", "s_or_b32") and s0 is not None and s0 == s1:
-                    out = s0
+                    noop = (op in ("s_add_u32", "s_add_i32", "s_or_b32") and t0[1] == 0) \
+                        or (op == "s_and_b32" and t0[1] == 0xFFFFFFFF)
+                    out = s1 if noop else _as_offset_origin(s1)
+                elif op in ("s_and_b32", "s_or_b32") and s0 is not None and _root_origin(s0) == _root_origin(s1):
+                    out = s0 if s0 == s1 else _as_offset_origin(s0)
             if out is not None:
                 sym[dst[0]] = out
             else:
@@ -19914,11 +20276,12 @@ def _step_scalar_provenance(sym, ins, desc_src=None):
         dst = _scalar_operand_slots(a[0])
         base = _scalar_operand_slots(a[1])
         if dst:
-            base_origin = _symbolic_origin(sym.get(base[0])) if base else None
-            if base_origin is not None:
-                off = _sload_static_offset(ins, sym, op.startswith("s_buffer"))
+            base_tag = _symbolic_origin(sym.get(base[0])) if base else None
+            base_root = _root_origin(base_tag)
+            if base_root is not None and _origin_depth(base_root) < 4:
+                off = None if base_tag[0] == "off" else _sload_static_offset(ins, sym, op.startswith("s_buffer"))
                 for i, slot in enumerate(dst):
-                    sym[slot] = ("load", base_origin, off + 4 * i) if off is not None else ("load_dyn", base_origin)
+                    sym[slot] = ("load", base_root, off + 4 * i) if off is not None else ("load_dyn", base_root)
             else:
                 clear_slots(dst)
             if desc_src is not None:
@@ -19929,12 +20292,25 @@ def _step_scalar_provenance(sym, ins, desc_src=None):
                     else:
                         desc_src.pop(slot, None)
         return
+    # Any non-writelane instruction that writes a VGPR clears any spilled scalar lanes parked in that VGPR.
+    if (not op.startswith(VGPR_READ_ONLY_PREFIXES)
+            and not (op.startswith(("buffer_load", "tbuffer_load")) and "lds" in ins.get("mods", ()))
+            and not (op.startswith("ds_") and not _is_ds_dst_only(op))):
+        written_v = _arg_vgprs(a[0])
+        if op == "v_swap_b32" and len(a) >= 2:
+            written_v |= _arg_vgprs(a[1])
+        if written_v:
+            clear_vgpr_lanes(written_v)
     # Any other instruction that writes scalar destination slots clears their provenance.
     if op.startswith(("s_cmp", "s_bitcmp", "s_cbranch", "s_branch", "s_waitcnt", "s_nop", "s_endpgm",
                       "s_barrier", "s_sendmsg", "s_setreg", "s_round_mode", "s_store", "s_buffer_store",
                       "buffer_", "tbuffer_", "global_", "flat_", "scratch_", "image_", "ds_", "exp")):
         return
-    if op.startswith("s_") or op in ("v_readfirstlane_b32", "v_readlane_b32") or op.startswith("v_cmp"):
+    if op.startswith("v_cmp"):
+        if not op.startswith("v_cmpx"):
+            dst = _scalar_operand_slots(a[0])
+            clear_slots(dst if dst else ["vcc_lo", "vcc_hi"])
+    elif op.startswith("s_") or op in ("v_readfirstlane_b32", "v_readlane_b32"):
         clear_slots(_scalar_operand_slots(a[0]))
     if len(a) >= 2 and op in ("v_add_co_u32", "v_add_co_ci_u32", "v_sub_co_u32", "v_sub_co_ci_u32",
                               "v_subrev_co_u32", "v_subrev_co_ci_u32", "v_mad_u64_u32", "v_mad_i64_i32",
@@ -19942,23 +20318,75 @@ def _step_scalar_provenance(sym, ins, desc_src=None):
         clear_slots(_scalar_operand_slots(a[1]))
 
 
-def _classify_scalar_uses(ins, desc_src, used_as_desc, used_as_data):
-    """Record whether scalar operands read by `ins` are used solely as descriptors (T#/S#/V#) or as general data."""
+def _classify_scalar_uses(ins, sym, desc_src, used_as_desc, used_as_data, used_as_sload_base):
+    """Record whether scalar operands read by `ins` are used solely as descriptors (T#/S#/V#), as base pointers
+    of another s_load, or as general data."""
     if not desc_src:
         return
     op = base_op(ins["op"])
     a = ins["args"]
     if not a:
         return
-    if op in ("s_mov_b32", "s_mov_b64"):
-        # Pure copies propagate desc_src without classifying the value yet.
-        return
+    if op in ("s_mov_b32", "s_mov_b64", "s_cselect_b32", "s_cselect_b64", "s_cmov_b32", "s_cmov_b64"):
+        dst = _scalar_operand_slots(a[0])
+        want = 2 if op.endswith("_b64") else 1
+        if dst and len(dst) == want:
+            # Pure copies/selects into tracked scalar slots propagate desc_src without classifying the value yet.
+            return
     if op in ("s_swappc_b64", "s_setpc_b64", "s_call_b64") or op.startswith("s_movrel"):
         for tags in desc_src.values():
             used_as_data.update(tags)
         return
-    # Identify operand indices that are pure descriptor reads (T#, S#, V#) and operand indices that are write-only.
+    if op == "v_writelane_b32":
+        if len(a) >= 3 and a[0]["k"] == "vgpr":
+            lane = _const_lane(sym, a[2])
+            # Lane index operand (if scalar reg) is data; source sS propagates into ("v", vr, lane) when lane is const.
+            for idx in ((2,) if lane is not None else (1, 2)):
+                slots = _scalar_operand_slots(a[idx])
+                if slots:
+                    for s in slots:
+                        tags = desc_src.get(s)
+                        if tags:
+                            used_as_data.update(tags)
+        else:
+            for arg in a:
+                slots = _scalar_operand_slots(arg)
+                if slots:
+                    for s in slots:
+                        tags = desc_src.get(s)
+                        if tags:
+                            used_as_data.update(tags)
+        return
+    if op == "v_readlane_b32":
+        if len(a) >= 3 and a[1]["k"] == "vgpr":
+            lane = _const_lane(sym, a[2])
+            slots = _scalar_operand_slots(a[2])
+            if slots:
+                for s in slots:
+                    tags = desc_src.get(s)
+                    if tags:
+                        used_as_data.update(tags)
+            if lane is None:
+                vr = a[1]["r"]
+                for k, tags in desc_src.items():
+                    if isinstance(k, tuple) and k[1] == vr:
+                        used_as_data.update(tags)
+        return
+    if op.startswith(("v_movrels", "v_movreld", "v_movrelsd", "v_swaprel")):
+        for k, tags in desc_src.items():
+            if isinstance(k, tuple):
+                used_as_data.update(tags)
+    else:
+        # Any non-readlane read of a spill VGPR consumes all descriptor tags parked in its lanes as general data.
+        vreads = _vgpr_reads_of(ins)
+        if vreads:
+            for k, tags in desc_src.items():
+                if isinstance(k, tuple) and k[1] in vreads:
+                    used_as_data.update(tags)
+
+    # Identify operand indices that are pure descriptor reads (T#, S#, V#), s_load base ptrs, or write-only.
     desc_idxs = set()
+    sload_base_idxs = set()
     write_only_idxs = set()
     if op.startswith("image_"):
         if len(a) >= 3:
@@ -19968,10 +20396,14 @@ def _classify_scalar_uses(ins, desc_src, used_as_desc, used_as_data):
         if not op.startswith(("image_store", "image_atomic")):
             write_only_idxs.add(0)
     elif op.startswith(("buffer_", "tbuffer_")):
-        if len(a) >= 3:
-            desc_idxs.add(2)    # V#
-        if op.startswith(("buffer_load", "tbuffer_load")):
-            write_only_idxs.add(0)
+        if "lds" in ins.get("mods", ()) and op.startswith(("buffer_load", "tbuffer_load")):
+            if len(a) >= 2:
+                desc_idxs.add(1)    # V# (no vdata operand when lds is set)
+        else:
+            if len(a) >= 3:
+                desc_idxs.add(2)    # V#
+            if op.startswith(("buffer_load", "tbuffer_load")):
+                write_only_idxs.add(0)
     elif op.startswith("s_buffer_"):
         if len(a) >= 2:
             desc_idxs.add(1)    # V#
@@ -19979,6 +20411,8 @@ def _classify_scalar_uses(ins, desc_src, used_as_desc, used_as_data):
             write_only_idxs.add(0)
     elif op.startswith("s_load_dword"):
         write_only_idxs.add(0)
+        if len(a) >= 2:
+            sload_base_idxs.add(1)
     elif op.startswith("s_") and not op.startswith(("s_cmp", "s_bitcmp", "s_cbranch", "s_branch", "s_store",
                                                     "s_atomic", "s_setreg", "s_sendmsg", "s_waitcnt", "s_nop",
                                                     "s_endpgm", "s_barrier", "s_round_mode", "s_cmov", "s_bitset")):
@@ -19990,11 +20424,19 @@ def _classify_scalar_uses(ins, desc_src, used_as_desc, used_as_data):
                   "v_div_scale_f32", "v_div_scale_f64"):
             write_only_idxs.add(1)
 
+    child_id = id(ins)
     for idx, arg in enumerate(a):
         if idx in write_only_idxs:
             continue
         slots = _scalar_operand_slots(arg)
         if not slots:
+            continue
+        if idx in sload_base_idxs:
+            for s in slots:
+                tags = desc_src.get(s)
+                if tags:
+                    for parent_id in tags:
+                        used_as_sload_base.setdefault(parent_id, set()).add(child_id)
             continue
         target = used_as_desc if idx in desc_idxs else used_as_data
         for s in slots:
@@ -20009,17 +20451,18 @@ def analyse_scalar_load_ro(blocks, succ, user_limit=USER_SGPRS, sys_sgprs=()):
     Returns True when the shader performs no PhysicalStorageBuffer memory writes at all (all scalar loads are safe),
     or a frozenset of id(ins) for scalar loads proven not to alias any PSB write in the module:
       - If any s_dcache_* instruction is present alongside a PSB write, falls back conservatively to frozenset().
-      - Descriptor-heap s_load* (32-bit user SGPR pointer with high dword = constant 0, whose base origin is not
-        explicitly written and whose loaded dwords are consumed solely as T#/S#/V# descriptors) and s_getpc_b64
-        code/rodata loads are read-only.
-      - Any scalar load with no PSB write reachable before OR after it on any CFG path is read-only.
+      - Descriptor-only s_load* (from a 32-bit or 64-bit user SGPR table pointer or multi-level table load,
+        including descriptors carried through scalar-spill VGPRs via v_writelane_b32/v_readlane_b32, whose origin
+        chain is not explicitly written and whose loaded dwords are consumed solely as T#/S#/V# descriptors or as
+        the base pointer of another descriptor-only s_load) and s_getpc_b64 code/rodata loads are read-only.
+      - Any scalar load with no PSB write reachable before it on any CFG path (`not store_reached`, including loop
+        back-edges) is read-only unless its known origin explicitly aliases a known PSB write reachable after it.
       - Any scalar load whose symbolic descriptor/pointer origin (user SGPR root or static descriptor-table slot) is
         strictly disjoint from every PSB write's origin in the module is read-only."""
     if not blocks:
         return True
     nb = len(blocks)
     has_dcache = False
-    block_writes = [False] * nb
     has_any_write = False
     for b, blk in enumerate(blocks):
         for ins in blk:
@@ -20029,43 +20472,13 @@ def analyse_scalar_load_ro(blocks, succ, user_limit=USER_SGPRS, sys_sgprs=()):
             if op.startswith("s_dcache_"):
                 has_dcache = True
             if op.startswith(_PSB_WRITE_PREFIXES):
-                block_writes[b] = True
                 has_any_write = True
     if not has_any_write:
         return True
     if has_dcache:
         return frozenset()
 
-    # Forward CFG reachability: whether any PSB write can precede entry to block b.
-    write_in = [False] * nb
-    write_out = list(block_writes)
-    changed = True
-    while changed:
-        changed = False
-        for b in range(nb):
-            if write_out[b]:
-                for s in succ[b]:
-                    if not write_in[s]:
-                        write_in[s] = True
-                        if not write_out[s]:
-                            write_out[s] = True
-                        changed = True
-
-    # Backward CFG reachability: whether any PSB write can follow exit from block b.
-    write_after_out = [False] * nb
-    write_after_in = list(block_writes)
-    changed = True
-    while changed:
-        changed = False
-        for b in range(nb):
-            if any(write_after_in[s] for s in succ[b]):
-                if not write_after_out[b]:
-                    write_after_out[b] = True
-                    if not write_after_in[b]:
-                        write_after_in[b] = True
-                    changed = True
-
-    # Forward SGPR/VCC descriptor provenance and s_load-origin dataflow.
+    # Forward SGPR/VCC/spill-VGPR descriptor provenance and s_load-origin dataflow (also discovers reachable blocks).
     system = set(sys_sgprs)
     entry_sym = [None] * nb
     entry_dsrc = [None] * nb
@@ -20086,7 +20499,11 @@ def analyse_scalar_load_ro(blocks, succ, user_limit=USER_SGPRS, sys_sgprs=()):
                 entry_dsrc[s] = dict(dsrc)
                 work.append(s)
             else:
-                merged_sym = {k: v for k, v in entry_sym[s].items() if sym.get(k) == v}
+                merged_sym = {}
+                for k, v in entry_sym[s].items():
+                    m = _merge_sym_tag(v, sym.get(k))
+                    if m is not None:
+                        merged_sym[k] = m
                 # Join desc_src by union so any path on which a slot comes from an s_load sees all its uses.
                 merged_dsrc = dict(entry_dsrc[s])
                 for k, v in dsrc.items():
@@ -20096,10 +20513,12 @@ def analyse_scalar_load_ro(blocks, succ, user_limit=USER_SGPRS, sys_sgprs=()):
                     entry_dsrc[s] = merged_dsrc
                     work.append(s)
 
-    # Collect all PSB write origins, classify s_load uses, and evaluate every scalar load at its exact program point.
+    # Collect per-block PSB writes/origins, classify s_load uses, and record every scalar load at its exact point.
     write_origins = set()
+    block_writes_list = [[] for _ in range(nb)]  # per block: [(idx, origin_or_None), ...]
     used_as_desc, used_as_data = set(), set()
-    scalar_loads = []  # (ins, b, idx, is_heap_ptr, origin)
+    used_as_sload_base = {}  # parent s_load id -> set of child s_load ids
+    scalar_loads = []  # (ins, b, idx, is_desc_ptr, origin)
     for b in range(nb):
         if entry_sym[b] is None:
             continue
@@ -20109,33 +20528,109 @@ def analyse_scalar_load_ro(blocks, succ, user_limit=USER_SGPRS, sys_sgprs=()):
             op = base_op(ins["op"])
             if op == "s_endpgm":
                 break
-            _classify_scalar_uses(ins, dsrc, used_as_desc, used_as_data)
+            _classify_scalar_uses(ins, sym, dsrc, used_as_desc, used_as_data, used_as_sload_base)
             if op.startswith(_PSB_WRITE_PREFIXES):
-                write_origins.add(_psb_write_origin(ins, sym))
+                wo = _psb_write_origin(ins, sym)
+                write_origins.add(wo)
+                block_writes_list[b].append((idx, wo))
             elif op.startswith(("s_load_dword", "s_buffer_load_dword")) and len(ins["args"]) >= 2:
                 base = _scalar_operand_slots(ins["args"][1])
                 origin = _symbolic_origin(sym.get(base[0])) if base else None
-                is_heap_ptr = (op.startswith("s_load_dword") and base is not None and len(base) == 2 and
-                               origin is not None and origin[0] == "in" and sym.get(base[1]) == ("const", 0))
-                scalar_loads.append((ins, b, idx, is_heap_ptr, origin))
+                hi_tag = sym.get(base[1]) if (base and len(base) == 2) else None
+                origin_root = _root_origin(origin)
+                hi_root = _root_origin(hi_tag)
+                is_desc_ptr = (
+                    op.startswith("s_load_dword") and base is not None and len(base) == 2
+                    and origin_root is not None and origin_root[0] in ("in", "load", "load_dyn")
+                    and hi_root is not None and hi_root[0] in ("const", "in", "load", "load_dyn")
+                )
+                scalar_loads.append((ins, b, idx, is_desc_ptr, origin))
             _step_scalar_provenance(sym, ins, dsrc)
 
+    # Forward CFG store-reachability: whether any PSB write can precede entry to block b (including loop back-edges).
+    block_writes = [bool(block_writes_list[b]) for b in range(nb)]
+    write_in = [False] * nb
+    write_out = list(block_writes)
+    changed = True
+    while changed:
+        changed = False
+        for b in range(nb):
+            if write_out[b]:
+                for s in succ[b]:
+                    if not write_in[s]:
+                        write_in[s] = True
+                        if not write_out[s]:
+                            write_out[s] = True
+                        changed = True
+
+    # Backward CFG reachability: whether any PSB write (and which write origins, including None) can follow block b.
+    write_after_out = [False] * nb
+    write_after_in = list(block_writes)
+    write_after_out_origins = [set() for _ in range(nb)]
+    write_after_in_origins = [{wo for _, wo in block_writes_list[b]} for b in range(nb)]
+    changed = True
+    while changed:
+        changed = False
+        for b in range(nb):
+            if any(write_after_in[s] for s in succ[b]):
+                if not write_after_out[b]:
+                    write_after_out[b] = True
+                    if not write_after_in[b]:
+                        write_after_in[b] = True
+                    changed = True
+            for s in succ[b]:
+                if write_after_in_origins[s]:
+                    before_o = len(write_after_out_origins[b])
+                    write_after_out_origins[b].update(write_after_in_origins[s])
+                    if len(write_after_out_origins[b]) != before_o:
+                        write_after_in_origins[b].update(write_after_out_origins[b])
+                        changed = True
+
+    # Least fixed point for multi-level descriptor-only s_load_dword* instructions.
+    known_write_origins = {wo for wo in write_origins if wo is not None}
+    desc_cand = set()
+    for ins, b, idx, is_desc_ptr, origin in scalar_loads:
+        lid = id(ins)
+        if (is_desc_ptr
+                and not _origin_chain_aliases_known(origin, known_write_origins)
+                and lid not in used_as_data
+                and (lid in used_as_desc or lid in used_as_sload_base)):
+            desc_cand.add(lid)
+    desc_only_ro = set()
+    changed = True
+    while changed:
+        changed = False
+        for lid in desc_cand:
+            if lid in desc_only_ro:
+                continue
+            children = used_as_sload_base.get(lid)
+            if children is None:
+                if lid in used_as_desc:
+                    desc_only_ro.add(lid)
+                    changed = True
+            elif children <= desc_only_ro:
+                desc_only_ro.add(lid)
+                changed = True
+
     ro = set()
-    for ins, b, idx, is_heap_ptr, origin in scalar_loads:
+    for ins, b, idx, is_desc_ptr, origin in scalar_loads:
         if origin == ("code",):
             ro.add(id(ins))
             continue
-        if is_heap_ptr and origin not in write_origins and id(ins) in used_as_desc and id(ins) not in used_as_data:
+        if id(ins) in desc_only_ro:
             ro.add(id(ins))
             continue
-        blk = blocks[b]
-        w_before = write_in[b] or any(base_op(blk[k]["op"]).startswith(_PSB_WRITE_PREFIXES) for k in range(idx))
-        w_after = write_after_out[b] or any(base_op(blk[k]["op"]).startswith(_PSB_WRITE_PREFIXES)
-                                            for k in range(idx + 1, len(blk)))
+        w_before = write_in[b] or any(w_idx < idx for w_idx, _ in block_writes_list[b])
+        w_after = write_after_out[b] or any(w_idx > idx for w_idx, _ in block_writes_list[b])
         if not w_before and not w_after:
             ro.add(id(ins))
             continue
-        if origin is not None and not any(_origins_may_alias(origin, wo) for wo in write_origins):
+        if not w_before:
+            after_origins = write_after_out_origins[b] | {wo for w_idx, wo in block_writes_list[b] if w_idx > idx}
+            if origin is not None and None not in after_origins and not _origin_chain_aliases_known(origin, after_origins):
+                ro.add(id(ins))
+                continue
+        if origin is not None and not _origin_chain_aliases_known(origin, write_origins):
             ro.add(id(ins))
     return frozenset(ro)
 
