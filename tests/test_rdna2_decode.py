@@ -40,6 +40,7 @@ import rdna2_decode  # noqa: E402
 import rdna2spirv  # noqa: E402
 import shader_disasm  # noqa: E402
 import shader_ir  # noqa: E402
+import spirv_asm  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
 
 
@@ -670,6 +671,167 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(rdna2_decode._mimg_addr_count("image_get_lod", 1, True), 1)          # 2D a16
         self.assertEqual(rdna2_decode._mimg_addr_count("image_get_lod", 2, True), 2)          # 3D a16
         self.assertEqual(rdna2_decode._mimg_data_count("image_atomic_fcmpswap", 1, False, True), 3)
+
+    def test_gfx10_special_source_operands_235_to_239(self):
+        # AMD RDNA2 ISA Table 21 special source codes 235..239.
+        specials = (
+            (235, "src_shared_base"),
+            (236, "src_shared_limit"),
+            (237, "src_private_base"),
+            (238, "src_private_limit"),
+            (239, "src_pops_exiting_wave_id"),
+        )
+        for code_id, name in specials:
+            with self.subTest(code=code_id, name=name):
+                # SOP1 s_mov_b32 s5, <special> (opc=0x03), VOP1 v_mov_b32_e32 v5, <special> (opc=0x01),
+                # and VOP3 v_mov_b32_e64 v5, <special> (opc=0x181).
+                raw = words(
+                    (0x17D << 23) | (5 << 16) | (0x03 << 8) | code_id,
+                    (0x3F << 25) | (5 << 17) | (0x01 << 9) | code_id,
+                    (0x35 << 26) | (0x181 << 16) | 5,
+                    code_id,
+                )
+                dec = rdna2_decode.decode_bytes(raw)
+                self.assertEqual(dec["invalid"], 0)
+                text, bad = rdna2_decode.disasm_bytes(raw)
+                self.assertEqual(bad, 0)
+                reparsed = [shader_ir.parse_line(ln) for ln in text.splitlines() if ln.strip()]
+                expected_asms = (
+                    f"s_mov_b32 s5, {name}",
+                    f"v_mov_b32_e32 v5, {name}",
+                    f"v_mov_b32_e64 v5, {name}",
+                )
+                for ins, rep, asm in zip(dec["insns"], reparsed, expected_asms):
+                    exp = shader_ir.parse_line(asm)
+                    for field in ("op", "args", "mods"):
+                        self.assertEqual(ins[field], exp[field])
+                        self.assertEqual(rep[field], exp[field])
+
+        # End-to-end POPS pixel shader using src_pops_exiting_wave_id (code 239):
+        # s_mov_b32 s0, src_pops_exiting_wave_id; v_mov_b32_e32 v0, s0; exp mrt0 v0..v0 done vm; s_endpgm
+        code = words(
+            (0x17D << 23) | (0 << 16) | (0x03 << 8) | 239,
+            (0x3F << 25) | (0 << 17) | (0x01 << 9) | 0,
+            (0x3E << 26) | (1 << 12) | (1 << 11) | 0xF,
+            0,
+            0xBF810000,
+        )
+        asm, bad, err = shader_disasm.disasm(code, "gfx1013", backend="python")
+        self.assertEqual((bad, err), (0, ""))
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm_dir = os.path.join(tmp, "disasm")
+            os.mkdir(disasm_dir)
+            with open(os.path.join(tmp, "ps_pops.dxbc"), "wb") as f:
+                f.write(b"DXBC" + bytes(28))
+            src = os.path.join(disasm_dir, "ps_pops.s")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write("; ps_pops  code 0x0..0x14 (python), gfx1013, 0 invalid words\n" + asm)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                spv_text = rdna2spirv.translate(src)
+                dec = rdna2_decode.decode_bytes(code, name="ps_pops")
+                with patch.object(rdna2spirv, "parse_file", return_value=dec):
+                    spv_direct = rdna2spirv.translate(src)
+        for spv in (spv_text, spv_direct):
+            self.assertIn("PixelInterlockOrderedEXT", spv)
+            self.assertIn("OpBeginInvocationInterlockEXT", spv)
+            self.assertIn("OpEndInvocationInterlockEXT", spv)
+            self.assertEqual(struct.unpack_from("<I", spirv_asm.assemble(spv), 0)[0], spirv_asm.SPIRV_MAGIC)
+
+    def test_f64_literal_sources_decode_format_and_translate(self):
+        # Trailing 32-bit literal on f64 operands across VOP1, VOPC, and VOP3, including values < 100
+        # that must format in hex so shader_ir.parse_line distinguishes literal 0x1 from inline 1.
+        cases = (
+            # VOP1 v_frexp_exp_i32_f64_e32 v0, 0x40180000 / 0x1 / 0x0
+            (words((0x3F << 25) | (0 << 17) | (0x3C << 9) | 255, 0x40180000),
+             "v_frexp_exp_i32_f64_e32 v0, 0x40180000", 1, 8),
+            (words((0x3F << 25) | (0 << 17) | (0x3C << 9) | 255, 0x1),
+             "v_frexp_exp_i32_f64_e32 v0, 0x1", 1, 1),
+            (words((0x3F << 25) | (0 << 17) | (0x3C << 9) | 255, 0x0),
+             "v_frexp_exp_i32_f64_e32 v0, 0x0", 1, 1),
+            # VOP1 v_cvt_f32_f64_e32 v2, 0x3ff80000
+            (words((0x3F << 25) | (2 << 17) | (0x0F << 9) | 255, 0x3FF80000),
+             "v_cvt_f32_f64_e32 v2, 0x3ff80000", 1, 8),
+            # VOP3 v_add_f64 v[0:1], 0x1, 1  (literal 0x1 vs inline integer 1)
+            (words((0x35 << 26) | (0x164 << 16) | 0, 255 | (129 << 9), 0x1),
+             "v_add_f64 v[0:1], 0x1, 1", 1, 1),
+            # VOP3 v_add_f64 v[0:1], neg(0x3ff00000), |0x3ff00000|
+            (words((0x35 << 26) | (0x164 << 16) | (2 << 8) | 0, (1 << 29) | 255 | (255 << 9), 0x3FF00000),
+             "v_add_f64 v[0:1], neg(0x3ff00000), |0x3ff00000|", 1, 8),
+            # VOP3 v_ldexp_f64 v[0:1], 0x3ff00000, 3  (SRC0 is f64, SRC1 is inline int)
+            (words((0x35 << 26) | (0x168 << 16) | 0, 255 | (131 << 9), 0x3FF00000),
+             "v_ldexp_f64 v[0:1], 0x3ff00000, 3", 1, 8),
+        )
+        for raw, asm, arg_idx, digits in cases:
+            with self.subTest(asm=asm):
+                (ins,) = rdna2_decode.decode_bytes(raw)["insns"]
+                expected = shader_ir.parse_line(asm)
+                self.assertTrue(ins["args"][arg_idx].get("f64_literal"))
+                self.assertEqual(ins["args"][arg_idx].get("literal_hex_digits"), digits)
+                for field in ("op", "args", "mods"):
+                    self.assertEqual(ins[field], expected[field])
+                line = rdna2_decode.format_insn(ins).split(";", 1)[0].strip()
+                self.assertEqual(line, asm)
+                reparsed = shader_ir.parse_line(line)
+                for field in ("op", "args", "mods"):
+                    self.assertEqual(reparsed[field], expected[field])
+
+        # VOPC & VOP3 f64 compares and class: SRC0 ('f64') is tagged, while integer SRC1 on class/ldexp
+        # and integer SRC0 on v_cvt_f64_i32 are not tagged as f64_literal.
+        cmp_e32, = rdna2_decode.decode_bytes(words((0x3E << 25) | (0x21 << 17) | (2 << 9) | 255, 0x1))["insns"]
+        self.assertEqual(cmp_e32["op"], "v_cmp_lt_f64_e32")
+        self.assertTrue(cmp_e32["args"][1].get("f64_literal"))
+        self.assertEqual(cmp_e32["args"][1].get("literal_hex_digits"), 1)
+        self.assertEqual(rdna2_decode.format_insn(cmp_e32).split(";", 1)[0].strip(),
+                         "v_cmp_lt_f64_e32 vcc_lo, 0x1, v[2:3]")
+
+        cls_e64, = rdna2_decode.decode_bytes(
+            words((0x35 << 26) | (0xA8 << 16) | 0, (256 + 2) | (255 << 9), 0x3FF))["insns"]
+        self.assertEqual(cls_e64["op"], "v_cmp_class_f64_e64")
+        self.assertNotIn("f64_literal", cls_e64["args"][2])
+
+        ldexp_int, = rdna2_decode.decode_bytes(
+            words((0x35 << 26) | (0x168 << 16) | 0, (256 + 2) | (255 << 9), 0x100))["insns"]
+        self.assertNotIn("f64_literal", ldexp_int["args"][2])
+
+        cvt_i32, = rdna2_decode.decode_bytes(
+            words((0x3F << 25) | (0 << 17) | (0x04 << 9) | 255, 0x1234))["insns"]
+        self.assertEqual(cvt_i32["op"], "v_cvt_f64_i32_e32")
+        self.assertNotIn("f64_literal", cvt_i32["args"][1])
+
+        # End-to-end execution through both disasm_bytes -> parse_file -> translate AND decode_bytes -> translate:
+        #   v_frexp_exp_i32_f64_e32 v0, 0x40180000  -> 3          (6.0 = 0.75 * 2^3)
+        #   v_frexp_mant_f64_e32    v[1:2], 0x40180000 -> (0, 0x3fe80000)
+        #   v_frexp_exp_i32_f64_e32 v3, 0x1         -> -1041      (0x00000001_00000000, not inline 1 -> -1073)
+        #   exp mrt0 v0, v1, v2, v3 done vm
+        #   s_endpgm
+        prog = words(
+            (0x3F << 25) | (0 << 17) | (0x3C << 9) | 255, 0x40180000,
+            (0x3F << 25) | (1 << 17) | (0x3D << 9) | 255, 0x40180000,
+            (0x3F << 25) | (3 << 17) | (0x3C << 9) | 255, 0x1,
+            (0x3E << 26) | (1 << 12) | (1 << 11) | 0xF,
+            0 | (1 << 8) | (2 << 16) | (3 << 24),
+            0xBF810000,
+        )
+        asm, bad, err = shader_disasm.disasm(prog, "gfx1013", backend="python")
+        self.assertEqual((bad, err), (0, ""))
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm_dir = os.path.join(tmp, "disasm")
+            os.mkdir(disasm_dir)
+            with open(os.path.join(tmp, "ps_f64lit.dxbc"), "wb") as f:
+                f.write(b"DXBC" + bytes(28))
+            src = os.path.join(disasm_dir, "ps_f64lit.s")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write("; ps_f64lit  code 0x0..0x24 (python), gfx1013, 0 invalid words\n" + asm)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                spv_text = rdna2spirv.translate(src)
+                dec = rdna2_decode.decode_bytes(prog, name="ps_f64lit")
+                with patch.object(rdna2spirv, "parse_file", return_value=dec):
+                    spv_direct = rdna2spirv.translate(src)
+        want = [3, 0, 0x3FE80000, (-1041) & 0xFFFFFFFF]
+        self.assertEqual(list(si.run_fragment(spv_text)["%out_mrt0"]), want)
+        self.assertEqual(list(si.run_fragment(spv_direct)["%out_mrt0"]), want)
 
 
 if __name__ == "__main__":
