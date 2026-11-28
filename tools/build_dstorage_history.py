@@ -352,6 +352,32 @@ def fingerprint(pools, base_history):
     return digest.hexdigest()
 
 
+def _write_json_atomically(path, docs):
+    text = json.dumps(docs)
+    try:
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        mask = os.umask(0)
+        os.umask(mask)
+        mode = 0o666 & ~mask
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(text)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
 def build(game, output, trainer, base_history=None, json_out=None, if_needed=False):
     pools = calib._resolve_pools([str(game)])
     if any(output.resolve() == Path(p).resolve() for p in pools):
@@ -374,7 +400,7 @@ def build(game, output, trainer, base_history=None, json_out=None, if_needed=Fal
         extend_missing(docs, fit_slices(pools))
         fit_decoded_neighbors(pools, docs)
         history = temp/"history.json"
-        history.write_text(json.dumps(docs), encoding="utf-8", newline="\n")
+        _write_json_atomically(history, docs)
         if not trainer:
             # Cross-built PE helpers cannot run directly on Unix. Build the same small host tool locally.
             tables = temp/"bcpack_tables.inc"
@@ -394,7 +420,7 @@ def build(game, output, trainer, base_history=None, json_out=None, if_needed=Fal
         ix7 = sum(bool(v) for row in docs["bc7"]["historyIndexBits"] for v in row)
         print(f"Available predictors: BC6H endpoints {ep6}/256, indices {ix6}/256; "
               f"BC7 endpoint fields {ep7}/6144, index fields {ix7}/8192.", flush=True)
-        history.write_text(json.dumps(docs), encoding="utf-8", newline="\n")
+        _write_json_atomically(history, docs)
         pack.write_profile(str(history), temp/"history.bcph")
         signature += ":" + hashlib.sha256((temp/"history.bcph").read_bytes()).hexdigest()
         (temp/"signature").write_text(signature, encoding="utf-8", newline="\n")
