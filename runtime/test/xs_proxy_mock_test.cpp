@@ -17,6 +17,7 @@
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/xmem.h"
 #include "../src/title_page_watch.h"
+#include "../src/title_va_alias.h"
 #include "../src/d3d12_xs_frame_events.h"
 #include "../src/native_pso.h"
 
@@ -89,6 +90,8 @@ constexpr std::uint64_t kFenceHandle = 0x1000, kResourceHandle = 0x2000;  // the
 constexpr std::uint64_t kCompletedValue = 7;                            // what a mock fence's slot 8 returns
 constexpr UINT kHeapMarker = 0x26262626;  // the VisibleNodeMask a mock device's slot 26 answers
 constexpr SIZE_T kMockHeapCpuStart = 0x55550000ull;
+// The CPU start a mock descriptor heap reports; a test that needs the descriptors in memory points it at a buffer.
+SIZE_T g_mock_heap_cpu_start = kMockHeapCpuStart;
 constexpr UINT64 kMockHeapGpuStart = 0x66660000ull;
 constexpr UINT kMockDescriptorInc = 32;
 // {5d1e0c4a-2b7f-4e61-9a3d-8c4b2f1e6a70}: an interface the mock queue implements that the proxy does not model.
@@ -555,8 +558,8 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         *reinterpret_cast<void**>(a3) = g_mock_mapped;
     }
     if (m->kind == Kind::heap && slot == 9) {
-        if (a1) reinterpret_cast<D3D12_CPU_DESCRIPTOR_HANDLE*>(a1)->ptr = kMockHeapCpuStart;
-        return kMockHeapCpuStart;
+        if (a1) reinterpret_cast<D3D12_CPU_DESCRIPTOR_HANDLE*>(a1)->ptr = g_mock_heap_cpu_start;
+        return g_mock_heap_cpu_start;
     }
     if (m->kind == Kind::heap && slot == 10) {
         if (a1) reinterpret_cast<D3D12_GPU_DESCRIPTOR_HANDLE*>(a1)->ptr = kMockHeapGpuStart;
@@ -3447,6 +3450,92 @@ int check_descriptor_heap_hooks() {
     return 0;
 }
 
+// ---- Title-backed descriptor heaps hold what the real heap holds (RT-XS-DESCRIPTOR-MIRROR-GAPS) ----
+// Both heaps are memory here: the title's backing (from the XMem hook) and the real heap's CPU range (the mock's).
+// 1. Slot 61, CreateSamplerX for a title caller, stores the sampler at the title's address too, as slot 22 does.
+// 2. A descriptor table bound on a list (slots 35/36) is filled from the title's backing when the real range is a
+//    mapped one (the descriptor mapping provider says so). On Wine VirtualQuery may call such memory free; here it is
+//    ordinary memory, so this checks the mapped path works, not the Wine case itself.
+bool g_mirror_mapped = false;
+bool mock_descriptor_mapping(ID3D12DescriptorHeap*, SIZE_T, SIZE_T) { return g_mirror_mapped; }
+
+int check_descriptor_mirror() {
+    alignas(64) static std::uint8_t title[8 * kMockDescriptorInc];
+    alignas(64) static std::uint8_t real_heap[8 * kMockDescriptorInc];
+    std::memset(title, 0, sizeof(title));
+    std::memset(real_heap, 0, sizeof(real_heap));
+    g_heap_hook = {};
+    xs::set_descriptor_heap_allocator(&mock_heap_alloc, &mock_heap_free);
+    g_mock_heap_cpu_start = reinterpret_cast<SIZE_T>(real_heap);
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, true);
+    EXPECT(device);
+    xs::set_descriptor_mapping_provider(device, &mock_descriptor_mapping);
+    const IID iid_heap = __uuidof(ID3D12DescriptorHeap);
+    const SIZE_T title_base = reinterpret_cast<SIZE_T>(title);
+
+    // 1. A sampler heap backed by `title`; the "driver" writes the sampler into the real heap's slot 3.
+    g_mirror_mapped = false;
+    g_heap_hook.next_ptr = title;
+    D3D12_DESCRIPTOR_HEAP_DESC desc{};
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    desc.NumDescriptors = 8;
+    void* heap = nullptr;
+    EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&desc), word(&iid_heap), word(&heap)))) && heap);
+    EXPECT(raw(heap, 9) == title_base);
+    const SIZE_T off3 = 3 * kMockDescriptorInc;
+    for (unsigned i = 0; i < kMockDescriptorInc; ++i) real_heap[off3 + i] = std::uint8_t(0x40 + i);
+    D3D12_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    xs::set_console_caller([](std::uint64_t) { return true; });
+    raw(device, 61, word(&sampler), title_base + off3);
+    xs::set_console_caller(nullptr);
+    EXPECT(mock->args[22][1] == reinterpret_cast<SIZE_T>(real_heap) + off3);   // the real heap's slot 3
+    EXPECT(std::memcmp(title + off3, real_heap + off3, kMockDescriptorInc) == 0);
+    EXPECT(title[off3 - 1] == 0 && title[off3 + kMockDescriptorInc] == 0);    // that slot only
+    EXPECT(raw(heap, 2) == 0);
+
+    // 2. A shader-visible heap whose real range is mapped (the Vulkan device's live arena): the title writes slot 2
+    //    in its own memory, while the real slot holds what an earlier submission's shaders read (timbot103's review
+    //    of #2498). Binding a table that covers it while a list is recorded leaves the real slot alone; the queue's
+    //    pull at submission (pull_title_descriptors, through title_va_aliases) takes the title's slot.
+    std::memset(title, 0, sizeof(title));
+    std::memset(real_heap, 0, sizeof(real_heap));
+    g_mirror_mapped = true;
+    g_heap_hook.next_ptr = title;
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heap = nullptr;
+    EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&desc), word(&iid_heap), word(&heap)))) && heap);
+    const SIZE_T off2 = 2 * kMockDescriptorInc;
+    for (unsigned i = 0; i < kMockDescriptorInc; ++i) title[off2 + i] = std::uint8_t(0x80 + i);
+    std::uint8_t in_flight[kMockDescriptorInc];
+    for (unsigned i = 0; i < kMockDescriptorInc; ++i) in_flight[i] = real_heap[off2 + i] = std::uint8_t(0x11 + i);
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    const IID gcl_iid = __uuidof(ID3D12GraphicsCommandList);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+    void* list = nullptr;
+    EXPECT(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, word(allocator), 0, word(&gcl_iid),
+                     word(&list))) == S_OK);
+    raw(list, 36, 0, kMockHeapGpuStart);                     // SetGraphicsRootDescriptorTable(0, heap start)
+    raw(list, 35, 0, kMockHeapGpuStart);                     // SetComputeRootDescriptorTable(0, heap start)
+    EXPECT(std::memcmp(real_heap + off2, in_flight, kMockDescriptorInc) == 0);  // untouched while recording
+    leonida::title_va_aliases().pull_descriptors(real_heap, sizeof(real_heap));  // the queue, at submission
+    EXPECT(std::memcmp(real_heap + off2, title + off2, kMockDescriptorInc) == 0);
+    EXPECT(release(list) == 0 && release(allocator) == 0 && raw(heap, 2) == 0);
+
+    g_mirror_mapped = false;
+    g_mock_heap_cpu_start = kMockHeapCpuStart;
+    xs::set_descriptor_heap_allocator(nullptr, nullptr);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: slot 61 samplers are stored at a title-backed heap's address, and a mapped real range takes a "
+                "bound table's descriptors from the title's memory at submission, not while a list is recorded\n",
+                g_label);
+    return 0;
+}
+
 // ---- Committed resources lease their size through the title's XMem hooks (RT-5 stop 17) ----
 // Slots 76 and 127 allocate the slot-25 size of the resource through the installed hooks with page-size field 2, the
 // resource holds the lease, and the hooks' free runs once, when the resource is destroyed.
@@ -5410,6 +5499,7 @@ int main(int argc, char** argv) {
         check_fence_completed_value() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_lists() ||
         check_signalx_detection() || check_list_tail_names() || check_console_command_list() ||
+        check_descriptor_mirror() ||
         check_custom_heap_properties() ||
         check_resource_allocation_info() || check_slot70() || check_slot70_raw_buffer() ||
         check_slot57_native_graphics() || check_committed_resource3_x() ||

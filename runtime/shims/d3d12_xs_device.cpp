@@ -385,6 +385,12 @@ void local_mirror_table(const DeviceProxy* device, std::uint64_t gpu_handle) {
         const std::uint64_t offset = (gpu_handle - gpu_start) / kLocalDescriptorBytes * kLocalDescriptorBytes;
         const std::uint64_t slots = (std::min<std::uint64_t>)(kLocalMirrorSlots, (bytes - offset) / kLocalDescriptorBytes);
         const SIZE_T copy_bytes = slots * kLocalDescriptorBytes;
+        // A mapped real range is the Vulkan device's live arena: shaders of lists already submitted read it, and the
+        // queue rewrites the slots it pulls there in place (buffer addresses rebased) when it submits. A raw copy made
+        // here, while a list is recorded, could overwrite a translated slot an earlier submission is still reading.
+        // The queue pulls the title's slots for every bound table itself (pull_title_descriptors), so a mapped range
+        // is left to it.
+        if (range.mapped) return;
         if (!local_accessible(range.real_start + offset, copy_bytes, true)) return;
         const auto copied = copy_title_slots(reinterpret_cast<std::uint8_t*>(range.real_start + offset),
                                              range.custom_start + offset, copy_bytes);
@@ -5125,6 +5131,9 @@ void proxy_create_sampler_x(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, s
     // A destination in the title's own descriptor range is translated to the real heap's, as device slots 17 to 24 do.
     handle = translate_cpu_handle(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(dest)});
     self->real->CreateSampler(desc, handle);
+    // And stored at the title's address for a title-backed heap, as slot 22 does: a title that copies its samplers
+    // from that memory would otherwise copy zeros.
+    local_write_through(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(dest)}, 1);
 }
 
 // The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named
