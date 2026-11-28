@@ -87,7 +87,10 @@ public:
     CopyFile2Trap() {
         if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll"))
             target_ = reinterpret_cast<uint8_t*>(GetProcAddress(k32, "CopyFile2"));
-        if (!target_) return;
+        if (!target_) {
+            absent_ = true;  // Wine 9: no export at all, so nothing can call it and there is nothing to trap
+            return;
+        }
         DWORD old = 0;
         if (!VirtualProtect(target_, sizeof(saved_), PAGE_EXECUTE_READWRITE, &old)) {
             target_ = nullptr;
@@ -110,11 +113,13 @@ public:
         FlushInstructionCache(GetCurrentProcess(), target_, sizeof(saved_));
     }
     bool armed() const { return target_ != nullptr; }
+    bool absent() const { return absent_; }  // the host exports no CopyFile2
     CopyFile2Trap(const CopyFile2Trap&) = delete;
     CopyFile2Trap& operator=(const CopyFile2Trap&) = delete;
 
 private:
     uint8_t* target_ = nullptr;
+    bool absent_ = false;
     uint8_t saved_[14] = {};
 };
 
@@ -535,7 +540,10 @@ int main() {
         check(submit(rc, {{"a", "WINE_OLD_A"}, {"b", "WINE_OLD_B"}}) == S_OK, "seed a and b for the CopyFile2 checks");
         {
             CopyFile2Trap trap;
-            check(trap.armed(), "CopyFile2 is trapped");
+            // Where the host has no CopyFile2 (Wine 9), the copies below are checked against the real thing; a
+            // CopyFile2 that exists but could not be patched is a failure.
+            if (trap.absent()) std::puts("note: the host exports no CopyFile2; checking the copies without a trap");
+            check(trap.armed() || trap.absent(), "CopyFile2 is trapped, or the host has none");
             check(submit(rc, {{"a", "WINE_NEW_A"}}) == S_OK && read_blob(rollback_dir, L"a") == "WINE_NEW_A",
                   "an update that overwrites a blob succeeds without CopyFile2");
             hold = CreateFileW((rollback_dir / L"b").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
