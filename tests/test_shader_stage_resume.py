@@ -129,6 +129,62 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.assertEqual(self.run_stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"])
         self.assertEqual(self.run_stage(), [])
 
+    def test_a_same_size_index_that_names_another_shader_is_translated_again(self):
+        # The completeness check counts entries, so an index left by other inputs with as many entries as the carve
+        # passed for this folder's finished translation and no step ran.
+        self.run_stage()
+        index = os.path.join(self.spirv, "index.json")
+        with open(index, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"unrelated": {"stage": "vs"}}, f)
+        plan = os.path.join(self.spirv, make_game.SHARD_PLAN)
+        with open(plan, "w", encoding="utf-8", newline="\n") as f:
+            f.write("{}\n")
+        self.assertEqual(self.run_stage(), ["translate"])
+        with open(index, encoding="utf-8") as f:
+            self.assertEqual(list(json.load(f)), ["s0"])
+        self.assertFalse(os.path.exists(plan), "the stale index's shard plan must not be reused")
+        self.assertEqual(self.run_stage(), [])
+
+    def test_a_translation_that_names_another_shader_fails_the_stage(self):
+        def stranger(disasm, spirv, jobs, emulate=False, fallbacks=()):
+            self.ran.append("translate")
+            os.makedirs(spirv, exist_ok=True)
+            with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"unrelated": {"stage": "vs"}}, f)
+
+        err = io.StringIO()
+        with mock.patch.object(self, "fake_translate", stranger), mock.patch("sys.stderr", err),                 self.assertRaises(SystemExit) as stop:
+            self.run_stage()
+        self.assertEqual(stop.exception.code, 1)
+        self.assertIn("unrelated", err.getvalue())
+        self.assertIn("not carved here", err.getvalue())
+
+    def test_index_strangers_are_names_with_no_carved_shader(self):
+        self.touch(self.dxbc, "index.json")
+        carved = os.path.join(self.dxbc, "index.json")
+        index = os.path.join(self.spirv, "index.json")
+        os.makedirs(self.spirv, exist_ok=True)
+
+        def strangers(text):
+            with open(index, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            return make_game.translated_index_strangers(index, carved)
+
+        self.assertEqual(strangers('{"s0": {}}'), [])
+        self.assertEqual(strangers('{"s0": {}, "b": {}, "a": {}}'), ["a", "b"])
+        # What other checks own is not judged here: an empty, unreadable or non-mapping index.
+        self.assertEqual(strangers("{}"), [])
+        self.assertEqual(strangers("not json"), [])
+        self.assertEqual(strangers("[]"), [])
+        with open(carved, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"not": "a list"}')
+        self.assertEqual(strangers('{"unrelated": {}}'), [])
+        with open(carved, "w", encoding="utf-8", newline="\n") as f:
+            f.write('[{"name": "no file field"}]')
+        self.assertEqual(strangers('{"unrelated": {}}'), [])
+        os.remove(carved)
+        self.assertEqual(strangers('{"unrelated": {}}'), [])
+
     def test_llvm_version_change_at_the_same_path_refreshes_only_the_dependent_steps(self):
         wrapper = os.path.join(self.work, "fake llvm-mc.py")
         with open(wrapper, "w", encoding="utf-8") as f:

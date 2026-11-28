@@ -1304,6 +1304,30 @@ def translated_index_is_empty(index: str) -> bool:
         return False
 
 
+def translated_index_strangers(index: str, carved: str) -> list[str]:
+    """The names in a saved translated index that are no carved shader of this work folder, sorted; [] when
+    there are none or it cannot be judged here (a missing, unreadable or malformed file: other checks own those).
+
+    A shader keeps its carved file's stem through unpacking, disassembly and translation, so rdna2spirv.py can only
+    publish entries named after carved shaders. An entry with another name was left by other inputs: an index
+    with the right number of entries is not thereby this folder's translation."""
+    try:
+        with open(index, encoding="utf-8") as f:
+            names = json.load(f)
+        with open(carved, encoding="utf-8") as f:
+            rows = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(names, dict) or not isinstance(rows, list):
+        return []
+    stems = set()
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("file"), str):
+            return []
+        stems.add(os.path.splitext(row["file"])[0])
+    return sorted(name for name in names if name not in stems)
+
+
 def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulated: bool = False,
             fallbacks: tuple[str, ...] = ()) -> None:
     src = os.path.join(game, "shaders.rpf")
@@ -1397,6 +1421,14 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         # its parts are what the empty merge read, so a retry has to translate them again rather than reuse them.
         log("shaders: the saved translated index names no shaders: translating again")
         drop(translated, shard_plan)
+    if os.path.isfile(translated):
+        # The same number of entries is not the same shaders. An index naming a shader this folder never carved was
+        # left by other inputs; its shard parts describe the same outputs, so the plan goes with it.
+        strangers = translated_index_strangers(translated, carved)
+        if strangers:
+            log(f"shaders: the saved translated index names {len(strangers)} shader(s) that were not carved here "
+                f"(first: {strangers[0]}): translating again")
+            drop(translated, shard_plan)
     if not os.path.isfile(translated):
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
@@ -1415,6 +1447,10 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
             f.write(sources + "\n")
         translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
     verify_translation_completeness(dxbc, spirv)
+    strangers = translated_index_strangers(translated, carved)
+    if strangers:
+        fail(f"shaders: the translation index names {len(strangers)} shader(s) that were not carved here "
+             f"(first: {strangers[0]}), so it is not this folder's translation. Run the shaders stage again")
     native_pso_hashes(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
