@@ -18098,6 +18098,10 @@ public:
                 if (!view.resource) log_once("unsupported typeless or RGBA8 RTV format/subresource:", int(requested));
             } else if (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != rd.Format) {
                 view = {};
+                if (first_diagnostic("mismatched typed RTV format",
+                                     (int(rd.Format) << 16) | (int(desc->Format) & 0xffff)))
+                    std::fprintf(stderr, "[rt] d3d12: mismatched typed RTV format: view %d on resource %d\n",
+                                 int(desc->Format), int(rd.Format));
             }
         } else if (resource) {
             stub("ID3D12Device::CreateRenderTargetView(resource from another device)");
