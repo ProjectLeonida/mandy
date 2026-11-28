@@ -582,8 +582,8 @@ jobs:
       - name: Runtime tests on MoltenVK
         shell: bash
         env:
-          # vk_overlapping_occlusion: since #2100 (D3D-252), https://github.com/ItsNotRexed/Leonida/issues/3796#issuecomment-7086691314
-          EXPECTED_FAILURES: vk_overlapping_occlusion
+          # None today: vk_overlapping_occlusion passes on MoltenVK. Add a name here with what tracks it.
+          EXPECTED_FAILURES: ""
         run: |
           set +e
           ctest --test-dir runtime/build --output-on-failure -j "$(sysctl -n hw.ncpu)" 2>&1 | tee "$RUNNER_TEMP/ctest.log"
