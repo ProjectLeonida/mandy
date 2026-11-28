@@ -11,6 +11,78 @@ This page collects the setup steps and the problems testers have run into so far
 
 [claims]: https://github.com/ubiquitarianism/leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
 
+## Quick start on Windows
+
+The shortest path from a fresh Windows PC to a result you can post. The rest of this page has the details and the
+problems testers have hit; the steps below link to them.
+
+1. Install, in this order:
+   - Visual Studio 2022 (Community or Build Tools) with "Desktop development with C++", the "C++ CMake tools for
+     Windows" component and Windows SDK 10.0.26100 or newer.
+   - The [Vulkan SDK](https://vulkan.lunarg.com/). It sets `VULKAN_SDK` and puts `spirv-as`, `spirv-val`,
+     `glslangValidator` and `vulkaninfo` on `PATH`.
+   - [Python 3.12+](https://www.python.org/downloads/), with "Add python.exe to PATH" ticked, and git.
+   - Optional but needed for the full suite: `llvm-mc` with the AMDGPU target (see [What you need](#what-you-need)).
+     `powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1` builds one and sets `LLVM_MC` for you.
+2. Open a new PowerShell window (so it sees the new `PATH`), clone the repository and build the test programs:
+
+   ```powershell
+   git clone --recursive https://github.com/ubiquitarianism/leonida
+   cd leonida
+   powershell -ExecutionPolicy Bypass -File scripts\build_runtime.ps1
+   ```
+
+   The script uses the newest Visual Studio it finds. If Visual Studio 2026 is also installed and the link step
+   fails there, build from a "Developer PowerShell for VS 2022" instead:
+   `cmake -S runtime -B runtime\build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLEONIDA_REQUIRE_VULKAN=ON`, then
+   `cmake --build runtime\build`.
+3. Run the suite twice, once as your GPU runs it and once with wave64 emulation (this matters on NVIDIA and Intel,
+   whose subgroups are 32 wide, see [GPUs with 32-wide subgroups](#gpus-with-32-wide-subgroups-nvidia-intel-apple)):
+
+   ```powershell
+   python -I scripts\run_gpu_tests.py
+   $env:LEONIDA_W64_EMULATE = "1"; python -I scripts\run_gpu_tests.py; Remove-Item Env:LEONIDA_W64_EMULATE
+   ```
+
+   Without `llvm-mc`, add `--disasm-dir tests/semantic/fixtures/disasm` to both commands. That runs the
+   pre-disassembled subset only, so say "subset" in your result.
+
+   Using a prebuilt `runtime-windows` artifact instead of building? Check out the commit that built it and read
+   this page at that commit (see [Without a compiler](#without-a-compiler-a-ci-built-runtime)): an older
+   `run_gpu_tests.py` may not take every option shown here. `python -I scripts\run_gpu_tests.py --help`, run from
+   that checkout, lists the options it does take.
+4. Collect what the record needs:
+
+   ```powershell
+   git rev-parse HEAD                      # the commit you built
+   vulkaninfo --summary                    # GPU name, driver version, Vulkan version
+   python -I tools\vk_subgroup_info.py     # subgroup range (min_subgroup_size, max_subgroup_size)
+   cmd /c ver                              # Windows build
+   ```
+
+5. Copy a Windows file in [`gpu-test-results/`](../gpu-test-results) (`RTX3060Ti-Windows.txt` is a complete one), fill
+   in your GPU, driver, subgroup range, OS build, commit, tool versions and the last line each run printed
+   (`N/M passed, K skipped`), and list every `FAIL` line. Then follow [Posting your result](#posting-your-result).
+
+A `FAIL` is worth reporting, not a reason to stop: check [Known problems](#known-problems) first, and say in the
+record whether it matched a row there.
+
+### Testing someone else's pull request
+
+Once your GPU has a record, testing open pull requests on it helps more than a second record: review and testing
+are what most pull requests wait for. Pick one that changes the translator, the runtime or a GPU test, then:
+
+```powershell
+git fetch origin pull/<N>/head:pr-<N>
+git checkout pr-<N>
+powershell -ExecutionPolicy Bypass -File scripts\build_runtime.ps1   # always rebuild after switching
+python -I scripts\run_gpu_tests.py                                  # add --filter <name> for the tests it touches
+```
+
+Run `main` the same way for comparison (`git checkout main`, rebuild, run). Then comment on the pull request with
+one line per mode, in the form `<GPU>, <driver>, Windows <build>: X of Y passed, K skipped, F failed (native);
+main at <commit>: ...`, plus any `FAIL` lines that differ from `main`.
+
 ## What you need
 
 - **Python 3.12+**, which `make_game.py` requires (it stops with "Python 3.12 or newer is needed" on an older one, so
@@ -54,6 +126,32 @@ This page collects the setup steps and the problems testers have run into so far
     for `VK_KHR_maintenance8`; older ones still build, but skip what needs it.
   - macOS: `brew install llvm molten-vk vulkan-headers vulkan-loader spirv-tools vulkan-tools`. The test programs
     load MoltenVK directly; set `LEONIDA_VULKAN_LOADER` to use the Vulkan loader instead.
+
+## Source-only smoke verification (DX-07)
+
+To verify a checkout quickly on any platform without game files, retail binaries, or hardware prerequisites:
+
+```bash
+# Standard-library sanity and toolchain discovery (Windows, Linux, macOS)
+python -I scripts/smoke.py --prereqs-only
+
+# Fast source-only smoke suite (< 1 second)
+python -I scripts/smoke.py --quick
+
+# Full synthetic smoke validation (compileall, no-game-data, CLI help, unit tests)
+python -I scripts/smoke.py
+
+# Machine-readable output for scripts and CI
+python -I scripts/smoke.py --json
+
+# Also available through the unified developer entry point
+python -I scripts/dev.py smoke --quick
+```
+
+Exit codes:
+- `0`: all requested synthetic checks passed.
+- `1`: one or more synthetic checks or tests failed.
+- `2`: required environment prerequisites missing (e.g., Python < 3.10) or invalid options.
 
 ## Build the test programs
 
@@ -336,12 +434,13 @@ of those fail for that reason.
 
 ### Run a Windows CI artifact under Wine
 
-The `Runtime` workflow uploads `runtime-windows` for seven days. It contains the Windows executables, DLLs,
+The [Runtime workflow](https://github.com/ubiquitarianism/leonida/actions/workflows/runtime.yml) uploads
+`runtime-windows` for seven days. It contains the Windows executables, DLLs,
 synthetic test shaders, CTest inventory and the path of the Windows checkout. From a clean checkout of the commit
 used by the Windows job, set `run_id` to the Actions run ID and download the artifact to `runtime/build`:
 
 ```sh
-gh run download "$run_id" --repo ItsNotRexed/Leonida --name runtime-windows --dir runtime/build
+gh run download "$run_id" --repo ubiquitarianism/leonida --name runtime-windows --dir runtime/build
 
 WINE=wine WINEPREFIX="$(mktemp -d)" WINEDLLOVERRIDES="mscoree,mshtml=" WINEDEBUG=-all \
   bash scripts/run_wine_session.sh python3 -I scripts/run_wine_tests.py \
@@ -628,7 +727,7 @@ constant `false` there instead makes the emulated `ms_tri` draw a frame byte-ide
 `ms_tri`, `ms_wave_info_s3`, `ms_w64x_ballot` and `ms_v5_workgroup` byte-identical to NVIDIA's at both widths (Mesa
 26.0.3, [measured by @TreXito](https://github.com/ItsNotRexed/Leonida/pull/3838#issuecomment-7086696759), with a 42-line reduced
 reproducer). llvmpipe is not a substitute for a result from a
-real GPU in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): it catches regressions, not hardware
+real GPU in [gpu-test-results/](../gpu-test-results/): it catches regressions, not hardware
 differences.
 
 ## Macs in CI
@@ -742,6 +841,22 @@ exits 77, so CI skips it. `image_fuzz.py --oracle hw` loads a linear texture thr
 (GFX11 on gfx11xx, GFX10 on gfx103x; `tests/test_image_fuzz_hw.py` has the exact words) and compares every texel with
 its CPU model; add `--negative-control` to check that wrong models are caught. A gfx1150 (RDNA3.5) is not RDNA2: a
 match supports the model and does not prove RDNA2. Run these one at a time: a second job on the same GPU can hang it.
+
+## Model oracle on any Vulkan GPU (no AMD hardware)
+
+`pk16_diff.py`, `vint_diff.py` and `sdwa_diff.py` judge their translated programs on a Vulkan GPU only against the words
+a native AMD GPU produced (`--oracle hw,vk`). `tools/vk_model_fuzz.py` runs the same programs, for the same seed, on
+whatever Vulkan GPU you have and judges them against the fuzzer's reference model instead:
+
+```sh
+python -I tools/vk_model_fuzz.py pk16_diff --programs 1500 --seed 11 --build runtime/build
+```
+
+`--build` is the folder with `vk_compute_test`; `llvm-mc` with the AMDGPU target is needed as for `valu_fuzz.py`. It exits
+0 when every judged program matched, 1 on a mismatch (the first few programs are printed), 2 when `vk_compute_test` is
+missing and 77 when nothing could be judged. A program the model declines counts as a skip. A mismatch here is the GPU
+disagreeing with the model, which is a driver difference, a translator bug or a model bug: re-read the program with
+the fuzzer itself (`pk16_diff.py --seed S --programs N`) before reporting it.
 
 ## Choosing the GPU
 
