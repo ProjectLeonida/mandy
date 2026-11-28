@@ -64,7 +64,7 @@ FLAG_WRITERS = {
     "imul": "CV", "mul": "CV",
     "bsf": "Z", "bsr": "Z",
     "bt": "C", "bts": "C", "btr": "C", "btc": "C",
-    "popcnt": "Z",
+    "popcnt": "Z", "cmpxchg8b": "Z", "cmpxchg16b": "Z",
     "cmps": "NZCVPA", "scas": "NZCVPA",
     "sahf": "NZCPA", "popf": "NZCVPA",
     "clc": "C", "stc": "C", "cmc": "C",
@@ -175,6 +175,7 @@ OF = {
     0xC0: ("xadd", "Eb Gb"), 0xC1: ("xadd", "Ev Gv"),
     0xC3: ("movnti", "Ev Gv"),
     0xAE: ("grp15", "E"),
+    0xC7: ("grp9", "E"),
     0x77: ("emms", ""),
     0x06: ("clts", "sys"), 0x09: ("wbinvd", "sys"),
     0x18: ("nop", "Ev"), 0x19: ("nop", "Ev"), 0x1A: ("nop", "Ev"), 0x1B: ("nop", "Ev"),
@@ -499,6 +500,9 @@ def _classify(ins, mnem, cc_index, state):
         ins.kind = "leave"
     elif mnem == "not":
         ins.kind = "alu"
+    elif mnem in ("cmpxchg8b", "cmpxchg16b"):
+        ins.kind = "cas2"
+        ins.flags_w = "Z"
     else:
         ins.kind = "sys"
 
@@ -632,7 +636,7 @@ def decode_one(buf, pos, end, addr):
 
     if mnem == "invalid" or opspec in ("invalid", "sys"):
         pass  # still decoded below so operands/length are right where known
-    if mnem in ("grp1", "grp2", "grp3", "grp4", "grp5", "grp8", "grppop", "grpmov", "grp15"):
+    if mnem in ("grp1", "grp2", "grp3", "grp4", "grp5", "grp8", "grp9", "grppop", "grpmov", "grp15"):
         return _finish_group(buf, pos, end, ins, start, mnem, opspec, state, addr, opcode_byte)
     if mnem in ("invalid",):
         ins.mnem, ins.kind, ins.error = "invalid", "invalid", "invalid opcode"
@@ -678,6 +682,18 @@ def _finish_group(buf, pos, end, ins, start, group, opspec, state, addr, opcode_
         mnem, spec = ("fence" if mod == 3 else _GROUP15[reg7]), ""
         ins.mnem, ins.size = mnem, pos - start
         ins.kind = "nop" if mnem in ("fence", "xsaveopt") else "sys"
+        return ins
+    elif group == "grp9":
+        if mod == 3 or reg7 != 1:
+            ins.unknown, ins.mnem, ins.size = True, f"grp9_{reg7}", pos - start
+            return ins
+        mnem = "cmpxchg16b" if state["rexw"] else "cmpxchg8b"
+        ins.mnem = mnem
+        ins.ops = (rm_make(16 if state["rexw"] else 8),)
+        ins.size = pos - start
+        if ins.ops[0][0] == "m" and ins.ops[0][1]["rip"]:
+            ins.ops[0][1]["abs"] = ins.addr + ins.size + ins.ops[0][1]["disp"]
+        _classify(ins, mnem, opcode_byte & 0xF, state)
         return ins
     elif group == "grppop":
         if reg7 != 0:
@@ -1086,6 +1102,18 @@ class Asm:
 
     def udiv(self, rd, rn, rm, sf=1):
         self.emit((0x9AC00800 if sf else 0x1AC00800) | rm << 16 | rn << 5 | rd)
+
+    # exclusive pair load/store (ARMv8.0 LL/SC atomics)
+    def ldaxp(self, rt1, rt2, rn, sf=1):
+        assert rt1 != rt2
+        self.emit((0xC87F8000 if sf else 0x887F8000) | rt2 << 10 | rn << 5 | rt1)
+
+    def stlxp(self, rs, rt1, rt2, rn, sf=1):
+        assert rs != rt1 and rs != rt2 and rs != rn
+        self.emit((0xC8208000 if sf else 0x88208000) | rs << 16 | rt2 << 10 | rn << 5 | rt1)
+
+    def clrex(self):
+        self.emit(0xD5033F5F)
 
     # loads/stores
     def ldr(self, rt, rn, off=0, size=8, signed=False, target_sf=1):
@@ -2247,6 +2275,8 @@ class FunctionTranslator:
             self._emit_ret(ins)
         elif k == "leave":
             self._emit_leave(ins)
+        elif k == "cas2":
+            self._emit_cas2(ins)
         elif m == "bswap":
             sz = self._op_size(ins.ops[0])
             g = GMAP[ins.ops[0][1]]
@@ -2316,6 +2346,76 @@ class FunctionTranslator:
         a.label(tl)
         a.mov(g, T0, sf)
         a.label(done)
+
+    def _emit_cas2(self, ins):
+        """Emit cmpxchg8b (m64 vs EDX:EAX -> ECX:EBX) and cmpxchg16b (m128 vs RDX:RAX -> RCX:RBX)."""
+        if len(ins.ops) != 1 or ins.ops[0][0] != "m":
+            raise UnhandledInsn(ins, "non-memory cmpxchg8b/16b")
+        a = self.asm
+        is16 = ins.mnem == "cmpxchg16b"
+        sf = 1 if is16 else 0
+        half = 8 if is16 else 4
+        align_mask = 15 if is16 else 7
+        self._mem_addr(ins.ops[0][1], ADDR_T)
+
+        done_lbl = self._skip_lbl()
+        if ins.lock:
+            retry_lbl = self._skip_lbl()
+            fail_ll_lbl = self._skip_lbl()
+            unaligned_lbl = self._skip_lbl()
+            fail_plain_lbl = self._skip_lbl()
+            # Guard ARMv8.0 LDAXP/STLXP alignment without clobbering NZCV.
+            a.and_i(T0, ADDR_T, align_mask)
+            a.cbnz(T0, unaligned_lbl)
+
+            a.label(retry_lbl)
+            a.ldaxp(T0, T1, ADDR_T, sf=sf)
+            a.eor_r(T2, T0, GMAP[0], sf=sf)
+            a.eor_r(T3, T1, GMAP[2], sf=sf)
+            a.orr_r(T2, T2, T3, sf=sf)
+            a.cbnz(T2, fail_ll_lbl, sf=sf)
+            a.stlxp(T3, GMAP[3], GMAP[1], ADDR_T, sf=sf)
+            a.cbnz(T3, retry_lbl, sf=0)
+            a.movz(T2, 1, 0, sf=0)
+            a.b(done_lbl)
+
+            a.label(fail_ll_lbl)
+            a.clrex()
+            a.mov(GMAP[0], T0, sf=sf)
+            a.mov(GMAP[2], T1, sf=sf)
+            a.movz(T2, 0, 0, sf=0)
+            a.b(done_lbl)
+
+            a.label(unaligned_lbl)
+        else:
+            fail_plain_lbl = self._skip_lbl()
+
+        a.ldr(T0, ADDR_T, 0, size=half)
+        a.ldr(T1, ADDR_T, half, size=half)
+        a.eor_r(T2, T0, GMAP[0], sf=sf)
+        a.eor_r(T3, T1, GMAP[2], sf=sf)
+        a.orr_r(T2, T2, T3, sf=sf)
+        a.cbnz(T2, fail_plain_lbl, sf=sf)
+        a.str(GMAP[3], ADDR_T, 0, size=half)
+        a.str(GMAP[1], ADDR_T, half, size=half)
+        a.movz(T2, 1, 0, sf=0)
+        a.b(done_lbl)
+
+        a.label(fail_plain_lbl)
+        a.mov(GMAP[0], T0, sf=sf)
+        a.mov(GMAP[2], T1, sf=sf)
+        a.movz(T2, 0, 0, sf=0)
+
+        a.label(done_lbl)
+        need = self.needed.get(ins.addr, set())
+        if "Z" in need:
+            a.mrs_nzcv(T0)
+            a.bfi(T0, T2, 30, 1)
+            a.msr_nzcv(T0)
+        if ins.addr in self.mat:
+            a.ldr(T0, CTX_REG, CTX_EFLAGS, size=4)
+            a.bfi(T0, T2, 6, 1)
+            a.str(T0, CTX_REG, CTX_EFLAGS, size=4)
 
     def translate(self):
         for ins in self.insns:
