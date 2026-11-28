@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -3134,6 +3135,37 @@ bool host_ray_tracing(ID3D12Device* host) {
            o5.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
 }
 
+// Resource flag 0x400 is D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT and feature 54 D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT,
+// whose data is one UINT tier (DirectX-Headers v1.618.1; Windows SDK 10.0.26100's d3d12.h has neither). The flag is
+// valid only where the feature reports TIER_1, and E_INVALIDARG otherwise (DirectX-Specs,
+// D3D12TightPlacedResourceAlignment.md), so a host's answer follows its runtime's version and its driver, not
+// ID3D12Device11. Measured with the Agility SDK's D3D12Core 1.618.5 and 1.620.2 as the host runtime: an RTX 4060
+// Laptop (NVIDIA 621.40) reports TIER_1 and accepts the flag on buffers and textures; an Iris Xe (Intel
+// 32.0.101.7092) and WARP (10.0.26100.5074) report NOT_SUPPORTED and refuse it. Windows 11 24H2's own D3D12Core
+// 10.0.26100.5074 has ID3D12Device11 to 14 and no tight alignment at all: feature 54 is E_INVALIDARG and its debug
+// layer calls 0x400 an unrecognized bit, on all three adapters.
+// 0x200 is D3D12_RESOURCE_FLAG_VIDEO_PROCESS_3DLUT_ONLY (DirectX-Headers v1.620.1 is the first to name it). The two
+// Agility runtimes take it on a 3D texture only and refuse it on a buffer, as the layer does; 10.0.26100.5074 takes it
+// on buffers and on 2D and 3D textures.
+constexpr D3D12_FEATURE kFeatureTightAlignment = D3D12_FEATURE(54);
+#if defined(D3D12_SDK_VERSION) && D3D12_SDK_VERSION >= 618
+static_assert(kFeatureTightAlignment == D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT);
+static_assert(sizeof(D3D12_FEATURE_DATA_TIGHT_ALIGNMENT) == sizeof(UINT));
+#endif
+
+// The host's runtime has USE_TIGHT_ALIGNMENT, whatever its driver reports: it is D3D12Core 1.618 or newer, the kind
+// that refuses 0x200 on a buffer.
+bool host_knows_tight_alignment(ID3D12Device* host) {
+    UINT tier = 0;
+    return SUCCEEDED(host->CheckFeatureSupport(kFeatureTightAlignment, &tier, sizeof(tier)));
+}
+
+// The host accepts USE_TIGHT_ALIGNMENT, as the layer does: its runtime has the flag and its driver reports TIER_1.
+bool host_tight_alignment(ID3D12Device* host) {
+    UINT tier = 0;  // D3D12_TIGHT_ALIGNMENT_TIER_NOT_SUPPORTED
+    return SUCCEEDED(host->CheckFeatureSupport(kFeatureTightAlignment, &tier, sizeof(tier))) && tier != 0;
+}
+
 // Windows 10's runtime (no ID3D12Device10) still checks a buffer's initial state and refuses a HARDWARE_PROTECTED
 // heap, where newer runtimes and the layer accept them (measured on Windows 10 22H2 build 19045.5737). Windows 11
 // 23H2's runtime (D3D12Core 10.0.22621.5415: ID3D12Device10 but no ID3D12Device11) still refuses the
@@ -3158,15 +3190,19 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         InvalidCase call;
         bool (*comparable)(ID3D12Device*) = nullptr;
         bool windows10_refuses = false;
+        // The layer's answer where the host is not comparable. Without it such a host checks nothing: one that
+        // happens to answer as a wrong layer does would hide it.
+        std::optional<HRESULT> recorded;
     };
     const auto device10 = [](ID3D12Device* d) {
         Ref<ID3D12Device10> newer;
         return SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&newer.p)));
     };
     // Windows 11 23H2's in-box runtime (D3D12Core 10.0.22621.5415) has ID3D12Device10 but not ID3D12Device11, and
-    // still answers five of the device10 cases as Windows 10 does (HARDWARE_PROTECTED and flag 0x400 refused, 2049
-    // shader-visible samplers refused, a type -1 list created). Those five are compared only on a host with
-    // ID3D12Device11, which newer runtimes have (d3d12_sampler2_test compares against one).
+    // still answers three of the device10 cases as Windows 10 does (HARDWARE_PROTECTED refused, 2049 shader-visible
+    // samplers refused, a type -1 list created). Those three are compared only on a host with ID3D12Device11, which
+    // newer runtimes have (d3d12_sampler2_test compares against one). It refuses flag 0x400 too, as every runtime
+    // without tight alignment does: those two cases go by host_tight_alignment.
     const auto device11 = [](ID3D12Device* d) {
         Ref<ID3D12Device11> newer;
         return SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&newer.p)));
@@ -3786,11 +3822,13 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              desc.Flags = D3D12_RESOURCE_FLAGS(D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE);
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
          }, +device10},
+        // VIDEO_PROCESS_3DLUT_ONLY: refused on a buffer by the layer and by D3D12Core 1.618.5 and 1.620.2;
+        // 10.0.26100.5074 takes it.
         {"committed: resource flag 0x200 on a buffer", [](ID3D12Device* d) {
              auto desc = buffer_desc(256);
              desc.Flags = D3D12_RESOURCE_FLAGS(0x200);
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
-         }},
+         }, host_knows_tight_alignment, false, E_INVALIDARG},
         {"committed: resource flag 0x800 on a texture", [](ID3D12Device* d) {
              auto desc = rgba8(D3D12_RESOURCE_FLAGS(0x800));
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
@@ -3814,14 +3852,15 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              auto desc = rgba8(D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE);
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
          }, +device10},
+        // USE_TIGHT_ALIGNMENT: the layer accepts it, as a host that reports TIER_1 does.
         {"committed: resource flag 0x400 on a buffer", [](ID3D12Device* d) {
              auto desc = buffer_desc(256);
              desc.Flags = D3D12_RESOURCE_FLAGS(0x400);
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
-         }, +device11},
+         }, host_tight_alignment, false, S_OK},
         {"committed: resource flag 0x400 on a texture", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(D3D12_RESOURCE_FLAGS(0x400)));
-         }, +device11},
+         }, host_tight_alignment, false, S_OK},
         // A null output is a capability check; with invalid arguments too, the host's answer says which comes first.
         {"committed: heap type 99, null output", [](ID3D12Device* d) {
              const H heap{D3D12_HEAP_TYPE(99)};
@@ -4317,9 +4356,17 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         }
         const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
         if (verbose) std::printf(" ours 0x%08lx host 0x%08lx\n", a, b);
+        const bool comparable = !c.comparable || c.comparable(host.p);
+        if (!comparable && c.recorded && a != *c.recorded) {
+            ++mismatches;
+            std::fprintf(stderr,
+                         "invalid arguments %s: ours 0x%08lx, recorded 0x%08lx (host 0x%08lx, not comparable)\n",
+                         c.name, a, *c.recorded, b);
+            continue;
+        }
         if (a == b) continue;
         if (c.windows10_refuses && windows10_refusal(c.name, host.p, a, b)) continue;
-        if (c.comparable && !c.comparable(host.p)) {
+        if (!comparable) {
             std::printf("invalid arguments %s: not comparable on this host (ours 0x%08lx, host 0x%08lx)\n", c.name,
                         a, b);
             continue;
