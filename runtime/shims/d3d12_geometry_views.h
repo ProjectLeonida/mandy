@@ -1,6 +1,7 @@
 #pragma once
 
 #include "d3d12_title_buffer_windows.h"
+#include "../src/memory_breakdown.h"
 #include "../src/title_geometry_watch.h"
 #include <atomic>
 #include <chrono>
@@ -318,6 +319,7 @@ public:
         VkDeviceSize va{};
         bool at_cap = false;
         const bool over_bytes = bytes_ >= limit || bytes > limit - bytes_;
+        leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::geometry);
         if (over_bytes || !pool_.allocate(device, bytes, va, mapped, true, limit, &at_cap)) {
             if (at_cap || over_bytes) {
                 refused_[key] = gen;
@@ -380,6 +382,18 @@ public:
         std::lock_guard lock(execute_mutex_);
         executing_.push_back(++execute_serial_);
         return execute_serial_;
+    }
+    // The last replay begun, and the oldest still in progress (kAfterExecutes when none): what execute_end stamps by,
+    // for a copy the device retires the same way outside these views (a title window, DeviceState::retire_windows).
+    std::uint64_t execute_epoch() {
+        std::lock_guard lock(execute_mutex_);
+        return execute_serial_;
+    }
+    std::uint64_t oldest_execute() {
+        std::lock_guard lock(execute_mutex_);
+        std::uint64_t oldest = kAfterExecutes;
+        for (const auto s : executing_) oldest = (std::min)(oldest, s);
+        return oldest;
     }
     // The replay that began with `serial` has recorded its submissions. Views retired while only replays now finished
     // were in progress get submitted() (the context's submitted_retire_ticket(), read here, after those replays
