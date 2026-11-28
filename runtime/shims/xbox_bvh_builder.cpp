@@ -60,6 +60,7 @@
 #include "d3d12_xs_device.h"
 #include "shims.h"
 #include "../src/xdxr_descs.h"
+#include "xbox_bvh_builder_rules.h"
 
 namespace {
 
@@ -261,24 +262,19 @@ void builder_build_batched2x(void*, void* list, UINT count, const xdxr::BatchedD
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build;
         std::memcpy(&build, &element, sizeof(build));
         // The postbuild descriptions, without the offline-statistics type the DLL refuses (docs/xdxr.md §4).
-        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC kept[16];
-        UINT n_kept = 0;
-        bool skipped_statistics = false;
-        const auto* post = reinterpret_cast<const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*>(
-            element.postbuild_info_descs);
-        for (UINT p = 0; post && p < element.num_postbuild_info_descs; ++p) {
-            if (static_cast<uint32_t>(post[p].InfoType) == xdxr::kPostbuildInfoOfflineStatistics) {
-                skipped_statistics = true;
-                continue;
-            }
-            if (n_kept == 16) {
-                static std::atomic<bool> s_logged{false};
-                log_once(s_logged, "more than 16 postbuild descriptions in one element; the rest are dropped");
-                break;
-            }
-            kept[n_kept++] = post[p];
+        // Every description is scanned, also past the 16 kept, so a 0x10 one at any index skips the element
+        // (xbox_bvh_builder_rules.h).
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC kept[rt::xbox_bvh::kMaxKeptPostbuild];
+        const auto filtered = rt::xbox_bvh::filter_postbuild(
+            reinterpret_cast<const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*>(
+                element.postbuild_info_descs),
+            element.num_postbuild_info_descs, kept);
+        const UINT n_kept = filtered.kept;
+        if (filtered.dropped) {
+            static std::atomic<bool> s_logged{false};
+            log_once(s_logged, "more than 16 postbuild descriptions in one element; the rest are dropped");
         }
-        if (skipped_statistics) {
+        if (filtered.skipped_statistics) {
             // The DLL throws E_INVALIDARG for this element before any work; the shim skips it the same way.
             static std::atomic<bool> s_logged{false};
             log_once(s_logged, "an element asked for offline statistics (0x10), which the DLL refuses; element skipped");
@@ -351,9 +347,16 @@ HRESULT builder_rehydrate_batched2x(void* self, void* list, UINT count,
             if (!build.ScratchAccelerationStructureData && device) {
                 D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild{};
                 device->GetRaytracingAccelerationStructurePrebuildInfo(&build.Inputs, &prebuild);
-                const UINT64 size = prebuild.ScratchDataSizeInBytes ? prebuild.ScratchDataSizeInBytes : 1;
-                region = scratch_bytes;
-                scratch_bytes += (size + kAlign - 1) / kAlign * kAlign;
+                // A size whose aligned region would not fit the 64-bit total gets none (the build is skipped below
+                // as one without scratch) rather than wrapping the total and overlapping the other regions.
+                if (!rt::xbox_bvh::add_scratch_region(scratch_bytes, prebuild.ScratchDataSizeInBytes, kAlign,
+                                                      region)) {
+                    static std::atomic<bool> s_overflow_logged{false};
+                    log_once(s_overflow_logged,
+                             "RehydrateRaytracingAccelerationStructureBatched2X: an element's scratch size does not "
+                             "fit the batch's scratch buffer; it gets none");
+                    region = kNoRegion;
+                }
             }
         } else if (src) {
             source_only = true;

@@ -2788,6 +2788,11 @@ if(TARGET Vulkan::Headers)
     # XboxBvhBuilder.dll served by the layer's builder (RT-5, boot stop 18): the seven exports the executable imports,
     # through the shim registry as the title binds them; the structures are checked like d3d12_xdxr_rt's.
     set(LEONIDA_XBOX_BVH_BUILDER_OUT "${CMAKE_CURRENT_BINARY_DIR}/xbox_bvh_builder_cases")
+    # The postbuild filter and scratch regions of the XboxBvhBuilder shim, on the CPU (xbox_bvh_builder_rules.h).
+    add_executable(xbox_bvh_builder_rules_test test/xbox_bvh_builder_rules_test.cpp)
+    target_compile_definitions(xbox_bvh_builder_rules_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(xbox_bvh_builder_rules_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME xbox_bvh_builder_rules COMMAND xbox_bvh_builder_rules_test)
     add_executable(xbox_bvh_builder_test test/xbox_bvh_builder_test.cpp shims/xbox_bvh_builder.cpp shims/registry.cpp)
     target_link_libraries(xbox_bvh_builder_test PRIVATE gta6rt_d3d12_com)
     # LEONIDA_VULKAN_DEVICE: the shim hands its rehydration scratch to the layer's list, as in gta6rt.
