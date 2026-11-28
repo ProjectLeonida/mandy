@@ -9,9 +9,11 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -147,11 +149,64 @@ class GameRunSummaryTest(unittest.TestCase):
         self.assertIn("(+3 more methods)", text)
 
     def test_bad_arguments_fail(self):
-        for argv in (["/nonexistent/run/folder"], [HERE, "--top", "0"]):
+        for argv in (["/nonexistent/run/folder"], [HERE, "--top", "0"], [HERE, "--limit-seconds", "0"],
+                     [HERE, "--limit-seconds", "-5"]):
             with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as raised:
                     summary.main(argv)
                 self.assertEqual(raised.exception.code, 2)
+
+    def test_utf8_bom_exit_code_and_seconds_are_parsed(self):
+        run = self.run_folder(startup=[{"kind": "trace_open"}])
+        with open(os.path.join(run, "exit_code"), "w", encoding="utf-8-sig", newline="\n") as f:
+            f.write("124\n")
+        with open(os.path.join(run, "seconds"), "w", encoding="utf-8-sig", newline="\n") as f:
+            f.write("45\n")
+        s = summary.summarize(run, limit_seconds=60)
+        self.assertEqual(s["exit_code"], 124)
+        self.assertEqual(s["seconds"], 45)
+        self.assertIn("time limit (60 s) reached", s["end"])
+
+    def test_deeply_nested_boot_jsonl_line_is_counted_as_bad(self):
+        run = self.run_folder(startup=[{"kind": "trace_open"}], tail='{"kind": "error"}\n')
+        real_loads = summary.json.loads
+
+        def flaky_loads(line, *args, **kwargs):
+            if '"error"' in line:
+                raise RecursionError("maximum recursion depth exceeded")
+            return real_loads(line, *args, **kwargs)
+
+        with mock.patch.object(summary.json, "loads", side_effect=flaky_loads):
+            s = summary.summarize(run)
+        self.assertEqual(s["startup_bad_lines"], 1)
+        self.assertEqual(s["startup_events"], {"trace_open": 1})
+
+    def test_lines_handles_oserror_on_second_open(self):
+        real_open = open
+        calls = 0
+
+        def flaky_open(path, *args, **kwargs):
+            nonlocal calls
+            if str(path).endswith("stderr.log"):
+                calls += 1
+                if calls == 2:
+                    raise OSError("vanished")
+            return real_open(path, *args, **kwargs)
+
+        run = self.run_folder()
+        with mock.patch("builtins.open", side_effect=flaky_open):
+            self.assertEqual(list(summary._lines(os.path.join(run, "stderr.log"))), [])
+
+    def test_non_ascii_stdout_is_safe_under_redirected_io(self):
+        run = self.run_folder()
+        with open(os.path.join(run, "stderr.log"), "a", encoding="utf-8", newline="\n") as f:
+            f.write("[d3d12-trace] #99 Custom\u2603Method failed\n")
+        proc = subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "game_run_summary.py"), run],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue("Custom?Method" in proc.stdout or "Custom\u2603Method" in proc.stdout, proc.stdout)
 
 
 if __name__ == "__main__":

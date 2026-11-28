@@ -54,13 +54,16 @@ def _lines(path):
     except OSError:
         return
     encoding = "utf-16" if head in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
-    with open(path, encoding=encoding, errors="replace") as f:
-        yield from f
+    try:
+        with open(path, encoding=encoding, errors="replace") as f:
+            yield from f
+    except OSError:
+        return
 
 
 def _read_int(path):
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             return int(f.read().strip())
     except (OSError, ValueError):
         return None
@@ -113,7 +116,7 @@ def summarize(run: str, limit_seconds: int | None = None, top: int = 12) -> dict
             continue
         try:
             event = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             bad_lines += 1
             continue
         if not isinstance(event, dict) or "kind" not in event:
@@ -214,6 +217,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if not os.path.isdir(args.run):
         parser.error(f"no run folder: {args.run}")
+    if args.limit_seconds is not None and args.limit_seconds < 1:
+        parser.error("--limit-seconds must be 1 or more")
     if args.top < 1:
         parser.error("--top must be 1 or more")
     s = summarize(args.run, args.limit_seconds, args.top)
