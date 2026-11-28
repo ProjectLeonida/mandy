@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -147,6 +148,21 @@ inline bool write_png(std::FILE* file, VkExtent2D extent, VkFormat format, bool 
     return chunk(file, "IDAT", big_endian((b << 16) | a)) && chunk(file, "IEND", {});
 }
 
+// LEONIDA_PRESENT_DUMP_SLOW_MS: a number of milliseconds over 0. Unset or empty is 0 (off); anything else is refused.
+struct SlowGap {
+    std::uint64_t ms = 0;
+    bool valid = true;
+};
+
+inline SlowGap parse_slow_gap(const char* text) {
+    if (!text || !*text) return {};
+    std::uint64_t ms = 0;
+    const char* const end = text + std::strlen(text);
+    const auto parsed = std::from_chars(text, end, ms);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || !ms) return {0, false};
+    return {ms, true};
+}
+
 class PresentDump {
 public:
     PresentDump() {
@@ -182,14 +198,40 @@ public:
             }
             dir_ = std::filesystem::absolute(value);
             std::filesystem::create_directories(dir_);
+            // The loading screens are thousands of presents a few milliseconds apart and the frames after them come
+            // seconds apart, at a present number that differs from run to run (1,930 and 2,634 were measured for the
+            // same title), so no N keeps the slow ones without the thousands before them. This keeps them by their gap.
+#ifdef _WIN32
+            char text[24] = {};
+            size_t text_length = 0;
+            const errno_t read = getenv_s(&text_length, text, "LEONIDA_PRESENT_DUMP_SLOW_MS");
+            const SlowGap gap = read == 0 ? parse_slow_gap(text) : SlowGap{0, false};
+#else
+            const SlowGap gap = parse_slow_gap(std::getenv("LEONIDA_PRESENT_DUMP_SLOW_MS"));
+#endif
+            if (!gap.valid)
+                std::fprintf(stderr, "[rt] present: invalid LEONIDA_PRESENT_DUMP_SLOW_MS (expected milliseconds > 0); "
+                                     "ignored\n");
+            slow_gap_ = std::chrono::milliseconds(gap.ms);
             interval_ = interval;
         } catch (const std::exception&) { bad_value(); }
     }
 
     bool enabled() const { return interval_ != 0; }
-    bool due(std::uint64_t frames_shown) const {
+    // Whether the present with this index (from 0) is dumped: every Nth, and with LEONIDA_PRESENT_DUMP_SLOW_MS every
+    // one that comes at least that long after the one before it. A present asks twice, to copy its image and to save
+    // it: the first question measures the gap and both get its answer. Presents come one at a time.
+    bool due(std::uint64_t index) {
         const auto n = interval_.load();
-        return n && frames_shown % n == 0;
+        if (!n) return false;
+        if (!asked_ || asked_index_ != index) {
+            const auto now = std::chrono::steady_clock::now();
+            slow_ = slow_gap_.count() && asked_ && now - asked_at_ >= slow_gap_;
+            asked_ = true;
+            asked_index_ = index;
+            asked_at_ = now;
+        }
+        return index % n == 0 || slow_;
     }
     void disable(const char* why) {
         if (interval_.exchange(0)) std::fprintf(stderr, "[rt] present: %s; LEONIDA_PRESENT_DUMP disabled\n", why);
@@ -250,6 +292,11 @@ private:
 
     std::filesystem::path dir_;
     std::atomic<std::uint64_t> interval_{0};
+    std::chrono::milliseconds slow_gap_{0};  // LEONIDA_PRESENT_DUMP_SLOW_MS; 0: off
+    std::chrono::steady_clock::time_point asked_at_{};  // when the last present first asked due()
+    std::uint64_t asked_index_ = 0;
+    bool asked_ = false;
+    bool slow_ = false;  // the answer for asked_index_
     std::jthread writer_;  // joined before the state it uses is destroyed
 };
 

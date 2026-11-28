@@ -22,6 +22,14 @@
 int main(int argc, char** argv) {
     using namespace leonida;
     namespace fs = std::filesystem;
+    // LEONIDA_PRESENT_DUMP_SLOW_MS, before any device is asked for: milliseconds over 0, or nothing.
+    EXPECT(present_dump::parse_slow_gap(nullptr).valid && present_dump::parse_slow_gap(nullptr).ms == 0);
+    EXPECT(present_dump::parse_slow_gap("").valid && present_dump::parse_slow_gap("").ms == 0);
+    EXPECT(present_dump::parse_slow_gap("250").valid && present_dump::parse_slow_gap("250").ms == 250);
+    for (const char* text : {"0", "-1", "1.5", "250ms", " 250", "ms"}) {
+        EXPECT(!present_dump::parse_slow_gap(text).valid);
+        EXPECT(present_dump::parse_slow_gap(text).ms == 0);
+    }
     vktest::Device d;
     const auto status = d.initialize(true);
     if (status == vktest::DeviceStatus::unavailable) return 77;
@@ -30,10 +38,15 @@ int main(int argc, char** argv) {
     testfiles::ScratchDir scratch("leonida_present_dump");
     const fs::path dir = scratch.path() / "frames";
     const std::string_view mode = argc == 2 ? argv[1] : "";
-    EXPECT(mode.empty() || mode == "--default" || mode == "--invalid");
+    EXPECT(mode.empty() || mode == "--default" || mode == "--invalid" || mode == "--slow");
+    // --slow: N is 60, so of three presents only the first is an Nth one; the third comes after a pause longer than
+    // LEONIDA_PRESENT_DUMP_SLOW_MS and is dumped for that, the second right after the first is not.
+    const bool slow = mode == "--slow";
     const int interval = mode == "--default" ? 60 : 2;
-    const auto setting = dir.wstring() + (mode == "--default" ? L"" : mode == "--invalid" ? L",0" : L",2");
+    const auto setting =
+        dir.wstring() + (mode == "--default" ? L"" : mode == "--invalid" ? L",0" : slow ? L",60" : L",2");
     EXPECT(_wputenv_s(L"LEONIDA_PRESENT_DUMP", setting.c_str()) == 0);
+    EXPECT(_wputenv_s(L"LEONIDA_PRESENT_DUMP_SLOW_MS", slow ? L"1000" : L"") == 0);
     // An earlier dump might be a hard link outside the requested directory. Replacing it must leave that file intact.
     const auto sentinel = scratch.path() / "outside";
     if (mode == "--default") {
@@ -80,6 +93,7 @@ int main(int argc, char** argv) {
         EXPECT(presenter.ok());
         EXPECT(presenter.present(1, true) == VK_SUCCESS);
         for (int i = 1; i < interval; ++i) EXPECT(presenter.present_blank(true) == VK_SUCCESS);
+        if (slow) Sleep(1500);
         PresentPlanes planes;
         planes.plane[0].source = 1;
         planes.plane[0].dest[3] = 0.5f;
