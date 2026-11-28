@@ -720,6 +720,36 @@ int main() {
           emulated->emulated());
     CHECK(emulated->lds_bytes == 33332 && entry->lds_bytes == 0);  // workgroup bytes, emulation included (SHADER-309)
     CHECK(library.spirv(*entry).size() == 5);
+
+    // JSON names are UTF-8 even when the host filesystem's narrow encoding is not.
+    {
+        const auto folder = dir / "utf8";
+        std::filesystem::create_directories(folder);
+        {
+            std::ofstream index(folder / "index.json", std::ios::binary);
+            index << "{\"cs_\\u00e9\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash << "\"},"
+                     "\"cs_alias\": {\"stage\": \"cs\", \"spv\": \"explicit_\\u00e9.spv\", \"fssm_sha256\": \""
+                  << hash2 << "\"}}";
+        }
+        const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
+        for (const auto* name : {u8"cs_\u00e9.spv", u8"explicit_\u00e9.spv"}) {
+            std::ofstream module(folder / name, std::ios::binary);
+            module.write(reinterpret_cast<const char*>(words), sizeof(words));
+            CHECK(module.good());
+        }
+        ShaderLibrary utf8;
+        CHECK(utf8.load(folder));
+        for (const auto& key : {hash, hash2}) {
+            const auto* module = utf8.find("cs", key);
+            CHECK(module && utf8.spirv_bytes(*module) == sizeof(words));
+            CHECK(utf8.spirv(*module).size() == 5);
+        }
+        auto fallback = *utf8.find("cs", hash2);
+        fallback.name = "\xc3";  // an incomplete UTF-8 sequence in the default name
+        CHECK(utf8.spirv_bytes(fallback) == sizeof(words));
+        CHECK(utf8.spirv(fallback).size() == 5);
+    }
+
     // A relative folder (LEONIDA_SHADERS=spirv) is fixed when it is loaded: the modules are read later, after the title
     // may have changed the current directory, and must still come from the folder that was loaded.
     {
