@@ -50,7 +50,8 @@ function loadStudio() {
     vm.runInContext(script, context);
     vm.runInContext(`
         scene = { objects: new Set(), add(o) { this.objects.add(o); }, remove(o) { this.objects.delete(o); } };
-        camera = { position: new THREE.Vector3() };
+        camera = { position: new THREE.Vector3(), near: 0.1, far: 1000, projections: 0,
+            updateProjectionMatrix() { this.projections++; } };
         controls = { target: new THREE.Vector3(), update() {} };`, context);
     return { context, elements, loads, alerts, run: code => vm.runInContext(code, context) };
 }
@@ -134,6 +135,25 @@ test('a download that finishes or fails after a later click does not replace the
     assert.deepEqual([...studio.run('scene.objects')], [modelC]);
     assert.equal(studio.elements.get('stat-name').innerText, 'c.glb');
     assert.deepEqual(studio.alerts, []);
+});
+
+test('the camera fit keeps a 2 cm prop and a 600 m terrain tile between the near and far planes', () => {
+    for (const [x, y, z] of [[0.02, 0.02, 0.02], [5, 1.5, 2], [600, 40, 600]]) {
+        const studio = loadStudio();
+        studio.context.boxSize = { x, y, z };
+        studio.run(`THREE.Box3 = class { setFromObject() { return this; } getCenter(v) { return v; }
+            getSize(v) { return Object.assign(v, boxSize); } };
+            loadModel('/models/a.glb', 'a.glb', '', 1);`);
+        studio.loads[0].onLoad({ scene: fakeModel() });
+        // The camera sits at maxDim * (1.5, 1.2, 1.8) from the centred model; every point of the model's box is
+        // within half its diagonal of the centre.
+        const maxDim = Math.max(x, y, z), distance = maxDim * Math.hypot(1.5, 1.2, 1.8);
+        const radius = Math.hypot(x, y, z) / 2;
+        const camera = studio.run('camera');
+        assert.ok(camera.near < distance - radius, `${maxDim} m: near ${camera.near} clips the model`);
+        assert.ok(camera.far > distance + radius, `${maxDim} m: far ${camera.far} clips the model`);
+        assert.ok(camera.projections > 0, 'the projection is rebuilt with the new planes');
+    }
 });
 
 test('switching models in clay mode disposes the old model\'s geometry, material and texture, not the clay', () => {
