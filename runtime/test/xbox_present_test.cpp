@@ -1122,6 +1122,10 @@ int main() {
                 pair[1] = parameters(half_white.source, nullptr, xbox_scale_filter_point, 0, rt::d3d12::xbox_plane_flag_overlay);
                 EXPECT(present_planes(pair, 2) && composed_ok());
                 EXPECT(region_is(frame, 0, 0, width, height, {197, 64, 64}, 1));
+                const FLOAT add_unorm_one_alpha[4] = {188.0f / 255.0f, 0.0f, 0.0f, 1.0f / 255.0f};
+                EXPECT(fill(half_white.source, add_unorm_one_alpha));
+                EXPECT(present_planes(pair, 2) && composed_ok());
+                EXPECT(region_is(frame, 0, 0, width, height, {197, 64, 64}, 2));
 
                 const FLOAT clear_zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 const FLOAT straight_zero_alpha[4] = {1.0f, 0.0f, 0.0f, 0.0f};
@@ -1231,6 +1235,17 @@ int main() {
                 EXPECT(present_planes(pair, 2) && composed_ok());
                 EXPECT(region_is(frame, 0, 0, width, height, {186, 186, 186}, 3));
                 std::printf("compose: HDR10 plane 1 additive premultiplied (a == 0) over SDR plane 0: ok\n");
+
+                EXPECT(paint10a(hdr_ui, {8, 0, 16, 16}, 0, 0, 0, 3));
+                pair[1] = parameters(hdr_ui.source, nullptr, xbox_scale_filter_linear,
+                                     rt::d3d12::xbox_color_space_g2084_p2020, rt::d3d12::xbox_plane_flag_overlay);
+                EXPECT(present_planes(pair, 2) && composed_ok());
+                const double luminance = xbox_present_ref::pq_decode(add100 / 1023.0);
+                for (UINT x = 0; x < width; ++x) {
+                    const double opaque_weight = std::clamp((x + 0.5) * 16.0 / width - 7.5, 0.0, 1.0);
+                    const int byte = int(std::lround(255 * xbox_present_ref::sdr_encode(luminance * (1.0 - opaque_weight) / 203.0)));
+                    EXPECT(region_is(frame, x, 0, x + 1, height, {byte, byte, byte}, 3));
+                }
             }
 
             // D: an SDR plane 1 next to an HDR10 plane 0 that is not flagged an overlay is the GameDVR copy: not shown.
