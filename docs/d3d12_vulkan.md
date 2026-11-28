@@ -4005,12 +4005,18 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   (`CommandList` is a value; the application may `Reset` its list at once) and holds the operation. Everything the
   queue is asked to do after it (batches, Signals, queue markers) goes behind it, so per-queue order is kept.
   The held operations are recorded and submitted, in order, on their own `VkQueue` as soon as the Signals they wait for
-  have been submitted: by the thread that submits that Signal (or makes the CPU `Signal`), after it has dropped its own
-  queue's state lock. There is no worker thread and no GPU wait is added, but the call that releases is not free: that
-  thread records the held batches (what the `ExecuteCommandLists` would have cost, including whatever `execute` does
-  for the lists, such as the bindless upload's wait for the device until D3D-314 removes it) while it still holds the
-  mutex of the D3D12 queue whose `Signal` or `Wait` it is in, so other calls on that queue wait meanwhile; and
-  `remove_fence`, queue destruction and presenter destruction wait for a release in progress. One thread releases at a
+  have been submitted.
+  By default the thread that submits that Signal (or makes the CPU `Signal`) records them, while it still holds the
+  mutex of the D3D12 queue whose `Signal` or `Wait` it is in. With `LEONIDA_RELEASE_WORKER=1` it only asks: the held
+  queue's own worker thread records and submits them (`release_ready`, RT-RELEASER-HELD-REPLAY), the worker
+  `LEONIDA_SUBMIT_ASYNC` runs the queue's calls on, started for releases alone on the queue's first release when that
+  is off. No GPU wait is added. Recording a held batch costs what its `ExecuteCommandLists` would have, including its
+  first-use pipeline builds (tens of seconds each when cold), and with the setting that cost stays with the queue that
+  held it: the thread that signalled goes on, and the list values' releaser, which signals the gates of every queue
+  from one thread, is no longer kept by one queue's replay while the other queues' gates wait. Other calls on the held
+  queue wait for its state lock meanwhile, as before. Off by default until game runs on two vendors show it right.
+  `LEONIDA_HELD_RUN_DELAY_MS=<n>` makes each held operation wait n ms first, for tests (`d3d12_held_release_worker_test`
+  runs both ways). `remove_fence`, queue destruction and presenter destruction wait for a release in progress. One thread releases at a
   time (the others leave a note and the running one makes another pass); a release that submits a Signal lets the
   next queue's front run in the same pass, so chains (C waits B, B waits A, in any submission order) and operations
   with several waits resolve in dependency order, and the layout tracker follows that order. A wait whose value has

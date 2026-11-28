@@ -401,7 +401,7 @@ int main(int argc, char** argv) {
             EXPECT(presenter.present_planes(planes, true) == VK_SUCCESS);
             EXPECT(presenter.presented() == shown && !presenter.last_present_tore());
             EXPECT(capture_matches({51, 153, 230}, 2));
-            EXPECT(gate.signal(1));   // releases the render, then the presents, in order, on this thread
+            EXPECT(gate.signal(1));   // releases the render, then the presents, in order
             EXPECT(queue.idle());
             EXPECT(presenter.presented() == shown + 3 && presenter.composed_presents() >= 1);
             // The composed frame (0.2, 0.8, 0.4 in the plane) is the last one shown; a blank last would be black.

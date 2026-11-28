@@ -332,10 +332,11 @@ int main() {
             EXPECT(queue_a.signal(after.semaphore(), 1));                  // held behind it
             EXPECT(after.completed() == 0 && queue_a.take_held_failure() == ReplayResult::success);
             driver::fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
-            EXPECT(gate.signal(1));                                        // releases the batch on this thread
+            EXPECT(gate.signal(1));    // releases the batch (on the queue's worker with LEONIDA_RELEASE_WORKER=1)
+            EXPECT(after.wait(1, 10'000'000'000ULL));                      // the Signal behind it still signaled
+            EXPECT(queue_a.idle());
             EXPECT(queue_a.take_held_failure() == ReplayResult::unsupported);
             EXPECT(queue_a.take_held_failure() == ReplayResult::success);  // reported once
-            EXPECT(queue_a.idle() && after.completed() == 1);              // the Signal behind it still signaled
 
             driver::captured_wait_count.store(0);
             driver::captured_wait_sem.store(0);
@@ -355,8 +356,8 @@ int main() {
         // 3c. A Signal whose vkQueueSubmit fails signals nothing: a queue waiting for it stays held (the value is not
         //     counted as submitted), and the application's retry of the Signal goes through and releases it.
         {
-            VulkanFence fence(context, 0);
-            EXPECT(fence.semaphore() != VK_NULL_HANDLE);
+            VulkanFence fence(context, 0), done(context, 0);
+            EXPECT(fence.semaphore() != VK_NULL_HANDLE && done.semaphore() != VK_NULL_HANDLE);
             const std::uint64_t pattern = 0x5ca1ab1e0ddba11ULL;
             std::memcpy(src_ptr, &pattern, sizeof(pattern));
             std::memset(dst_ptr, 0, sizeof(pattern));
@@ -366,6 +367,7 @@ int main() {
             const CommandList* ptr = &copy_list;
             queue_b.wait(fence.semaphore(), 1);
             EXPECT(queue_b.execute({&ptr, 1}) == ReplayResult::success);  // held for the Signal
+            EXPECT(queue_b.signal(done.semaphore(), 1));                   // held behind it: tells when it ran
             driver::fail_next_submit.store(VK_ERROR_OUT_OF_HOST_MEMORY);
             EXPECT(!queue_a.signal(fence.semaphore(), 1));                     // the submit fails
             EXPECT(queue_b.idle() && fence.completed() == 0);
@@ -373,6 +375,9 @@ int main() {
             std::memcpy(&got, dst_ptr, sizeof(got));
             EXPECT(got == 0);                                                  // the waiter did not run
             EXPECT(queue_a.signal(fence.semaphore(), 1));                      // the retry signals, and releases it
+            // The release may run on queue B's worker (LEONIDA_RELEASE_WORKER=1), after the Signal call returned:
+            // waited for through the Signal behind the batch, as an application would.
+            EXPECT(done.wait(1, 10'000'000'000ULL));
             EXPECT(queue_b.idle() && queue_a.idle() && fence.completed() == 1);
             std::memcpy(&got, dst_ptr, sizeof(got));
             EXPECT(got == pattern);

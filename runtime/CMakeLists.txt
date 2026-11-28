@@ -2184,7 +2184,10 @@ if(TARGET Vulkan::Headers)
   endif()
   if(BUILD_TESTING)
     add_test(NAME vk_queue_query_sync COMMAND vk_queue_query_sync_test)
-    set_tests_properties(vk_queue_query_sync PROPERTIES SKIP_RETURN_CODE 77)
+    # The same with held work released on the queue's worker (LEONIDA_RELEASE_WORKER=1, RT-RELEASER-HELD-REPLAY).
+    add_test(NAME vk_queue_query_sync_release_worker COMMAND vk_queue_query_sync_test)
+    set_tests_properties(vk_queue_query_sync vk_queue_query_sync_release_worker PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(vk_queue_query_sync_release_worker PROPERTIES ENVIRONMENT "LEONIDA_RELEASE_WORKER=1")
   endif()
   # Fence and queue teardown with submissions pending: a fence released after an unheld Signal, the bindless upload
   # queue destroyed before another queue submits, the device-fault submit ring forgetting destroyed semaphores.
@@ -2472,7 +2475,11 @@ if(TARGET Vulkan::Headers)
     endif()
     add_test(NAME vk_presenter_sync COMMAND vk_presenter_sync_test)
     add_test(NAME vk_presenter_sparse_capture COMMAND vk_presenter_sync_test --sparse-capture)
-    set_tests_properties(vk_presenter_sync vk_presenter_sparse_capture PROPERTIES SKIP_RETURN_CODE 77)
+    # The presenter with held work released on the queue's worker (LEONIDA_RELEASE_WORKER=1, RT-RELEASER-HELD-REPLAY).
+    add_test(NAME vk_presenter_sync_release_worker COMMAND vk_presenter_sync_test)
+    set_tests_properties(vk_presenter_sync vk_presenter_sparse_capture vk_presenter_sync_release_worker
+                         PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(vk_presenter_sync_release_worker PROPERTIES ENVIRONMENT "LEONIDA_RELEASE_WORKER=1")
     set(conformance_src ${CMAKE_CURRENT_SOURCE_DIR}/../tools/conformance/native/src)
     add_executable(vk_present_dump_test test/vk_present_dump_test.cpp
                    ${conformance_src}/png_io.cpp ${conformance_src}/diagnostics.cpp)
@@ -3027,6 +3034,16 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_staged_copy_wait_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_staged_copy_wait COMMAND d3d12_staged_copy_wait_test)
     set_tests_properties(d3d12_staged_copy_wait PROPERTIES SKIP_RETURN_CODE 77)
+    # Held work released by another thread's Signal runs on the queue's worker with LEONIDA_RELEASE_WORKER=1
+    # (RT-RELEASER-HELD-REPLAY); the second entry checks that the default still releases on the signalling thread.
+    add_executable(d3d12_held_release_worker_test test/d3d12_held_release_worker_test.cpp)
+    target_link_libraries(d3d12_held_release_worker_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_held_release_worker_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_held_release_worker_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_held_release_worker COMMAND d3d12_held_release_worker_test)
+    add_test(NAME d3d12_held_release_on_signaller COMMAND d3d12_held_release_worker_test)
+    set_tests_properties(d3d12_held_release_worker d3d12_held_release_on_signaller PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(d3d12_held_release_worker PROPERTIES ENVIRONMENT "LEONIDA_RELEASE_WORKER=1")
     # Fence events the host runtime sets or refuses (released fences, no fences), compared with the host devices.
     add_executable(d3d12_fence_events_test test/d3d12_fence_events_test.cpp)
     target_link_libraries(d3d12_fence_events_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)

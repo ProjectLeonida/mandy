@@ -66,9 +66,8 @@ public:
         if (held_.load(std::memory_order_acquire) == 0 || in_pump()) return;
         {
             std::lock_guard pump(pump_mutex_);
-            in_pump() = true;  // what is dropped may release other fences: they must not wait for this lock
+            PumpScope scope;  // what is dropped may release other fences: they must not wait for this lock
             for (Holder* holder : snapshot()) holder->discard_waiting_on(semaphore);
-            in_pump() = false;
         }
         pump_ready();
     }
@@ -172,19 +171,42 @@ public:
         for (;;) {
             std::unique_lock pump(pump_mutex_, std::try_to_lock);
             if (!pump) return;  // another thread is releasing and will see dirty_
-            in_pump() = true;
-            while (dirty_.exchange(false, std::memory_order_acq_rel)) {
-                bool progress = true;
-                while (progress) {
-                    progress = false;
-                    for (Holder* holder : snapshot()) progress |= holder->release_ready();
+            {
+                PumpScope scope;
+                while (dirty_.exchange(false, std::memory_order_acq_rel)) {
+                    bool progress = true;
+                    while (progress) {
+                        progress = false;
+                        for (Holder* holder : snapshot()) progress |= holder->release_ready();
+                    }
+                    run_barriers();
                 }
-                run_barriers();
             }
-            in_pump() = false;
             pump.unlock();
             if (!dirty_.load(std::memory_order_acquire)) return;
         }
+    }
+
+    // A pass run now, after any pass in progress (waited for, not handed off): when it returns, what was already
+    // released has been offered again and every Present that can run has run. For a caller that waits for a queue
+    // (VulkanQueue::idle) after its worker has finished, since the worker's own pass can hand its last step (the
+    // Presents behind what it released) to a pass another thread is running.
+    // No "nothing to do" shortcut: a pass on another thread takes a Present off the list before it runs it, so an
+    // empty list can still mean a Present in progress. Taking pump_mutex_ waits for that pass, Present included.
+    void pump_now() {
+        if (in_pump()) return;
+        {
+            std::lock_guard pump(pump_mutex_);
+            PumpScope scope;
+            dirty_.store(false, std::memory_order_release);
+            bool progress = true;
+            while (progress) {
+                progress = false;
+                for (Holder* holder : snapshot()) progress |= holder->release_ready();
+            }
+            run_barriers();
+        }
+        if (dirty_.load(std::memory_order_acquire)) pump_ready();
     }
 
 private:
@@ -198,6 +220,14 @@ private:
         static thread_local bool pumping = false;
         return pumping;
     }
+    // Marks this thread as inside a pass for its scope, and clears the mark however the scope ends (an exception
+    // from a holder would otherwise leave every later pass on this thread skipped).
+    struct PumpScope {
+        PumpScope() { in_pump() = true; }
+        ~PumpScope() { in_pump() = false; }
+        PumpScope(const PumpScope&) = delete;
+        PumpScope& operator=(const PumpScope&) = delete;
+    };
 
     std::vector<Holder*> snapshot() const {
         std::lock_guard lock(mutex_);
