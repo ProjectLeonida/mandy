@@ -147,6 +147,13 @@ def check(exe, root, device, require_hit):
     expect(verify("--limit", "1", "--smallest-first", "--min-bytes", "1"), 2,
            f"selected=1 verified={int(confirmed)} missing_or_unusable=0 unverified={int(not confirmed)} errors=1")
 
+    env["LEONIDA_SKIP_COMPUTE"] = "second"
+    expect(verify("--skip-listed"), 0 if confirmed else 2,
+           f"selected=1 verified={int(confirmed)} missing_or_unusable=0 unverified={int(not confirmed)} "
+           "errors=0 filtered=0 not_buildable=0 skipped_listed=1")
+    expect(verify(), 2, "errors=1")
+    del env["LEONIDA_SKIP_COMPUTE"]
+
     # The identical entry in an external seed does not certify a missing local journal file.
     seed = root / "seed"
     seed.mkdir()

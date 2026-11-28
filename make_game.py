@@ -1879,26 +1879,54 @@ def keep_recorded_fallback(flag: str, work: str) -> bool:
     return True
 
 
-def smallest_max_subgroup(vulkaninfo_text: str):
-    """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
+def max_subgroup_decider(vulkaninfo_text: str):
+    """(size, device, left_out): the smallest maxSubgroupSize vulkaninfo reports (text or --json output), the name
+    of the device that reports it (None when the output names no devices), and the names of the CPU devices left
+    out. A CPU device (llvmpipe, lavapipe, SwiftShader) only counts when no other device is listed: the runtime
+    ranks it below every GPU (runtime/src/vulkan_device_filter.h, tools/vk_subgroup_info.py device_rank), and
+    llvmpipe's maxSubgroupSize of 8 would otherwise turn emulation on beside a GPU with native wave64. size is
+    None when it can't be told."""
     size = r'maxSubgroupSize"?\s*[=:]\s*(\d+)'
     # A device's own name is the least indented one; deeper ones (VK_KHR_maintenance7's layered APIs, e.g.
     # MoltenVK's Metal device, in both the text and the --json output) belong to the device above them.
-    names = list(re.finditer(r'(?m)^([ \t]*)"?deviceName"?\s*[=:]', vulkaninfo_text))
+    names = list(re.finditer(r'(?m)^([ \t]*)"?deviceName"?\s*[=:]\s*"?([^"\n]*)', vulkaninfo_text))
     depth = min((len(m.group(1)) for m in names), default=0)
-    starts = [m.start() for m in names if len(m.group(1)) == depth]
-    if not starts:
+    devices = [m for m in names if len(m.group(1)) == depth]
+    if not devices:
         sizes = [int(n) for n in re.findall(size, vulkaninfo_text)]
-        return min(sizes) if sizes else None
+        return (min(sizes) if sizes else None), None, []
+    # deviceType sits beside deviceName in VkPhysicalDeviceProperties (just before it in the text output; the
+    # --json output may order the keys differently), so each device takes the nearest one at the same depth.
+    types = [(m.start(), m.group(2)) for m in
+             re.finditer(r'(?m)^([ \t]*)"?deviceType"?\s*[=:]\s*"?([A-Z_0-9]+)', vulkaninfo_text)
+             if len(m.group(1)) == depth]
+
+    def is_cpu(pos):
+        if not types:
+            return False
+        kind = min(types, key=lambda t: abs(t[0] - pos))[1]
+        return kind.endswith("TYPE_CPU") or kind == "4"
+
     # One section per device (a 1.3 device can print the size twice, in two property structs): one value each,
     # and a device that prints none makes the answer unknown rather than being left out of the smallest.
     per_device = []
-    for a, b in zip(starts, starts[1:] + [len(vulkaninfo_text)]):
-        sizes = [int(n) for n in re.findall(size, vulkaninfo_text[a:b])]
-        if not sizes:
-            return None
-        per_device.append(min(sizes))
-    return min(per_device)
+    ends = [m.start() for m in devices[1:]] + [len(vulkaninfo_text)]
+    for m, end in zip(devices, ends):
+        sizes = [int(n) for n in re.findall(size, vulkaninfo_text[m.start():end])]
+        per_device.append((min(sizes) if sizes else None, m.group(2).strip().rstrip(","), is_cpu(m.start())))
+    gpus = [d for d in per_device if not d[2]]
+    left_out = [d[1] for d in per_device if d[2]] if gpus else []
+    counted = gpus or per_device
+    if any(d[0] is None for d in counted):
+        return None, None, left_out
+    smallest = min(counted, key=lambda d: d[0])
+    return smallest[0], smallest[1], left_out
+
+
+def smallest_max_subgroup(vulkaninfo_text: str):
+    """The smallest maxSubgroupSize vulkaninfo reports (text or --json output), or None; CPU devices only count when
+    no GPU is listed (max_subgroup_decider)."""
+    return max_subgroup_decider(vulkaninfo_text)[0]
 
 
 def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, bool]:
@@ -1906,7 +1934,8 @@ def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, boo
     shader is only exact without it when the GPU gives it 64-wide subgroups; with it, it is exact on any subgroup
     size, at the cost of a workgroup barrier per segment. "auto" keeps emulation off on native-wave64 RDNA1/2
     under the AMD Windows driver. Elsewhere it turns emulation on unless every Vulkan device reports
-    maxSubgroupSize >= 64 and the runtime probe does not rule out native wave64."""
+    maxSubgroupSize >= 64 and the runtime probe does not rule out native wave64; a CPU device (llvmpipe) only
+    counts when no GPU is listed (max_subgroup_decider)."""
     if mode == "on":
         return True, False
     if mode == "off":
@@ -1927,24 +1956,28 @@ def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, boo
             "(#857), so auto uses native wave64 and rebuilds emulated outputs (--wave64-emulate on to force emulation)")
         return False, False
     exe = shutil.which("vulkaninfo")
-    size = None
+    size, decider, left_out = None, None, []
     if exe:
         try:
             r = subprocess.run([exe], capture_output=True, text=True, errors="replace", timeout=120)
-            size = smallest_max_subgroup(r.stdout)
+            size, decider, left_out = max_subgroup_decider(r.stdout)
         except (OSError, subprocess.SubprocessError):
             size = None
+    if left_out:
+        log(f"shaders: left out of the wave64 choice, as the runtime never picks a CPU device beside a GPU: "
+            f"{', '.join(left_out)}")
     if size is None:
         log("shaders: couldn't read the GPU's subgroup size from vulkaninfo: wave64 emulation on "
             "(exact on every GPU; --wave64-emulate off to skip it on a GPU with 64-wide subgroups)")
         return True, True
     on = size < 64
+    by = f" ({decider})" if decider else ""
     if not on and native64 is False:
         stages = "compute" if compute_only else "both compute and mesh"
-        log(f"shaders: smallest maximum subgroup size is {size}, but the Vulkan query found no 64-wide path for "
+        log(f"shaders: smallest maximum subgroup size is {size}{by}, but the Vulkan query found no 64-wide path for "
             f"{stages} (fixed default size or required-size control): wave64 emulation on")
         return True, True
-    log(f"shaders: smallest maximum subgroup size is {size}: wave64 emulation {'on' if on else 'off'}")
+    log(f"shaders: smallest maximum subgroup size is {size}{by}: wave64 emulation {'on' if on else 'off'}")
     return on, True
 
 
@@ -2738,7 +2771,12 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     inflight = os.path.join(out, "pipeline_inflight.txt")
     skip = os.path.join(out, "pipeline_crashes.txt")
     report = os.path.join(out, "pipeline_crashes.json")
-    drop(inflight, skip, report)   # every module gets a fresh chance on each run (a new translator may have fixed it)
+    drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
+    try:
+        drop(report)
+    except OSError as error:
+        log(f"pipelines: cannot remove old pipeline_crashes.json ({error.strerror or error}). "
+            "That report may be stale.")
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
     jobs_args = ["--jobs", str(jobs)] if jobs else []
     base = [exe, spirv, cache, *jobs_args]
@@ -2825,20 +2863,20 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             break
     if crashed and not code:
         code = 1
-    if crashed:
-        record_crashes(out, spirv, crashed)
+    report_written = bool(crashed) and record_crashes(out, spirv, crashed)
     drop(inflight)
     if code != 0:
-        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed (with their SPIR-V " \
-              f"hashes in pipeline_crashes.json): " + ", ".join(crashed) if crashed else ""
+        report_note = " (with their SPIR-V hashes in pipeline_crashes.json)" if report_written else ""
+        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed{report_note}: " \
+              + ", ".join(crashed) if crashed else ""
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
     seed_bvh()
     log("pipelines: done")
 
 
-def record_crashes(out: str, spirv: str, crashed: "list[str]") -> None:
-    """pipeline_crashes.json: name and SHA-256 of each module that took the driver down, so a report names the
-    exact translation without attaching the shader. OSError (a missing .spv) leaves that module's hash null."""
+def record_crashes(out: str, spirv: str, crashed: "list[str]") -> bool:
+    """Write confirmed module names and hashes to pipeline_crashes.json and return whether it was written.
+    An unreadable .spv leaves its hash null."""
     def digest(name: str) -> "str | None":
         try:
             with open(os.path.join(spirv, name + ".spv"), "rb") as f:
@@ -2854,6 +2892,8 @@ def record_crashes(out: str, spirv: str, crashed: "list[str]") -> None:
         # The durable record is best-effort. A report path that cannot be written must not
         # replace the checker diagnostic that names the modules which took the driver down.
         log(f"pipelines: cannot write pipeline_crashes.json: {error.strerror or error}")
+        return False
+    return True
 
 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the

@@ -13,11 +13,14 @@ method, scope and caveats. No game data is included.
 | [boot_leads.md](boot_leads.md) | Open leads that may move the retail boot further (TLS at module index 0, feature level at device creation, command-list replay, descriptor words, shader corpus count, frame pacing), each with where it lands, how to implement it and how to test it. Hypotheses, not measurements. |
 | [rpf.md](rpf.md) | RPF9 archive layout, the carve tools and the unreadable encrypted TOC. |
 | [linux.md](linux.md) | Linux in one page: what runs natively and what runs under Wine or Proton, the Ubuntu packages, `Build.sh`, the runtime cross-build, and why there is no native Linux `gta6rt`. |
+| [running.md](running.md) | Running the game per platform and GPU (Linux/Wine with AMD, Linux/Proton and Windows with NVIDIA, Windows with AMD, Intel, macOS): build, shaders, pipeline pre-compile, driver settings, environment, what to expect; each value measured by us, reported by others (linked) or TBD. |
 | [testing.md](testing.md) | Running the GPU tests on your own GPU: setup per OS, wave64 emulation, running without a GPU on Mesa llvmpipe, and known problems. |
 | [gpu_test_results.md](gpu_test_results.md) | Published GPU test results by hardware, driver and commit, with pass, skip and failure counts. |
 | [modding.md](modding.md) | The mod format: `mods/<folder>/mod.json`, checked and loaded in name order by `gta6rt`; a swap takes effect once the game's archetype lookup is hooked (needs the executable, RT-5). A mod names game models and holds no game data. |
 | [progress_dashboard.md](progress_dashboard.md) | A local page of what works, what changed since it last passed and what blocks next: unit and runtime tests, the translator contract by confirmation method, measured imports, corpus counts and, with `--github`, CI and the D3D- items (`tools/progress_dashboard.py`). |
 | [dev-tools.md](dev-tools.md) | The development CLI `scripts/dev.py`: `discover` (text or `--json`, schema version 1) lists the boot-trace analyzer and the guest-scene runner with their help commands and prerequisites, without running them; live attach, pause, step and screenshots are not available through it. |
+| [agent_collaboration.md](agent_collaboration.md) | How contributors' coding agents work together through GitHub: which machine profile takes which work, the `AGENT-MSG`, `RUN` and `TEST-WANTED` blocks, and the evidence tags. A convention, not a measurement. |
+| [history/README.md](history/README.md) | The original repository's surviving history as portable, hashed text: the 251 `old-pr/*` branch tips and the 135 indexed old issues, with the script that regenerates them ([#563](https://github.com/ubiquitarianism/leonida/issues/563)). |
 
 ## Archives and assets
 
