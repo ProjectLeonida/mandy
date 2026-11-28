@@ -157,6 +157,29 @@ tests to verify the ordering of submissions and writes in Leonida's own implemen
 [victory-readme]: https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/README.md#license
 [victory-gpu]: https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/crates/victory-gpu/Cargo.toml
 
+## LooperSalty/AnyXboxX
+
+<https://github.com/LooperSalty/AnyXboxX>
+
+A prototype Xbox Series X emulator: it maps GDK PE32+ images, runs their code on Unicorn, and replaces the console
+system functions with high-level emulation, a C++ runtime in native mode and Python in the isolated machine, the way
+WinDurango or Wine do. It presents itself as the console (`XSystemGetDeviceType` answers `XboxScarlettAnaconda`) and
+specialises on one build, the same one as here. It builds on [VIctory](https://github.com/Marvisak/VIctory) above
+through a pinned fork as a submodule.
+
+**Licence:** GPL-3.0. Compatible with this project's GPL-3.0-or-later on the same terms as SCARAB above: adapted code
+may be reused with attribution and the original notice, and facts still come first.
+
+**What we use it for:** the closest independent comparison there is - same title, same build, same month, a different
+architecture (D3D12 and HLSL/DXIL over Unicorn versus Vulkan and SPIR-V here). Its README (at commit `b101499`,
+2026-11-25) reports the batch-8 frontier measured on an i7-13700KF and an RTX 4070 SUPER on Windows 11: the build
+launches, reaches the world and draws, at 4.8 to 5.4 fps with about 6,550 draws per frame (5.4 to 7.1 fps when given
+an offline GDK `xg_xs.dll` for texture layout), with 6 shaders still not translated, 16 pipelines refused by the
+driver and no ray-traced lighting (the BVH builder stays off, about 350 dispatches dropped per frame). Those counts
+are a ready cross-check for the translator and a target list for what still fails. Two caveats before comparing
+numbers: the hardware is far faster than a low-end PC, and it needs SM 6.6 with mesh shaders, so a card without them
+cannot run it at all.
+
 ## microsoft/libHttpClient
 
 <https://github.com/microsoft/libHttpClient>
