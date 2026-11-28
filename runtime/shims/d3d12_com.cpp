@@ -227,6 +227,16 @@ public:
     const std::vector<IUnknown*>& pinned() const { return held_; }
     // rt::d3d12::hold_until_reset: an object the recording uses that its caller does not keep (a shim's own scratch).
     void hold_for_recording(IUnknown* object) { hold(object); }
+    // rt::d3d12::drop_recording: what Reset lets go of, now, without a new recording; the list stays closed.
+    bool drop_recording() {
+        if (!list_.drop_recording()) return false;
+        calls_.clear();
+        tables_.clear();
+        directly_indexed_ = false;
+        release_held();
+        reset_state(nullptr);
+        return true;
+    }
     bool needs_all_sampled_views() const {
         if (directly_indexed_) return true;
         for (const auto& command : list_.commands()) {
@@ -2996,6 +3006,11 @@ bool hold_until_reset(ID3D12GraphicsCommandList* list, IUnknown* object) {
     if (!l || !object) return false;
     l->hold_for_recording(object);
     return true;
+}
+
+bool drop_recording(ID3D12GraphicsCommandList* list) {
+    GraphicsCommandList* l = GraphicsCommandList::from(list);
+    return l && l->drop_recording();
 }
 
 bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Command>& commands) {

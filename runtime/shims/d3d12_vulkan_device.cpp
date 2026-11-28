@@ -3376,7 +3376,12 @@ struct DeviceState {
         std::uint64_t start, shader_va, size, ticket, epoch;
         std::uint8_t* mapped;
         std::uint64_t lists;  // the command-list epoch of the retirement
+        std::chrono::steady_clock::time_point retired_at;  // for the warning in stamp_retired_windows
     };
+    // A retired window still without a ticket this long after its retirement is reported once: a replay that does
+    // not end, or a command list recorded before the retirement that is closed and never reset or released.
+    static constexpr std::chrono::seconds kRetiredWindowWait{30};
+    std::atomic<bool> retired_window_wait_reported{false};
     static constexpr std::size_t kWindowAliasRemovals = 4096;  // kept before every window is looked at instead
     std::mutex window_alias_removal_mutex;  // a leaf: taken in alias_changed, under the alias table's lock
     std::vector<std::pair<std::uint64_t, std::uint64_t>> window_alias_removals;  // (shader VA, bytes)
@@ -3488,12 +3493,13 @@ struct DeviceState {
         std::vector<RetiredWindow> retiring;
         const std::uint64_t epoch = geometry.execute_epoch();
         const std::uint64_t lists = leonida::command_list_epochs::advance();
+        const auto now = std::chrono::steady_clock::now();
         std::uint64_t bytes = 0;
         std::erase_if(title_windows, [&](const TitleWindow& window) {
             if (!is_gone(window.shader_va)) return false;
             retire_shadow(window.mapped);
             retiring.push_back({window.start, window.shader_va, window.size, rt::d3d12::GeometryViews::kAfterExecutes,
-                                epoch, window.mapped, lists});
+                                epoch, window.mapped, lists, now});
             title_window_bytes -= window.size;
             bytes += window.size;
             return true;
@@ -3552,12 +3558,34 @@ struct DeviceState {
         const std::uint64_t oldest_list = leonida::command_list_epochs::oldest();
         const std::uint64_t ticket = context->submitted_retire_ticket();
         bool left = false;
+        const RetiredWindow* longest = nullptr;  // the earliest retired of those left without a ticket
+        std::size_t waiting = 0;
+        std::uint64_t waiting_bytes = 0;
         for (RetiredWindow& window : retired_windows) {
             if (window.ticket != rt::d3d12::GeometryViews::kAfterExecutes) continue;
-            if (window.epoch < oldest && window.lists <= oldest_list) window.ticket = ticket;
-            else left = true;
+            if (window.epoch < oldest && window.lists <= oldest_list) {
+                window.ticket = ticket;
+                continue;
+            }
+            left = true;
+            ++waiting;
+            waiting_bytes += window.size;
+            if (!longest || window.retired_at < longest->retired_at) longest = &window;
         }
         retired_windows_unstamped.store(left, std::memory_order_release);
+        if (!longest || retired_window_wait_reported.load(std::memory_order_relaxed)) return;
+        const auto waited = std::chrono::steady_clock::now() - longest->retired_at;
+        if (waited < kRetiredWindowWait || retired_window_wait_reported.exchange(true, std::memory_order_relaxed))
+            return;
+        const std::uint64_t latest = leonida::command_list_epochs::current();
+        std::fprintf(stderr, "[rt] d3d12: a title window retired %lld s ago still waits for %s; %zu retired windows "
+                             "(%llu KiB) wait for a ticket, and the oldest command list alive began %llu command-list "
+                             "epochs ago (logged once)\n",
+                     static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(waited).count()),
+                     longest->epoch >= oldest ? "a replay in progress at its retirement"
+                                              : "a command list recorded before its retirement",
+                     waiting, static_cast<unsigned long long>(waiting_bytes >> 10),
+                     static_cast<unsigned long long>(latest - std::min(oldest_list, latest)));
     }
     // ExecuteCommandLists replays in progress, for GeometryViews::kAfterExecutes (see drain_geometry_releases).
     // A plain aggregate on purpose: a C++ thread_local with a destructor in gta6rt.exe adds TLS callbacks to the image
@@ -4966,6 +4994,27 @@ struct DeviceState {
                          static_cast<unsigned long long>(pool_span_bytes >> 10),
                          static_cast<long long>(geometry_spans), static_cast<unsigned long long>(pool_spans_retired),
                          static_cast<unsigned long long>(unbacked_requests));
+            // The retired windows whose memory is not freed yet, and of those the ones still without a ticket, which
+            // wait for a replay in progress at their retirement or for a command list recorded before it
+            // (stamp_retired_windows); and how many command-list epochs ago the oldest list alive began.
+            std::lock_guard retired(retired_window_mutex);
+            std::size_t unstamped = 0;
+            std::uint64_t retired_bytes = 0, unstamped_bytes = 0;
+            for (const RetiredWindow& window : retired_windows) {
+                retired_bytes += window.size;
+                if (window.ticket != rt::d3d12::GeometryViews::kAfterExecutes) continue;
+                ++unstamped;
+                unstamped_bytes += window.size;
+            }
+            const std::uint64_t latest = leonida::command_list_epochs::current();
+            const std::uint64_t oldest_list = leonida::command_list_epochs::oldest();
+            std::fprintf(stderr,
+                         "[rt] d3d12: title memory: %zu retired windows (%llu KiB) not freed yet, %zu of them "
+                         "(%llu KiB) without a ticket; the oldest command list alive began %llu command-list epochs "
+                         "ago\n",
+                         retired_windows.size(), static_cast<unsigned long long>(retired_bytes >> 10), unstamped,
+                         static_cast<unsigned long long>(unstamped_bytes >> 10),
+                         static_cast<unsigned long long>(latest - std::min(oldest_list, latest)));
         }
     }
 

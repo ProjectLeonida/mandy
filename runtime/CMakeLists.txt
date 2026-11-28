@@ -3463,6 +3463,14 @@ if(TARGET Vulkan::Headers)
     target_link_options(xbox_list_value_fallback_test PRIVATE /OPT:NOREF)
     add_test(NAME xbox_list_value_fallback COMMAND xbox_list_value_fallback_test)
     set_tests_properties(xbox_list_value_fallback PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    # The spare real lists a list-value cut leaves: an idle one drops its recording, so it holds back no retired title
+    # window (src/command_list_epochs.h) and holds nothing its recording used.
+    add_executable(xbox_list_cut_spares_test test/xbox_list_cut_spares_test.cpp shims/d3d12_xs_device.cpp
+                   shims/d3d12_xs_pso_stream.cpp)
+    target_link_libraries(xbox_list_cut_spares_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(xbox_list_cut_spares_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
+    add_test(NAME xbox_list_cut_spares COMMAND xbox_list_cut_spares_test)
+    set_tests_properties(xbox_list_cut_spares PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_executable(d3d12_present_test test/d3d12_present_test.cpp)
     target_link_libraries(d3d12_present_test PRIVATE gta6rt_d3d12_com user32 gdi32 dxgi)
     target_compile_definitions(d3d12_present_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

@@ -1719,7 +1719,10 @@ The copies:
   began before the retirement is gone (reset, released, or a held batch's or the async worker's copy of it run), and
   the submissions recorded by then have completed: a list resolves its root views when they are recorded, so one
   recorded before the retirement and executed, or executed again, after it still names the window
-  (`src/command_list_epochs.h`). Until then its copy stays a target of its pages' tracker, refreshed like the others,
+  (`src/command_list_epochs.h`). A list-value cut's spare drops its recording when it becomes one
+  ([d3d12_xs_console_abi.md](d3d12_xs_console_abi.md)); a list the title closes and then neither resets nor releases
+  keeps every window retired after its recording began, and a retired window still waiting after 30 s is logged once.
+  Until it is freed its copy stays a target of its pages' tracker, refreshed like the others,
   and what the GPU wrote in it goes back to the title's pages: with its submissions' write-back, and once more when it
   is freed (a range noted when a list was recorded can be copied back before a held batch has run). A retired copy goes
   back only on the bytes no live copy over them changed, byte by byte (the window and the buffer that replaced it can
