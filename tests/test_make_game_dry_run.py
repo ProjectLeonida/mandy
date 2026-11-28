@@ -337,7 +337,9 @@ class PipelineStageIsolationTest(unittest.TestCase):
             make_game.pipelines(self.work_dir, self.out_dir, jobs=4)
 
         self.assertEqual(len(executed_cmds), 1)
-        self.assertEqual(executed_cmds[0], [dummy_exe, "--precompile-pipelines", "--threads", "4"])
+        # Windows: smallest first, and --parent so the run stops when this make_game process ends.
+        self.assertEqual(executed_cmds[0], [dummy_exe, "--precompile-pipelines", "--threads", "4",
+                                            "--smallest-first", "--parent", str(os.getpid())])
 
     def test_pipelines_stage_alone_invokes_no_asset_or_shader_compilers(self) -> None:
         game_dir = os.path.join(self.tmp.name, "game")

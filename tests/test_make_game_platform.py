@@ -548,7 +548,9 @@ class RuntimeExeTest(unittest.TestCase):
                 mock.patch.object(make_game, "log"), \
                 mock.patch.object(make_game, "_run_precompile", return_value=0) as run_pre:
             make_game.pipelines(work, self.out, jobs=3)
-        self.assertEqual(run_pre.call_args.args[0], ["/usr/bin/wine", exe, "--precompile-pipelines", "--threads", "3"])
+        # Off Windows there is no --parent: Wine cannot open a host process by its PID.
+        self.assertEqual(run_pre.call_args.args[0],
+                         ["/usr/bin/wine", exe, "--precompile-pipelines", "--threads", "3", "--smallest-first"])
 
     def test_pipelines_off_windows_without_gta6rt_says_how_to_get_it(self):
         err = io.StringIO()
