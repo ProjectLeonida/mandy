@@ -1,7 +1,7 @@
 # Agents working together
 
 Many contributors work through a coding agent, each on its own machine. This page is how those agents share work
-without their humans briefing them: where they read and write, which machine takes which kind of work, three blocks
+without their humans briefing them: where they read and write, which machine takes which kind of work, four blocks
 with fixed fields, and how sure a claim is. It adds to [CONTRIBUTING.md](../CONTRIBUTING.md) and
 [AGENTS.md](../AGENTS.md) and replaces nothing in them. No game data is included.
 
@@ -35,10 +35,10 @@ with fixed fields, and how sure a claim is. It adds to [CONTRIBUTING.md](../CONT
 - M is wide: say the video memory and whether it is a laptop, since an 8 GB laptop and a 16 GB desktop card behave
   differently. A laptop with an integrated and a discrete GPU has the profile of its discrete GPU; it is not F.
 
-## Three blocks
+## Four blocks
 
-Each block starts with its prefix (`AGENT-MSG`, `RUN`, `TEST-WANTED`) so a search finds it, and says it is
-AI-assisted. Values only: no shader or program names, addresses, local paths or raw log lines.
+Each block starts with its prefix (`AGENT-MSG`, `RUN`, `PICTURE`, `TEST-WANTED`) so a search finds it, and says it
+is AI-assisted. Values only: no shader or program names, addresses, local paths or raw log lines.
 
 A message from one agent to another:
 
@@ -76,6 +76,31 @@ VERDICT:     prediction <held | missed by ...>
 
 Two runs compare only when `BASE`, `RECIPE`, `CACHES` and `INSTRUMENTS` match, apart from the variable under study:
 a diagnostic run and a progress run do not compare even when the recipe reads the same.
+
+What a frame shows, in numbers: `python -I tools/picture_metrics.py <frame> [<reference>]` prints the block from a
+PNG or PPM on your disk, `--json` the same numbers as JSON. The frame stays local: the block has no pixels, no image
+and no path. Fill in the first line; the values below are from a synthetic frame:
+
+```
+PICTURE | 2026-11-27 14:05 UTC | <GitHub handle> | AI-assisted: <tool>
+FRAME:    1280x720 | reference 1280x720
+LUMA:     mean 126.75 | min 0 | max 128 | sd 12.59 | dark 0.0098
+DARK 4x4: 0.01 0.01 0.01 0.01 / 0.01 0.01 0.01 0.01 / 0.01 0.01 0.01 0.01 / 0.01 0.01 0.01 0.01
+LATTICE:  tile 8 | period 16 | phase 9 | diagonal + | corner TL | tiles 900 | cover 1.0
+BLOCKS:   none
+DIFF:     changed 0 of 14400 8x8 tiles | share 0.0 | reference luma mean 126.75
+CLASS:    LATTICE (measured) | given: none
+EVIDENCE: MEASURED (tools/picture_metrics.py, 2 frames)
+```
+
+`CLASS` is one of `LATTICE`, `BLACK-NEAR`, `BLOCKS`, `FLASH`, `CHAR-BLACK`, `CHAR-MISSING`, `2D-MISSING`,
+`STRAY-GEO`, `SMEAR` or `OK`. The tool measures the first four and `OK`; the other five need to know what the scene
+should show, so only a human gives them (`--class`, with `--region X,Y,W,H` for the numbers of the part concerned),
+and they print as `given`, never as `measured`. A measured class is a hint: a human confirms it before it is
+called a defect. Several sharp rectangles (HUD panels, window frames) can read as `BLOCKS`, and blocks off the
+frame's origin are given at the divisor of their edges (16-pixel blocks shifted by 4 read as 4x4). A lattice that
+repeats fewer than three times in the frame is not reported. A 1280x720 frame takes a few seconds. Put the block
+next to the `RUN` block of the run that made the frame.
 
 A request for a test on a machine you do not have, as a comment on the pull request to test. With no pull request, it
 is its own issue titled `TEST-WANTED [<profile>] <one line>`, closed by its author when done, so that
