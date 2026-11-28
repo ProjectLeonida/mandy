@@ -4737,8 +4737,9 @@ Not implemented yet:
     before each dispatch. Copies and compute dispatches cannot execute inside dynamic rendering, so render-pass
     integration must place the capture outside the rendering scope while preserving capture at `SetPredication`.
     These are requirements for those future integrations, not compute-dispatch or render-pass support added here.
-  `CopyBufferRegion` under a predicate instead uses a byte-granular compute dispatch inside the captured
-  conditional scope; both operations, unaligned offsets and lengths, and the full 64-bit predicate are covered.
+  `CopyBufferRegion` and buffer-to-buffer `CopyResource` under a predicate use a byte-granular compute dispatch
+  inside the captured conditional scope. This handles both predicate operations, unaligned offsets and lengths,
+  and the full 64-bit predicate. See the [D3D12 predication rules](https://learn.microsoft.com/en-us/windows/win32/direct3d12/predication#setpredication).
   Zero-byte copies are no-ops, as checked against native WARP. Unpredicated copies retain `vkCmdCopyBuffer`.
   The compute helper requires enabled Vulkan 1.2 `storageBuffer8BitAccess` (not `shaderInt8`) and a compute queue;
   without it, preparation rejects the predicated buffer copy rather than executing it unconditionally.
@@ -4767,7 +4768,7 @@ Not implemented yet:
   with glslang 16.6.0 (`-V --target-env vulkan1.2 -Os`) and validated for Vulkan 1.2.
 
   Open:
-  - Texture copies, `CopyResource` and resolves. Vulkan's conditional rendering does not cover transfer
+  - Texture copies (including texture `CopyResource`) and resolves. Vulkan's conditional rendering does not cover transfer
     commands, so these still run unconditionally and `PreparedList::unpredicated_copies` counts them.
 
   - Draws, dispatches and `ExecuteIndirect` are covered by conditional rendering as soon as they are replayed

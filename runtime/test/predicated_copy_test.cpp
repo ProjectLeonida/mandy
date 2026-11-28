@@ -58,10 +58,23 @@ int main(){
     vk.prepare_predicated_copy=[](VkBuffer,VkBuffer,VkDeviceSize,VkDeviceSize,VkDeviceSize,std::vector<PredicatedCopyDispatch>&){return false;};
     EXPECT(check({2,0,1,0,1})==ReplayResult::unsupported); // allocation/preparation failure cannot fall back
     vk.prepare_predicated_copy=copier;
+    destination.buffer_offset = (UINT64_C(1) << 34) + 3;
     CommandList resource_copy;
     EXPECT(resource_copy.set_predication({3,0,d3d12_predication::equal_zero}));
     EXPECT(resource_copy.copy_resource({2,1})&&resource_copy.close());
-    EXPECT(prepare(resource_copy,resolve,vk,result)==ReplayResult::success&&result.unpredicated_copies==1);
+    const auto before_resource = prepared;
+    destination.host_readable = true;
+    EXPECT(prepare(resource_copy,resolve,vk,result)==ReplayResult::success);
+    EXPECT(prepared==before_resource+1 && got_src==source.buffer_offset && got_dst==destination.buffer_offset &&
+           got_bytes==source.size && result.unpredicated_copies==0 && result.commands.back().buffer_copies.empty());
+    EXPECT(result.wrote_readback && result.readback_src_stages==VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    destination.size = source.size - 1;
+    EXPECT(prepare(resource_copy,resolve,vk,result)==ReplayResult::invalid_copy && prepared==before_resource+1);
+    destination.size = source.size;
+    vk.emit_predicated_copy = {};
+    EXPECT(prepare(resource_copy,resolve,vk,result)==ReplayResult::unsupported && prepared==before_resource+1);
+    vk.emit_predicated_copy=[](VkCommandBuffer,const std::vector<PredicatedCopyDispatch>&){};
+    destination.host_readable = false;
     vk.reset_query_pool=available<PFN_vkCmdResetQueryPool>();vk.begin_query=available<PFN_vkCmdBeginQuery>();
     vk.end_query=available<PFN_vkCmdEndQuery>();vk.write_timestamp=available<PFN_vkCmdWriteTimestamp>();
     vk.copy_query_pool_results=available<PFN_vkCmdCopyQueryPoolResults>();vk.fill_buffer=available<PFN_vkCmdFillBuffer>();
@@ -70,7 +83,7 @@ int main(){
     CommandList statistics;
     EXPECT(statistics.set_predication({3,0,d3d12_predication::equal_zero}));
     EXPECT(statistics.begin_query({1,d3d12_query::pipeline_statistics,0}));
-    EXPECT(statistics.copy_buffer({2,0,1,0,1}));
+    EXPECT(statistics.copy_resource({2,1}));
     EXPECT(statistics.end_query({1,d3d12_query::pipeline_statistics,0})&&statistics.close());
     const auto before=prepared;
     EXPECT(prepare(statistics,resolve,vk,result)==ReplayResult::unsupported && prepared==before);
