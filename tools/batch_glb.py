@@ -7,7 +7,7 @@ that cannot be read or decoded is left out of that model and reported (one
 line each, counted in the summary), never dropped silently; a model that
 fails to convert is named with its error. Exit status is 1 only when a
 model failed. A missing input folder or an output path that cannot be created
-exits 2.
+exits 2. If two OBJ names map to the same GLB, the batch exits 2 before writing any model.
 
 Usage:
     python -I tools/batch_glb.py <in_dir> <out_dir> [--jobs N] [--up z|y] [--textures <dir>]
@@ -21,8 +21,10 @@ import argparse
 import concurrent.futures
 import os
 import sys
+import tempfile
 import threading
 import time
+import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import glb_writer
@@ -150,6 +152,30 @@ def convert_single(
         return False, in_path, str(exc), dropped
 
 
+def _check_output_names(names: list[str], out_dir: str) -> None:
+    # os.replace publishes a directory entry. Probe similar stems on the destination
+    # volume so case-sensitive sources and case-insensitive outputs work together.
+    by_stem: dict[str, list[str]] = {}
+    for name in names:
+        stem = os.path.splitext(name)[0]
+        key = unicodedata.normalize("NFD", unicodedata.normalize("NFD", stem).upper().casefold())
+        by_stem.setdefault(key, []).append(name)
+    for group in by_stem.values():
+        if len(group) < 2:
+            continue
+        with tempfile.TemporaryDirectory(dir=out_dir, prefix=".glb-name-") as probe:
+            written = []
+            for name in group:
+                path = os.path.join(probe, os.path.splitext(name)[0] + ".glb")
+                try:
+                    with open(path, "xb"):
+                        pass
+                except FileExistsError:
+                    previous = next(src for src, entry in written if os.path.samefile(entry, path))
+                    raise ValueError(f"{previous!r} and {name!r} map to the same GLB in {out_dir}") from None
+                written.append((name, path))
+
+
 def batch_convert(
     in_dir: str,
     out_dir: str,
@@ -165,6 +191,8 @@ def batch_convert(
     obj_files = [
         f for f in os.listdir(in_dir) if f.lower().endswith(".obj") and os.path.isfile(os.path.join(in_dir, f))
     ]
+
+    _check_output_names(obj_files, out_dir)
 
     tex_index = _build_texture_index(texture_dir)
     tex_cache = TextureCache()
