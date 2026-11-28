@@ -84,6 +84,8 @@ std::vector<Lookup> g_lookups;
 //  xcrdapi.dll               functions/dstoragegetfactory). dstorage_xs.dll is the console name; xcrdapi.dll is a
 //                            console module the title may import it from (docs/directstorage.md). dstorage.cpp serves
 //                            it; the class is kept for a build without that shim.
+//  xapu.dll, chad.dll        the HRESULT returns of the shims in xapu_queue.cpp (xapu.dll) and xapu_chad.cpp
+//                            (chad.dll); XApuGetResultCount returns uint32_t.XApuGetResultCount returns uint32_t.
 const char* const kNotHResult[] = {
     "XAsyncCancel", "XAsyncComplete",
     "XTaskQueueCloseHandle", "XTaskQueueDispatch", "XTaskQueueGetCurrentProcessTaskQueue",
