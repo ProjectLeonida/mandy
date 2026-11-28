@@ -19,6 +19,7 @@ Usage:
 each container as `<module>.dxbc` plus an `index.json` whose entries the translator reads (with `stage` from
 `PSV0`, defaulting to `"cs"` when absent), so the next step can be `fssm_unpack.py <DIR>`: nothing is extracted unless asked for, and extracted shaders are game
 data that must stay in the user's work folder, never in the repository. Nothing here prints shader bytes.
+`--json` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 
 For a native program packed in an SGD5 envelope, `offset` locates the envelope, `stored_size` includes its header,
 and `size` and `sha256` describe the inflated DXBC. Plain containers keep their original ordering and offsets.
@@ -32,12 +33,16 @@ import hashlib
 import json
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
 import zlib
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 DXBC = b"DXBC"
@@ -251,11 +256,11 @@ def safe_stem(name: str | None, index: int) -> str:
     return stem or f"container_{index:02d}"
 
 
-def extract(data: bytes, records: list[dict], directory: str) -> list[dict]:
+def extract(data: bytes, records: list[dict], directory: str, start_index: int = 0) -> list[dict]:
     """Write each container as `<module>.dxbc`; return the translator's index entries."""
     os.makedirs(directory, exist_ok=True)
     index = []
-    for k, record in enumerate(records):
+    for k, record in enumerate(records, start=start_index):
         stem = safe_stem(record["name"], k)
         file = f"{stem}.dxbc"
         target = os.path.join(directory, file)
@@ -340,9 +345,9 @@ def main(argv=None) -> int:
                 )
         if a.extract:
             try:
-                index.extend(extract(data, records, a.extract))
+                index.extend(extract(data, records, a.extract, start_index=len(index)))
             except OSError as e:
-                print(f"ERROR: cannot write {a.extract}: {e}", file=sys.stderr)
+                print(f"ERROR: cannot write {a.extract}: {e.strerror or e}", file=sys.stderr)
                 return 2
 
     if a.extract:
@@ -350,21 +355,52 @@ def main(argv=None) -> int:
             with open(index_path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(index, f, indent=0)
         except OSError as e:
-            print(f"ERROR: cannot write {index_path}: {e}", file=sys.stderr)
+            print(f"ERROR: cannot write {index_path}: {e.strerror or e}", file=sys.stderr)
             return 2
         print(f"  extracted {len(index)} file(s) to {a.extract}")
         print("  these are game data: do not commit them", file=sys.stderr)
 
     if a.json:
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(all_records, f, indent=1)
+            write_json_report(a.json, all_records)
         except OSError as e:
-            print(f"ERROR: cannot write {a.json}: {e}", file=sys.stderr)
+            print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 2
         print(f"wrote {a.json}")
     return status
+
+
+def write_json_report(path: str, report) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    destination = os.path.realpath(path)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=os.path.dirname(destination) or ".", prefix=".pe_shader_containers-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

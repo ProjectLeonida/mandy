@@ -14,6 +14,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -297,10 +298,50 @@ class ReportPathTests(unittest.TestCase):
         with open(blocker, "rb") as f:
             self.assertEqual(f.read(), b"keep me")
 
+    def test_extract_multi_image_sequential_stems(self):
+        blob1 = container([(b"DXIL", dxil_payload("cs", xbch=True, bitcode=False))])
+        blob2 = container([(b"DXIL", dxil_payload("cs", xbch=True, bitcode=False))])
+        with tempfile.TemporaryDirectory() as tmp:
+            img1 = os.path.join(tmp, "img1.dll")
+            img2 = os.path.join(tmp, "img2.dll")
+            out = os.path.join(tmp, "out")
+            with open(img1, "wb") as f:
+                f.write(b"MZ" + blob1)
+            with open(img2, "wb") as f:
+                f.write(b"MZ" + blob2)
+            code, stdout, err = self.run_main([img1, img2, "--extract", out])
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "  these are game data: do not commit them\n")
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                index = json.load(f)
+            self.assertEqual(
+                index,
+                [
+                    {"name": "container_00", "file": "container_00.dxbc", "stage": "cs"},
+                    {"name": "container_01", "file": "container_01.dxbc", "stage": "cs"},
+                ],
+            )
+            self.assertTrue(os.path.exists(os.path.join(out, "container_00.dxbc")))
+            self.assertTrue(os.path.exists(os.path.join(out, "container_01.dxbc")))
+
 
 def psv0(stage_code: int) -> bytes:
     """Build a minimal PSV0 chunk payload whose ShaderStage byte is `stage_code`."""
     return struct.pack("<I", 48) + bytes(24) + bytes([stage_code]) + bytes(23)
+
+
+class JsonPreserveTests(unittest.TestCase):
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '[{"previous": true}]'
+            js = os.path.join(tmp, "census.json")
+            with open(js, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(psc, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    psc.write_json_report(js, [{"shaders": 1}])
+            with open(js, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
 class Psv0StageTests(unittest.TestCase):
