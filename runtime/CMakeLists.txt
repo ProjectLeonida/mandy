@@ -835,6 +835,9 @@ if(BUILD_TESTING)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
+  # DirectStorage BC texture macro-unshuffle (runtime/src/dstorage_swizzle.h): pure stdlib.
+  add_executable(dstorage_swizzle_test test/dstorage_swizzle_test.cpp)
+  add_test(NAME dstorage_swizzle COMMAND dstorage_swizzle_test)
   # Textures sharing blocks of device memory (runtime/src/image_memory.h): pure stdlib, counted fake allocations.
   add_executable(image_memory_test test/image_memory_test.cpp)
   find_package(Threads REQUIRED)
