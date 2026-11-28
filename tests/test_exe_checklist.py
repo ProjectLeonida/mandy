@@ -215,5 +215,104 @@ class ExeChecklist(unittest.TestCase):
         self.assertTrue(any(n["file"] == "docs/modding.md" and n["kind"] == "ASSUMPTION" for n in notes))
 
 
+class ExeChecklistEdgeCases(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        os.makedirs(os.path.join(self.root, "runtime", "shims"))
+        os.makedirs(os.path.join(self.root, "docs"))
+        with open(os.path.join(self.root, "runtime", "shims", "demo.cpp"), "w",
+                  encoding="utf-8", newline="\n") as f:
+            f.write(SHIM)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_plus_and_numbered_list_items_do_not_merge_and_strip_prefix(self):
+        doc_path = os.path.join(self.root, "docs", "lists.md")
+        with open(doc_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(
+                "1. **VERIFY:** first numbered item\n"
+                "2. **VERIFY:** second numbered item\n"
+                "   continued on next line\n"
+                "3) unrelated item\n"
+                "+ **ASSUMPTION:** plus bullet item\n"
+                "+ another bullet\n"
+            )
+        notes = ec.doc_notes(doc_path, "docs/lists.md")
+        self.assertEqual([(n["line"], n["kind"]) for n in notes],
+                         [(1, "VERIFY"), (2, "VERIFY"), (5, "ASSUMPTION")])
+        self.assertEqual([n["text"] for n in notes], [
+            "first numbered item",
+            "second numbered item continued on next line",
+            "plus bullet item",
+        ])
+
+    def test_without_marker_preserves_text_before_later_colon_on_colonless_markers(self):
+        doc_path = os.path.join(self.root, "docs", "colonless.md")
+        with open(doc_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(
+                "- **Assumption** the table uses key: value\n"
+                "- **Unverified** fixed 1 GiB quota\n"
+                "\n"
+                "**ASSUMPTION**: trailing colon outside bold\n"
+            )
+        docs = ec.doc_notes(doc_path, "docs/colonless.md")
+        self.assertEqual([n["text"] for n in docs], [
+            "the table uses key: value",
+            "fixed 1 GiB quota",
+            "trailing colon outside bold",
+        ])
+
+        shim_path = os.path.join(self.root, "runtime", "shims", "colonless.cpp")
+        with open(shim_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(
+                "// ASSUMPTION buffer uses key: value\n"
+                "int a;\n"
+                "// ASSUMPTION (no exe yet): keeps parenthetical strip\n"
+                "int b;\n"
+                "// VERIFY no colon at all\n"
+            )
+        code = ec.code_notes(shim_path, "runtime/shims/colonless.cpp")
+        self.assertEqual([n["text"] for n in code], [
+            "buffer uses key: value",
+            "keeps parenthetical strip",
+            "no colon at all",
+        ])
+
+    def test_called_classes_reads_utf8_bom_report(self):
+        report = os.path.join(self.root, "bom.json")
+        payload = json.dumps({"images": [{"classes": [{"class_id": SAVE_CLASS.upper()}]}]}).encode("utf-8")
+        with open(report, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + payload)
+        out = os.path.join(self.root, "checklist.md")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = ec.main(["--root", self.root, "--gdk-calls", report, "--out", out])
+        self.assertEqual(rc, 0)
+        with open(out, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("demo.cpp:3` ASSUMPTION **called**", text)
+
+    def test_malformed_gdk_calls_json_shapes_exit_1(self):
+        bad_payloads = [
+            "[]",
+            '{"images": null}',
+            '{"images": ["bad"]}',
+            '{"classes": null}',
+            '{"classes": ["bad"]}',
+            '{"classes": [{"class_id": true}]}',
+        ]
+        for idx, payload in enumerate(bad_payloads):
+            with self.subTest(payload=payload):
+                report = os.path.join(self.root, f"bad_{idx}.json")
+                with open(report, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(payload)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                    rc = ec.main(["--root", self.root, "--gdk-calls", report])
+                self.assertEqual(rc, 1)
+                self.assertIn("cannot read the gdk_runtime_calls report", stderr.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
