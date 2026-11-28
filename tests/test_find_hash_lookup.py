@@ -129,5 +129,46 @@ class FindHashLookupTest(unittest.TestCase):
             self.assertNotIn("Traceback", r.stderr)
 
 
+    def test_negative_window_raises(self):
+        data, _, _ = image()
+        with self.assertRaisesRegex(ValueError, "--window"):
+            fhl.rank(data, [("player_story000_00", fhl.joaat("player_story000_00"))], window=-1)
+
+    def test_non_positive_top_raises(self):
+        data, _, _ = image()
+        hashes = [("player_story000_00", fhl.joaat("player_story000_00"))]
+        for top in (0, -1):
+            with self.subTest(top=top), self.assertRaisesRegex(ValueError, "--top"):
+                fhl.rank(data, hashes, top=top)
+
+    def test_zero_window_produces_no_candidates(self):
+        data, _, _ = image()
+        hashes = [("player_story000_00", fhl.joaat("player_story000_00")),
+                  ("cs_mandy", fhl.joaat("cs_mandy"))]
+        report = fhl.rank(data, hashes, window=0)
+        self.assertEqual(report["candidates"], [])
+
+    def test_a_truncated_raw_section_is_clamped_to_the_bytes_present(self):
+        data, _, _ = image()
+        truncated = data[:-100]
+        sections = fhl.sections(truncated)
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(sections[0][3], len(truncated) - TEXT_RAW)
+
+    def test_cli_rejects_bad_window_and_top_without_a_traceback(self):
+        data, _, _ = image()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            for args in (("--window", "-1"), ("--top", "0"), ("--top", "-1")):
+                with self.subTest(args=args):
+                    r = subprocess.run([sys.executable, "-I", TOOL, exe, *args],
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                    self.assertIn("ERROR", r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
