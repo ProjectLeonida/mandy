@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bvh_index  # noqa: E402
 from file_mode import published_mode  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 VBASE = 0x50000000
 PBASE = 0x60000000
@@ -173,9 +174,17 @@ def check_buffer(desc, payload):
 
 def scan(path, start=None, limit=None, max_inflate=1 << 28):
     """Walk an RPF9 archive and return (rows, summary)."""
+    if start is not None and (type(start) is not int or start < 0):
+        raise ValueError("start offset must be a non-negative integer")
+    if limit is not None and (type(limit) is not int or limit < 1):
+        raise ValueError("limit must be a positive integer")
+    if type(max_inflate) is not int or max_inflate < 1:
+        raise ValueError("max_inflate must be a positive integer")
     rows = []
     with open(path, "rb") as fh:
         if os.fstat(fh.fileno()).st_size == 0:
+            if start:
+                raise ValueError("start offset is outside the archive")
             return rows, summarize(rows)
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         try:
@@ -183,7 +192,7 @@ def scan(path, start=None, limit=None, max_inflate=1 << 28):
             pos = start if start is not None else (_u32(m, 4) if size >= 8 else size)
             if not 0 <= pos <= size:
                 raise ValueError("start offset is outside the archive")
-            end = min(size, pos + limit) if limit else size
+            end = min(size, pos + limit) if limit is not None else size
             pending = None   # the previous stream's descriptor row, waiting for its following stream
             while pos < end:
                 mt = bvh_index.ZHDR.search(m, pos, end)
@@ -291,9 +300,11 @@ def write_json_report(path, report):
         mode = os.stat(destination).st_mode
     except FileNotFoundError:
         mode = None
+    except OSError:
+        mode = 0
     if mode is not None and not stat.S_ISREG(mode):
         with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+            json.dump(report, f, indent=1, allow_nan=False)
             f.write("\n")
         return
     if mode is not None:
@@ -306,7 +317,7 @@ def write_json_report(path, report):
     )
     try:
         with staged:
-            json.dump(report, staged, indent=1)
+            json.dump(report, staged, indent=1, allow_nan=False)
             staged.write("\n")
         if os.name != "nt":
             os.chmod(staged.name, published_mode(destination))
@@ -325,20 +336,38 @@ def main(argv=None):
     ap.add_argument("--start", type=_nonneg)
     ap.add_argument("--limit", type=_positive)
     a = ap.parse_args(argv)
-    if a.json and os.path.exists(a.json) and os.path.exists(a.archive) and os.path.samefile(a.json, a.archive):
-        print("bvh_groups: --json would replace the archive", file=sys.stderr)
+    if not a.archive.strip():
+        print("bvh_groups: archive path must not be empty", file=sys.stderr)
         return 2
+    if a.json is not None:
+        if not a.json.strip():
+            print("bvh_groups: --json must not be empty", file=sys.stderr)
+            return 2
+        if os.path.isdir(a.json) or a.json.endswith(os.sep) or (os.altsep and a.json.endswith(os.altsep)):
+            print("bvh_groups: --json is a directory, not a file: %s" % a.json, file=sys.stderr)
+            return 2
+        for parent in (os.path.dirname(os.path.abspath(a.json)), os.path.dirname(os.path.realpath(a.json))):
+            if parent and not os.path.isdir(parent):
+                print("bvh_groups: output directory does not exist: %s" % parent, file=sys.stderr)
+                return 2
+        if same_report_path(a.archive, a.json):
+            print("bvh_groups: --json would replace the archive", file=sys.stderr)
+            return 2
     try:
         rows, summary = scan(a.archive, a.start, a.limit)
     except (OSError, ValueError) as e:
         print("bvh_groups: %s" % e, file=sys.stderr)
         return 2
+    if a.json is not None:
+        try:
+            write_json_report(a.json, {"source": a.archive, "summary": summary, "rows": rows})
+        except OSError as e:
+            print("bvh_groups: cannot write %s: %s" % (a.json, e.strerror or e), file=sys.stderr)
+            return 2
     for k, v in summary["counts"].items():
         print("%8d  %s" % (v, k))
     for k, v in summary["bvh_preceded_by"].items():
         print("%8d  bvh stream preceded by %s" % (v, k))
-    if a.json:
-        write_json_report(a.json, {"source": a.archive, "summary": summary, "rows": rows})
     return 0
 
 
