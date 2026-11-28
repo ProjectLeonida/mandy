@@ -5019,7 +5019,10 @@ struct entry {               // 10 uints = 40 bytes
   first layer, whose slot records that image as its owner so another dimension's image with the same slot number does
   not inherit it). One layout serves the device: any module whose meta says `tagged` makes the table tagged, because
   the kind word is additive (a plain module ignores the word and reads the index, which the tagged layout keeps at
-  the same place), so a plain majority never turns it off; no tagged module is the old plain layout.
+  the same place), so a plain majority never turns it off; no tagged module is the old plain layout. With no
+  library loaded at all (the GPU tests and tools, which bring their own modules) the table is tagged, the default
+  of `tools/rdna2spirv.py --descriptor-table` (`kNoLibraryDescriptorTableLayout`, kept equal to it by
+  `tests/test_descriptor_table_default.py`); a plain table there gave `cs_texture_uav` an all-zero kind word.
   `LEONIDA_DESCRIPTOR_TABLE=plain|tagged` overrides, and the runtime says so loudly when an override forces plain
   while tagged modules exist.
 - The layer must keep the table sparse enough that no live key needs more than eight probes. When all eight slots are occupied,

@@ -923,6 +923,13 @@ inline DescriptorTableLayout majority_descriptor_table_layout(const DescriptorTa
     return census.tagged > 0 ? DescriptorTableLayout::tagged : DescriptorTableLayout::plain;
 }
 
+// The layout with no library loaded (the GPU tests and tools create pipelines from modules they bring themselves):
+// tools/rdna2spirv.py's default --descriptor-table, which is what those modules were translated with. Tagged is
+// also safe for a plain module, which reads the index and ignores the kind word. A plain default handed every
+// tagged module an all-zero kind, so cs_texture_uav.spv stored to the fallback image. Kept equal to the translator
+// by tests/test_descriptor_table_default.py.
+inline constexpr DescriptorTableLayout kNoLibraryDescriptorTableLayout = DescriptorTableLayout::tagged;
+
 // LEONIDA_DESCRIPTOR_TABLE=plain|tagged overrides the modules' vote. False when `value` is null, empty or not one
 // of the two layouts (an unrecognised value is ignored rather than failing startup).
 inline bool descriptor_table_layout_from_env(const char* value, DescriptorTableLayout* layout) {

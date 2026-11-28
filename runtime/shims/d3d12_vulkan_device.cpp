@@ -15714,12 +15714,14 @@ public:
         // each index and uses it to tell which array that index is bound in (a 3D T# read by a 2D op is not another
         // image), and the inserts below fill it. A plain library reads only the index, exactly as before. The kind
         // word is additive, so one tagged module needs the tagged layout whatever the plain count (the library's
-        // vote); chosen once here, like the hash kind, and LEONIDA_DESCRIPTOR_TABLE overrides.
+        // vote); chosen once here, like the hash kind, and LEONIDA_DESCRIPTOR_TABLE overrides. With no library the
+        // modules come from the caller (GPU tests, tools), translated with rdna2spirv.py's default layout.
         leonida::DescriptorTableCensus table_modules{};
-        leonida::DescriptorTableLayout descriptor_table = leonida::DescriptorTableLayout::plain;
-        if (const leonida::ShaderLibrary* library = state_.library()) {
-            table_modules = library->descriptor_table_census();
-            descriptor_table = library->descriptor_table_layout();
+        const leonida::ShaderLibrary* table_library = state_.library();
+        leonida::DescriptorTableLayout descriptor_table = leonida::kNoLibraryDescriptorTableLayout;
+        if (table_library) {
+            table_modules = table_library->descriptor_table_census();
+            descriptor_table = table_library->descriptor_table_layout();
         }
         leonida::DescriptorTableLayout override_table = descriptor_table;
         if (leonida::descriptor_table_layout_from_env(std::getenv("LEONIDA_DESCRIPTOR_TABLE"), &override_table)) {
@@ -15739,6 +15741,9 @@ public:
         } else if (table_modules.tagged && table_modules.plain) {
             std::fprintf(stderr, "[rt] d3d12: descriptor table: %zu tagged / %zu plain modules; using %s\n",
                          table_modules.tagged, table_modules.plain,
+                         leonida::descriptor_table_layout_name(descriptor_table));
+        } else if (!table_library) {
+            std::fprintf(stderr, "[rt] d3d12: descriptor table: %s (no shader library; the translator's default)\n",
                          leonida::descriptor_table_layout_name(descriptor_table));
         } else {
             std::fprintf(stderr, "[rt] d3d12: descriptor table: %s (all %zu modules)\n",
