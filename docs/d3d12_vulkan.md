@@ -2894,6 +2894,22 @@ Pipeline creation:
   `LEONIDA_TRACE_PIPELINE_COMPILE=1` records each graphics and compute build's trigger, thread, elapsed time,
   SPIR-V size, shader names and Vulkan application-cache feedback (1 hit, 0 miss, -1 unavailable). It also
   times cache reads, merges, writes and draw/dispatch pipeline lookups that take at least 1 ms.
+  The `pipeline-compile-begin`, `pipeline-compile` and (for a draw) `pipeline-use` lines carry `id=` and the
+  `variant=` it was built or asked for. `id=` is the identity of a graphics pipeline's description, the same in every
+  run of the same shaders: a SHA-256 of the decoded state blocks (blend, sample mask, rasterizer, depth and stencil,
+  stream output), the checksum and size of each stage's DXBC container (VS, PS, DS, HS, GS, and the MS of a mesh
+  pipeline; an AS is hashed too, but a pipeline with one is refused before it gets an identity), the render target and
+  depth formats, the sample count, the input layout, strip cut and topology type (not for a mesh pipeline, whose D3D12
+  reading ignores them), and for a stream the back face's stencil masks and the depth bounds test. Those two are only
+  passed on the `ID3D12Device2::CreatePipelineState` path: a console stream prepared at bind time (`resolve_type`)
+  builds without them, so the same stream of the title gets another `id` there. The identity is that of what is built
+  (`graphics_identity`, `runtime/shims/d3d12_graphics_identity.h`). The root signature, an address and the device are
+  not in it. `PipelineState::create_graphics` computes it, so every graphics creation path sets it
+  (`CreateGraphicsPipelineState`, slot 57, and `ID3D12Device2::CreatePipelineState`, mesh pipelines included). `id=-`
+  is a compute pipeline. `key=` is the other name, the description the PC runtime matches a `CachedPSO` against: it
+  holds the root signature (its content, or its address for an object that is not ours), so it can differ between
+  runs, and the stream path leaves it `-`. `id=` is for telling the same pipeline apart from another across runs; it
+  does not change what is built or the driver's cache key.
   `LEONIDA_ASYNC_PIPELINES=1` schedules cold first-use builds on the warm-up worker ahead of speculative work; how long
   a submission waits for them, and what is skipped, is "Pipelines still being built" below. Strict replay builds
   synchronously and waits for every build. `LEONIDA_COMPUTE_WARMUP=0` restricts the worker to pipelines requested by

@@ -1540,6 +1540,13 @@ if(BUILD_TESTING)
     target_compile_options(pso_stream_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(pso_stream_test PRIVATE /OPT:NOREF)
     add_test(NAME pso_stream COMMAND pso_stream_test)
+    # The identity of a graphics description (d3d12_graphics_identity.h): header only, synthetic descriptions.
+    add_executable(graphics_identity_test test/graphics_identity_test.cpp)
+    target_include_directories(graphics_identity_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+    target_compile_definitions(graphics_identity_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(graphics_identity_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(graphics_identity_test PRIVATE /OPT:NOREF)
+    add_test(NAME graphics_identity COMMAND graphics_identity_test)
   endif()
 
   if(TARGET root_sig_test)

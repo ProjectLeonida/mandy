@@ -12,6 +12,7 @@
 #include "d3d12_com.h"
 #include "d3d12_compile_exit.h"
 #include "d3d12_pipeline_compile.h"
+#include "d3d12_graphics_identity.h"
 #include "d3d12_precompile.h"
 #include "d3d12_compile_helper.h"
 #include "d3d12_pipeline_checkpoint.h"
@@ -11207,23 +11208,6 @@ private:
     std::atomic<ULONG> refs_{1};
 };
 
-// A shader as the key sees it, without reading the whole program on every PSO: a DXBC container already carries a
-// checksum of its contents (bytes 4..19), so that and the size stand for it. A container without one (all zero, as
-// hand-built test containers have) or other bytecode is hashed with FNV-1a.
-void key_shader(leonida::cached_pso::KeyBuilder& key, const char* stage, const D3D12_SHADER_BYTECODE& code) {
-    const auto* bytes = static_cast<const std::uint8_t*>(code.pShaderBytecode);
-    const std::size_t size = bytes ? code.BytecodeLength : 0;
-    key.tag(stage).u32(std::uint32_t(size)).u32(std::uint32_t(std::uint64_t(size) >> 32));
-    if (size >= 20 && std::memcmp(bytes, "DXBC", 4) == 0 &&
-        std::any_of(bytes + 4, bytes + 20, [](std::uint8_t b) { return b != 0; })) {
-        key.bytes(bytes + 4, 16);
-        return;
-    }
-    std::uint64_t h = 0xcbf29ce484222325ull;
-    for (std::size_t i = 0; i < size; ++i) h = (h ^ bytes[i]) * 0x100000001b3ull;
-    key.u32(std::uint32_t(h)).u32(std::uint32_t(h >> 32));
-}
-
 void key_root_signature(leonida::cached_pso::KeyBuilder& key, ID3D12RootSignature* signature);
 
 // The parts of a compute description the PC runtime matches a cached PSO against (not Flags, measured).
@@ -11240,52 +11224,7 @@ leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& 
     leonida::cached_pso::KeyBuilder key;
     key.tag("graphics");
     key_root_signature(key, desc.pRootSignature);
-    key_shader(key, "vs", desc.VS);
-    key_shader(key, "ps", desc.PS);
-    key_shader(key, "ds", desc.DS);
-    key_shader(key, "hs", desc.HS);
-    key_shader(key, "gs", desc.GS);
-    const D3D12_STREAM_OUTPUT_DESC& so = desc.StreamOutput;
-    key.u32(so.pSODeclaration ? so.NumEntries : 0);
-    for (UINT i = 0; so.pSODeclaration && i < so.NumEntries; ++i) {
-        const D3D12_SO_DECLARATION_ENTRY& e = so.pSODeclaration[i];
-        key.u32(e.Stream).text(e.SemanticName).u32(e.SemanticIndex).u32(e.StartComponent).u32(e.ComponentCount);
-        key.u32(e.OutputSlot);
-    }
-    key.u32(so.pBufferStrides ? so.NumStrides : 0);
-    for (UINT i = 0; so.pBufferStrides && i < so.NumStrides; ++i) key.u32(so.pBufferStrides[i]);
-    key.u32(so.RasterizedStream);
-    const D3D12_BLEND_DESC& blend = desc.BlendState;
-    key.u32(blend.AlphaToCoverageEnable).u32(blend.IndependentBlendEnable);
-    for (const D3D12_RENDER_TARGET_BLEND_DESC& t : blend.RenderTarget)
-        key.u32(t.BlendEnable).u32(t.LogicOpEnable).u32(t.SrcBlend).u32(t.DestBlend).u32(t.BlendOp).u32(t.SrcBlendAlpha)
-            .u32(t.DestBlendAlpha).u32(t.BlendOpAlpha).u32(t.LogicOp).u32(t.RenderTargetWriteMask);
-    key.u32(desc.SampleMask);
-    const D3D12_RASTERIZER_DESC& r = desc.RasterizerState;
-    std::uint32_t bias_clamp = 0, slope = 0;
-    std::memcpy(&bias_clamp, &r.DepthBiasClamp, 4);
-    std::memcpy(&slope, &r.SlopeScaledDepthBias, 4);
-    key.u32(r.FillMode).u32(r.CullMode).u32(r.FrontCounterClockwise).u32(std::uint32_t(r.DepthBias)).u32(bias_clamp);
-    key.u32(slope).u32(r.DepthClipEnable).u32(r.MultisampleEnable).u32(r.AntialiasedLineEnable);
-    key.u32(r.ForcedSampleCount).u32(r.ConservativeRaster);
-    const D3D12_DEPTH_STENCIL_DESC& d = desc.DepthStencilState;
-    key.u32(d.DepthEnable).u32(d.DepthWriteMask).u32(d.DepthFunc).u32(d.StencilEnable).u32(d.StencilReadMask);
-    key.u32(d.StencilWriteMask);
-    for (const D3D12_DEPTH_STENCILOP_DESC& face : {d.FrontFace, d.BackFace})
-        key.u32(face.StencilFailOp).u32(face.StencilDepthFailOp).u32(face.StencilPassOp).u32(face.StencilFunc);
-    const D3D12_INPUT_LAYOUT_DESC& input = desc.InputLayout;
-    const UINT input_count =
-        input.pInputElementDescs ? std::min<UINT>(input.NumElements, D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT) : 0;
-    key.u32(input_count);
-    for (UINT i = 0; i < input_count; ++i) {
-        const D3D12_INPUT_ELEMENT_DESC& e = input.pInputElementDescs[i];
-        key.text(e.SemanticName).u32(e.SemanticIndex).u32(e.Format).u32(e.InputSlot).u32(e.AlignedByteOffset);
-        key.u32(e.InputSlotClass).u32(e.InstanceDataStepRate);
-    }
-    key.u32(desc.IBStripCutValue).u32(std::bit_cast<std::uint32_t>(desc.PrimitiveTopologyType))
-        .u32(desc.NumRenderTargets);
-    for (const DXGI_FORMAT format : desc.RTVFormats) key.u32(format);
-    key.u32(desc.DSVFormat).u32(desc.SampleDesc.Count).u32(desc.SampleDesc.Quality).u32(desc.NodeMask);
+    key_graphics_state(key, desc, true);
     return leonida::sha256_hex(key.data());
 }
 
@@ -11322,13 +11261,6 @@ public:
 // subobject that is absent takes the runtime's default (the CD3DX12 defaults: depth test on with LESS, back-face
 // culling, no blending, sample mask 0xFFFFFFFF, one sample). A type given twice, a truncated stream or an unknown
 // type is E_INVALIDARG, as on the PC runtime; state this layer cannot honour yet is E_NOTIMPL with a log.
-// The back face's stencil masks of a DEPTH_STENCIL2 subobject. D3D12_DEPTH_STENCIL_DESC has one read and one write
-// mask for both faces, so the face masks travel beside the description.
-struct StencilFaceMasks {
-    UINT8 read = D3D12_DEFAULT_STENCIL_READ_MASK;
-    UINT8 write = D3D12_DEFAULT_STENCIL_WRITE_MASK;
-};
-
 struct PipelineStream {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics{};
     bool back_masks = false;  // DEPTH_STENCIL2: back_stencil holds the back face's masks
@@ -12272,6 +12204,8 @@ public:
         }
         if (desc.NodeMask & ~1u) return E_INVALIDARG;
         if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
+        // Observation only (the pipeline-compile and pipeline-use log lines): every creation path ends here.
+        description_id_ = graphics_identity(desc, ms, as, back_masks, depth_bounds);
         if (!device_.arena.mapped) {
             return stream_unsupported("pipelines need the GPU address arena (bufferDeviceAddress); stage", 1);
         }
@@ -13045,7 +12979,7 @@ public:
         graphics_.variant = [this](std::uint32_t unbound) {
             return replay_pipeline("draw", [&] {
                 return graphics_.async_build ? queue_build(false, unbound) : variant(unbound, "draw");
-            });
+            }, description_id_, unbound);
         };
         graphics_.built = [this](std::uint32_t unbound) {
             std::unique_lock lock(variants_mutex_, std::try_to_lock);  // held: another thread is compiling one
@@ -13724,7 +13658,7 @@ private:
             }
         }
         CompileTrace trace;
-        trace.begin(info, device_.info.pipeline_creation_feedback, trigger, profile_shaders_.c_str(), unbound, bytes, cache_key_);
+        trace.begin(info, device_.info.pipeline_creation_feedback, trigger, profile_shaders_.c_str(), unbound, bytes, cache_key_, description_id_);
         const leonida::dev_status::Build dev_build(r.mesh ? "mesh pipeline" : "graphics pipeline");
         const leonida::pipeline_profile::DriverCall profile(r.mesh ? "ms" : "vs", lazy_ ? "lazy" : "eager",
                                                          program, fragment, unbound);
@@ -13923,6 +13857,8 @@ private:
     bool native_source_ready_ = false;
     std::shared_ptr<PipelineState> native_owner_;
     leonida::cached_pso::Key cache_key_;
+    // graphics_identity of the description create_graphics was given; empty for a compute pipeline.
+    std::string description_id_;
     leonida::cached_pso::Key order_key_;  // see set_order_key; empty: cache_key_
     std::uint64_t order_hash_ = 0;        // 0: this pipeline is not in the order log
     char order_kind_ = 'c';

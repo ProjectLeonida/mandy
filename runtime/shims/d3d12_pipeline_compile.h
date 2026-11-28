@@ -113,14 +113,18 @@ inline long long compile_wall_ms() {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-template<class Build> VkPipeline replay_pipeline(const char* trigger, Build&& get) {
+// `description_id` is the graphics_identity of the pipeline being used ("-" for none, as for a compute pipeline) and
+// `variant` the variant asked for.
+template<class Build> VkPipeline replay_pipeline(const char* trigger, Build&& get, const std::string& description_id = {},
+                                                 std::uint32_t variant = 0) {
     if (!trace_pipeline_compile()) return get();
     const auto start = compile_us();
     auto handle = get();
     auto elapsed = compile_us() - start;
     if (elapsed >= 1000)
-        std::fprintf(stderr, "[rt] pipeline-use trigger=%s tid=%lu us=%lld ready=%d end_ms=%lld\n",
-                     trigger, GetCurrentThreadId(), elapsed, int(handle != VK_NULL_HANDLE), compile_wall_ms());
+        std::fprintf(stderr, "[rt] pipeline-use trigger=%s tid=%lu us=%lld ready=%d end_ms=%lld id=%s variant=%u\n",
+                     trigger, GetCurrentThreadId(), elapsed, int(handle != VK_NULL_HANDLE), compile_wall_ms(),
+                     description_id.empty() ? "-" : description_id.c_str(), variant);
     return handle;
 }
 
@@ -130,15 +134,18 @@ struct CompileTrace {
                                                nullptr, &feedback, 0, nullptr};
     long long started = 0;
     const char* key = "-";
+    const char* id = "-";  // graphics_identity of a graphics pipeline, "-" for a compute pipeline
     bool linked = false;  // chain is in a create info's pNext chain
 
     template<class Info> void begin(Info& info, bool supported, const char* trigger, const char* shaders,
-                                    std::uint32_t variant, std::size_t bytes, const std::string& description_key) {
+                                    std::uint32_t variant, std::size_t bytes, const std::string& description_key,
+                                    const std::string& description_id = {}) {
         if (!trace_pipeline_compile()) return;
         if (!description_key.empty()) key = description_key.c_str();
+        if (!description_id.empty()) id = description_id.c_str();
         if (supported) request_feedback(info);
-        std::fprintf(stderr, "[rt] pipeline-compile-begin trigger=%s tid=%lu bytes=%zu variant=%u begin_ms=%lld key=%s shaders=%s\n",
-                     trigger, GetCurrentThreadId(), bytes, variant, compile_wall_ms(), key, shaders);
+        std::fprintf(stderr, "[rt] pipeline-compile-begin trigger=%s tid=%lu bytes=%zu variant=%u begin_ms=%lld key=%s id=%s shaders=%s\n",
+                     trigger, GetCurrentThreadId(), bytes, variant, compile_wall_ms(), key, id, shaders);
         started = compile_us();
     }
 
@@ -163,8 +170,9 @@ struct CompileTrace {
         const auto ended = compile_us();
         const int hit = this->hit();
         std::fprintf(stderr, "[rt] pipeline-compile trigger=%s tid=%lu start_us=%lld us=%lld hit=%d bytes=%zu "
-                             "variant=%u result=%d end_ms=%lld key=%s shaders=%s\n", trigger, GetCurrentThreadId(), started,
-                             ended - started, hit, bytes, variant, int(result), compile_wall_ms(), key, shaders);
+                             "variant=%u result=%d end_ms=%lld key=%s id=%s shaders=%s\n", trigger, GetCurrentThreadId(),
+                             started, ended - started, hit, bytes, variant, int(result), compile_wall_ms(), key, id,
+                             shaders);
     }
 };
 
