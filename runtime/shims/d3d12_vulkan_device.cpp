@@ -15525,6 +15525,24 @@ public:
             };
             leonida::mem_probe::start(std::move(facts));
         }
+        state_.context->set_root_argument_upload(
+            [this](std::span<const std::uint32_t> words, std::uint64_t& va) -> std::shared_ptr<void> {
+                if (words.empty() || words.size() > rt::rootsig::kMaxD3d12Cost || !state_.arena.mapped)
+                    return {};
+                // Immutable per dispatch and per submission. Wide scalar loads may read past the last argument;
+                // keep one dwordx16 of zeroed padding within this allocation.
+                const VkDeviceSize bytes = words.size_bytes() + 64;
+                VkDeviceSize offset = 0;
+                if (!state_.arena_allocate(bytes, 16, offset, DeviceState::arena_buffer)) return {};
+                auto owner = std::shared_ptr<void>(state_.arena.mapped + offset, [this, offset, bytes](void*) {
+                    state_.arena_release(offset, bytes, DeviceState::arena_buffer);
+                });
+                std::memcpy(state_.arena.mapped + offset, words.data(), words.size_bytes());
+                std::memset(state_.arena.mapped + offset + words.size_bytes(), 0, 64);
+                // Translated loads add heap_base themselves: s[0:1] is a console VA, never a raw Vulkan BDA.
+                va = offset;
+                return owner;
+            });
         if (info.conditional_rendering) {
             const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                 info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
@@ -18361,8 +18379,8 @@ public:
             if (container_size != size) return E_INVALIDARG;
         }
         // The repository's root-signature model (runtime/src/root_signature.h): parse the RTS0 blob, then pack
-        // the parameters into the 32 user-data dwords in the console layout. pack_stage() refuses what it cannot
-        // place (past s31: the console spills those to memory, in a layout that is still open), and so does this.
+        // the parameters into the 32 user-data dwords in the console layout and a full compute argument block.
+        // Non-compute spills remain unmeasured and are refused, never silently truncated.
         const rt::rootsig::DecodeResult parsed = rt::rootsig::parse_rts0(bytes, size);
         if (!parsed.ok) {
             std::fprintf(stderr, "[rt] d3d12: root signature not understood: %s\n", parsed.error.c_str());
@@ -18411,7 +18429,7 @@ public:
         layout.graphics_ok = graphics_ok;
         layout.mesh_ok = pixel.ok && mesh.ok;
         layout.compute_ok = compute.ok;
-        if (compute.ok && !compute.spill_dwords) layout.compute_arguments_end = compute.end_sgpr;
+        if (compute.ok && !compute.spills()) layout.compute_arguments_end = compute.end_sgpr;
         // Vertex, pixel and geometry shaders share the s8 layout and one user-data block (a non-compute stage
         // refuses a spill, so pixel.ok means every argument is inline).
         if (pixel.ok) layout.graphics_arguments_end = pixel.end_sgpr;
@@ -18428,8 +18446,10 @@ public:
             }
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
                                          compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr,
-                                         table_descriptor_count(parsed.sig.params[i])});
+                                         table_descriptor_count(parsed.sig.params[i]),
+                                         compute.ok ? compute.block_dword[i] : rt::rootsig::kNoBlockDword});
         }
+        layout.block_dwords = compute.ok ? compute.block_dwords : 0;
         register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(
             std::move(layout), leonida::sha256_hex({static_cast<const std::uint8_t*>(blob), size}));

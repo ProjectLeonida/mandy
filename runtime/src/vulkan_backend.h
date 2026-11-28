@@ -1910,6 +1910,15 @@ public:
         bindless_prepare_ = std::move(prepare);
     }
 
+    // Upload into fresh, host-coherent console-addressable storage. The returned owner releases the range; each
+    // queue retains it until the submission completes. No range is shared by concurrent dispatches or queues.
+    using RootArgumentUpload =
+        std::function<std::shared_ptr<void>(std::span<const std::uint32_t>, std::uint64_t&)>;
+    void set_root_argument_upload(RootArgumentUpload upload) {
+        std::unique_lock lock(resource_mutex_);
+        root_argument_upload_ = std::move(upload);
+    }
+
     // D24_UNORM_S8_UINT stored as D32: copies of its depth plane run a compute pass (vulkan_depth24.h). `allocate`
     // gives the scratch buffers device-local memory. Without this such a copy is refused as unsupported.
     void enable_depth24(PFN_vkGetDeviceProcAddr get, Depth24Converter::Allocate allocate,
@@ -2426,6 +2435,7 @@ private:
     std::uint64_t prelude_version_ = 0;
     std::unique_ptr<Depth24Converter> depth24_;
     std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
+    RootArgumentUpload root_argument_upload_;
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
@@ -3271,6 +3281,7 @@ private:
         ReplayFunctions replay{};
         unsigned mesh_draws = 0;
         std::vector<VulkanContext::GeometryUpload> geometry;
+        std::vector<std::shared_ptr<void>> root_arguments;
         std::uint64_t captures = 0;
         for (const auto* list : lists)
             for (const auto& command : list->commands())
@@ -3311,6 +3322,15 @@ private:
                 };
             }
             replay.graphics_family = family_ == context_.graphics_family_;
+            if (context_.root_argument_upload_) {
+                replay.prepare_root_arguments = [this, &root_arguments](std::span<const std::uint32_t> words,
+                                                                      std::uint64_t& va) {
+                    auto owner = context_.root_argument_upload_(words, va);
+                    if (!owner) return false;
+                    root_arguments.push_back(std::move(owner));
+                    return true;
+                };
+            }
             replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
                                   : kind_ == QueueKind::compute ? detail::queue_stages_compute
                                                                 : 0;
@@ -3488,6 +3508,7 @@ private:
                 recycle_khr_stages(khr_guard.stages);
                 recycle_khr_as_queries(khr_guard.as_queries);
                 geometry.clear();
+                root_arguments.clear();
 
                 std::shared_ptr<void> demand;
                 if (context_.large_compile_demand_ && compiles.any_large()) demand = context_.large_compile_demand_();
@@ -3844,6 +3865,7 @@ private:
             slot->predicated_copy = std::move(copy_batch);
             slot->counted_dispatch = std::move(counted_batch);
             slot->indirect_clamp = std::move(clamp_batch);
+            slot->root_arguments = std::move(root_arguments);
             queries.commit();
             slot->segments = std::move(queries.retained);
             slot->geometry = std::move(geometry);
@@ -4131,6 +4153,7 @@ private:
         std::vector<KhrInstanceStage> khr_instances;  // KHR ARRAY_OF_POINTERS staging, same lifetime
         std::vector<KhrAsQueryPool> khr_as_queries;   // KHR postbuild COMPACTED_SIZE query pools, same lifetime
         std::vector<VulkanContext::GeometryUpload> geometry;
+        std::vector<std::shared_ptr<void>> root_arguments;  // immutable compute argument blocks, same lifetime
     };
 
     struct PendingBindings {
@@ -4299,6 +4322,7 @@ private:
             if (slot.ticket > done) continue;
             slot.segments.clear();
             slot.geometry.clear();
+            slot.root_arguments.clear();
             recycle_khr_stages(slot.khr_instances);
             recycle_khr_as_queries(slot.khr_as_queries);
             for (VkEvent event : slot.events)

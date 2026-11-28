@@ -143,7 +143,9 @@ int main() {
         check(!p.ok && p.error.find("64-dword") == std::string::npos && p.error.find("spill") != std::string::npos,
               "pack_stage: 64 constants pass the cost limit for a pixel shader (refused only as a spill)");
         const StagePackResult c = pack_stage(sig, Stage::Compute);
-        check(c.ok && c.d3d12_cost == 64 && c.spill_dword == std::vector<uint32_t>({0}) && c.spill_dwords == 64,
+        check(c.ok && c.d3d12_cost == 64 && c.spills() && c.spill_start == 0 &&
+                  c.first_sgpr == std::vector<uint32_t>({kNoSgpr}) && c.end_sgpr == 4 &&
+                  c.block_dword == std::vector<uint32_t>({0}) && c.block_dwords == 64,
               "pack_stage: 64 constants pass the cost limit for compute, spilled whole");
         sig.params = {consts(32), consts(0), consts(32)};
         check(pack(sig).error.find("spill") != std::string::npos, "32 + 0 + 32 constants cost 64, not more");
@@ -467,64 +469,91 @@ int main() {
 
         // An empty signature is valid and uses nothing.
         const StagePackResult empty = pack_stage(RootSignature{}, Stage::Compute);
-        check(empty.ok && empty.first_sgpr.empty() && empty.spill_dword.empty() && empty.end_sgpr == 4 &&
-                  empty.spill_dwords == 0,
+        check(empty.ok && empty.first_sgpr.empty() && empty.block_dword.empty() && empty.end_sgpr == 4 &&
+                  empty.block_dwords == 0 && !empty.spills(),
               "pack_stage: empty signature");
     }
 
-    // Compute spills parameters from the first one that does not fit whole from s4..s31 into the packed spill array
-    // (s[0:1]); non-compute stages still refuse spills. Compute budget is 28 inline SGPRs above s4, mesh 16 above s16.
+    // pack_stage: compute lays a non-fitting signature into the measured argument block behind s[0:1] instead of
+    // refusing; the other stages keep the refusal (their spill is unmeasured). Compute has 28 SGPRs above s4, mesh 16.
     {
         RootSignature exact;
         exact.params = {consts(28)};
-        const StagePackResult exact_r = pack_stage(exact, Stage::Compute);
-        check(exact_r.ok && exact_r.end_sgpr == 32 && exact_r.spill_dwords == 0 &&
-                  exact_r.spill_dword == std::vector<uint32_t>({kNoSpill}),
-              "pack_stage: 28 constants fill compute inline SGPRs with no spill");
-
+        const StagePackResult fill = pack_stage(exact, Stage::Compute);
+        check(fill.ok && fill.first_sgpr == std::vector<uint32_t>({4}) && fill.end_sgpr == 32 &&
+                  !fill.spills() && fill.block_dwords == 28 && fill.block_dword == std::vector<uint32_t>({0}),
+              "pack_stage: 28 constants fill compute exactly, block spans all of them");
+        // The measured XboxBvhBuilder.dll shape (docs/d3d12_vulkan.md section 3.5): 5 root UAVs, 3 root SRVs and
+        // 14 constants span 30 dwords from s4 — the descriptors stay inline s4..s19 and the constants go to the
+        // block, which still holds every parameter in the inline layout's widths as bytes.
+        RootSignature builder;
+        builder.params = {view(), view(), view(), view(), view(), view(), view(), view(), consts(14)};
+        const StagePackResult b = pack_stage(builder, Stage::Compute);
+        check(b.ok && b.first_sgpr == std::vector<uint32_t>(
+                                               {4, 6, 8, 10, 12, 14, 16, 18, rt::rootsig::kNoSgpr}) &&
+                  b.spills() && b.spill_start == 8 && b.end_sgpr == 20,
+              "pack_stage: the builder's 30-dword signature spills its constants parameter");
+        check(b.block_dword == std::vector<uint32_t>(
+                                   {0, 2, 4, 6, 8, 10, 12, 14, 16}) && b.block_dwords == 30,
+              "pack_stage: the argument block is the inline layout in bytes (descriptors 2 dwords, constants 1)");
+        // A fitting signature still gets its block layout (measured: a fitting builder program reads the block).
+        RootSignature fitting;
+        fitting.params = {view(), view(), consts(16)};  // span 20 from s4: fits
+        const StagePackResult f = pack_stage(fitting, Stage::Compute);
+        check(f.ok && !f.spills() && f.first_sgpr == std::vector<uint32_t>({4, 6, 8}) &&
+                  f.block_dword == std::vector<uint32_t>({0, 2, 4}) && f.block_dwords == 20,
+              "pack_stage: a fitting signature gets both layouts");
+        // Parameters fit whole or become block-only; an unused inline word is not filled by later parameters.
         RootSignature over;
         over.params = {consts(27), view()};  // the view would need s31..s32, so it spills
         const StagePackResult r = pack_stage(over, Stage::Compute);
         check(r.ok && r.first_sgpr == std::vector<uint32_t>({4, kNoSgpr}) &&
-                  r.spill_dword == std::vector<uint32_t>({kNoSpill, 0}) && r.end_sgpr == 31 && r.spill_dwords == 2,
-              "pack_stage: compute parameter that does not fit whole spills at offset 0");
+                  r.spills() && r.spill_start == 1 && r.end_sgpr == 31 &&
+                  r.block_dword == std::vector<uint32_t>({0, 27}) && r.block_dwords == 29,
+               "pack_stage: whole-parameter spill keeps its full-block offset");
 
         RootSignature fits_old;
         fits_old.params = {consts(30)};  // fits pack()'s 32 from s0, spills on compute from s4
         const StagePackResult cs_fits = pack_stage(fits_old, Stage::Compute);
         check(pack(fits_old).ok && cs_fits.ok && cs_fits.first_sgpr == std::vector<uint32_t>({kNoSgpr}) &&
-                  cs_fits.spill_dword == std::vector<uint32_t>({0}) && cs_fits.end_sgpr == 4 &&
-                  cs_fits.spill_dwords == 30,
+                  cs_fits.spill_start == 0 && cs_fits.block_dword == std::vector<uint32_t>({0}) &&
+                  cs_fits.end_sgpr == 4 && cs_fits.block_dwords == 30,
               "pack_stage: compute inline budget is 28 from s4; 30 constants spill all 30 dwords");
 
-        // Mixed spill without alignment padding: table (1), root view (2), constants (3) pack at 0, 1, 3.
+        // The full block has no alignment padding before an odd-dword root view.
         RootSignature mixed_spill;
         mixed_spill.params = {consts(26), view(), table(), view(), consts(3)};
         const StagePackResult ms = pack_stage(mixed_spill, Stage::Compute);
         check(ms.ok && ms.first_sgpr == std::vector<uint32_t>({4, 30, kNoSgpr, kNoSgpr, kNoSgpr}) &&
-                  ms.spill_dword == std::vector<uint32_t>({kNoSpill, kNoSpill, 0, 1, 3}) && ms.end_sgpr == 32 &&
-                  ms.spill_dwords == 6,
-              "pack_stage: compute spill packs mixed table, unaligned root view, and constants contiguously");
+                  ms.block_dword == std::vector<uint32_t>({0, 26, 28, 29, 31}) && ms.end_sgpr == 32 &&
+                  ms.spill_start == 2 && ms.block_dwords == 34,
+               "pack_stage: compute block packs mixed table, unaligned root view, and constants contiguously");
 
         // Once one parameter spills, every subsequent parameter spills even if a later 1-dword table would fit in s31.
         RootSignature monotonic;
         monotonic.params = {consts(27), view(), table()};
         const StagePackResult mr = pack_stage(monotonic, Stage::Compute);
         check(mr.ok && mr.first_sgpr == std::vector<uint32_t>({4, kNoSgpr, kNoSgpr}) &&
-                  mr.spill_dword == std::vector<uint32_t>({kNoSpill, 0, 2}) && mr.end_sgpr == 31 &&
-                  mr.spill_dwords == 3,
-              "pack_stage: first spilling parameter sends every subsequent parameter to the spill array");
+                  mr.block_dword == std::vector<uint32_t>({0, 27, 29}) && mr.end_sgpr == 31 &&
+                  mr.spill_start == 1 && mr.block_dwords == 30,
+               "pack_stage: first spilling parameter sends every subsequent parameter to the block");
 
         // 64-dword D3D12 cost still holds for spilling compute signatures.
         RootSignature max64;
         max64.params = {consts(64)};
         const StagePackResult m64 = pack_stage(max64, Stage::Compute);
-        check(m64.ok && m64.end_sgpr == 4 && m64.spill_dwords == 64 && m64.d3d12_cost == 64,
+        check(m64.ok && m64.end_sgpr == 4 && m64.spills() && m64.block_dwords == 64 && m64.d3d12_cost == 64,
               "pack_stage: 64-dword spilled compute signature accepted");
 
+        // Mesh keeps the refusal: its spill is unmeasured.
+        RootSignature mesh_over;
+        mesh_over.params = {consts(16), table()};
+        check(!pack_stage(mesh_over, Stage::Mesh).ok &&
+                  pack_stage(mesh_over, Stage::Mesh).error.find("spill unmeasured") != std::string::npos,
+              "pack_stage: mesh still refuses a spill (unmeasured), and names the reason");
         RootSignature tables;
         tables.params.assign(20, table());  // one dword each: compute s4..s23; pack() needs 40
-        check(pack_stage(tables, Stage::Compute).ok && !pack(tables).ok,
+        check(pack_stage(tables, Stage::Compute).ok && !pack(tables).ok && !pack_stage(tables, Stage::Compute).spills(),
               "pack_stage: 20 one-dword tables fit compute, which pack() refuses (40 dwords of tables)");
         tables.params.assign(16, table());  // fills mesh s16..s31 exactly
         check(pack_stage(tables, Stage::Mesh).ok, "pack_stage: 16 tables fill the mesh stage exactly");
@@ -593,20 +622,28 @@ int main() {
         zero.params = {consts(0)};
         const StagePackResult lone = pack_stage(zero, Stage::Compute);
         check(lone.ok && lone.first_sgpr.size() == 1 && lone.first_sgpr[0] == 4 && lone.end_sgpr == 4 &&
-                  lone.spill_dwords == 0,
+                  !lone.spills() && lone.block_dword == std::vector<uint32_t>({0}) && lone.block_dwords == 0,
               "pack_stage: zero-value constants accepted");
         zero.params = {consts(1), consts(0), table(), consts(0), consts(26)};
         const StagePackResult mixed = pack_stage(zero, Stage::Compute);
-        check(mixed.ok && mixed.first_sgpr.size() == 5 && mixed.first_sgpr[0] == 4 && mixed.first_sgpr[1] == 5 &&
-                  mixed.first_sgpr[2] == 5 && mixed.first_sgpr[3] == 6 && mixed.first_sgpr[4] == 6 &&
-                  mixed.end_sgpr == 32 && mixed.spill_dwords == 0 && mixed.d3d12_cost == 1 + 1 + 26,
+        check(mixed.ok && mixed.first_sgpr == std::vector<uint32_t>({4, 5, 5, 6, 6}) && mixed.end_sgpr == 32 &&
+                  !mixed.spills() && mixed.block_dword == std::vector<uint32_t>({0, 1, 1, 2, 2}) &&
+                  mixed.block_dwords == 28 && mixed.d3d12_cost == 1 + 1 + 26,
               "pack_stage: zero-value constants between others fill compute exactly, offsets unchanged");
-        // In the compute spill array a zero-value constant takes no dwords either: the next parameter shares its offset.
+        // Zero-value constants at the s31 boundary do not spill; a following non-zero parameter spills.
+        zero.params = {consts(28), consts(0)};
+        const StagePackResult boundary = pack_stage(zero, Stage::Compute);
+        check(boundary.ok && !boundary.spills() && boundary.end_sgpr == 32 &&
+                  boundary.block_dword == std::vector<uint32_t>({0, 28}) && boundary.block_dwords == 28,
+              "pack_stage: zero-value constants at s31 boundary do not spill");
+        // In the compute argument block a zero-value constant takes no dwords either: the next parameter shares its offset.
         zero.params = {consts(28), table(), consts(0), consts(1)};
         const StagePackResult spilled = pack_stage(zero, Stage::Compute);
-        check(spilled.ok && spilled.end_sgpr == 32 &&
-                  spilled.spill_dword == std::vector<uint32_t>({kNoSpill, 0, 1, 1}) && spilled.spill_dwords == 2,
-              "pack_stage: zero-value constants in the compute spill array take no dwords");
+        check(spilled.ok && spilled.first_sgpr == std::vector<uint32_t>({4, kNoSgpr, kNoSgpr, kNoSgpr}) &&
+                  spilled.end_sgpr == 32 && spilled.spills() && spilled.spill_start == 1 &&
+                  spilled.block_dword == std::vector<uint32_t>({0, 28, 29, 29}) && spilled.block_dwords == 30,
+              "pack_stage: zero-value constants in the compute argument block take no dwords");
+        // Validation continues after the first block-only parameter.
         RootSignature costly;
         costly.params = {consts(32), consts(33)};
         const StagePackResult costly_r = pack_stage(costly, Stage::Compute);
@@ -615,6 +652,24 @@ int main() {
         RootSignature many;
         many.params.assign(65, table());
         check(!pack_stage(many, Stage::Compute).ok, "pack_stage: more than 64 parameters rejected");
+        RootSignature bad;
+        bad.params = {consts(29), RootParameter{}};
+        bad.params.back().type = static_cast<ParamType>(99);
+        check(!pack_stage(bad, Stage::Compute).ok, "pack_stage: unknown type after spill rejected");
+        bad.params.back() = consts(36);
+        check(!pack_stage(bad, Stage::Compute).ok, "pack_stage: over-cost constants after spill rejected");
+        bad.params.back() = consts(0);
+        const auto zero_after_spill = pack_stage(bad, Stage::Compute);
+        check(zero_after_spill.ok && zero_after_spill.spills() && zero_after_spill.spill_start == 0 &&
+                  zero_after_spill.first_sgpr == std::vector<uint32_t>({kNoSgpr, kNoSgpr}) &&
+                  zero_after_spill.block_dword == std::vector<uint32_t>({0, 29}) &&
+                  zero_after_spill.block_dwords == 29,
+              "pack_stage: zero constants after spill accepted with zero block dwords");
+        RootSignature maximum;
+        maximum.params.assign(64, table());
+        const auto max = pack_stage(maximum, Stage::Compute);
+        check(max.ok && max.block_dwords == 64 && max.block_dword.back() == 63,
+              "pack_stage: maximum cost fits the 64-dword snapshot bound");
     }
 
     if (g_failures != 0) std::printf("%d FAILURES\n", g_failures);

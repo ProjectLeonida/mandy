@@ -382,6 +382,9 @@ struct Dispatch {
     std::uint32_t x;
     std::uint32_t y;
     std::uint32_t z;
+    // Full console compute root arguments, captured at record time. Replay uploads an immutable copy for this
+    // execution and supplies its console VA in s[0:1]. Empty for ownerless/legacy callers.
+    std::vector<std::uint32_t> root_arguments;
 };
 
 // D3D12_VIEWPORT.
@@ -649,6 +652,7 @@ struct ExecuteIndirect {
     // as it is.
     std::uintptr_t pipeline = 0;
     std::array<std::uint32_t, 32> user_data{};
+    std::vector<std::uint32_t> root_arguments;  // DISPATCH kind only, as for Dispatch
 };
 
 // Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).

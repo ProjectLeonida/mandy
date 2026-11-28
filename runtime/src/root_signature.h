@@ -3,8 +3,8 @@
 // No d3d12.h, no windows.h: this compiles on Linux CI and in the Windows
 // runtime alike. It models exactly what docs/d3d12_vulkan.md section 3.5
 // needs: root parameters in order, static samplers (no dwords), the 64-dword
-// D3D12 cost limit, and the 32-dword console user-SGPR budget. Anything that
-// does not fit is refused loudly, never guessed (see pack()).
+// D3D12 cost limit, and the 32-dword console user-SGPR budget. Compute's argument block is modelled by pack_stage;
+// unmeasured graphics spills are refused loudly.
 //
 // Numbering follows D3D12 docs: descriptor tables cost 1 dword of the 64-dword
 // limit, root views (CBV/SRV/UAV) cost 2, 32-bit constants cost their count.
@@ -135,10 +135,10 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 //     signature confirms them yet, and visibility is not modelled (every parameter takes its place in every stage).
 //     The graphics bind point uses Stage::Pixel (s8, as vertex and geometry); a mesh shader reads the same dwords
 //     through its translator-side window (docs/d3d12_vulkan.md section 3.5).
-// A parameter that does not fit goes to the console's spill array behind s[0:1] (compute, section 7) together with
-// every parameter after it. For compute that packed spill array (1 dword per 32-bit constant, 2 per root descriptor,
-// 1 per descriptor table, no alignment padding) is modelled in StagePackResult; non-compute stages still refuse spills
-// because their spill pointer SGPR is unmeasured.
+// A parameter that does not fit goes to the console's argument block behind s[0:1] (compute, section 7) together
+// with every parameter after it; for compute the block is modelled (measured on XboxBvhBuilder.dll's programs):
+// the inline layout's widths as bytes, every parameter in root-signature order — see StagePackResult. The other
+// stages keep the refusal.
 enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, Mesh = 4 };
 
 [[nodiscard]] constexpr uint32_t stage_base(Stage stage) noexcept {
@@ -169,24 +169,33 @@ enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, 
 }
 
 constexpr uint32_t kNoSgpr = 0xFFFFFFFFu;
-constexpr uint32_t kNoSpill = 0xFFFFFFFFu;
+constexpr uint32_t kNoBlockDword = 0xFFFFFFFFu;
 
 struct StagePackResult {
     bool ok = false;
     std::string error;                 // set when !ok; names the refusing parameter
     Stage stage = Stage::Compute;
-    uint32_t base = 0;                 // stage_base(stage)
+    uint32_t base = 0;            // stage_base(stage)
     std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR (kNoSgpr when spilled or refused)
-    std::vector<uint32_t> spill_dword; // per parameter: dword offset in s[0:1] spill array (kNoSpill when inline)
-    uint32_t end_sgpr = 0;             // one past the last inline SGPR used: the RSRC2 USER_SGPR count
-    uint32_t spill_dwords = 0;         // total dwords in the packed spill array (0 when nothing spills)
-    uint32_t d3d12_cost = 0;           // cost against the 64-dword D3D12 limit
+    uint32_t end_sgpr = 0;        // one past the last SGPR used: the RSRC2 USER_SGPR count the layout implies
+    uint32_t d3d12_cost = 0;      // cost against the 64-dword D3D12 limit
+    // The argument block behind s[0:1] (measured on XboxBvhBuilder.dll's programs, docs/d3d12_vulkan.md section 3.5):
+    // every parameter, inline or not, in root-signature order at the inline layout's widths as bytes — a root
+    // CBV/SRV/UAV 8 B, a descriptor table 4 B, a 32-bit constant 4 B per value, no alignment. block_dword[i] is
+    // parameter i's first dword in that block (kNoBlockDword when the signature is refused), block_dwords the
+    // block's size; for compute it is the full span whether or not the signature fits s4..s31 (at most 64).
+    // Non-compute stages have no block metadata.
+    uint32_t spill_start = kNoSgpr;         // first parameter that did not fit inline (kNoSgpr: all fit)
+    std::vector<uint32_t> block_dword;      // per parameter: first dword in the argument block
+    uint32_t block_dwords = 0;              // the argument block's size, in dwords
+    [[nodiscard]] bool spills() const { return spill_start != kNoSgpr; }
 };
 
 // Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, an
-// unknown parameter type or the 64-dword cost limit. Compute spills any trailing parameters from the first one
-// that does not fit whole into spill_dword; non-compute stages refuse any spill. A constant parameter of 0 values
-// takes no SGPRs and no spill dwords.
+// unknown parameter type or the 64-dword cost limit. Compute signatures that spill keep every parameter after the
+// first non-fitting one out of the inline SGPRs; all compute arguments are laid out into the measured argument
+// block instead of refused (non-compute stages refuse any spill because theirs is unmeasured). A constant parameter
+// of 0 values takes no SGPRs and no block dwords.
 [[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage);
 
 // D3D12 cost of one parameter against the 64-dword limit.

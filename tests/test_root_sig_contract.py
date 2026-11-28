@@ -355,17 +355,56 @@ def test_zero_value_constants_take_no_dwords():
     assert error == "" and [(d["param"], d["sub"]) for d in dwords[4:]] == [(1, 0), (1, 1), (3, 0)]
     dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 0}]}, "cs")
     assert error == "" and len(dwords) == 4
+    dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 28},
+                                                {"type": "constants", "count": 0}]}, "cs")
+    assert error == "" and len(dwords) == 32
+    dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 28}, {"type": "table"},
+                                                {"type": "constants", "count": 0},
+                                                {"type": "constants", "count": 1}]}, "cs")
+    assert error == "" and len(dwords) == 32
+    dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 29},
+                                                {"type": "constants", "count": 0}]}, "cs")
+    assert error == "" and len(dwords) == 4
+    dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 64}]}, "cs")
+    assert error == "" and len(dwords) == 4
+    dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 64}]}, "ps")
+    assert dwords == [] and "spill" in error
     dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": -1}]})
     assert dwords == [] and "count >= 0" in error
 
 
-def test_console_layout_spill_refused():
+def test_console_layout_spill_goes_to_the_argument_block():
     sig = {"version": "1.1", "flags": 0, "params": [{"type": "table"} for _ in range(17)]}
-    assert rsc.pack_layout(sig, "ms")[1] != ""                     # 17 one-dword tables past s31
-    sig["params"].pop()
-    assert rsc.pack_layout(sig, "ms")[1] == ""                     # 16 fill s16..s31
+    dwords, error = rsc.pack_layout(sig, "ms")
+    assert dwords == [] and "spill unsupported" in error  # Graphics spill remains unmeasured.
+
     dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 29}]}, "cs")
-    assert dwords == [] and "param 0" in error and "spill" in error
+    assert error == "" and len(dwords) == 4                        # the whole 29-dword parameter spills: none inline
+    assert all(slot["param"] is None for slot in dwords)
+
+    # Do not resume inline placement after the first non-fitting parameter.
+    sig = {"params": [{"type": "constants", "count": 27}, {"type": "cbv"}, {"type": "table"}]}
+    dwords, error = rsc.pack_layout(sig, "cs")
+    assert error == "" and len(dwords) == 31
+
+
+@pytest.mark.parametrize("tail", [
+    {"type": "constants", "count": -1},
+    {"type": "constants", "count": True},
+    {"type": "constants", "count": 36},
+    {"type": "unknown"},
+    {"type": "ufo"},
+])
+def test_console_spill_validates_the_entire_tail(tail):
+    dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 29}, tail]}, "cs")
+    assert dwords == [] and error
+
+
+def test_console_spill_does_not_resume_inline_placement():
+    sig = {"params": [{"type": "constants", "count": 27}, {"type": "uav"}, {"type": "table"}]}
+    dwords, error = rsc.pack_layout(sig, "cs")
+    assert error == "" and len(dwords) == 31
+    assert all(slot["param"] == 0 for slot in dwords[4:])
 
 
 def test_console_reconcile_fsr_reads():

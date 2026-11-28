@@ -1355,12 +1355,23 @@ struct ReplayFunctions {
     // copies go through it, image to buffer to image. Without it such a copy is unsupported. The expanded indices of
     // an indexed quad list are written there too (prepare_quad_indices).
     std::function<bool(VkDeviceSize bytes, VkBuffer&, VkDeviceSize&)> copy_scratch;
+    // Preparation uploads an immutable copy into host-coherent console-addressable memory. The caller owns and
+    // retains it until this submission completes, and returns its console VA (loads add heap_base). No transfer
+    // commands: Vulkan's host-write -> queue-submit dependency makes these pre-submit writes visible to shaders.
+    std::function<bool(std::span<const std::uint32_t>, std::uint64_t&)> prepare_root_arguments;
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
 };
 
 namespace detail {
+
+inline bool prepare_root_arguments(std::span<const std::uint32_t> words, const ReplayFunctions& vk,
+                                   std::uint64_t& va) {
+    return words.empty() ||
+           (words.size() <= 64 && vk.prepare_root_arguments && vk.prepare_root_arguments(words, va) &&
+            va % 4 == 0 && va <= (1ull << 40) - words.size_bytes() - 64);
+}
 
 struct QueryResolveRun {
     VkQueryPool pool = VK_NULL_HANDLE;    // null: zero fill for queries that were never ended
@@ -1452,6 +1463,7 @@ struct Prepared {
     QueryPool* queries = nullptr;  // query commands: the heap
     ComputePipeline pipeline;  // dispatches
     PipelineCompiles::Ticket compile = 0;  // dispatches: where the pipeline comes from when it was not built yet
+    std::uint64_t root_argument_va = 0;  // this execution's immutable argument block
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
     std::uint32_t depth_uav_copy = UINT32_MAX;
     bool order_depth_uav = false;
@@ -4108,6 +4120,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     return ReplayResult::invalid_indirect_arguments;
                 p.source = *cnt;
             }
+            if (ind->kind != IndirectKind::dispatch && !ind->root_arguments.empty()) return unsupported_at(__LINE__);
             if (ind->kind != IndirectKind::dispatch && !vk.external_graphics_scope) continue;
             // The clamp pass (vulkan_indirect_clamp.h): the arguments are copied on the GPU into scratch with their
             // values bounded before the indirect command reads them, so a stale or garbage record left by a skipped or
@@ -4170,6 +4183,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!found && p.pipeline.async_build && !strict_replay()) continue;
                 if (!found) return unresolved_at(__LINE__);
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
+            }
+            if (!ind->root_arguments.empty()) {
+                if (ind->kind != IndirectKind::dispatch || !ind->pipeline ||
+                    !detail::prepare_root_arguments(ind->root_arguments, vk, p.root_argument_va))
+                    return unsupported_at(__LINE__);
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
@@ -4295,6 +4313,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 continue;
             }
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
+            if (!detail::prepare_root_arguments(dispatch->root_arguments, vk, p.root_argument_va))
+                return unsupported_at(__LINE__);
         } else if (const auto draw = draw_command(command); draw.state) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
@@ -5372,6 +5392,10 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             if (ind->pipeline) {
                 ShaderUserData data{};
                 std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
+                if (!ind->root_arguments.empty()) {
+                    data.s[0] = std::uint32_t(p.root_argument_va);
+                    data.s[1] = std::uint32_t(p.root_argument_va >> 32);
+                }
                 data.heap_base = vk.heap_base;
                 data.code_base = p.pipeline.code_base;
                 vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
@@ -5493,6 +5517,10 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                                       {dispatch->x, dispatch->y, dispatch->z});
             ShaderUserData data{};
             std::copy(dispatch->user_data.begin(), dispatch->user_data.end(), data.s);
+            if (!dispatch->root_arguments.empty()) {
+                data.s[0] = std::uint32_t(p.root_argument_va);
+                data.s[1] = std::uint32_t(p.root_argument_va >> 32);
+            }
             data.heap_base = vk.heap_base;
             data.code_base = p.pipeline.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
