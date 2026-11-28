@@ -1514,6 +1514,36 @@ if(BUILD_TESTING)
     # LEONIDA_SLOT133_LAYOUT_WORD=1 (set by the test itself): the slot 133 stand-in reads its fourth word as a layout.
     add_test(NAME xs_proxy_mock_slot133_layout COMMAND xs_proxy_mock_test --slot133-layout)
   endif()
+  # Portable BCPack codec/BPTC decode test (src/bcpack.cpp) on synthetic Python-generated vectors.
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    set(bcpack_decode_test_dir "${CMAKE_CURRENT_BINARY_DIR}/bcpack_decode_test_gen")
+    set(bcpack_decode_test_tables "${bcpack_decode_test_dir}/bcpack_tables.inc")
+    set(bcpack_decode_test_vectors "${bcpack_decode_test_dir}/dstorage_vectors.inc")
+    add_custom_command(OUTPUT "${bcpack_decode_test_tables}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${bcpack_decode_test_dir}"
+      COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_bcpack_runtime_tables.py"
+              "${bcpack_decode_test_tables}"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_bcpack_runtime_tables.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../tools/bcpack.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../tools/bcpack_tables.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../tools/bcpack_tables_bptc.py"
+      VERBATIM)
+    add_custom_command(OUTPUT "${bcpack_decode_test_vectors}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${bcpack_decode_test_dir}"
+      COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/test/dstorage_vectors.py"
+              "${bcpack_decode_test_vectors}"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/test/dstorage_vectors.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_bcpack.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../tools/bcpack.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../tools/bcpack_tables.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../tools/bcpack_tables_bptc.py"
+      VERBATIM)
+    add_executable(bcpack_decode_test test/bcpack_decode_test.cpp src/bcpack.cpp
+      "${bcpack_decode_test_tables}" "${bcpack_decode_test_vectors}")
+    target_include_directories(bcpack_decode_test PRIVATE "${bcpack_decode_test_dir}")
+    add_test(NAME bcpack_decode COMMAND bcpack_decode_test)
+  endif()
   # Reads d3d12.h and takes MSVC options, so only where the Windows runtime is built.
   if(TARGET gta6rt)
     add_executable(pso_stream_test
