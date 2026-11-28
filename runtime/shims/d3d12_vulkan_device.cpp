@@ -12597,6 +12597,19 @@ public:
             layout_info.setLayoutCount = 1;
             layout_info.pSetLayouts = &set0_layout;
             pipeline_.bindless_set = device_.bindless->set();
+            bool has_storage_image = !entry->binding_mask_known;
+            if (entry->binding_mask_known) {
+                for (std::uint32_t b = 0; b < leonida::bindless::binding_count; ++b) {
+                    if ((entry->binding_mask & (std::uint64_t{1} << b)) &&
+                        leonida::bindless::bindings[b].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+                        has_storage_image = true;
+                        break;
+                    }
+                }
+            }
+            pipeline_.writes_storage_image = has_storage_image;
+        } else {
+            pipeline_.writes_storage_image = false;
         }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
         compute_entry_ = entry;
@@ -15010,6 +15023,7 @@ public:
             }
             if (family.queueFlags & VK_QUEUE_COMPUTE_BIT)
                 state_.context->set_occlusion_resolve_memory(state_.memory);
+            state_.context->set_target_dump_memory(state_.memory, properties.limits.maxMemoryAllocationCount);
         }
 
         if (info.debug_utils) {

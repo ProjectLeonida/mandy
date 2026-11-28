@@ -476,6 +476,7 @@ struct PipelineHandles {
 constexpr ResourceId kRt0Id = 1;
 constexpr ResourceId kRt1Id = 2;
 constexpr ResourceId kUav0Id = 3;
+constexpr ResourceId kDepthUavId = 4;
 constexpr std::uintptr_t kPsoSingle = 101;
 constexpr std::uintptr_t kPsoMrt = 102;
 constexpr std::uintptr_t kPsoCsStore = 201;
@@ -520,6 +521,8 @@ bool record_three_pass_list(CommandList& list, std::array<float, 4> scope1_color
     if (!list.draw(std::move(draw2))) return false;
 
     if (!list.transition({kUav0Id, all_subresources, d3d12_state::common, d3d12_state::unordered_access})) return false;
+    if (!list.transition({kDepthUavId, all_subresources, d3d12_state::common, d3d12_state::unordered_access}))
+        return false;
 
     Dispatch noop_dispatch{};
     noop_dispatch.pipeline = kPsoCsNoop;
@@ -536,13 +539,16 @@ bool record_three_pass_list(CommandList& list, std::array<float, 4> scope1_color
     write_dispatch.z = 1;
     if (!list.dispatch(write_dispatch)) return false;
 
+    if (!list.transition({kDepthUavId, all_subresources, d3d12_state::unordered_access, d3d12_state::common}))
+        return false;
     if (!list.transition({kUav0Id, all_subresources, d3d12_state::unordered_access, d3d12_state::common})) return false;
     if (!list.transition({kRt0Id, all_subresources, d3d12_state::render_target, d3d12_state::common})) return false;
     if (!list.transition({kRt1Id, all_subresources, d3d12_state::render_target, d3d12_state::common})) return false;
     return list.close();
 }
 
-void register_scene(VulkanContext& context, VkImage rt0, VkImage rt1, VkImage uav0, const PipelineHandles& handles) {
+void register_scene(VulkanContext& context, VkImage rt0, VkImage rt1, VkImage uav0, VkImage depth_uav,
+                    const PipelineHandles& handles) {
     ResourceBinding rt0_binding{};
     rt0_binding.image = rt0;
     rt0_binding.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -568,6 +574,14 @@ void register_scene(VulkanContext& context, VkImage rt0, VkImage rt1, VkImage ua
     uav0_binding.width = kUavWidth;
     uav0_binding.height = kUavHeight;
     context.add_resource(kUav0Id, uav0_binding, VK_IMAGE_LAYOUT_UNDEFINED);
+
+    ResourceBinding depth_uav_binding{};
+    depth_uav_binding.image = depth_uav;
+    depth_uav_binding.format = VK_FORMAT_D32_SFLOAT;
+    depth_uav_binding.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depth_uav_binding.width = kUavWidth;
+    depth_uav_binding.height = kUavHeight;
+    context.add_resource(kDepthUavId, depth_uav_binding, VK_IMAGE_LAYOUT_UNDEFINED);
 
     GraphicsPipeline pso_single{};
     pso_single.pipeline = handles.gfx_single;
@@ -682,6 +696,67 @@ int check_dumped_frame(const fs::path& dir, std::uint64_t expected_frame, std::a
     return 0;
 }
 
+struct MockDumpCounters {
+    std::uint32_t buffers_created = 0;
+    std::uint32_t buffers_destroyed = 0;
+    std::uint32_t memories_allocated = 0;
+    std::uint32_t memories_freed = 0;
+    std::uint32_t copies = 0;
+    std::uint64_t next_handle = 1;
+};
+
+MockDumpCounters g_mock_dump;
+
+VKAPI_ATTR VkResult VKAPI_CALL mock_create_buffer(VkDevice, const VkBufferCreateInfo*, const VkAllocationCallbacks*,
+                                                  VkBuffer* out) {
+    ++g_mock_dump.buffers_created;
+    *out = reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(g_mock_dump.next_handle++));
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL mock_destroy_buffer(VkDevice, VkBuffer, const VkAllocationCallbacks*) {
+    ++g_mock_dump.buffers_destroyed;
+}
+VKAPI_ATTR void VKAPI_CALL mock_buffer_reqs(VkDevice, VkBuffer, VkMemoryRequirements* req) {
+    *req = {256, 16, 1u};
+}
+VKAPI_ATTR VkResult VKAPI_CALL mock_alloc_mem(VkDevice, const VkMemoryAllocateInfo*, const VkAllocationCallbacks*,
+                                              VkDeviceMemory* out) {
+    ++g_mock_dump.memories_allocated;
+    *out = reinterpret_cast<VkDeviceMemory>(static_cast<std::uintptr_t>(g_mock_dump.next_handle++));
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL mock_free_mem(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {
+    ++g_mock_dump.memories_freed;
+}
+VKAPI_ATTR VkResult VKAPI_CALL mock_bind_buf(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) { return VK_SUCCESS; }
+VKAPI_ATTR VkResult VKAPI_CALL mock_map_mem(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkMemoryMapFlags,
+                                            void**) {
+    return VK_ERROR_MEMORY_MAP_FAILED;
+}
+VKAPI_ATTR void VKAPI_CALL mock_unmap_mem(VkDevice, VkDeviceMemory) {}
+VKAPI_ATTR void VKAPI_CALL mock_barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
+                                        std::uint32_t, const VkMemoryBarrier*, std::uint32_t,
+                                        const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
+VKAPI_ATTR void VKAPI_CALL mock_copy_img_buf(VkCommandBuffer, VkImage, VkImageLayout, VkBuffer, std::uint32_t,
+                                             const VkBufferImageCopy*) {
+    ++g_mock_dump.copies;
+}
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL mock_get_device_proc(VkDevice, const char* name) {
+    if (std::strcmp(name, "vkCreateBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&mock_create_buffer);
+    if (std::strcmp(name, "vkDestroyBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&mock_destroy_buffer);
+    if (std::strcmp(name, "vkGetBufferMemoryRequirements") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(&mock_buffer_reqs);
+    if (std::strcmp(name, "vkAllocateMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&mock_alloc_mem);
+    if (std::strcmp(name, "vkFreeMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&mock_free_mem);
+    if (std::strcmp(name, "vkBindBufferMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&mock_bind_buf);
+    if (std::strcmp(name, "vkMapMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&mock_map_mem);
+    if (std::strcmp(name, "vkUnmapMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&mock_unmap_mem);
+    if (std::strcmp(name, "vkCmdPipelineBarrier") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&mock_barrier);
+    if (std::strcmp(name, "vkCmdCopyImageToBuffer") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(&mock_copy_img_buf);
+    return nullptr;
+}
+
 int test_unit_helpers() {
     EXPECT(!target_dump::parse_config_utf8("").valid);
     EXPECT(!target_dump::parse_config_utf8("dumps").valid);
@@ -699,6 +774,69 @@ int test_unit_helpers() {
     EXPECT(target_dump::raw_texel_size(VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT) == 4);
     EXPECT(target_dump::raw_texel_size(VK_FORMAT_D16_UNORM, VK_IMAGE_ASPECT_DEPTH_BIT) == 2);
     EXPECT(target_dump::raw_texel_size(VK_FORMAT_BC7_UNORM_BLOCK, VK_IMAGE_ASPECT_COLOR_BIT) == 0);
+
+    // Queue-scoped UAV isolation, depth UAV skip, staging allocation/byte caps, and RAII cleanup.
+    testfiles::ScratchDir unit_scratch("leonida_target_dump_unit");
+    const fs::path unit_dir = unit_scratch.path() / "unit";
+    EXPECT(set_target_dump_env(&unit_dir, ",1"));
+    g_mock_dump = {};
+    {
+        TargetDump dump;
+        EXPECT(dump.enabled());
+        const auto fake_dev = reinterpret_cast<VkDevice>(std::uintptr_t{0x1});
+        const auto queue_a = reinterpret_cast<VkQueue>(std::uintptr_t{0xA});
+        const auto queue_b = reinterpret_cast<VkQueue>(std::uintptr_t{0xB});
+        const auto fake_cb = reinterpret_cast<VkCommandBuffer>(std::uintptr_t{0xC});
+        dump.initialize(&mock_get_device_proc, fake_dev);
+        VkPhysicalDeviceMemoryProperties mem{};
+        mem.memoryTypeCount = 1;
+        mem.memoryHeapCount = 1;
+        mem.memoryTypes[0].propertyFlags =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        mem.memoryHeaps[0].size = 1u << 20;
+        dump.set_memory_properties(mem, 16);
+        dump.set_staging_limits(512, 1);
+
+        target_dump::UavImage color_uav{};
+        color_uav.image = reinterpret_cast<VkImage>(std::uintptr_t{0x101});
+        color_uav.format = VK_FORMAT_R8G8B8A8_UNORM;
+        color_uav.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        color_uav.width = 4;
+        color_uav.height = 4;
+
+        target_dump::UavImage depth_uav = color_uav;
+        depth_uav.image = reinterpret_cast<VkImage>(std::uintptr_t{0x102});
+        depth_uav.format = VK_FORMAT_D32_SFLOAT;
+        depth_uav.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+
+        // Track both on queue A; depth UAV must be ignored.
+        dump.begin_submission(1, queue_a);
+        dump.note_uav(10, color_uav);
+        dump.note_uav(11, depth_uav);
+        dump.commit_submission(true, 1);
+
+        // Dispatch on queue B must NOT capture queue A's UAV (no cross-queue transfer read).
+        dump.begin_submission(1, queue_b);
+        dump.after_dispatch(fake_cb, true, [](auto, auto, auto, auto) { return true; });
+        EXPECT(g_mock_dump.copies == 0);
+        dump.commit_submission(true, 2);
+
+        // Dispatch on queue A captures color_uav (1 allocation), and a second capture hits the 1-allocation cap.
+        dump.begin_submission(1, queue_a);
+        dump.after_dispatch(fake_cb, true, [](auto, auto, auto, auto) { return true; });
+        EXPECT(g_mock_dump.copies == 1);
+        EXPECT(dump.outstanding_staging_allocations() == 1);
+        EXPECT(dump.outstanding_staging_bytes() == 64);
+        dump.after_dispatch(fake_cb, true, [](auto, auto, auto, auto) { return true; });
+        EXPECT(g_mock_dump.copies == 1);  // capped at 1 outstanding allocation
+        // Rollback frees the staged buffer/memory via RAII and zeroes outstanding counters.
+        dump.commit_submission(false, 0);
+        EXPECT(dump.outstanding_staging_allocations() == 0);
+        EXPECT(dump.outstanding_staging_bytes() == 0);
+        EXPECT(g_mock_dump.buffers_created == 1 && g_mock_dump.buffers_destroyed == 1);
+        EXPECT(g_mock_dump.memories_allocated == 1 && g_mock_dump.memories_freed == 1);
+    }
+    EXPECT(set_target_dump_env(nullptr, nullptr));
     return 0;
 }
 
@@ -724,7 +862,9 @@ int main(int argc, char** argv) {
     const VkImage rt0 = d.image(VK_FORMAT_R8G8B8A8_UNORM, kRtWidth, kRtHeight, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     const VkImage rt1 = d.image(VK_FORMAT_R32_UINT, kRtWidth, kRtHeight, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     const VkImage uav0 = d.image(VK_FORMAT_R8G8B8A8_UNORM, kUavWidth, kUavHeight, 1, VK_IMAGE_USAGE_STORAGE_BIT);
-    EXPECT(rt0 && rt1 && uav0);
+    const VkImage depth_uav =
+        d.image(VK_FORMAT_D32_SFLOAT, kUavWidth, kUavHeight, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    EXPECT(rt0 && rt1 && uav0 && depth_uav);
 
     PipelineHandles handles{d};
     EXPECT(handles.init(uav0));
@@ -765,7 +905,7 @@ int main(int argc, char** argv) {
             EXPECT(context.target_dump_enabled());
         }
 
-        register_scene(context, rt0, rt1, uav0, handles);
+        register_scene(context, rt0, rt1, uav0, depth_uav, handles);
 
         VulkanQueue queue(context, d.queue, d.family);
         EXPECT(queue.ok());

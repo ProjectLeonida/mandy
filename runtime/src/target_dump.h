@@ -356,7 +356,30 @@ public:
         }
     }
 
-    void set_memory_properties(const VkPhysicalDeviceMemoryProperties& memory) { memory_ = memory; }
+    void set_memory_properties(const VkPhysicalDeviceMemoryProperties& memory,
+                               std::uint32_t max_memory_allocations = 0) {
+        memory_ = memory;
+        if (max_memory_allocations > 0) {
+            const std::uint32_t safe_cap = std::max(1u, max_memory_allocations / 8u);
+            max_staging_allocations_ = std::min(max_staging_allocations_, safe_cap);
+        }
+    }
+
+    void set_staging_limits(VkDeviceSize max_bytes, std::uint32_t max_allocations) {
+        std::lock_guard lock(mutex_);
+        max_staging_bytes_ = max_bytes;
+        max_staging_allocations_ = max_allocations;
+    }
+
+    VkDeviceSize outstanding_staging_bytes() const noexcept {
+        std::lock_guard lock(mutex_);
+        return outstanding_staging_bytes_;
+    }
+
+    std::uint32_t outstanding_staging_allocations() const noexcept {
+        std::lock_guard lock(mutex_);
+        return outstanding_staging_allocations_;
+    }
 
     bool enabled() const noexcept { return target_frame_.load(std::memory_order_relaxed) != 0; }
     std::uint64_t target_frame() const noexcept { return target_frame_.load(std::memory_order_relaxed); }
@@ -371,9 +394,10 @@ public:
         return false;
     }
 
-    void begin_submission(std::uint64_t frame) {
+    void begin_submission(std::uint64_t frame, VkQueue queue = VK_NULL_HANDLE) {
         pending_passes_.clear();
         pending_captured_ = false;
+        current_queue_ = queue;
         {
             std::lock_guard lock(mutex_);
             saved_uavs_ = active_uavs_;
@@ -386,9 +410,11 @@ public:
     }
 
     void note_uav(std::uint64_t id, const UavImage& image) {
-        if (!id || !image.image) return;
+        // Depth/stencil UAVs write to separate storage-plane child images rather than the parent depth image; skip them
+        // so post-dispatch capture never dumps stale pre-dispatch parent depth.
+        if (!id || !image.image || image.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return;
         std::lock_guard lock(mutex_);
-        active_uavs_[id] = image;
+        active_uavs_[id] = {current_queue_, image};
     }
 
     void clear_uav(std::uint64_t id, std::uint32_t base_mip, std::uint32_t level_count, std::uint32_t base_layer,
@@ -396,7 +422,7 @@ public:
         std::lock_guard lock(mutex_);
         const auto it = active_uavs_.find(id);
         if (it == active_uavs_.end()) return;
-        const UavImage& entry = it->second;
+        const UavImage& entry = it->second.image;
         const bool mip_hit = entry.mip >= base_mip &&
                              (level_count == VK_REMAINING_MIP_LEVELS || entry.mip - base_mip < level_count);
         const bool layer_hit = entry.layer >= base_layer &&
@@ -426,16 +452,17 @@ public:
             std::lock_guard lock(mutex_);
             if (active_uavs_.empty()) return;
             std::uint32_t slot_index = 0;
-            for (const auto& [id, uav] : active_uavs_) {
-                if (!uav.image || uav.samples > 1) continue;
+            for (const auto& [id, tracked] : active_uavs_) {
+                if (tracked.queue != current_queue_) continue;
+                const UavImage& uav = tracked.image;
+                if (!uav.image || uav.samples > 1 || uav.aspects != VK_IMAGE_ASPECT_COLOR_BIT) continue;
                 if (!is_general(id, uav.aspects, uav.mip, uav.layer)) continue;
                 TargetImage target{};
                 target.image = uav.image;
                 target.format = uav.format;
                 target.image_format = uav.format;
-                target.aspect = (uav.aspects & VK_IMAGE_ASPECT_COLOR_BIT) ? VK_IMAGE_ASPECT_COLOR_BIT
-                                                                          : VK_IMAGE_ASPECT_DEPTH_BIT;
-                target.layout_aspects = uav.aspects;
+                target.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+                target.layout_aspects = VK_IMAGE_ASPECT_COLOR_BIT;
                 target.layout = VK_IMAGE_LAYOUT_GENERAL;
                 target.width = std::max(1u, uav.width >> uav.mip);
                 target.height = std::max(1u, uav.height >> uav.mip);
@@ -456,10 +483,10 @@ public:
                 std::lock_guard lock(mutex_);
                 active_uavs_ = std::move(saved_uavs_);
             }
-            destroy_passes(pending_passes_);
             pending_passes_.clear();
             pending_captured_ = false;
             capturing_ = false;
+            current_queue_ = VK_NULL_HANDLE;
             return;
         }
         if (!pending_passes_.empty()) {
@@ -475,6 +502,7 @@ public:
         pending_passes_.clear();
         pending_captured_ = false;
         capturing_ = false;
+        current_queue_ = VK_NULL_HANDLE;
     }
 
     std::uint64_t max_pending_ticket() const {
@@ -509,7 +537,7 @@ public:
                     entry.kind = std::move(pass.kind);
                     for (auto& target : pass.targets) {
                         write_captured_target(pass.pass, target, entry.targets);
-                        destroy_target(target);
+                        target.staging.reset();
                     }
                     if (!entry.targets.empty()) completed_passes_.push_back(std::move(entry));
                 }
@@ -531,7 +559,6 @@ public:
     }
 
     void discard_pending() {
-        destroy_passes(pending_passes_);
         pending_passes_.clear();
         std::vector<InFlightBatch> leftovers;
         {
@@ -539,10 +566,18 @@ public:
             leftovers.swap(in_flight_);
             has_pending_.store(false, std::memory_order_release);
         }
-        for (auto& batch : leftovers) destroy_passes(batch.passes);
+        leftovers.clear();
     }
 
 private:
+    static constexpr VkDeviceSize default_max_staging_bytes = VkDeviceSize(512) << 20;
+    static constexpr std::uint32_t default_max_staging_allocations = 256u;
+
+    struct TrackedUav {
+        VkQueue queue = VK_NULL_HANDLE;
+        UavImage image{};
+    };
+
     struct DeviceFunctions {
         PFN_vkCreateBuffer create_buffer = nullptr;
         PFN_vkDestroyBuffer destroy_buffer = nullptr;
@@ -563,6 +598,45 @@ private:
         }
     };
 
+    struct StagingAllocation {
+        TargetDump* owner = nullptr;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceSize bytes = 0;
+
+        StagingAllocation() = default;
+        StagingAllocation(TargetDump* owner_in, VkBuffer buf, VkDeviceMemory mem, VkDeviceSize size) noexcept
+            : owner(owner_in), buffer(buf), memory(mem), bytes(size) {}
+        ~StagingAllocation() { reset(); }
+        StagingAllocation(const StagingAllocation&) = delete;
+        StagingAllocation& operator=(const StagingAllocation&) = delete;
+        StagingAllocation(StagingAllocation&& other) noexcept
+            : owner(std::exchange(other.owner, nullptr)),
+              buffer(std::exchange(other.buffer, VK_NULL_HANDLE)),
+              memory(std::exchange(other.memory, VK_NULL_HANDLE)),
+              bytes(std::exchange(other.bytes, 0)) {}
+        StagingAllocation& operator=(StagingAllocation&& other) noexcept {
+            if (this != &other) {
+                reset();
+                owner = std::exchange(other.owner, nullptr);
+                buffer = std::exchange(other.buffer, VK_NULL_HANDLE);
+                memory = std::exchange(other.memory, VK_NULL_HANDLE);
+                bytes = std::exchange(other.bytes, 0);
+            }
+            return *this;
+        }
+        explicit operator bool() const noexcept { return buffer != VK_NULL_HANDLE && memory != VK_NULL_HANDLE; }
+        void reset() noexcept {
+            if (owner) {
+                owner->release_staging(buffer, memory, bytes);
+                owner = nullptr;
+            }
+            buffer = VK_NULL_HANDLE;
+            memory = VK_NULL_HANDLE;
+            bytes = 0;
+        }
+    };
+
     struct PendingTarget {
         std::string slot;
         VkFormat format = VK_FORMAT_UNDEFINED;
@@ -573,8 +647,7 @@ private:
         std::uint32_t layer = 0;
         unsigned bytes_per_texel = 0;
         VkDeviceSize bytes = 0;
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
+        StagingAllocation staging;
     };
 
     struct PendingPass {
@@ -628,33 +701,49 @@ private:
         return false;
     }
 
-    void destroy_target(PendingTarget& target) {
-        if (!device_) return;
-        if (target.buffer && fns_.destroy_buffer) fns_.destroy_buffer(device_, target.buffer, nullptr);
-        if (target.memory && fns_.free_memory) fns_.free_memory(device_, target.memory, nullptr);
-        target.buffer = VK_NULL_HANDLE;
-        target.memory = VK_NULL_HANDLE;
+    void release_staging(VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize bytes) noexcept {
+        if (device_) {
+            if (buffer && fns_.destroy_buffer) fns_.destroy_buffer(device_, buffer, nullptr);
+            if (memory && fns_.free_memory) fns_.free_memory(device_, memory, nullptr);
+        }
+        std::lock_guard lock(mutex_);
+        if (outstanding_staging_allocations_ > 0) --outstanding_staging_allocations_;
+        outstanding_staging_bytes_ = outstanding_staging_bytes_ >= bytes ? outstanding_staging_bytes_ - bytes : 0;
     }
 
-    void destroy_passes(std::vector<PendingPass>& passes) {
-        for (auto& pass : passes)
-            for (auto& target : pass.targets) destroy_target(target);
-    }
+    bool allocate_staging(VkDeviceSize bytes, StagingAllocation& out) {
+        out.reset();
+        {
+            std::lock_guard lock(mutex_);
+            if (outstanding_staging_allocations_ >= max_staging_allocations_ || bytes > max_staging_bytes_ ||
+                outstanding_staging_bytes_ > max_staging_bytes_ - bytes) {
+                if (!staging_limit_logged_.exchange(true, std::memory_order_relaxed)) {
+                    std::fprintf(stderr,
+                                 "[rt] target-dump: staging limit reached (%u/%u allocations, %llu/%llu bytes); "
+                                 "skipping further captures until earlier submissions retire\n",
+                                 outstanding_staging_allocations_, max_staging_allocations_,
+                                 static_cast<unsigned long long>(outstanding_staging_bytes_),
+                                 static_cast<unsigned long long>(max_staging_bytes_));
+                }
+                return false;
+            }
+            ++outstanding_staging_allocations_;
+            outstanding_staging_bytes_ += bytes;
+        }
 
-    bool allocate_staging(VkDeviceSize bytes, VkBuffer& out_buffer, VkDeviceMemory& out_memory) {
-        out_buffer = VK_NULL_HANDLE;
-        out_memory = VK_NULL_HANDLE;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        StagingAllocation guard(this, VK_NULL_HANDLE, VK_NULL_HANDLE, bytes);
         VkBufferCreateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         info.size = bytes;
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        if (fns_.create_buffer(device_, &info, nullptr, &out_buffer) != VK_SUCCESS) {
-            out_buffer = VK_NULL_HANDLE;
-            return false;
-        }
+        if (fns_.create_buffer(device_, &info, nullptr, &buffer) != VK_SUCCESS) return false;
+        guard.buffer = buffer;
+
         VkMemoryRequirements req{};
-        fns_.buffer_requirements(device_, out_buffer, &req);
+        fns_.buffer_requirements(device_, buffer, &req);
         const auto order = memory_type_order(
             memory_, req.memoryTypeBits,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -664,16 +753,13 @@ private:
             alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
             alloc.allocationSize = req.size;
             alloc.memoryTypeIndex = type;
-            if (fns_.allocate_memory(device_, &alloc, nullptr, &out_memory) == VK_SUCCESS) break;
-            out_memory = VK_NULL_HANDLE;
+            if (fns_.allocate_memory(device_, &alloc, nullptr, &memory) == VK_SUCCESS) break;
+            memory = VK_NULL_HANDLE;
         }
-        if (!out_memory || fns_.bind_buffer(device_, out_buffer, out_memory, 0) != VK_SUCCESS) {
-            if (out_memory) fns_.free_memory(device_, out_memory, nullptr);
-            fns_.destroy_buffer(device_, out_buffer, nullptr);
-            out_buffer = VK_NULL_HANDLE;
-            out_memory = VK_NULL_HANDLE;
-            return false;
-        }
+        guard.memory = memory;
+        if (!memory || fns_.bind_buffer(device_, buffer, memory, 0) != VK_SUCCESS) return false;
+
+        out = std::move(guard);
         return true;
     }
 
@@ -703,9 +789,9 @@ private:
             if (pixels == 0 || pixels > (std::numeric_limits<VkDeviceSize>::max)() / bpp) continue;
             const VkDeviceSize bytes = VkDeviceSize(pixels * bpp);
 
-            VkBuffer buffer = VK_NULL_HANDLE;
-            VkDeviceMemory memory = VK_NULL_HANDLE;
-            if (!allocate_staging(bytes, buffer, memory)) continue;
+            StagingAllocation staging;
+            if (!allocate_staging(bytes, staging)) continue;
+            const VkBuffer buffer = staging.buffer;
 
             const VkImageLayout copy_layout = target.layout == VK_IMAGE_LAYOUT_GENERAL
                                                   ? VK_IMAGE_LAYOUT_GENERAL
@@ -780,8 +866,7 @@ private:
             captured.layer = target.layer;
             captured.bytes_per_texel = bpp;
             captured.bytes = bytes;
-            captured.buffer = buffer;
-            captured.memory = memory;
+            captured.staging = std::move(staging);
             pass.targets.push_back(std::move(captured));
         }
 
@@ -796,8 +881,10 @@ private:
 
     bool write_captured_target(std::uint32_t pass_number, const PendingTarget& target,
                                std::vector<IndexTarget>& out_targets) {
+        if (!target.staging) return false;
         void* mapped = nullptr;
-        if (fns_.map_memory(device_, target.memory, 0, target.bytes, 0, &mapped) != VK_SUCCESS || !mapped) return false;
+        if (fns_.map_memory(device_, target.staging.memory, 0, target.bytes, 0, &mapped) != VK_SUCCESS || !mapped)
+            return false;
         const auto* bytes = static_cast<const std::uint8_t*>(mapped);
         const bool png = uses_png(target.format, target.aspect);
         char prefix[32];
@@ -811,7 +898,7 @@ private:
             return std::fwrite(bytes, 1, static_cast<std::size_t>(target.bytes), file) ==
                    static_cast<std::size_t>(target.bytes);
         });
-        fns_.unmap_memory(device_, target.memory);
+        fns_.unmap_memory(device_, target.staging.memory);
         if (!written) return false;
         out_targets.push_back({target.slot, target.format, target.width, target.height, target.mip, target.layer,
                                target.bytes_per_texel, png, filename});
@@ -846,9 +933,14 @@ private:
     VkPhysicalDeviceMemoryProperties memory_{};
 
     mutable std::mutex mutex_;
-    std::map<std::uint64_t, UavImage> active_uavs_;
-    std::map<std::uint64_t, UavImage> saved_uavs_;
+    std::map<std::uint64_t, TrackedUav> active_uavs_;
+    std::map<std::uint64_t, TrackedUav> saved_uavs_;
     std::vector<InFlightBatch> in_flight_;
+    VkDeviceSize max_staging_bytes_ = default_max_staging_bytes;
+    std::uint32_t max_staging_allocations_ = default_max_staging_allocations;
+    VkDeviceSize outstanding_staging_bytes_ = 0;
+    std::uint32_t outstanding_staging_allocations_ = 0;
+    std::atomic<bool> staging_limit_logged_{false};
 
     std::mutex io_mutex_;
     std::vector<IndexPass> completed_passes_;
@@ -856,6 +948,7 @@ private:
 
     bool capturing_ = false;
     bool pending_captured_ = false;
+    VkQueue current_queue_ = VK_NULL_HANDLE;
     std::uint32_t committed_passes_ = 0;
     std::uint32_t next_pass_ = 0;
     std::vector<PendingPass> pending_passes_;

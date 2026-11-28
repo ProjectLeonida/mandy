@@ -1647,8 +1647,18 @@ public:
         occlusion_resolve_memory_ = memory;
         target_dump_.set_memory_properties(memory);
     }
-    void set_target_dump_memory(const VkPhysicalDeviceMemoryProperties& memory) {
-        target_dump_.set_memory_properties(memory);
+    void set_target_dump_memory(const VkPhysicalDeviceMemoryProperties& memory,
+                                std::uint32_t max_memory_allocations = 0) {
+        target_dump_.set_memory_properties(memory, max_memory_allocations);
+    }
+    void set_target_dump_limits(VkDeviceSize max_bytes, std::uint32_t max_allocations) {
+        target_dump_.set_staging_limits(max_bytes, max_allocations);
+    }
+    VkDeviceSize target_dump_outstanding_bytes() const noexcept {
+        return target_dump_.outstanding_staging_bytes();
+    }
+    std::uint32_t target_dump_outstanding_allocations() const noexcept {
+        return target_dump_.outstanding_staging_allocations();
     }
     bool target_dump_enabled() const noexcept { return target_dump_.enabled(); }
     void flush_target_dump() {
@@ -3753,7 +3763,7 @@ private:
         if (context_.target_dump_.enabled()) {
             const std::uint64_t frame = submit_phases::totals().present_serial.load(std::memory_order_relaxed) + 1;
             if (context_.target_dump_.active_for_frame(frame)) {
-                context_.target_dump_.begin_submission(frame);
+                context_.target_dump_.begin_submission(frame, queue_);
                 replay.target_dump = &context_.target_dump_;
                 target_dump_guard.dump = &context_.target_dump_;
                 target_dump_active = true;
