@@ -21986,15 +21986,17 @@ Device* list_device(IUnknown* device) {
     return nullptr;
 }
 
-// LEONIDA_RT_AS=off (diagnostic): acceleration-structure builds and copies are not recorded at all, so no BVH is
-// written; traversal finds whatever the structures' memory holds. For telling a device loss in the builds apart from
-// one elsewhere.
+// LEONIDA_RT_AS=off (diagnostic): acceleration-structure builds, copies and postbuild info are not recorded at all,
+// so no BVH is written; traversal finds whatever the structures' memory holds. For telling a device loss in the builds
+// apart from one elsewhere.
 bool acceleration_structures_off() {
     static const bool off = [] {
         char value[8] = {};
         std::size_t length = 0;
         const bool set = getenv_s(&length, value, "LEONIDA_RT_AS") == 0 && length > 1 && !std::strcmp(value, "off");
-        if (set) std::fprintf(stderr, "[rt] d3d12: LEONIDA_RT_AS=off: acceleration-structure builds and copies are dropped\n");
+        if (set)
+            std::fprintf(stderr,
+                         "[rt] d3d12: LEONIDA_RT_AS=off: acceleration-structure builds, copies and postbuild info are dropped\n");
         return set;
     }();
     return off;
@@ -22013,6 +22015,7 @@ bool resolve_acceleration_structure_copy(IUnknown* device, leonida::CopyAccelera
 }
 
 bool resolve_acceleration_structure_postbuild(IUnknown* device, leonida::AccelerationStructurePostbuild& info) {
+    if (acceleration_structures_off()) return false;
     Device* d = list_device(device);
     return !d || d->resolve_xdxr_postbuild(info);
 }

@@ -2842,9 +2842,11 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_dxr_validation_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_dxr_validation COMMAND d3d12_dxr_validation_test)
     add_test(NAME d3d12_dxr_validation_khr COMMAND d3d12_dxr_validation_test)
-    set_tests_properties(d3d12_dxr_validation d3d12_dxr_validation_khr PROPERTIES SKIP_RETURN_CODE 77
-                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    add_test(NAME d3d12_dxr_validation_off COMMAND d3d12_dxr_validation_test)
+    set_tests_properties(d3d12_dxr_validation d3d12_dxr_validation_khr d3d12_dxr_validation_off
+                         PROPERTIES SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
     set_tests_properties(d3d12_dxr_validation_khr PROPERTIES ENVIRONMENT "LEONIDA_RT_AS=khr")
+    set_tests_properties(d3d12_dxr_validation_off PROPERTIES ENVIRONMENT "LEONIDA_RT_AS=off")
 
     # D3D12 permits UpdateTileMappings on DIRECT/COPY/COMPUTE and a sparse buffer must remain
     # accessible across their selected Vulkan families. The optional API-dump check catches an
