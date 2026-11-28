@@ -58,16 +58,49 @@ of the x86-64 → arm64 groundwork.
   beyond decode, x87, `rcl`/`rcr`, `std` (DF=1), system/privileged insns, `int`/`syscall`, far
   transfers. Real binaries are x87/SIMD-heavy, so coverage on the engine image will be far below
   the fixture suite until those lands — `recomp_census.py` is the tool that will measure it.
-- The engine image itself is still not in the repository (the exe obtained so far is a packaging
-  probe — `docs/boot.md`), so nothing here has run against real code. First real milestone is the
-  census over a genuine PE, then a same-behaviour run of a real function under qemu against a
-  native x86-64 run.
+- The engine image itself is still not in the repository, but `recomp_census.py` has now been run
+  against the local `1.0.2.1` retail executable (`game_scarlett_master.exe`, 120,181,760 bytes) —
+  see [Retail executable census (1.0.2.1)](#retail-executable-census-1021) below. Next milestone is a
+  same-behaviour run of a real function under qemu against a native x86-64 run.
 
 ## Next steps
 
-1. `recomp_census.py` on the real image: instruction histogram, coverage %, hazard list.
-2. SIMD/SSE emitters (the largest hazard class on any modern binary), then `std`/RCL-RCR.
+1. ~~`recomp_census.py` on the real image: instruction histogram, coverage %, hazard list.~~ Done on
+   `1.0.2.1` (84.77% instruction coverage across 299,257 `.pdata` functions; VEX/SSE/AVX ops dominate
+   the remaining 15.23%).
+2. SIMD/SSE/AVX emitters (the largest hazard class on the retail binary), then `bt`, `cmpxchg`, and
+   `std`/RCL-RCR.
 3. SEH story: translate `.xdata` prologue ops or run translated code inside a frame the host
    unwinder can walk — needed before C++ `throw` works.
 4. arm64 userland runner (Mach-O + `mmap` JIT-free) to replace the qemu harness on Apple silicon.
 5. Vulkan backend under MoltenVK on macOS as the first graphics target; Metal backend later.
+
+## Retail executable census (1.0.2.1)
+
+Measured on `game_scarlett_master.exe` (Xbox Series `1.0.2.1`, 120,181,760 bytes) with
+`python -I tools/recomp_census.py <exe> --out <dir>` at `main` `bcaa13dad` with PR
+[#1121](https://github.com/ubiquitarianism/leonida/pull/1121) (`old-pr/9855`, which fixes the truncated
+VEX/EVEX `IndexError` and `vzeroupper` desync that otherwise abort the census on `main`). Aggregate
+counts only; no game bytes or code.
+
+| Metric | Measured |
+|---|---|
+| `.pdata` functions | 299,257 (92,353,193 code bytes) |
+| Decoded instructions | 21,518,571 |
+| Translated instructions | 84.77% (151,107 functions fully covered; 148,150 with gaps) |
+| Decode errors | 41,091 (41,006 `decode:op_90`) |
+| Branch instructions | 2,446,825 |
+| Indirect control flow | `call` 105,179; `jmp` 8,018; `ret` 232,851 |
+| Unwind info flags (`main` `.xdata` reader) | `none` 298,146; `FHANDLER` 515; `EHANDLER,UHANDLER` 496; `UHANDLER` 97; `EHANDLER` 3 |
+
+Top unhandled / hazard mnemonics (VEX-prefixed SIMD/AVX `v*` opcodes dominate):
+
+- **VEX/SIMD (`v*`):** `v28` (367,994), `v29` (317,513), `v10` (268,958), `v59` (232,529),
+  `v11` (220,760), `v18` (175,501), `v57` (138,025), `vc6` (97,178), `v7c` (79,604),
+  `v2e` (75,814), `v0c` (74,738), `v58` (71,159), `vc2` (70,707), `v5c` (59,246),
+  `v77` (48,224), `va8` (46,138), `vb8` (44,516), `v4a` (41,775).
+- **Non-VEX:** `jcc` (41,099), `decode:op_90` (41,006), `bt` (18,009), `cmpxchg` (17,878).
+
+Note on `decode:op_90`: `0x90` (bare `nop`) is missing from `PRIMARY` on `main` (the `xchg` loop starts
+at `0x91`), and `recomp_census.py` stops decoding a function at its first decode error, so decoded
+instruction counts and coverage undercount functions that hit `0x90`.

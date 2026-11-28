@@ -68,7 +68,7 @@ method, scope and caveats. No game data is included.
 | Document | Measured content |
 |---|---|
 | [d3d12_vulkan.md](d3d12_vulkan.md) | Xbox D3D12 to Vulkan plan and status; device proxy, queues, command lists, barriers, copies. |
-| [mobile.md](mobile.md) | arm64/mobile path: the x86-64 → arm64 static-recompiler groundwork (`tools/x64_recomp.py`), the `.pdata` coverage census (`tools/recomp_census.py`), and what still blocks iOS. |
+| [mobile.md](mobile.md) | arm64/mobile path: the x86-64 → arm64 static-recompiler groundwork (`tools/x64_recomp.py`), the retail `1.0.2.1` `.pdata` census (`tools/recomp_census.py`: 299,257 functions / 21,518,571 instructions / 84.77% covered with `#1121`), and what still blocks iOS. |
 | [first_run_ui.md](first_run_ui.md) | Build the Windows integration and display the offline first-run controller prompts; the scripted-pad route through the first-run pages to the story load. |
 | [boot.md](boot.md) | The first real boot: the `gta6rt --trace`/`--trace-d3d12` runbook, the startup + D3D12 trace summary (`tools/boot_trace.py`), the triage order and the Q1–Q22 checklist. |
 | [retail_boot_chain.md](retail_boot_chain.md) | How far `gta6rt --run` gets with the retail executable: the stops in order and what clears each, the physical-page export shapes, device slots 26, 48 and 73, and the device slots the executable calls, counted from the file (`tools/d3d12_device_calls.py`). |
