@@ -20,6 +20,7 @@
 // stage's records blob carries the source container's HASH digest after its 0x43 word (docs/fspx.md, kind 7).
 // The block index is not trusted as the stage: the stage comes from the translator's index entry of the container.
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -27,9 +28,10 @@
 #include <map>
 #include <optional>
 #include <span>
-#include <set>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -147,12 +149,13 @@ inline std::optional<FixedState> decode_state_b(std::span<const std::uint8_t> b,
     if (s.topology_type > 4) return fail("blob B topology type over 4");
     const std::uint32_t count = read_u32(b, 0x4c);
     if (count > kMaxInputElements) return fail("blob B input element count over 32");
+    s.elements.reserve(count);
     std::size_t at = kStateBHeader;
     for (std::uint32_t i = 0; i < count; ++i) {
-        if (at + 4 > b.size()) return fail("blob B input element past the end");
+        if (b.size() - at < 4) return fail("blob B input element past the end");
         const std::uint32_t length = read_u32(b, at);
         at += 4;
-        if (length < 2 || length > kMaxSemanticName || at + length + 24 > b.size())
+        if (length < 2 || length > kMaxSemanticName || b.size() - at < std::size_t(length) + 24)
             return fail("blob B semantic name length out of range");
         const auto* name = reinterpret_cast<const char*>(b.data() + at);
         if (name[length - 1] != '\0' || std::memchr(name, '\0', length - 1))
@@ -390,16 +393,40 @@ inline std::optional<DepthRaster> d3d12_depth_raster(const DepthRasterRegisters&
 
 using Digest = std::array<std::uint8_t, 16>;
 
+struct DigestHash {
+    std::size_t operator()(const Digest& d) const noexcept {
+        std::uint64_t lo = 0, hi = 0;
+        std::memcpy(&lo, d.data(), 8);
+        std::memcpy(&hi, d.data() + 8, 8);
+        std::uint64_t x = lo ^ (hi * 0x9e3779b97f4a7c15ull);
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ull;
+        x ^= x >> 27;
+        x *= 0x94d049bb133111ebull;
+        x ^= x >> 31;
+        return static_cast<std::size_t>(x);
+    }
+};
+
 // Every 16 bytes that follow a 4-aligned 0x43 word, without duplicates. A register number can also read 0x43, so
 // all candidates are returned and the map decides which one names a container.
 inline std::vector<Digest> record_digests(std::span<const std::uint8_t> records) {
     std::vector<Digest> out;
-    std::set<Digest> seen;
+    std::unordered_set<Digest, DigestHash> seen;
+    constexpr std::size_t kLinearDedupLimit = 16;
     for (std::size_t at = 0; at + 4 + 16 <= records.size(); at += 4) {
         if (read_u32(records, at) != 0x43) continue;
         Digest d;
         std::memcpy(d.data(), records.data() + at + 4, 16);
-        if (seen.insert(d).second) out.push_back(d);
+        if (!seen.empty()) {
+            if (seen.insert(d).second) out.push_back(d);
+        } else if (std::find(out.begin(), out.end(), d) == out.end()) {
+            out.push_back(d);
+            if (out.size() >= kLinearDedupLimit) {
+                seen.reserve(kLinearDedupLimit * 2);
+                seen.insert(out.begin(), out.end());
+            }
+        }
     }
     return out;
 }
@@ -407,6 +434,7 @@ inline std::vector<Digest> record_digests(std::span<const std::uint8_t> records)
 inline std::string hex(const Digest& d) {
     static constexpr char kHex[] = "0123456789abcdef";
     std::string s;
+    s.reserve(32);
     for (const std::uint8_t b : d) {
         s += kHex[b >> 4];
         s += kHex[b & 15];
@@ -445,6 +473,8 @@ public:
             return false;
         };
         map_.clear();
+        const std::size_t approx = static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n'));
+        if (approx > 1) map_.reserve(approx);
         std::size_t line_no = 0;
         bool header = false;
         while (!text.empty()) {
@@ -468,9 +498,12 @@ public:
             if (!digest || stage.empty())
                 return fail("native_hashes.txt line " + std::to_string(line_no) + ": bad digest or stage");
             const std::string_view path = line.substr(t2 + 1);
-            const auto [it, inserted] = map_.try_emplace(*digest, ShaderRef{*digest, std::string(stage), std::string(path)});
-            if (!inserted && (it->second.stage != stage || it->second.path != path))
-                return fail("native_hashes.txt line " + std::to_string(line_no) + ": conflicting digest");
+            if (const auto it = map_.find(*digest); it != map_.end()) {
+                if (it->second.stage != stage || it->second.path != path)
+                    return fail("native_hashes.txt line " + std::to_string(line_no) + ": conflicting digest");
+            } else {
+                map_.emplace(*digest, ShaderRef{*digest, std::string(stage), std::string(path)});
+            }
         }
         if (!header) return fail("native_hashes.txt is empty");
         return true;
@@ -484,7 +517,7 @@ public:
     std::size_t size() const { return map_.size(); }
 
 private:
-    std::map<Digest, ShaderRef> map_;
+    std::unordered_map<Digest, ShaderRef, DigestHash> map_;
 };
 
 struct PlannedStage {
@@ -546,7 +579,11 @@ inline Plan plan(const GraphicsDesc& desc, const HashMap& map) {
             return p;
         }
         const ShaderRef* found = nullptr;
-        for (const Digest& d : record_digests(bytes(block.records))) {
+        const auto rec = bytes(block.records);
+        for (std::size_t at = 0; at + 4 + 16 <= rec.size(); at += 4) {
+            if (read_u32(rec, at) != 0x43) continue;
+            Digest d;
+            std::memcpy(d.data(), rec.data() + at + 4, 16);
             const ShaderRef* ref = map.find(d);
             if (!ref) continue;
             if (found && found != ref) {
