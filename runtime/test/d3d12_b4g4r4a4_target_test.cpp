@@ -15,9 +15,11 @@
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
 
+#include <cfenv>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -168,9 +170,10 @@ int main() {
     Ref<ID3D12Fence> fence;
     EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
-    // Values a 4-bit channel holds exactly (n / 15), so the RGBA8 bytes are n * 17.
-    const FLOAT outside_color[4] = {1.0f, 0.0f, 5.0f / 15, 1.0f};  // -> FF 00 55 FF
-    const FLOAT inside_color[4] = {0.0f, 10.0f / 15, 0.0f, 0.0f};  // -> 00 AA 00 00
+    // Values a 4-bit channel holds exactly (n / 15), plus a 4-bit tie (0.5 -> 8/15 = 0x88), out-of-range and NaN
+    // executed under FE_DOWNWARD so FP-mode-dependent rounding (std::nearbyint -> 7/15 = 0x77) fails.
+    const FLOAT outside_color[4] = {1.0f, 10.0f / 15.0f, 5.0f / 15.0f, 1.0f};
+    const FLOAT inside_color[4] = {0.5f, -1.0f, 2.0f, std::numeric_limits<float>::quiet_NaN()};  // -> 88 00 FF 00
     const D3D12_RECT rect{8, 4, 24, 12};
     list->ClearRenderTargetView(rtv, outside_color, 0, nullptr);
     list->ClearRenderTargetView(rtv, inside_color, 1, &rect);
@@ -183,7 +186,10 @@ int main() {
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     EXPECT(SUCCEEDED(list->Close()));
     ID3D12CommandList* lists[] = {list.p};
+    const int saved_round = std::fegetround();
+    std::fesetround(FE_DOWNWARD);
     queue->ExecuteCommandLists(1, lists);
+    std::fesetround(saved_round);
     EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
     EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
 
@@ -196,8 +202,8 @@ int main() {
             std::memcpy(texel, static_cast<const std::uint8_t*>(mapped) + y * kPitch + x * 4, sizeof(texel));
             const bool inside = x >= UINT(rect.left) && x < UINT(rect.right) && y >= UINT(rect.top) &&
                                 y < UINT(rect.bottom);
-            const std::uint8_t want[4] = {std::uint8_t(inside ? 0x00 : 0xFF), std::uint8_t(inside ? 0xAA : 0x00),
-                                          std::uint8_t(inside ? 0x00 : 0x55), std::uint8_t(inside ? 0x00 : 0xFF)};
+            const std::uint8_t want[4] = {std::uint8_t(inside ? 0x88 : 0xFF), std::uint8_t(inside ? 0x00 : 0xAA),
+                                          std::uint8_t(inside ? 0xFF : 0x55), std::uint8_t(inside ? 0x00 : 0xFF)};
             if (std::memcmp(texel, want, 4) != 0 && wrong++ < 4)
                 std::fprintf(stderr, "texel (%u, %u) = %02x %02x %02x %02x, want %02x %02x %02x %02x\n", x, y,
                              texel[0], texel[1], texel[2], texel[3], want[0], want[1], want[2], want[3]);
