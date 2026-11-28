@@ -21,6 +21,7 @@ import hashlib
 import math
 import os
 import re
+import signal
 import struct
 import subprocess
 import sys
@@ -20153,14 +20154,65 @@ def merge_shard_parts(out):
     return merged
 
 
-def _run_spirv_tool(cmd, **kwargs):
+_ORIG_SUBPROCESS_RUN = subprocess.run
+
+
+def _run_tool(cmd, *, input=None, text=False, cwd=None, timeout=None, env=None, **_ignored):
+    """Run an external SPIR-V tool and terminate it cleanly if interrupted (SIGINT/SIGTERM)."""
+    stdin_mode = subprocess.PIPE if input is not None else None
     try:
-        return subprocess.run(cmd, **kwargs)
+        p = subprocess.Popen(cmd, stdin=stdin_mode, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=text, cwd=cwd, env=env)
     except FileNotFoundError as exc:
         # Windows CreateProcess omits the executable name from WinError 2.
         if getattr(exc, "winerror", None) == 2 and exc.filename is None:
             exc.filename = cmd[0]
         raise
+    try:
+        out, err = p.communicate(input=input, timeout=timeout)
+    except BaseException:
+        if p.poll() is None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+                try:
+                    p.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            except OSError:
+                pass
+        raise
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
+def _run_spirv_tool(cmd, **kwargs):
+    if subprocess.run is not _ORIG_SUBPROCESS_RUN:
+        return subprocess.run(cmd, **kwargs)
+    return _run_tool(cmd, **kwargs)
+
+
+def _clean_stale_spirv_temps(out):
+    """Remove leftover .spirv-*.tmp staging files in `out` when no shard is running."""
+    if not os.path.isdir(out):
+        return
+    try:
+        with os.scandir(out) as entries:
+            for entry in entries:
+                if entry.name.startswith(".spirv-") and entry.name.endswith(".tmp") and entry.is_file(follow_symlinks=False):
+                    try:
+                        os.unlink(entry.path)
+                    except OSError:
+                        pass
+    except OSError:
+        pass
 
 
 # Keep resource bindings, specialization constants and stage interfaces used by the runtime linker.
@@ -20364,6 +20416,13 @@ def main():
     ap.add_argument("--opt", action="store_true",
                     help="run basic-block SPIR-V peephole optimization (tools/spirv_opt.py: register store-to-load "
                          "forwarding, OpAccessChain CSE, dead-store elimination, OpSelect/CopyObject folding, DCE)")
+    if hasattr(signal, "SIGTERM"):
+        def _on_sigterm(_signum, _frame):
+            raise SystemExit(128 + signal.SIGTERM)
+        try:
+            signal.signal(signal.SIGTERM, _on_sigterm)
+        except ValueError:
+            pass
     a = ap.parse_args()
     # A file at --out (or one above it) can never become a folder. Refuse it here, before
     # --merge publishes an index or os.makedirs raises a traceback. Same check as #1607's
@@ -20424,6 +20483,7 @@ def main():
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, merged)
         write_index(os.path.join(a.out, "index.json"), merged)
+        _clean_stale_spirv_temps(a.out)
         print(f"merged {len(merged)} entries")
         return 0
     single_file = os.path.isfile(a.src) and a.src.endswith(".s")
@@ -20558,6 +20618,7 @@ def main():
     if shard is None or not missing_inputs:
         write_index(idx_path, old)
     if shard is None:
+        _clean_stale_spirv_temps(a.out)
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, old)
     status_label = "assembled (spirv-val skipped)" if a.no_validate else "pass spirv-val"

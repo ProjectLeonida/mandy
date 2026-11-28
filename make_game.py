@@ -2139,6 +2139,22 @@ def _stop_procs(procs: list) -> None:
             pass
 
 
+def _clean_stale_spirv_temps(spirv: str) -> None:
+    """Remove leftover .spirv-*.tmp staging files after all shard processes have stopped."""
+    if not os.path.isdir(spirv):
+        return
+    try:
+        with os.scandir(spirv) as entries:
+            for entry in entries:
+                if entry.name.startswith(".spirv-") and entry.name.endswith(".tmp") and entry.is_file(follow_symlinks=False):
+                    try:
+                        os.unlink(entry.path)
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+
+
 def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
               fallbacks: tuple[str, ...] = ()) -> None:
     """rdna2spirv.py runs on one core: start one --shard per job side by side, then merge their index parts.
@@ -2212,6 +2228,7 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
                 time.sleep(1.0)
     except BaseException:
         _stop_procs(list(procs.values()))
+        _clean_stale_spirv_temps(spirv)
         raise
     if bad:
         # An older index describes the corpus from the run before: keeping it would make the next run take the

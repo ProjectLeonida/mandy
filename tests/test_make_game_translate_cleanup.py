@@ -126,5 +126,100 @@ class TranslateCleanupTests(unittest.TestCase):
         self.assertIsNotNone(stubborn.poll())
 
 
+    def test_translate_abort_cleans_stale_spirv_temps_and_keeps_valid_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            spirv = os.path.join(tmp, "spirv")
+            os.makedirs(disasm)
+            os.makedirs(spirv)
+            stale = os.path.join(spirv, ".spirv-leftover.tmp")
+            keep_spv = os.path.join(spirv, "cs_ok.spv")
+            keep_part = os.path.join(spirv, "index.part0.json")
+            for p, data in ((stale, b"tmp"), (keep_spv, b"spv"), (keep_part, b"{}")):
+                with open(p, "wb") as f:
+                    f.write(data)
+
+            p1 = FakeProc(running=True, poll_side_effect=KeyboardInterrupt)
+            with (
+                patch("make_game.log"),
+                patch("make_game.subprocess.Popen", return_value=p1),
+                patch("make_game.py"),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    make_game.translate(disasm, spirv, jobs=2)
+
+            self.assertFalse(os.path.exists(stale))
+            self.assertTrue(os.path.isfile(keep_spv))
+
+
+class Rdna2SpirvToolCleanupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tools_dir = os.path.join(ROOT, "tools")
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        import rdna2spirv
+        cls.rdna2spirv = rdna2spirv
+
+    def test_run_tool_terminates_child_on_abort(self):
+        started = []
+        real_popen = subprocess.Popen
+
+        def spy_popen(*args, **kwargs):
+            p = real_popen(*args, **kwargs)
+            orig_comm = p.communicate
+
+            def abort_communicate(*cargs, **ckwargs):
+                raise SystemExit(143)
+
+            p.communicate = abort_communicate
+            p._orig_communicate = orig_comm
+            started.append(p)
+            return p
+
+        with patch.object(self.rdna2spirv.subprocess, "Popen", side_effect=spy_popen):
+            with self.assertRaises(SystemExit):
+                self.rdna2spirv._run_tool([sys.executable, "-c", "import time; time.sleep(30)"])
+
+        self.assertEqual(len(started), 1)
+        self.assertIsNotNone(started[0].poll(), "child tool process was left running after abort")
+
+    def test_assemble_spirv_removes_tmp_when_tool_interrupted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sa = os.path.join(tmp, "s.spvasm")
+            sv = os.path.join(tmp, "s.spv")
+            with open(sa, "w", encoding="utf-8") as f:
+                f.write("; dummy\n")
+
+            with patch.object(self.rdna2spirv, "_run_tool", side_effect=SystemExit(143)):
+                with self.assertRaises(SystemExit):
+                    self.rdna2spirv.assemble_spirv(sa, sv)
+
+            leftovers = [n for n in os.listdir(tmp) if n.startswith(".spirv-") and n.endswith(".tmp")]
+            self.assertEqual(leftovers, [])
+            self.assertFalse(os.path.exists(sv))
+
+    def test_merge_cleans_stale_spirv_temps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            spirv = os.path.join(tmp, "spirv")
+            os.makedirs(disasm)
+            os.makedirs(spirv)
+            with open(os.path.join(spirv, "index.part0.json"), "w", encoding="utf-8") as f:
+                f.write('{"cs_ok": {"stage": "cs"}}')
+            with open(os.path.join(spirv, "shard0.json"), "w", encoding="utf-8") as f:
+                f.write('{"index": 0, "count": 1}')
+            stale = os.path.join(spirv, ".spirv-stale.tmp")
+            with open(stale, "wb") as f:
+                f.write(b"junk")
+
+            with patch.object(sys, "argv", ["rdna2spirv.py", disasm, "--out", spirv, "--merge"]):
+                rc = self.rdna2spirv.main()
+
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(stale))
+            self.assertTrue(os.path.isfile(os.path.join(spirv, "index.json")))
+
+
 if __name__ == "__main__":
     unittest.main()
