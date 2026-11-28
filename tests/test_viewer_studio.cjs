@@ -16,7 +16,8 @@ function fakeElement() {
             return {
                 add: name => { if (!this.className.split(' ').includes(name)) this.className += ` ${name}`; },
                 remove: name => { this.className = this.className.split(' ').filter(token => token !== name).join(' '); },
-                toggle() {},
+                toggle: (name, force = !this.className.split(' ').includes(name)) =>
+                    this.classList[force ? 'add' : 'remove'](name),
             };
         },
         setAttribute() {},
@@ -36,7 +37,14 @@ function loadStudio() {
     const document = {
         getElementById: id => elements.get(id) ?? elements.set(id, fakeElement()).get(id),
         createElement: fakeElement,
-        querySelectorAll: () => [],
+        querySelectorAll: selector => {
+            const found = [], visit = element => {
+                if (element.className.split(' ').includes(selector.slice(1))) found.push(element);
+                element.children.forEach(visit);
+            };
+            elements.forEach(visit);
+            return found;
+        },
     };
     const context = vm.createContext({
         document, URLSearchParams, localStorage: { getItem: () => null, setItem() {} }, window: {}, setTimeout() {},
@@ -228,6 +236,45 @@ test('language and equivalent search text preserve model pages and the selected 
     studio.run(`document.getElementById('model-search').value = 'Props'; onModelSearch();`);
     assert.equal(groups().length, 1);
     assert.equal(groups()[0].children[0].children[1].innerText, '1–100 / 201');
+});
+
+test('a failed download selects the row of the model still shown, also after the list is redrawn', () => {
+    const studio = loadStudio();
+    studio.context.models = ['a', 'b', 'c'].map(name => ({
+        name: `${name}.glb`, category: 'Props', folder: 'Synthetic', size: 4, url: `/models/${name}.glb`,
+    }));
+    const rows = () => studio.elements.get('model-list').children[0].children[1].children.at(-1).children;
+    const active = () => rows().flatMap((row, i) => row.className.split(' ').includes('active') ? ['abc'[i]] : []);
+    studio.run('allModels = models; renderAccordionList();');
+
+    rows()[0].onclick();
+    studio.loads[0].onError(new Error('first download failed'));
+    assert.deepEqual(active(), [], 'nothing is shown yet');
+
+    rows()[0].onclick();
+    studio.loads[1].onLoad({ scene: fakeModel() });
+    const list = rows();
+    rows()[1].onclick();
+    assert.deepEqual(active(), ['b']);
+    studio.loads[2].onError(new Error('failed'));
+    assert.equal(studio.elements.get('stat-name').innerText, 'a.glb');
+    assert.deepEqual(active(), ['a']);
+    assert.equal(rows(), list, 'the list is not rebuilt, so its scroll and collapsed groups stay');
+    studio.run('renderAccordionList();');
+    assert.deepEqual(active(), ['a']);
+
+    // A download that a later click replaced leaves the later selection alone, and the last failure goes back to a.
+    rows()[1].onclick();
+    rows()[2].onclick();
+    studio.loads[3].onError(new Error('late failure'));
+    assert.deepEqual(active(), ['c']);
+    studio.loads[4].onError(new Error('failed'));
+    assert.deepEqual(active(), ['a']);
+
+    rows()[1].onclick();
+    studio.loads[5].onLoad({ scene: fakeModel() });
+    assert.deepEqual(active(), ['b']);
+    assert.equal(studio.alerts.length, 3);
 });
 
 test('DDS inspector selects a mip and layer and clears controls for ordinary images', async () => {
