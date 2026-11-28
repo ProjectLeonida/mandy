@@ -553,6 +553,24 @@ class BootTraceTests(unittest.TestCase):
         ):
             self.assertIn(needle, text)
 
+    def test_text_summary_survives_map_records_without_a_module_name(self):
+        self.write(self.startup, [
+            {"kind": "map"},
+            {"kind": "map", "module": 42},
+            {"kind": "map", "module": ""},
+            {"kind": "map", "module": "synthetic.dll", "relocated": True},
+            {"kind": "exit", "code": 7},
+        ])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main([self.startup]), 0)
+        text = out.getvalue()
+        self.assertIn(
+            "modules (4): <unknown module>, <unknown module>, <unknown module>, synthetic.dll (relocated)",
+            text,
+        )
+        self.assertIn("exit: 7", text)
+
     def test_failed_file_opens_and_skipped_int3_are_listed(self):
         self.write(
             self.startup,
