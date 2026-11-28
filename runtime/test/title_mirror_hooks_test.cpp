@@ -1241,6 +1241,223 @@ int parallel_fill_and_write_back_benchmark() {
                 fill_serial_ms, fill_par_ms, fill_serial_ms / fill_par_ms);
     std::printf("bench (256-page write_back_batch):  serial %.3f ms -> parallel %.3f ms (%.2fx)\n",
                 wb_serial_ms, wb_par_ms, wb_serial_ms / wb_par_ms);
+
+    // Measure lock-free Phase 1 prehash + locked Phase 2 write_back_prehashed vs old 1-page-at-a-time fallback.
+    auto readback_pool = TitleMirror::make_worker_pool();
+    TitleMirror::PrehashedReadback prehashed;
+    double prehash_ms = 0.0, phase2_ms = 0.0;
+    for (int it = 0; it < kIters; ++it) {
+        for (std::size_t q = 0; q < 4; ++q)
+            staged[(q * 60 + 7) * kPage + 5 * 256 + 11] ^= std::uint8_t(it + 9);
+        const auto t0 = std::chrono::steady_clock::now();
+        TitleMirror::prehash_readback_slice(refs.data(), refs.size(), wb_ranges, staged.data(), prehashed,
+                                            readback_pool.get());
+        const auto t1 = std::chrono::steady_clock::now();
+        const std::uint64_t wb =
+            mirror.write_back_prehashed(refs.data(), refs.size(), prehashed, staged.data(), nullptr, nullptr, write_fn);
+        const auto t2 = std::chrono::steady_clock::now();
+        if (wb != 4 * 256) return 1;
+        prehash_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        phase2_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
+    }
+    std::printf("bench (256-page prehashed wb):      phase1 (unlocked) %.3f ms, phase2 (locked) %.3f ms\n",
+                prehash_ms / kIters, phase2_ms / kIters);
+    return 0;
+}
+
+int coalesced_write_back_runs_and_fallback() {
+    Fixture f;
+    TitleMirror mirror(f.hooks());
+    EXPECT(mirror.cover(kBase, kBase + 4 * kPage));
+    std::vector<std::uint8_t> f0(kPage, 0x10), f1(kPage, 0x20);
+    mirror.map(kBase, f0.data(), nullptr, 1);
+    mirror.map(kBase + kPage, f1.data(), nullptr, 1);
+    EXPECT(mirror.flush(1));
+
+    // GPU modifies contiguous pieces [0..31] (32 pieces = 8 KiB) and [62..67] (spanning 64-bit word boundary),
+    // with CPU also modifying piece 64 -> splits [62..67] into [62..63] and [65..67] with 1 conflict!
+    std::uint8_t* h0 = mirror.home_bytes(kBase);
+    for (std::size_t k = 0; k < 32; ++k) h0[k * 256 + 3] = std::uint8_t(0xA0 + k);
+    for (std::size_t k = 62; k <= 67; ++k) h0[k * 256 + 5] = std::uint8_t(0xB0 + (k - 62));
+    f0[64 * 256 + 7] = 0xCC;  // CPU conflict on piece 64
+
+    struct Call {
+        std::size_t off;
+        std::size_t n;
+    };
+    std::vector<Call> calls;
+    const auto base_ptr = reinterpret_cast<std::uintptr_t>(f0.data());
+    const auto write_coalesced = [&](std::uint64_t dst, const std::uint8_t* bytes, std::size_t n) {
+        calls.push_back({std::size_t(static_cast<std::uintptr_t>(dst) - base_ptr), n});
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), bytes, n);
+        return true;
+    };
+    const std::uint64_t written = mirror.write_back(kBase, kBase + kPage, write_coalesced);
+    EXPECT(written == (32 + 2 + 3) * 256);
+    EXPECT(calls.size() == 3);
+    EXPECT(calls[0].off == 0 && calls[0].n == 32 * 256);
+    EXPECT(calls[1].off == 62 * 256 && calls[1].n == 2 * 256);
+    EXPECT(calls[2].off == 65 * 256 && calls[2].n == 3 * 256);
+    EXPECT(f0[0 * 256 + 3] == 0xA0 && f0[31 * 256 + 3] == 0xBF);
+    EXPECT(f0[63 * 256 + 5] == 0xB1 && f0[64 * 256 + 7] == 0xCC && f0[65 * 256 + 5] == 0xB3);
+    EXPECT(mirror.counters().conflicts == 1);
+
+    // Multi-piece write() failure falls back piece-by-piece so healthy pieces still commit (piece 10 fails).
+    std::uint8_t* h1 = mirror.home_bytes(kBase + kPage);
+    for (std::size_t k = 8; k <= 12; ++k) h1[k * 256 + 1] = std::uint8_t(0x70 + k);
+    const auto base1 = reinterpret_cast<std::uintptr_t>(f1.data());
+    std::size_t multi_calls = 0, single_calls = 0;
+    const auto write_fallback = [&](std::uint64_t dst, const std::uint8_t* bytes, std::size_t n) {
+        const std::size_t off = std::size_t(static_cast<std::uintptr_t>(dst) - base1);
+        if (n > 256) {
+            ++multi_calls;
+            return false;  // force piece-by-piece fallback
+        }
+        ++single_calls;
+        if (off == 10 * 256) return false;  // single bad piece fails
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), bytes, n);
+        return true;
+    };
+    const std::uint64_t written1 = mirror.write_back(kBase + kPage, kBase + 2 * kPage, write_fallback);
+    EXPECT(written1 == 4 * 256 && multi_calls == 1 && single_calls == 5);
+    EXPECT(f1[8 * 256 + 1] == 0x78 && f1[9 * 256 + 1] == 0x79);
+    EXPECT(f1[10 * 256 + 1] == 0x20);  // failed piece untouched
+    EXPECT(f1[11 * 256 + 1] == 0x7B && f1[12 * 256 + 1] == 0x7C);
+    std::printf("coalesced_write_back_runs_and_fallback: coalesced runs, conflict split, and fallback ok\n");
+    return 0;
+}
+
+int prehashed_readback_and_skip_masks() {
+    constexpr std::size_t kPages = 48;
+    Fixture f;
+    TitleMirror mirror(f.hooks());
+    EXPECT(mirror.cover(kBase, kBase + (kPages + 4) * kPage));
+
+    std::vector<std::uint8_t> frames(kPages * kPage);
+    for (std::size_t i = 0; i < frames.size(); ++i)
+        frames[i] = std::uint8_t((i * 29 + (i / kPage) * 7 + 3) & 0xff);
+    for (std::size_t p = 0; p < kPages; ++p) {
+        // Page 11 aliases physical frame 10.
+        const std::size_t fidx = (p == 11) ? 10 : p;
+        mirror.map(kBase + p * kPage, frames.data() + fidx * kPage, nullptr, 1);
+    }
+    EXPECT(mirror.flush(1));
+
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges = {
+        {kBase + 0 * kPage, kBase + 20 * kPage},
+        {kBase + 20 * kPage + 2 * 256, kBase + 20 * kPage + 6 * 256},  // partial pieces [2..6)
+        {kBase + 22 * kPage, kBase + kPages * kPage},
+    };
+    const auto refs = mirror.homes_in_ranges(ranges);
+    EXPECT(refs.size() == kPages - 1);  // page 21 excluded
+
+    // Snapshot GPU staged buffer before concurrent upload() modifies some pieces!
+    std::vector<std::uint8_t> staged(refs.size() * kPage);
+    for (std::size_t i = 0; i < refs.size(); ++i) std::memcpy(staged.data() + i * kPage, refs[i].frame, kPage);
+
+    // GPU wrote:
+    // - Page 0: piece 1 (GPU-only) and piece 2 (will be concurrently uploaded by CPU -> skipped via skip_mask!)
+    // - Page 5: piece 10 (will be skipped whole via skip_page!)
+    // - Page 10 & alias 11: piece 4 (GPU-only, shared frame -> written ONCE even though both aliases see it)
+    // - Page 20 (partial [2..6)): piece 1 (out of range -> ignored), piece 3 (in range -> written)
+    // - Pages 25..40: pieces 0..3 (contiguous GPU writes)
+    staged[0 * kPage + 1 * 256 + 4] = 0xE1;
+    staged[0 * kPage + 2 * 256 + 4] = 0xE2;
+    staged[5 * kPage + 10 * 256 + 4] = 0xE5;
+    staged[10 * kPage + 4 * 256 + 4] = 0xEA;
+    staged[11 * kPage + 4 * 256 + 4] = 0xEA;
+    staged[20 * kPage + 1 * 256 + 4] = 0xEE;  // outside [2..6)
+    staged[20 * kPage + 3 * 256 + 4] = 0xEC;  // inside [2..6)
+    for (std::size_t idx = 24; idx < 39; ++idx) {
+        for (std::size_t k = 0; k < 4; ++k) staged[idx * kPage + k * 256 + 9] ^= 0x55;
+    }
+
+    // Simulate concurrent refresh_page_mirror() -> upload() modifying piece 2 of page 0 while readback was in flight:
+    // on_changed captures exact changed_pieces into skip_masks[0] WITHOUT invalidating piece 1!
+    frames[0 * kPage + 2 * 256 + 4] = 0x99;
+    std::vector<std::array<std::uint64_t, 4>> skip_masks(refs.size());
+    std::vector<std::uint8_t> skip_page(refs.size(), 0);
+    skip_page[5] = 1;  // simulate external whole-frame invalidation of page 5
+    EXPECT(mirror.dirty(kBase));
+    std::size_t changed_callbacks = 0;
+    EXPECT(mirror.upload([&](std::uint8_t* frame, const std::array<std::uint64_t, 4>& mask) {
+        ++changed_callbacks;
+        for (std::size_t i = 0; i < refs.size(); ++i) {
+            if (refs[i].frame == frame) {
+                for (std::size_t w = 0; w < 4; ++w) skip_masks[i][w] |= mask[w];
+            }
+        }
+    }) == 1);
+    EXPECT(changed_callbacks == 1);
+    EXPECT(skip_masks[0][0] == (std::uint64_t(1) << 2));
+
+    // Unchanged dirty upload must NOT invoke on_changed!
+    EXPECT(mirror.dirty(kBase + 2 * kPage));
+    EXPECT(mirror.upload([&](std::uint8_t*, const std::array<std::uint64_t, 4>&) { ++changed_callbacks; }) == 1);
+    EXPECT(changed_callbacks == 1);
+
+    // Phase 1 (lock-free parallel prehash) + Phase 2 (locked write_back_prehashed).
+    auto pool = TitleMirror::make_worker_pool();
+    TitleMirror::PrehashedReadback prehashed;
+    TitleMirror::prehash_readback_slice(refs.data(), refs.size(), ranges, staged.data(), prehashed, pool.get());
+    const auto write_fn = [](std::uint64_t dst, const std::uint8_t* bytes, std::size_t n) {
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), bytes, n);
+        return true;
+    };
+    const std::uint64_t written = mirror.write_back_prehashed(refs.data(), refs.size(), prehashed, staged.data(),
+                                                              skip_masks.data(), skip_page.data(), write_fn);
+    // Page 0 piece 1 (1) + Page 10 piece 4 (1, alias 11 sees updated home.sums) + Page 20 piece 3 (1) + 15*4 (60) = 63
+    EXPECT(written == 63 * 256);
+    EXPECT(frames[0 * kPage + 1 * 256 + 4] == 0xE1);  // GPU piece 1 written back!
+    EXPECT(frames[0 * kPage + 2 * 256 + 4] == 0x99);  // CPU-uploaded piece 2 NOT overwritten by stale staged 0xE2!
+    EXPECT(frames[5 * kPage + 10 * 256 + 4] != 0xE5); // skip_page[5] skipped whole page 5
+    EXPECT(frames[10 * kPage + 4 * 256 + 4] == 0xEA); // shared frame written back once
+    EXPECT(frames[20 * kPage + 1 * 256 + 4] != 0xEE); // out of partial range
+    EXPECT(frames[20 * kPage + 3 * 256 + 4] == 0xEC); // inside partial range
+
+    std::printf("prehashed_readback_and_skip_masks: lock-free Phase 1, piece skip_mask, skip_page, and aliases ok\n");
+    return 0;
+}
+
+int deferred_map_fill_and_on_changed() {
+    constexpr std::size_t kPages = 40;
+    Fixture f;
+    TitleMirror mirror(f.hooks());
+    EXPECT(mirror.cover(kBase, kBase + (kPages + 8) * kPage));
+
+    std::vector<std::uint8_t> frames(kPages * kPage);
+    for (std::size_t i = 0; i < frames.size(); ++i) frames[i] = std::uint8_t((i * 41 + 17) & 0xff);
+
+    // Map kPages with defer_fill=true: zero immediate uploads, range_sum returns false until upload().
+    for (std::size_t p = 0; p < kPages; ++p)
+        mirror.map(kBase + p * kPage, frames.data() + p * kPage, nullptr, TitleMirror::kUnstamped, true);
+    EXPECT(mirror.counters().uploads == 0);
+    std::uint64_t h = 0;
+    EXPECT(!mirror.range_sum(kBase, kPage, h));
+
+    // Unmap page 3 before upload(): its deferred home is erased and never wastes a fill!
+    mirror.map(kBase + 3 * kPage, nullptr, nullptr, TitleMirror::kUnstamped, true);
+
+    // Alias page 4 before upload(): make_copy() fills home + filtered copy immediately and clears whole_fill/dirty.
+    const VkBuffer arena = fake<VkBuffer>(0xD4);
+    mirror.alias(kBase + 4 * kPage, kBase + 5 * kPage, arena, 0);
+    EXPECT(mirror.counters().uploads == 1);
+    EXPECT(mirror.range_sum(kBase + 4 * kPage, kPage, h));
+
+    // upload() fills the remaining kPages - 2 deferred homes in parallel and fires on_changed for each.
+    std::size_t notified = 0;
+    const std::size_t filled = mirror.upload([&](std::uint8_t*, const std::array<std::uint64_t, 4>& mask) {
+        if (mask[0] == ~0ull && mask[1] == ~0ull && mask[2] == ~0ull && mask[3] == ~0ull) ++notified;
+    });
+    EXPECT(filled == kPages - 2 && notified == kPages - 2);
+    EXPECT(mirror.counters().uploads == kPages - 1);
+    for (std::size_t p = 0; p < kPages; ++p) {
+        if (p == 3) continue;
+        EXPECT(!std::memcmp(mirror.home_bytes(kBase + p * kPage), frames.data() + p * kPage, kPage));
+        EXPECT(mirror.range_sum(kBase + p * kPage, kPage, h));
+    }
+
+    std::printf("deferred_map_fill_and_on_changed: parallel deferred fills, unmap elision, and alias handoff ok\n");
     return 0;
 }
 
@@ -1263,6 +1480,9 @@ int main() {
     if (parallel_upload_matches_serial()) return 1;
     if (parallel_write_back_batch_matches_serial()) return 1;
     if (parallel_fill_and_write_back_benchmark()) return 1;
+    if (coalesced_write_back_runs_and_fallback()) return 1;
+    if (prehashed_readback_and_skip_masks()) return 1;
+    if (deferred_map_fill_and_on_changed()) return 1;
     std::printf("title_mirror_hooks_test: ok\n");
     return 0;
 }

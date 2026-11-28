@@ -32,8 +32,10 @@ public:
     ~HotColdTracking() override {
         geometry_writes::unsubscribe_writes(queue_);
         if (ww_reader_) title_write_watch::close_reader(ww_reader_);
-        for (const auto& [page, held] : guard_.hot) geometry_writes::set_hot(std::uintptr_t(page), false);
-        for (const auto& [page, cell] : guard_.cells) geometry_writes::release(std::uintptr_t(page));
+        for (const auto& [page, tc] : guard_.cells) {
+            if (tc.is_hot) geometry_writes::set_hot(std::uintptr_t(page), false);
+            geometry_writes::release(std::uintptr_t(page));
+        }
     }
     HotColdTracking(const HotColdTracking&) = delete;
     HotColdTracking& operator=(const HotColdTracking&) = delete;
@@ -66,8 +68,10 @@ public:
         const auto it = guard_.cells.find(addr);
         if (it == guard_.cells.end()) return;
         policy_.remove(addr, addr + Policy::kPage);
-        guard_.armed.erase(addr);
-        if (guard_.hot.erase(addr)) geometry_writes::set_hot(addr, false);
+        if (it->second.is_hot) {
+            it->second.is_hot = false;
+            geometry_writes::set_hot(addr, false);
+        }
         geometry_writes::release(addr);
         guard_.cells.erase(it);
         sync_pending_atomics();
@@ -78,16 +82,15 @@ public:
         bool overflow = false;
         geometry_writes::take_written(queue_, tiles_, overflow);
         if (overflow)
-            for (const auto& [page, cell] : guard_.cells) policy_.written(std::uintptr_t(page));
+            for (const auto& [page, tc] : guard_.cells) policy_.written(std::uintptr_t(page));
         else
             for (const std::uintptr_t tile : tiles_) {
-                const auto cell = guard_.cells.find(tile);
-                if (cell == guard_.cells.end()) continue;
+                const auto it = guard_.cells.find(tile);
+                if (it == guard_.cells.end()) continue;
+                const auto& tc = it->second;
                 // A guarded page whose cell has not moved since it was armed was not written since: the entry is
                 // older than the arming, or this tracking's own turn of the page from hot to cold.
-                const auto armed = guard_.armed.find(tile);
-                if (armed != guard_.armed.end() &&
-                    armed->second == cell->second->version.load(std::memory_order_acquire))
+                if (tc.is_armed && tc.armed_version == tc.cell->version.load(std::memory_order_acquire))
                     continue;
                 policy_.written(tile);
             }
@@ -117,10 +120,9 @@ public:
     bool unwritten(std::uint64_t page) override {
         const std::uintptr_t addr = std::uintptr_t(page) & ~(Policy::kPage - 1);
         if (ww_pages_.count(addr) || policy_.hot(addr)) return false;
-        const auto cell = guard_.cells.find(addr);
-        const auto armed = guard_.armed.find(addr);
-        return cell != guard_.cells.end() && armed != guard_.armed.end() &&
-               cell->second->version.load(std::memory_order_acquire) == armed->second;
+        const auto it = guard_.cells.find(addr);
+        return it != guard_.cells.end() && it->second.is_armed &&
+               it->second.cell->version.load(std::memory_order_acquire) == it->second.armed_version;
     }
 
 private:
@@ -129,7 +131,9 @@ private:
 
     void watch_guarded(std::uintptr_t addr) {
         if (guard_.cells.count(addr)) return;
-        guard_.cells.emplace(addr, geometry_writes::acquire(addr));
+        CellGuard::TrackedCell tc{};
+        tc.cell = geometry_writes::acquire(addr);
+        guard_.cells.emplace(addr, tc);
         policy_.add(addr, addr + Policy::kPage);  // copied (and armed) at the next collect
     }
 
@@ -295,37 +299,78 @@ private:
         static constexpr std::size_t kMaxBatchRunPages = 1024;  // up to 64 MiB per contiguous VirtualProtect run
         static constexpr std::size_t kMaxLockBatchPages = 128;  // pages per pin check + geometry_writes lock hold
 
-        std::unordered_map<std::uint64_t, geometry_writes::Cell*> cells;
-        std::unordered_map<std::uint64_t, std::uint64_t> armed;  // page -> its cell's version when last armed
-        std::unordered_map<std::uint64_t, bool> hot;             // pages this tracking holds hot in their cells
+        struct TrackedCell {
+            geometry_writes::Cell* cell = nullptr;
+            std::uint64_t armed_version = 0;
+            std::uint64_t known_mapping = 0;
+            DWORD known_protect = 0;  // uniform writable protection across all 16 sub-pages (0: unverified)
+            DWORD known_guarded = 0;  // geometry_writes::read_only(known_protect)
+            bool is_armed = false;
+            bool is_hot = false;
+        };
+
+        std::unordered_map<std::uint64_t, TrackedCell> cells;
+        std::uint64_t known_protect_gen = 0;
+        bool has_known_protect = false;
+
+        void sync_known_protect() {
+            const std::uint64_t cur = title_memory_map::generation();
+            if (cur == known_protect_gen) return;
+            if (!has_known_protect) {
+                known_protect_gen = cur;
+                return;
+            }
+            std::uint64_t now = cur;
+            bool invalidate_all = false;
+            if (!title_memory_map::changes_since(known_protect_gen, now, 0, UINTPTR_MAX,
+                                                 [&](std::uintptr_t c_from, std::uintptr_t c_to) {
+                                                     if (invalidate_all || c_from >= c_to) return;
+                                                     constexpr std::uintptr_t kTile = geometry_writes::tile_size;
+                                                     const std::uintptr_t first = c_from & ~(kTile - 1);
+                                                     const std::uintptr_t span = c_to - first;
+                                                     const std::size_t tiles = std::size_t((span - 1) / kTile) + 1;
+                                                     if (tiles > cells.size() / 2 + 64) {
+                                                         invalidate_all = true;
+                                                         return;
+                                                     }
+                                                     for (std::size_t t = 0; t < tiles; ++t) {
+                                                         const auto it = cells.find(first + std::uintptr_t(t) * kTile);
+                                                         if (it != cells.end()) {
+                                                             it->second.known_protect = 0;
+                                                             it->second.known_guarded = 0;
+                                                         }
+                                                     }
+                                                 })) {
+                invalidate_all = true;
+            }
+            if (invalidate_all) {
+                for (auto& entry : cells) {
+                    entry.second.known_protect = 0;
+                    entry.second.known_guarded = 0;
+                }
+                has_known_protect = false;
+            }
+            known_protect_gen = now;
+        }
 
         // Guarded (cold, or a hot page's probe): no longer hot for this owner, then armed.
         bool arm(std::uintptr_t page) {
-            const auto it = cells.find(page);
-            if (it == cells.end()) return false;
-            if (hot.erase(page)) geometry_writes::set_hot(page, false);
-            const std::uint64_t version = it->second->version.load(std::memory_order_acquire);
-            if (!geometry_writes::arm(page, *it->second)) {
-                armed.erase(page);
-                return false;
-            }
-            armed[page] = version;
-            return true;
+            std::uint8_t ok = 0;
+            arm_batch(&page, &ok, 1);
+            return ok != 0;
         }
 
         // Batched arming of sorted 64 KiB pages: coalesces both contiguous runs (up to 64 MiB in one VirtualProtect)
-        // and scattered pages into shared pin checks, shared geometry_writes lock holds, and a short-lived
-        // VirtualQuery region cache (invalidated by title_memory_map::generation() or any VirtualProtect failure).
+        // and scattered pages into shared pin checks, shared geometry_writes lock holds, a per-tile known-protection
+        // cache invalidated via title_memory_map::changes_since() (skipping VirtualQuery on repeat cold re-arms), and
+        // a short-lived VirtualQuery region cache within each lock hold.
         void arm_batch(const std::uintptr_t* pages, std::uint8_t* results, std::size_t count) {
             using geometry_writes::Cell;
             constexpr std::uintptr_t kTile = geometry_writes::tile_size;
             constexpr std::uintptr_t kHostPage = geometry_writes::page_size;
 
             if (!count) return;
-            if (count == 1) {
-                results[0] = arm(pages[0]) ? 1 : 0;
-                return;
-            }
+            sync_known_protect();
 
             for (std::size_t i = 0; i < count;) {
                 // Extend chunk up to kMaxLockBatchPages, or further across one contiguous run up to kMaxBatchRunPages.
@@ -344,7 +389,7 @@ private:
                 const std::size_t batch_n = j - i;
                 const std::uintptr_t* const batch_pages = pages + i;
 
-                run_cells_.resize(batch_n);
+                run_entries_.resize(batch_n);
                 run_versions_.resize(batch_n);
                 run_pinned_.assign(batch_n, 0);
                 run_eligible_.assign(batch_n, 0);
@@ -357,13 +402,17 @@ private:
                     const std::uintptr_t page = batch_pages[k];
                     const auto it = cells.find(page);
                     if (it == cells.end()) {
-                        run_cells_[k] = nullptr;
+                        run_entries_[k] = nullptr;
                         results[i + k] = 0;
                         continue;
                     }
-                    if (hot.erase(page)) geometry_writes::set_hot(page, false);
-                    run_cells_[k] = it->second;
-                    run_versions_[k] = it->second->version.load(std::memory_order_acquire);
+                    TrackedCell& tc = it->second;
+                    if (tc.is_hot) {
+                        tc.is_hot = false;
+                        geometry_writes::set_hot(page, false);
+                    }
+                    run_entries_[k] = &tc;
+                    run_versions_[k] = tc.cell->version.load(std::memory_order_acquire);
                     if (page < pin_lo) pin_lo = page;
                     const std::uintptr_t page_hi = (page <= UINTPTR_MAX - kTile) ? (page + kTile) : UINTPTR_MAX;
                     if (page_hi > pin_hi) pin_hi = page_hi;
@@ -385,16 +434,18 @@ private:
                 {
                     std::lock_guard lock(s.mutex);
                     for (std::size_t k = 0; k < batch_n; ++k) {
-                        Cell* c = run_cells_[k];
-                        if (!c) continue;
+                        TrackedCell* tc = run_entries_[k];
+                        if (!tc) continue;
+                        Cell* c = tc->cell;
                         if (c->hot) {
                             results[i + k] = 1;
-                            armed[batch_pages[k]] = run_versions_[k];
+                            tc->is_armed = true;
+                            tc->armed_version = run_versions_[k];
                             continue;
                         }
                         if (run_pinned_[k] || run_versions_[k] != c->version.load(std::memory_order_relaxed)) {
                             results[i + k] = 0;
-                            armed.erase(batch_pages[k]);
+                            tc->is_armed = false;
                             continue;
                         }
                         run_eligible_[k] = 1;
@@ -409,7 +460,8 @@ private:
                     DWORD cached_guarded = 0;
                     std::uint64_t cached_gen = 0;
 
-                    // Protect each contiguous sub-run of eligible cells with batched VirtualQuery + VirtualProtect.
+                    // Protect each contiguous sub-run of eligible cells with batched VirtualProtect (skipping
+                    // VirtualQuery when per-tile known_protect is valid).
                     for (std::size_t sub_start = 0; sub_start < batch_n;) {
                         if (!run_eligible_[sub_start]) {
                             ++sub_start;
@@ -424,21 +476,68 @@ private:
                         const std::uintptr_t sub_hi = sub_lo + (sub_end - sub_start) * kTile;
 
                         for (std::uintptr_t p = sub_lo; p < sub_hi;) {
+                            // Fast path: tile-aligned repeat arm with verified uniform protection and unchanged map
+                            // generation & cell mapping -> VirtualProtect directly with 0 VirtualQuery syscalls.
+                            if ((p & (kTile - 1)) == 0 && sub_hi - p >= kTile &&
+                                title_memory_map::generation() == known_protect_gen) {
+                                const std::size_t tile_k = sub_start + std::size_t((p - sub_lo) / kTile);
+                                TrackedCell* const tc0 = run_entries_[tile_k];
+                                if (tc0->known_protect != 0 &&
+                                    tc0->known_mapping == tc0->cell->mapping.load(std::memory_order_acquire)) {
+                                    const DWORD kp = tc0->known_protect;
+                                    const DWORD kg = tc0->known_guarded;
+                                    std::size_t fast_end = tile_k + 1;
+                                    while (fast_end < sub_end) {
+                                        TrackedCell* const tcn = run_entries_[fast_end];
+                                        if (tcn->known_protect != kp || tcn->known_guarded != kg ||
+                                            tcn->known_mapping != tcn->cell->mapping.load(std::memory_order_acquire))
+                                            break;
+                                        ++fast_end;
+                                    }
+                                    const std::uintptr_t end = p + (fast_end - tile_k) * kTile;
+                                    DWORD old{};
+                                    if (VirtualProtect(reinterpret_cast<void*>(p), end - p, kg, &old)) {
+                                        if (old == kp || old == kg) {
+                                            for (std::size_t t = tile_k; t < fast_end; ++t)
+                                                run_entries_[t]->cell->restore.fill(kp);
+                                            if (cached_hi && p >= cached_lo && end <= cached_hi) cached_lo = end;
+                                            p = end;
+                                            continue;
+                                        }
+                                        // Unexpected prior protection (caller bypassed title_memory_map::changed):
+                                        // restore `old` before falling through to VirtualQuery + VirtualProtect.
+                                        DWORD dummy{};
+                                        VirtualProtect(reinterpret_cast<void*>(p), end - p, old, &dummy);
+                                    }
+                                    // Unexpected protection or VirtualProtect failure: invalidate cached protection
+                                    // for these tiles and fall through to VirtualQuery + VirtualProtect.
+                                    for (std::size_t t = tile_k; t < fast_end; ++t) {
+                                        run_entries_[t]->known_protect = 0;
+                                        run_entries_[t]->known_guarded = 0;
+                                    }
+                                    cached_hi = 0;
+                                }
+                            }
+
+                            std::uintptr_t region_base = 0;
                             std::uintptr_t region_end = 0;
                             DWORD state = 0;
                             DWORD protect = 0;
                             DWORD guarded = 0;
+                            std::uint64_t query_gen = 0;
                             bool from_cache = false;
 
                             if (p >= cached_lo && p < cached_hi &&
                                 title_memory_map::generation() == cached_gen) {
+                                region_base = cached_lo;
                                 region_end = cached_hi;
                                 state = MEM_COMMIT;
                                 protect = cached_protect;
                                 guarded = cached_guarded;
+                                query_gen = cached_gen;
                                 from_cache = true;
                             } else {
-                                const std::uint64_t gen_before = title_memory_map::generation();
+                                query_gen = title_memory_map::generation();
                                 MEMORY_BASIC_INFORMATION m{};
                                 if (!VirtualQuery(reinterpret_cast<void*>(p), &m, sizeof m)) {
                                     const std::size_t tile_k = sub_start + std::size_t((p - sub_lo) / kTile);
@@ -446,7 +545,8 @@ private:
                                     p = (p & ~(kTile - 1)) + kTile;
                                     continue;
                                 }
-                                region_end = reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize;
+                                region_base = reinterpret_cast<std::uintptr_t>(m.BaseAddress);
+                                region_end = region_base + m.RegionSize;
                                 state = m.State;
                                 protect = m.Protect;
                                 guarded = geometry_writes::read_only(m.Protect);
@@ -456,7 +556,7 @@ private:
                                     cached_hi = region_end;
                                     cached_protect = protect;
                                     cached_guarded = guarded;
-                                    cached_gen = gen_before;
+                                    cached_gen = query_gen;
                                 } else {
                                     cached_hi = 0;
                                 }
@@ -476,7 +576,26 @@ private:
                                     for (std::uintptr_t q = p; q < end; q += kHostPage) {
                                         const std::size_t tile_k = sub_start + std::size_t((q - sub_lo) / kTile);
                                         const std::size_t sub_p = std::size_t((q & (kTile - 1)) / kHostPage);
-                                        run_cells_[tile_k]->restore[sub_p] = protect;
+                                        run_entries_[tile_k]->cell->restore[sub_p] = protect;
+                                    }
+                                    // Cache uniform whole-tile protections for future re-arms when the memory map
+                                    // generation matches our tracked journal watermark.
+                                    if (query_gen == known_protect_gen &&
+                                        title_memory_map::generation() == known_protect_gen) {
+                                        const std::uintptr_t first_full = (p + kTile - 1) & ~(kTile - 1);
+                                        const std::uintptr_t last_full = end & ~(kTile - 1);
+                                        if (first_full < last_full && region_base <= first_full &&
+                                            region_end >= last_full) {
+                                            for (std::uintptr_t t = first_full; t < last_full; t += kTile) {
+                                                const std::size_t tile_k =
+                                                    sub_start + std::size_t((t - sub_lo) / kTile);
+                                                TrackedCell* const tc = run_entries_[tile_k];
+                                                tc->known_protect = protect;
+                                                tc->known_guarded = guarded;
+                                                tc->known_mapping = tc->cell->mapping.load(std::memory_order_acquire);
+                                            }
+                                            has_known_protect = true;
+                                        }
                                     }
                                     if (cached_hi) cached_lo = end;
                                 } else if (from_cache) {
@@ -492,7 +611,7 @@ private:
                                         if (VirtualProtect(reinterpret_cast<void*>(t), t_end - t, guarded, &old)) {
                                             for (std::uintptr_t q = t; q < t_end; q += kHostPage) {
                                                 const std::size_t sub_p = std::size_t((q & (kTile - 1)) / kHostPage);
-                                                run_cells_[tile_k]->restore[sub_p] = protect;
+                                                run_entries_[tile_k]->cell->restore[sub_p] = protect;
                                             }
                                         } else {
                                             run_failed_[tile_k] = 1;
@@ -505,12 +624,14 @@ private:
                         }
 
                         for (std::size_t k = sub_start; k < sub_end; ++k) {
+                            TrackedCell* const tc = run_entries_[k];
                             if (!run_failed_[k]) {
                                 results[i + k] = 1;
-                                armed[batch_pages[k]] = run_versions_[k];
+                                tc->is_armed = true;
+                                tc->armed_version = run_versions_[k];
                             } else {
                                 results[i + k] = 0;
-                                armed.erase(batch_pages[k]);
+                                tc->is_armed = false;
                             }
                         }
                         sub_start = sub_end;
@@ -523,11 +644,16 @@ private:
         // Hot: the cell is held hot (writable, and written at every look for every other copy of the page), not
         // just reopened behind the other copies' backs (which left them blind: run 64's frozen video).
         void disarm(std::uintptr_t page) {
-            armed.erase(page);
-            if (cells.count(page) && hot.emplace(page, true).second) geometry_writes::set_hot(page, true);
+            const auto it = cells.find(page);
+            if (it == cells.end()) return;
+            it->second.is_armed = false;
+            if (!it->second.is_hot) {
+                it->second.is_hot = true;
+                geometry_writes::set_hot(page, true);
+            }
         }
 
-        std::vector<geometry_writes::Cell*> run_cells_;
+        std::vector<TrackedCell*> run_entries_;
         std::vector<std::uint64_t> run_versions_;
         std::vector<std::uint8_t> run_pinned_;
         std::vector<std::uint8_t> run_eligible_;

@@ -5248,7 +5248,7 @@ struct DeviceState {
         // plainest correct one (a guard on every page) until a measured one replaces it.
         std::unique_ptr<leonida::HotColdTracking> tracking;
         std::vector<std::uint64_t> written;
-        std::unordered_set<std::uintptr_t> fed_now;  // pages a change of this refresh mapped (filled already)
+        std::vector<std::uintptr_t> fed_now;  // pages a change of this refresh mapped (sorted when non-empty)
         // Ordinary title memory (not physical pages) in the mirror's range: base -> end of each such reservation, the
         // runs of it whose pages are mirrored (merged: begin -> end), and those pages. Mirrored as readers name it
         // (page_mirror_resolve): each page its own home, filled from the page itself. A release or decommit there
@@ -5287,7 +5287,13 @@ struct DeviceState {
         // in-flight vkCmdCopyBuffer or waits on an unsubmitted readback_done semaphore value.
         std::mutex readback_submit_mutex;
         std::atomic<std::uint64_t> readback_active_value{0};  // timeline value on readback_done for the submitted copy
-        std::unordered_set<std::uint8_t*> readback_invalidated;  // under `mutex`: physical frames mapped/uploaded during copy
+        std::unordered_set<std::uint8_t*> readback_invalidated;  // under `mutex`: physical frames invalidated during copy
+        std::vector<std::uint8_t*> readback_slice_frames;        // under `mutex`: sorted unique frames in active slice
+        std::vector<std::array<std::uint64_t, 4>> readback_slice_skip_masks;  // under `mutex`: upload()-modified pieces per slice frame
+        std::unique_ptr<leonida::TitleMirror::WorkerPool> readback_pool;      // under `readback_mutex`: lock-free Phase 1 hasher
+        leonida::TitleMirror::PrehashedReadback readback_prehashed;           // under `readback_mutex`: reusable Phase 1 sums
+        std::vector<std::array<std::uint64_t, 4>> readback_exec_skip_masks;   // under `readback_mutex`: Phase 2 per-slice masks
+        std::vector<std::uint8_t> readback_exec_skip_page;                    // under `readback_mutex`: Phase 2 skip flags
         struct AsyncReadback {
             bool active = false;
             std::uint64_t signal_value = 0;
@@ -5642,7 +5648,7 @@ struct DeviceState {
             for (std::uint64_t page = from; page < to; page += kPage) {
                 if (m.mirror->mirrored(page)) continue;
                 auto* const frame = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(page));
-                if (m.readback_in_flight) m.readback_invalidated.insert(frame);
+                note_readback_frame_invalidated_locked(frame);
                 m.tracking->watch(page);  // before the fill: a write after it is in the next collect
                 m.mirror->map(page, frame, nullptr);
                 m.identity.insert(page);
@@ -5856,6 +5862,35 @@ struct DeviceState {
         if (result == VK_ERROR_DEVICE_LOST) context->mark_device_lost();
         return result == VK_SUCCESS;
     }
+    // Records whole-frame invalidation only if `frame` is actually in the currently active readback slice
+    // (`page_mirror.mutex` held). Avoids poisoning `readback_invalidated` with unrelated hot/feed pages.
+    void note_readback_frame_invalidated_locked(std::uint8_t* frame) {
+        auto& m = page_mirror;
+        if (!m.readback_in_flight || !frame || m.readback_slice_frames.empty()) return;
+        if (std::binary_search(m.readback_slice_frames.begin(), m.readback_slice_frames.end(), frame))
+            m.readback_invalidated.insert(frame);
+    }
+    // Records piece-level upload() overwrites for frames in the active readback slice (`page_mirror.mutex` held).
+    // For any piece the CPU just uploaded, CPU wins under TitleMirror's conflict rule so Phase 2 simply skips those
+    // pieces without invalidating the whole page or pushing hot pages into an infinite retry_pages loop.
+    void note_readback_pieces_uploaded_locked(std::uint8_t* frame,
+                                              const std::array<std::uint64_t, 4>& changed_pieces) {
+        auto& m = page_mirror;
+        if (!m.readback_in_flight || !frame || m.readback_slice_frames.empty()) return;
+        const auto it = std::lower_bound(m.readback_slice_frames.begin(), m.readback_slice_frames.end(), frame);
+        if (it == m.readback_slice_frames.end() || *it != frame) return;
+        const std::size_t idx = static_cast<std::size_t>(it - m.readback_slice_frames.begin());
+        for (std::size_t w = 0; w < 4; ++w) m.readback_slice_skip_masks[idx][w] |= changed_pieces[w];
+    }
+    void clear_readback_in_flight_locked() {
+        auto& m = page_mirror;
+        m.readback_in_flight = false;
+        m.readback_active_value.store(0, std::memory_order_release);
+        m.readback_invalidated.clear();
+        m.readback_slice_frames.clear();
+        m.readback_slice_skip_masks.clear();
+    }
+
     // Launches the next valid slice (<= kReadbackPages) from `refs[cursor..]` asynchronously (page_mirror.readback_mutex
     // held, page_mirror.mutex NOT held). Returns true if a copy is now in flight; false if no valid pages remained.
     bool kick_async_readback_locked(std::vector<leonida::TitleMirror::HomeRef>&& refs, std::size_t cursor,
@@ -5868,7 +5903,7 @@ struct DeviceState {
         std::vector<leonida::TitleMirror::HomeRef> slice;
         slice.reserve(kReadbackPages);
         while (cursor < refs.size()) {
-            const std::size_t count = std::min(kReadbackPages, refs.size() - cursor);
+            const std::size_t count = (std::min)(kReadbackPages, refs.size() - cursor);
             const std::size_t next_cursor = cursor + count;
             slice.clear();
             std::uint64_t wait = 0;
@@ -5895,6 +5930,14 @@ struct DeviceState {
                 m.readback_in_flight = true;
                 m.readback_active_value.store(0, std::memory_order_release);
                 m.readback_invalidated.clear();
+                m.readback_slice_frames.clear();
+                m.readback_slice_frames.reserve(slice.size());
+                for (const auto& r : slice) m.readback_slice_frames.push_back(r.frame);
+                std::sort(m.readback_slice_frames.begin(), m.readback_slice_frames.end());
+                m.readback_slice_frames.erase(
+                    std::unique(m.readback_slice_frames.begin(), m.readback_slice_frames.end()),
+                    m.readback_slice_frames.end());
+                m.readback_slice_skip_masks.assign(m.readback_slice_frames.size(), {});
                 submit_lock.lock();
             }
             const bool submitted = submit_homes_copy_locked(slice.data(), slice.size(), wait, done);
@@ -5903,9 +5946,7 @@ struct DeviceState {
             if (!submitted) {
                 std::unique_lock mirror_lock(m.mutex, std::defer_lock);
                 leonida::submit_phases::lock_timed(mirror_lock);
-                m.readback_in_flight = false;
-                m.readback_active_value.store(0, std::memory_order_release);
-                m.readback_invalidated.clear();
+                clear_readback_in_flight_locked();
                 return false;
             }
             m.readback_async.active = true;
@@ -5930,7 +5971,7 @@ struct DeviceState {
             ++m.write_back_calls;
             m.write_back_ms += ms;
             m.write_back_wait_ms += waited_ms;
-            m.write_back_max_ms = std::max(m.write_back_max_ms, ms);
+            m.write_back_max_ms = (std::max)(m.write_back_max_ms, ms);
             m.written_back += batch_written;
         }
         written_out += batch_written;
@@ -5952,9 +5993,7 @@ struct DeviceState {
                 if (!poll_readback_locked(m.readback_async.signal_value, ready)) {
                     std::unique_lock mirror_lock(m.mutex, std::defer_lock);
                     leonida::submit_phases::lock_timed(mirror_lock);
-                    m.readback_in_flight = false;
-                    m.readback_active_value.store(0, std::memory_order_release);
-                    m.readback_invalidated.clear();
+                    clear_readback_in_flight_locked();
                     m.readback_async = {};
                     return true;
                 }
@@ -5968,9 +6007,7 @@ struct DeviceState {
                 if (!ok) {
                     std::unique_lock mirror_lock(m.mutex, std::defer_lock);
                     leonida::submit_phases::lock_timed(mirror_lock);
-                    m.readback_in_flight = false;
-                    m.readback_active_value.store(0, std::memory_order_release);
-                    m.readback_invalidated.clear();
+                    clear_readback_in_flight_locked();
                     m.readback_async = {};
                     return true;
                 }
@@ -5978,32 +6015,68 @@ struct DeviceState {
             const auto work_start = clock::now();
             std::uint64_t slice_written = 0;
             const std::size_t slice_pages = m.readback_async.slice.size();
+            // Phase 1 (lock-free with respect to page_mirror.mutex): compute 256-byte GPU piece hashes across the
+            // host-cached readback buffer in parallel using m.readback_pool (owned solely by readback_mutex).
+            if (slice_pages >= leonida::TitleMirror::kParallelThreshold && !m.readback_pool)
+                m.readback_pool = leonida::TitleMirror::make_worker_pool();
+            leonida::TitleMirror::prehash_readback_slice(m.readback_async.slice.data(), slice_pages,
+                                                         m.readback_async.ranges, m.readback_host, m.readback_prehashed,
+                                                         m.readback_pool.get());
+            // Phase 2 (short page_mirror.mutex hold): O(pieces) uint64 compare + coalesced write-back runs.
             {
                 std::unique_lock mirror_lock(m.mutex, std::defer_lock);
                 leonida::submit_phases::lock_timed(mirror_lock);
-                m.readback_in_flight = false;
-                m.readback_active_value.store(0, std::memory_order_release);
                 if (!m.mirror) {
-                    m.readback_invalidated.clear();
+                    clear_readback_in_flight_locked();
                     m.readback_async = {};
                     return true;
                 }
-                if (m.readback_invalidated.empty()) {
-                    slice_written = m.mirror->write_back_batch(m.readback_async.slice.data(), slice_pages,
-                                                               m.readback_async.ranges, m.readback_host, write);
-                } else {
+                bool any_skip_page = false;
+                bool any_skip_mask = false;
+                if (!m.readback_invalidated.empty()) {
+                    m.readback_exec_skip_page.assign(slice_pages, 0);
                     for (std::size_t i = 0; i < slice_pages; ++i) {
                         const auto& r = m.readback_async.slice[i];
                         if (m.readback_invalidated.count(r.frame)) {
+                            m.readback_exec_skip_page[i] = 1;
+                            any_skip_page = true;
                             if (!m.mirror->has_pending(r.page) && m.mirror->frame_at(r.page) == r.frame)
                                 retry_pages.push_back(r.page);
-                            continue;
                         }
-                        slice_written +=
-                            m.mirror->write_back_batch(&r, 1, m.readback_async.ranges, m.readback_host + i * kPage, write);
                     }
-                    m.readback_invalidated.clear();
                 }
+                if (!m.readback_slice_frames.empty()) {
+                    bool any_nonzero_mask = false;
+                    for (const auto& mask : m.readback_slice_skip_masks) {
+                        if (mask[0] | mask[1] | mask[2] | mask[3]) {
+                            any_nonzero_mask = true;
+                            break;
+                        }
+                    }
+                    if (any_nonzero_mask) {
+                        m.readback_exec_skip_masks.assign(slice_pages, {});
+                        for (std::size_t i = 0; i < slice_pages; ++i) {
+                            if (any_skip_page && m.readback_exec_skip_page[i]) continue;
+                            const auto it = std::lower_bound(m.readback_slice_frames.begin(),
+                                                             m.readback_slice_frames.end(),
+                                                             m.readback_async.slice[i].frame);
+                            if (it != m.readback_slice_frames.end() && *it == m.readback_async.slice[i].frame) {
+                                const std::size_t idx =
+                                    static_cast<std::size_t>(it - m.readback_slice_frames.begin());
+                                const auto& mask = m.readback_slice_skip_masks[idx];
+                                if (mask[0] | mask[1] | mask[2] | mask[3]) {
+                                    m.readback_exec_skip_masks[i] = mask;
+                                    any_skip_mask = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                clear_readback_in_flight_locked();
+                slice_written = m.mirror->write_back_prehashed(
+                    m.readback_async.slice.data(), slice_pages, m.readback_prehashed, m.readback_host,
+                    any_skip_mask ? m.readback_exec_skip_masks.data() : nullptr,
+                    any_skip_page ? m.readback_exec_skip_page.data() : nullptr, write);
             }
             const double slice_cpu_ms =
                 std::chrono::duration<double, std::milli>(clock::now() - work_start).count();
@@ -6140,10 +6213,12 @@ struct DeviceState {
         page_mirror.readback_async = {};
         page_mirror.readback_queued_ranges.clear();
         page_mirror.readback_async_pending.store(false, std::memory_order_release);
+        page_mirror.readback_pool.reset();
+        page_mirror.readback_prehashed = {};
+        page_mirror.readback_exec_skip_masks.clear();
+        page_mirror.readback_exec_skip_page.clear();
         std::lock_guard lock(page_mirror.mutex);
-        page_mirror.readback_in_flight = false;
-        page_mirror.readback_active_value.store(0, std::memory_order_release);
-        page_mirror.readback_invalidated.clear();
+        clear_readback_in_flight_locked();
         {
             std::unique_lock rc_lock(page_mirror.resolve_cache.mutex);
             page_mirror.resolve_cache.chunks.clear();
@@ -6204,17 +6279,25 @@ struct DeviceState {
         m.feed_pending.store(false, std::memory_order_release);
         ReleaseSRWLockExclusive(&m.feed_lock);
         m.fed_now.clear();
-        for (auto& change : m.taken) {
-            ++m.fed;
-            m.fed_now.insert(change.page);
-            if (m.readback_in_flight) {
-                if (std::uint8_t* old_frame = m.mirror->frame_at(change.page)) m.readback_invalidated.insert(old_frame);
-                if (change.frame) m.readback_invalidated.insert(change.frame);
+        if (!m.taken.empty()) {
+            m.fed_now.reserve(m.taken.size());
+            for (auto& change : m.taken) {
+                ++m.fed;
+                m.fed_now.push_back(change.page);
+                if (m.readback_in_flight) {
+                    note_readback_frame_invalidated_locked(m.mirror->frame_at(change.page));
+                    note_readback_frame_invalidated_locked(change.frame);
+                }
+                // Watched before the home is filled: a write after the fill is in the next collect.
+                if (!change.frame) m.tracking->unwatch(change.page);
+                else if (m.mirror->covers(change.page)) m.tracking->watch(change.page);
+                // Defer non-aliased new-home fills so upload() executes them in parallel across WorkerPool after
+                // collect() has armed the pages.
+                m.mirror->map(change.page, change.frame, std::move(change.keep), leonida::TitleMirror::kUnstamped,
+                              true);
             }
-            // Watched before the home is filled: a write after the fill is in the next collect.
-            if (!change.frame) m.tracking->unwatch(change.page);
-            else if (m.mirror->covers(change.page)) m.tracking->watch(change.page);
-            m.mirror->map(change.page, change.frame, std::move(change.keep));
+            std::sort(m.fed_now.begin(), m.fed_now.end());
+            m.fed_now.erase(std::unique(m.fed_now.begin(), m.fed_now.end()), m.fed_now.end());
         }
         m.taken.clear();
         // Ordinary memory released or decommitted: its mirrored pages leave (named again, they are mirrored again).
@@ -6225,8 +6308,7 @@ struct DeviceState {
             constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
             for (auto page = m.identity.lower_bound((from + kPage - 1) & ~(kPage - 1));
                  page != m.identity.end() && *page + kPage <= to;) {
-                if (m.readback_in_flight)
-                    if (std::uint8_t* old_frame = m.mirror->frame_at(*page)) m.readback_invalidated.insert(old_frame);
+                if (m.readback_in_flight) note_readback_frame_invalidated_locked(m.mirror->frame_at(*page));
                 m.tracking->unwatch(*page);
                 m.mirror->map(*page, nullptr, nullptr);
                 ++m.identity_released;
@@ -6247,18 +6329,24 @@ struct DeviceState {
             m.resolve_cache.ensured = m.ensured;
         }
         m.tracking->collect(m.written);  // re-watched before the copies below
+        const bool have_fed = !m.fed_now.empty();
         for (const std::uint64_t page : m.written)
-            if (!m.fed_now.count(std::uintptr_t(page)) && m.mirror->dirty(page)) {
+            if ((!have_fed || !std::binary_search(m.fed_now.begin(), m.fed_now.end(), std::uintptr_t(page))) &&
+                m.mirror->dirty(page)) {
                 ++m.dirty;
-                if (m.readback_in_flight)
-                    if (std::uint8_t* dirty_frame = m.mirror->frame_at(page)) m.readback_invalidated.insert(dirty_frame);
             }
         m.arm_failures += m.tracking->take_refused();
         // The changes noted since (a buffer released, a texture come): the slots of heaps read in place they touch are
         // filtered again into their homes now, before the pages written since are.
         for (ConsoleHeap* heap : m.in_place) apply_in_place_changes(*heap);
         m.in_place_pending.store(false, std::memory_order_release);
-        m.uploads += m.mirror->upload();
+        if (m.readback_in_flight && !m.readback_slice_frames.empty()) {
+            m.uploads += m.mirror->upload([&](std::uint8_t* frame, const std::array<std::uint64_t, 4>& changed_pieces) {
+                note_readback_pieces_uploaded_locked(frame, changed_pieces);
+            });
+        } else {
+            m.uploads += m.mirror->upload();
+        }
         if (m.mirror->last_upload_bytes() != 0 || !m.fed_now.empty())
             leonida::submit_phases::note_change(leonida::submit_phases::change_pages);
         if (m.mirror->has_retired_homes() && !m.readback_in_flight) m.mirror->retire(context->completed_retire_ticket());
