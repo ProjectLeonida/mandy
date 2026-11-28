@@ -255,6 +255,7 @@ python -I scripts/run_gpu_tests.py --build runtime/build/linux     # Windows: th
 ```
 
 `--filter <text>` runs only matching tests, and `--work <dir>` keeps the intermediate files.
+Give each simultaneous run a separate `--work` directory, including runs from older checkouts.
 Add `--require-pass` when verifying a specific path: an all-skipped run exits 1 instead of 0.
 Skips still appear as `SKIP`, and individual skips are allowed if at least one test passes and none fail.
 
