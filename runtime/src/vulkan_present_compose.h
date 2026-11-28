@@ -9,10 +9,13 @@
 #include "vulkan_backend.h"
 #include "present_compose_spv.h"
 #include "vulkan_aftermath.h"
+#include "vulkan_memory.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace leonida {
 
@@ -40,13 +43,8 @@ public:
         : context_(context), memory_(memory) {}
 
     ~PresentComposer() {
-        const VkDevice device = context_.device();
-        auto& vk = context_.vk;
         release_target();
-        if (pipeline_) vk.vkDestroyPipeline(device, pipeline_, nullptr);
-        if (pipeline_layout_) vk.vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
-        if (pool_) vk.vkDestroyDescriptorPool(device, pool_, nullptr);  // frees its sets
-        if (set_layout_) vk.vkDestroyDescriptorSetLayout(device, set_layout_, nullptr);
+        release_pipeline();
     }
     PresentComposer(const PresentComposer&) = delete;
     PresentComposer& operator=(const PresentComposer&) = delete;
@@ -57,12 +55,19 @@ public:
         state_ = State::failed;
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
-        if (!vk.vkCreateDescriptorSetLayout || !vk.vkCreateDescriptorPool || !vk.vkAllocateDescriptorSets ||
-            !vk.vkUpdateDescriptorSets || !vk.vkCreatePipelineLayout || !vk.vkCreateShaderModule ||
-            !vk.vkCreateComputePipelines || !vk.vkCmdBindPipeline || !vk.vkCmdBindDescriptorSets ||
-            !vk.vkCmdPushConstants || !vk.vkCmdDispatch || !vk.vkCreateImage || !vk.vkCreateImageView ||
-            !vk.vkAllocateMemory)
+        if (!vk.vkCreateDescriptorSetLayout || !vk.vkDestroyDescriptorSetLayout || !vk.vkCreateDescriptorPool ||
+            !vk.vkDestroyDescriptorPool || !vk.vkAllocateDescriptorSets || !vk.vkUpdateDescriptorSets ||
+            !vk.vkCreatePipelineLayout || !vk.vkDestroyPipelineLayout || !vk.vkCreateShaderModule ||
+            !vk.vkDestroyShaderModule || !vk.vkCreateComputePipelines || !vk.vkDestroyPipeline ||
+            !vk.vkCmdBindPipeline || !vk.vkCmdBindDescriptorSets || !vk.vkCmdPushConstants || !vk.vkCmdDispatch ||
+            !vk.vkCmdPipelineBarrier || !vk.vkCreateImage || !vk.vkDestroyImage ||
+            !vk.vkGetImageMemoryRequirements || !vk.vkAllocateMemory || !vk.vkFreeMemory || !vk.vkBindImageMemory ||
+            !vk.vkCreateImageView || !vk.vkDestroyImageView)
             return false;
+        const auto fail = [&] {
+            release_pipeline();
+            return false;
+        };
         std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
         for (std::uint32_t i = 0; i < 3; ++i) {
             bindings[i].binding = i;
@@ -73,34 +78,46 @@ public:
         VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         set_info.bindingCount = std::uint32_t(bindings.size());
         set_info.pBindings = bindings.data();
-        if (vk.vkCreateDescriptorSetLayout(device, &set_info, nullptr, &set_layout_) != VK_SUCCESS) return false;
+        if (vk.vkCreateDescriptorSetLayout(device, &set_info, nullptr, &set_layout_) != VK_SUCCESS) {
+            set_layout_ = VK_NULL_HANDLE;
+            return fail();
+        }
         const std::array<VkDescriptorPoolSize, 2> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2 * frame_slots},
                                                           {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, frame_slots}}};
         VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pool_info.maxSets = frame_slots;
         pool_info.poolSizeCount = std::uint32_t(sizes.size());
         pool_info.pPoolSizes = sizes.data();
-        if (vk.vkCreateDescriptorPool(device, &pool_info, nullptr, &pool_) != VK_SUCCESS) return false;
+        if (vk.vkCreateDescriptorPool(device, &pool_info, nullptr, &pool_) != VK_SUCCESS) {
+            pool_ = VK_NULL_HANDLE;
+            return fail();
+        }
         std::array<VkDescriptorSetLayout, frame_slots> layouts;
         layouts.fill(set_layout_);
         VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         allocate.descriptorPool = pool_;
         allocate.descriptorSetCount = frame_slots;
         allocate.pSetLayouts = layouts.data();
-        if (vk.vkAllocateDescriptorSets(device, &allocate, sets_.data()) != VK_SUCCESS) return false;
+        if (vk.vkAllocateDescriptorSets(device, &allocate, sets_.data()) != VK_SUCCESS) {
+            sets_.fill(VK_NULL_HANDLE);
+            return fail();
+        }
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PresentComposePush)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.setLayoutCount = 1;
         layout_info.pSetLayouts = &set_layout_;
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
-        if (vk.vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout_) != VK_SUCCESS) return false;
+        if (vk.vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout_) != VK_SUCCESS) {
+            pipeline_layout_ = VK_NULL_HANDLE;
+            return fail();
+        }
         VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         module_info.codeSize = sizeof(present_compose_spirv);
         module_info.pCode = present_compose_spirv;
         VkShaderModule module = VK_NULL_HANDLE;
         const aftermath::ShaderName aftermath_name("(runtime) present_compose");
-        if (vk.vkCreateShaderModule(device, &module_info, nullptr, &module) != VK_SUCCESS) return false;
+        if (vk.vkCreateShaderModule(device, &module_info, nullptr, &module) != VK_SUCCESS) return fail();
         VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
                                VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
@@ -108,7 +125,10 @@ public:
         const VkResult created =
             vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline_);
         vk.vkDestroyShaderModule(device, module, nullptr);
-        if (created != VK_SUCCESS) return false;
+        if (created != VK_SUCCESS) {
+            pipeline_ = VK_NULL_HANDLE;
+            return fail();
+        }
         state_ = State::ready;
         return true;
     }
@@ -118,6 +138,7 @@ public:
     // may still be in use.
     bool ensure_target(VkExtent2D extent, bool& changed) {
         changed = false;
+        if (!ready() || !extent.width || !extent.height) return false;
         if (image_ && extent_.width == extent.width && extent_.height == extent.height) return true;
         changed = true;
         release_target();
@@ -134,21 +155,42 @@ public:
         info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (vk.vkCreateImage(device, &info, nullptr, &image_) != VK_SUCCESS) return false;
+        if (vk.vkCreateImage(device, &info, nullptr, &image_) != VK_SUCCESS) {
+            image_ = VK_NULL_HANDLE;
+            return false;
+        }
         VkMemoryRequirements requirements{};
         vk.vkGetImageMemoryRequirements(device, image_, &requirements);
-        std::uint32_t type = UINT32_MAX;
-        for (std::uint32_t i = 0; i < memory_.memoryTypeCount; ++i)
-            if ((requirements.memoryTypeBits & (1u << i)) &&
-                (memory_.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-                type = i;
-                break;
+        std::vector<std::uint32_t> order;
+        if (memory_.memoryHeapCount) {
+            order = memory_type_order(memory_, requirements.memoryTypeBits, 0,
+                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, requirements.size);
+        } else {
+            for (const VkMemoryPropertyFlags flags :
+                 {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT), VkMemoryPropertyFlags(0)}) {
+                for (std::uint32_t i = 0; i < memory_.memoryTypeCount && i < VK_MAX_MEMORY_TYPES; ++i) {
+                    if (!(requirements.memoryTypeBits & (1u << i)) ||
+                        (memory_.memoryTypes[i].propertyFlags & flags) != flags)
+                        continue;
+                    if (std::find(order.begin(), order.end(), i) == order.end()) order.push_back(i);
+                }
             }
+        }
+        if (!resizable_bar(memory_)) {
+            // Keep the compose target (up to 64 MiB at 4K) off the small 256 MiB BAR window when pure VRAM is available.
+            std::stable_partition(order.begin(), order.end(), [&](std::uint32_t t) {
+                const auto f = memory_.memoryTypes[t].propertyFlags;
+                return (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+            });
+        }
         VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocate.allocationSize = requirements.size;
-        allocate.memoryTypeIndex = type;
-        if (type == UINT32_MAX || vk.vkAllocateMemory(device, &allocate, nullptr, &memory_object_) != VK_SUCCESS ||
-            vk.vkBindImageMemory(device, image_, memory_object_, 0) != VK_SUCCESS) {
+        for (const std::uint32_t type : order) {
+            allocate.memoryTypeIndex = type;
+            if (vk.vkAllocateMemory(device, &allocate, nullptr, &memory_object_) == VK_SUCCESS) break;
+            memory_object_ = VK_NULL_HANDLE;
+        }
+        if (!memory_object_ || vk.vkBindImageMemory(device, image_, memory_object_, 0) != VK_SUCCESS) {
             release_target();
             return false;
         }
@@ -158,6 +200,7 @@ public:
         view_info.format = target_format;
         view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         if (vk.vkCreateImageView(device, &view_info, nullptr, &view_) != VK_SUCCESS) {
+            view_ = VK_NULL_HANDLE;
             release_target();
             return false;
         }
@@ -235,13 +278,27 @@ private:
     void release_target() {
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
-        if (view_) vk.vkDestroyImageView(device, view_, nullptr);
-        if (image_) vk.vkDestroyImage(device, image_, nullptr);
-        if (memory_object_) vk.vkFreeMemory(device, memory_object_, nullptr);
+        if (view_ && vk.vkDestroyImageView) vk.vkDestroyImageView(device, view_, nullptr);
+        if (image_ && vk.vkDestroyImage) vk.vkDestroyImage(device, image_, nullptr);
+        if (memory_object_ && vk.vkFreeMemory) vk.vkFreeMemory(device, memory_object_, nullptr);
         view_ = VK_NULL_HANDLE;
         image_ = VK_NULL_HANDLE;
         memory_object_ = VK_NULL_HANDLE;
         extent_ = {};
+    }
+
+    void release_pipeline() {
+        auto& vk = context_.vk;
+        const VkDevice device = context_.device();
+        if (pipeline_ && vk.vkDestroyPipeline) vk.vkDestroyPipeline(device, pipeline_, nullptr);
+        if (pipeline_layout_ && vk.vkDestroyPipelineLayout) vk.vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
+        if (pool_ && vk.vkDestroyDescriptorPool) vk.vkDestroyDescriptorPool(device, pool_, nullptr);
+        if (set_layout_ && vk.vkDestroyDescriptorSetLayout) vk.vkDestroyDescriptorSetLayout(device, set_layout_, nullptr);
+        pipeline_ = VK_NULL_HANDLE;
+        pipeline_layout_ = VK_NULL_HANDLE;
+        pool_ = VK_NULL_HANDLE;
+        set_layout_ = VK_NULL_HANDLE;
+        sets_.fill(VK_NULL_HANDLE);
     }
 
     VulkanContext& context_;
