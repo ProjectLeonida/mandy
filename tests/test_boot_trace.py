@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -194,6 +195,37 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(trace["events"], len(STARTUP))
         self.assertEqual(trace["bad_lines"], 1)
         self.assertEqual(trace["bad_line_numbers"], [len(STARTUP) + 1])
+
+    def test_json_decoder_limits_do_not_hide_later_events(self):
+        digit_limit = sys.int_info.str_digits_check_threshold
+        self.addCleanup(sys.set_int_max_str_digits, sys.get_int_max_str_digits())
+        sys.set_int_max_str_digits(digit_limit)
+        nested_record = '{"kind":"fixture","value":[[0]]}'
+        decode = json.loads
+
+        def decode_row(line):
+            # The nesting depth that triggers an error varies across Python builds.
+            if line == nested_record:
+                raise RecursionError("synthetic decoder nesting limit")
+            return decode(line)
+
+        records = (
+            ("integer digits", '{"kind":"fixture","value":' + "1" * (digit_limit + 1) + '}'),
+            ("nesting", nested_record),
+        )
+        for decoder_limit, record in records:
+            with self.subTest(decoder_limit=decoder_limit):
+                self.write_lines(self.startup, [
+                    '{"kind":"trace_open","pid":7}',
+                    record,
+                    '{"kind":"exit","code":0}',
+                ])
+                with mock.patch.object(bt.json, "loads", side_effect=decode_row):
+                    trace = bt.parse_startup(self.startup)
+                self.assertEqual(trace["events"], 2)
+                self.assertEqual(trace["bad_lines"], 1)
+                self.assertEqual(trace["bad_line_numbers"], [2])
+                self.assertEqual(trace["exit"], 0)
 
     def test_crlf_and_non_object_lines_are_counted(self):
         self.write(
@@ -678,6 +710,37 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(text.count("    ? attributes ? requested ? pages from ?\n"), 2)
         self.assertIn("    XMemAllocatePhysicalPages attributes 0x10 requested ? pages from fixture.dll+0x50\n", text)
         self.assertIn(f"    XMemAllocatePhysicalPages attributes 0x20 requested 4 pages from {nbsp_caller}\n", text)
+
+    def test_pipeline_timing_counts_overlapping_compiles_and_waits(self):
+        self.write_lines(self.d3d12, [
+            D3D12[1],
+            "fixture.exe : [rt] pipeline-compile-begin trigger=draw tid=7 bytes=512 "
+            "variant=0 begin_ms=100 key=synthetic-key shaders=private_vs,private_ps",
+            "[rt] pipeline-compile-begin trigger=draw tid=8 bytes=512 "
+            "variant=0 begin_ms=101 key=synthetic-key shaders=private_vs,private_ps",
+            "[rt] pipeline-compile trigger=draw tid=8 start_us=1500 us=800 hit=1 bytes=512 "
+            "variant=0 result=0 end_ms=102 key=synthetic-key shaders=private_vs,private_ps",
+            "[rt] pipeline-compile trigger=dispatch tid=9 start_us=1600 us=5000 hit=-1 bytes=512 "
+            "variant=0 result=-4 end_ms=106 key=other-key shaders=private_cs",
+            "[rt] pipeline-use trigger=draw tid=10 us=6000 ready=0 end_ms=107",
+            "[rt] pipeline-use trigger=draw tid=11 us=1000 ready=1 end_ms=107",
+        ])
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertEqual(trace["ignored_lines"], 0)
+        self.assertEqual(trace["pipeline_timing"], {
+            "started": 2, "completed": 2, "completions_without_start": 1, "non_success_results": 1,
+            "cache_hits": 1, "max_compile_us": 5000, "logged_waits": 2, "waits_not_ready": 1,
+            "max_wait_us": 6000, "starts_without_completion": 1,
+        })
+        summary = bt.summarize(None, trace)
+        text = bt.format_text(summary, 10)
+        safe_json = json.dumps(bt.counts_only(summary))
+        self.assertIn("1 without a recorded completion", text)
+        self.assertIn("longest 6000 us", text)
+        self.assertEqual(bt.counts_only(summary)["d3d12"]["pipeline_timing"], trace["pipeline_timing"])
+        for raw in ("private_", "synthetic-key", "other-key"):
+            self.assertNotIn(raw, text)
+            self.assertNotIn(raw, safe_json)
 
     def test_frame_pacing_summary_parsed_formatted_and_kept_in_counts_only(self):
         self.write_lines(self.d3d12, [
