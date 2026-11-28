@@ -34,6 +34,7 @@
 #include "../src/command_list_epochs.h"
 #include "../src/value_write_sink.h"
 #include "../src/address_guard.h"
+#include "../src/address_guard_buffer.h"
 #include "../src/arena_blocks.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
@@ -6564,10 +6565,8 @@ struct DeviceState {
         if (!context || !arena.mapped || arena.size < ag::kGuardEnd) return false;
         auto& vk = context->vk;
         guard.table = std::make_unique<ag::AddressGuardTable>();
-        VkBufferCreateInfo create{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        create.size = guard.table->bytes();
-        create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-        create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        // Read by guarded shaders on every queue: shared by the device's queue families.
+        const VkBufferCreateInfo create = ag::table_buffer_info(guard.table->bytes(), families);
         if (vk.vkCreateBuffer(info.device, &create, nullptr, &guard.buffer) != VK_SUCCESS) {
             guard.buffer = VK_NULL_HANDLE;
             return false;

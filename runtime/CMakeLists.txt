@@ -2427,6 +2427,16 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vulkan_scratch COMMAND vulkan_scratch_test)
   endif()
+  # CPU-only: the address guard's page-table buffer is shared by the device's queue families
+  # (runtime/src/address_guard_buffer.h).
+  add_executable(address_guard_buffer_test test/address_guard_buffer_test.cpp)
+  target_link_libraries(address_guard_buffer_test PRIVATE Vulkan::Headers)
+  if(MSVC)
+    target_compile_options(address_guard_buffer_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME address_guard_buffer COMMAND address_guard_buffer_test)
+  endif()
   if(WIN32)
     # CPU-only: a completed GPU label is stored into a page the D3D12 layer watches (read-only until written) and
     # dropped for a page that is read-only by the title's own doing (runtime/src/vulkan_gpu_labels.h).
