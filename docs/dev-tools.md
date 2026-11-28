@@ -59,6 +59,39 @@ recorded events, and the exit status reports the analysis result.
 
 You can also run `python -I tools/boot_trace.py` with the same arguments.
 
+## Check the shader chain of a work folder
+
+`tools/chain_check.py` prints one page of counts for each link between the game files and the GPU. It reads the
+work folder that `make_game.py` built and, if you pass one, the log of one run:
+
+```powershell
+python -I tools/chain_check.py <work>
+python -I tools/chain_check.py <work> --log <OutDir>\<Name>.log --json
+```
+
+The page has one block per link, and each block gets a verdict (OK, WARN or FAIL) and its most likely cause:
+
+- tools: the llvm-mc each family was disassembled with and its AMDGPU target, spirv-val, and whether the
+  translator sources recorded in the folder still match this checkout's;
+- one block per family (game programs, pipeline library, FSPX, BVH, executable): programs unpacked, listings,
+  listings with rejected words, programs translated, and up to 5 refusal reasons from `logs/shaders.log`;
+- contract: tagged and plain modules, and the runtime folders that are present or absent (`fspx_compute` and the
+  others);
+- runtime, from `--log` (`scripts/windows-boot/boot.ps1`'s `<Name>.log`): modules loaded, failed device slot calls,
+  failed D3D12 calls, compute pipeline builds, waits at the compile gate, device faults and the exit code.
+
+The last line names the weakest link: the first block, in chain order, with the worst verdict.
+
+A family is FAIL when more than 1% of its programs have no module. An llvm-mc older than 23 is a WARN (#1923). The
+`--help` text lists every threshold. The report prints counts and fixed words only: no program names, no log lines
+and no paths. A refusal reason is printed only when it matches a message from `tools/rdna2spirv.py`; any other
+reason is counted as `other`. A D3D12 method name is printed only when the runtime's sources contain it, and the
+end of a boot digest only in the forms boot.ps1 writes. Add `--show-paths` to name the folder and the log, but not
+in a report you publish.
+
+The exit code is `0` whatever the verdicts. With `--strict` it is `1` when a block is FAIL, and bad arguments exit
+`2`. Probing asks llvm-mc, spirv-val and git for their versions; `--no-probe` runs nothing.
+
 ## Run a synthetic guest scene
 
 Use the existing headless runner with a loader and guest built on Windows
