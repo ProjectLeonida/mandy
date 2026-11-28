@@ -9,6 +9,7 @@
 #include "vulkan_backend.h"
 #include "present_compose_spv.h"
 #include "vulkan_aftermath.h"
+#include "vulkan_memory.h"
 
 #include <array>
 #include <cstdint>
@@ -118,6 +119,7 @@ public:
     // may still be in use.
     bool ensure_target(VkExtent2D extent, bool& changed) {
         changed = false;
+        if (!extent.width || !extent.height) return false;  // VUID-VkImageCreateInfo-extent-00944/00945
         if (image_ && extent_.width == extent.width && extent_.height == extent.height) return true;
         changed = true;
         release_target();
@@ -137,18 +139,14 @@ public:
         if (vk.vkCreateImage(device, &info, nullptr, &image_) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vk.vkGetImageMemoryRequirements(device, image_, &requirements);
-        std::uint32_t type = UINT32_MAX;
-        for (std::uint32_t i = 0; i < memory_.memoryTypeCount; ++i)
-            if ((requirements.memoryTypeBits & (1u << i)) &&
-                (memory_.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-                type = i;
-                break;
-            }
+        // DEVICE_LOCAL first, then any type the image takes (a full VRAM heap leaves system memory, slower but
+        // shown); only types whose heap holds it, and the next one when the driver refuses (vulkan_memory.h).
+        const auto order = memory_type_order(memory_, requirements.memoryTypeBits, 0,
+                                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, requirements.size);
         VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocate.allocationSize = requirements.size;
-        allocate.memoryTypeIndex = type;
-        if (type == UINT32_MAX || vk.vkAllocateMemory(device, &allocate, nullptr, &memory_object_) != VK_SUCCESS ||
-            vk.vkBindImageMemory(device, image_, memory_object_, 0) != VK_SUCCESS) {
+        memory_object_ = allocate_first_fitting(vk.vkAllocateMemory, device, allocate, order);
+        if (!memory_object_ || vk.vkBindImageMemory(device, image_, memory_object_, 0) != VK_SUCCESS) {
             release_target();
             return false;
         }
