@@ -401,6 +401,15 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Of a copy with two sides over memory of ours ([`by_address_opened`]):
+    /// the memory itself is the CPU's side, opened as this heap, and
+    /// `Card::staging` is a buffer placed over all of it. Nothing is copied
+    /// into that side and nothing compares it with the memory: whoever
+    /// writes the memory says which bytes changed ([`Shadow::resend`]). It
+    /// may write while a submission takes bytes out of the side to send
+    /// them; what it changed is resent after it wrote, so the next send has
+    /// it.
+    opened: Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -3859,6 +3868,7 @@ impl Shadow {
             wc: AtomicU8::new(0),
             mapped: false,
             place: None,
+            opened: None,
         }
     }
 
@@ -4603,8 +4613,9 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
-        // In place: the card reads title memory itself.
-        if self.place.is_some() {
+        // In place: the card reads title memory itself. Opened: the CPU's
+        // side is the memory, and its writer said what goes up.
+        if self.place.is_some() || self.opened.is_some() {
             return 0;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -4646,7 +4657,7 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
-        if self.place.is_some() {
+        if self.place.is_some() || self.opened.is_some() {
             return true;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -5048,6 +5059,17 @@ impl Shadow {
     /// Offsets `[from, to)` go up again whole, as the CPU's side has them.
     pub(crate) fn resend(&self, from: usize, to: usize) {
         self.card_changed(from, to);
+    }
+
+    /// [`Shadow::resend`] of each of `runs` (offsets `[from, to)`).
+    pub(crate) fn resend_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
+        self.card_changed_runs(runs);
+    }
+
+    /// Whether the CPU's side is the memory itself ([`by_address_opened`]):
+    /// then only what its writer resends goes up.
+    pub(crate) fn side_is_memory(&self) -> bool {
+        self.opened.is_some()
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
@@ -6296,6 +6318,23 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
 /// the only place that has it. The CPU's side holds the bytes as they were
 /// last taken, and only dwords that changed since go up.
 pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    by_address_with(start, len, false)
+}
+
+/// [`by_address`] of memory of ours that one writer changes, and that writer
+/// resends what it changed ([`Shadow::resend`]): an arena of
+/// [`crate::memory`]'s, which takes only the dwords title memory changed.
+/// The memory is opened as a heap of the host's and is itself the CPU's
+/// side, so its bytes are in the PC's memory once. That side was a buffer
+/// of the same size with the same bytes, which every refresh compared with
+/// the arena: 64 MiB more commit per arena, and with the structure builder
+/// (`LEONIDA_BVH_BUILDER=1`) up to 48 arenas. If the host does not open the
+/// memory, the copy is made as [`by_address`] makes it.
+pub(crate) fn by_address_opened(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    by_address_with(start, len, true)
+}
+
+fn by_address_with(start: u64, len: u64, open: bool) -> Option<Arc<Shadow>> {
     let host = host()?;
     if !cards() || !host.card_ready() {
         return None;
@@ -6310,7 +6349,13 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
-    let (staging, data) = host.shared_buffer(len)?;
+    let (staging, data, opened) = match open.then(|| opened_side(host, start, len)).flatten() {
+        Some(placed) => (placed.buffer, start as *mut u8, Some(placed.heap)),
+        None => {
+            let (staging, data) = host.shared_buffer(len)?;
+            (staging, data, None)
+        }
+    };
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
         host.uav_buffer(len)
     } else {
@@ -6339,10 +6384,44 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         has_sent: Default::default(),
         size: len,
     });
+    if opened.is_some() {
+        // Nothing asks the write watch about it (`Shadow::asked_ahead`): its
+        // writer tells.
+        *shadow.watched.get_mut() = NOT_WATCHED;
+        shadow.opened = opened;
+    }
     let shadow = Arc::new(shadow);
     note_carded(&shadow);
     elide::made(&shadow);
+    if shadow.opened.is_some() {
+        // All of it goes up once, as a new copy's first refresh sends it.
+        // (Once it is noted: the queue of changed copies names it by its
+        // place.)
+        shadow.resend(0, len as usize);
+    }
     Some(shadow)
+}
+
+/// For [`by_address_opened`]: `[start, start + len)` opened as a heap, with
+/// a buffer placed over it from its first byte, so that the buffer's offsets
+/// are the copy's (the card's side is filled from it at the same offsets).
+fn opened_side(host: &crate::host::Host, start: u64, len: u64) -> Option<crate::inplace::Placed> {
+    match crate::inplace::place_part(&host.device, start, len) {
+        Ok(placed) if placed.bias == 0 => Some(placed),
+        Ok(_) => None,
+        Err(e) => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    start = format_args!("{start:#x}"),
+                    len,
+                    error = ?e,
+                    "memory by address not opened as its copy's CPU side: that side is a buffer of its own, as before"
+                );
+            });
+            None
+        }
+    }
 }
 
 /// Copies of title memory outside buffers, by (start, length).
