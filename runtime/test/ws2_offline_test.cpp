@@ -541,6 +541,101 @@ int main() {
         closesocket(receiver);
     }
 
+    // 9. kevincommits' finding (#1608, batch 18, item 3). An empty name, and a null one for gethostbyname, is the
+    //    local computer: the host would answer with its real (LAN) addresses, so it is refused. A null getaddrinfo
+    //    node (a service-only lookup) is still answered. "localhost" is answered with loopback addresses only, as
+    //    the shim hands the host a loopback literal for it. An overlapped extension-pointer lookup is completed
+    //    synchronously: its event is set, its routine runs, and nothing writes into the shim's frame afterwards.
+    {
+        using AsyncByNameFn = HANDLE(WSAAPI*)(HWND, u_int, const char*, char*, int);
+        const auto sh_async_by_name = resolve<AsyncByNameFn>("WSAAsyncGetHostByName");
+        WSASetLastError(0);
+        check(sh_gethostbyname(nullptr) == nullptr && WSAGetLastError() == WSAHOST_NOT_FOUND,
+              "gethostbyname(NULL) is refused (the local computer's addresses)");
+        WSASetLastError(0);
+        check(sh_gethostbyname("") == nullptr && WSAGetLastError() == WSAHOST_NOT_FOUND,
+              "gethostbyname(\"\") is refused (the local computer's addresses)");
+        char async_buf[MAXGETHOSTSTRUCT] = {};
+        check(sh_async_by_name && sh_async_by_name(nullptr, 0, nullptr, async_buf, sizeof(async_buf)) == nullptr &&
+                  sh_async_by_name(nullptr, 0, "", async_buf, sizeof(async_buf)) == nullptr,
+              "WSAAsyncGetHostByName refuses a null or empty name");
+        ADDRINFOA* res = nullptr;
+        check(sh_getaddrinfo("", "80", nullptr, &res) == WSAHOST_NOT_FOUND && res == nullptr,
+              "getaddrinfo(\"\") is refused (the local computer's addresses)");
+        ADDRINFOW* res_w = nullptr;
+        check(sh_getaddrinfo_w(L"", L"80", nullptr, &res_w) == WSAHOST_NOT_FOUND && res_w == nullptr,
+              "GetAddrInfoW(L\"\") is refused");
+        ADDRINFOA hints{};
+        hints.ai_family = AF_INET;
+        check(sh_getaddrinfo(nullptr, "80", &hints, &res) == 0 && res != nullptr,
+              "getaddrinfo(NULL, service) is still answered");
+        if (res) freeaddrinfo(res);
+
+        // Every answer for localhost is loopback: IPv4 for AF_INET (and gethostbyname), IPv6 for AF_INET6.
+        const auto all_loopback = [](const ADDRINFOA* list, int family) {
+            if (!list) return false;
+            for (const ADDRINFOA* a = list; a; a = a->ai_next) {
+                if (a->ai_family != family) return false;
+                if (family == AF_INET &&
+                    reinterpret_cast<const uint8_t*>(&reinterpret_cast<const sockaddr_in*>(a->ai_addr)->sin_addr)[0] != 127)
+                    return false;
+                if (family == AF_INET6 && !IN6_IS_ADDR_LOOPBACK(&reinterpret_cast<const sockaddr_in6*>(a->ai_addr)->sin6_addr))
+                    return false;
+            }
+            return true;
+        };
+        res = nullptr;
+        check(sh_getaddrinfo("localhost", "80", &hints, &res) == 0 && all_loopback(res, AF_INET),
+              "getaddrinfo(localhost, AF_INET) answers 127.0.0.1 only");
+        if (res) freeaddrinfo(res);
+        res = nullptr;
+        hints.ai_family = AF_INET6;
+        check(sh_getaddrinfo("localhost.", "80", &hints, &res) == 0 && all_loopback(res, AF_INET6),
+              "getaddrinfo(localhost., AF_INET6) answers ::1 only");
+        if (res) freeaddrinfo(res);
+        const hostent* host = sh_gethostbyname("LOCALHOST");
+        bool host_loopback = host && host->h_addrtype == AF_INET && host->h_addr_list && host->h_addr_list[0];
+        for (int i = 0; host_loopback && host->h_addr_list[i]; ++i)
+            host_loopback = static_cast<uint8_t>(host->h_addr_list[i][0]) == 127;
+        check(host_loopback, "gethostbyname(LOCALHOST) answers loopback only");
+
+        // An overlapped SIO_GET_EXTENSION_FUNCTION_POINTER: answered at once, reported through the OVERLAPPED.
+        const SOCKET tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        GUID connect_ex_guid = WSAID_CONNECTEX;
+        LPFN_CONNECTEX direct = nullptr, overlapped_ex = nullptr;
+        DWORD returned = 0;
+        sh_wsa_ioctl(tcp, SIO_GET_EXTENSION_FUNCTION_POINTER, &connect_ex_guid, sizeof(connect_ex_guid), &direct,
+                     sizeof(direct), &returned, nullptr, nullptr);
+        WSAOVERLAPPED ov{};
+        ov.hEvent = WSACreateEvent();
+        returned = 0;
+        const int rc = sh_wsa_ioctl(tcp, SIO_GET_EXTENSION_FUNCTION_POINTER, &connect_ex_guid, sizeof(connect_ex_guid),
+                                    &overlapped_ex, sizeof(overlapped_ex), &returned, &ov, nullptr);
+        check(rc == 0 && overlapped_ex && overlapped_ex == direct && returned == sizeof(overlapped_ex),
+              "an overlapped WSAIoctl returns the same wrapped ConnectEx at once");
+        check(WaitForSingleObject(ov.hEvent, 0) == WAIT_OBJECT_0 && ov.Internal == 0 &&
+                  ov.InternalHigh == sizeof(overlapped_ex),
+              "an overlapped WSAIoctl sets its event and its OVERLAPPED's status and byte count");
+        WSACloseEvent(ov.hEvent);
+
+        static int routine_calls = 0;
+        static DWORD routine_bytes = 0;
+        routine_calls = 0;
+        const LPWSAOVERLAPPED_COMPLETION_ROUTINE routine = [](DWORD error, DWORD bytes, LPWSAOVERLAPPED, DWORD) {
+            if (!error) ++routine_calls;
+            routine_bytes = bytes;
+        };
+        WSAOVERLAPPED ov2{};
+        GUID send_msg_guid = WSAID_WSASENDMSG;
+        LPFN_WSASENDMSG send_msg = nullptr;
+        const int rc2 = sh_wsa_ioctl(tcp, SIO_GET_EXTENSION_FUNCTION_POINTER, &send_msg_guid, sizeof(send_msg_guid),
+                                     &send_msg, sizeof(send_msg), &returned, &ov2, routine);
+        SleepEx(0, TRUE);  // an alertable wait runs the queued routine
+        check(rc2 == 0 && send_msg && routine_calls == 1 && routine_bytes == sizeof(send_msg),
+              "an overlapped WSAIoctl with a completion routine runs it once at the next alertable wait");
+        closesocket(tcp);
+    }
+
     WSACleanup();
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
