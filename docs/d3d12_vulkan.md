@@ -1080,8 +1080,52 @@ The compute path, end to end:
   - **Buffers:** vertex and index views resolve to buffers by VA (arena or upload). A view that runs past its
     buffer is cut at the buffer's end. An unbound vertex slot, or an indexed draw with no index buffer, reads the
     arena's reserved first 64 KiB, which is kept zero (stride 0), so it gets the zeros D3D12 gives.
-  - **Attachments:** they move to attachment layouts through the tracker, and the draw runs in a
-    dynamic-rendering scope. Its layer count is the smallest layer count of the bound views.
+  - **Attachments:** they move to attachment layouts through the tracker. Consecutive resolved direct draws share
+    a dynamic-rendering scope when the prepared graphics pipeline, attachment slots/images/views/ranges/layouts,
+    render area and layer count match. Its layer count is the smallest layer count of the bound views. Every other
+    command, skipped draw, indirect draw, statistics segment endpoint or GPU helper closes the scope first. Each
+    draw still binds its own state and push constants; only redundant attachment dependencies and scope boundaries
+    are removed (D3D-REPLAY-DRAW-SCOPE-RUNS). Vulkan guarantees fixed-function depth/stencil/blend ordering in
+    [rasterization order](https://docs.vulkan.org/spec/latest/chapters/primsrast.html#primsrast-order) within the
+    scope. `replay_rendering_scope_test` checks the boundaries with CPU mocks; `vk_rendering_scope_test` checks
+    overlapping depth-tested and blended draws against independently calculated pixels and offers `--bench` for
+    CPU replay and GPU/frame timings, without game files.
+    Build `vk_rendering_scope_test` with CMake and run it once with `LEONIDA_VK_VALIDATION=1` for correctness,
+    then without validation with `--bench` for timings. It compares 1,000/10,000 draws in compatible runs of
+    1/4/16/64/all draws separated by global UAV barriers. Preparation and pipeline creation are outside the
+    measurements; `emit_ms` measures Vulkan command recording, `gpu_ms` brackets replay after draining the clears,
+    and `frame_ms` includes recording, submission, readback and waiting for GPU completion. Those are serialized
+    synthetic frame costs, not the game's FPS. Timings have no pass/fail threshold.
+    `--bench-mixed` adds runs of 2/3 draws split by UAV barriers, actual pipeline switches or color/depth target
+    switches, and direct runs interrupted by a single indirect draw. Its mixed case repeats 12 draw commands:
+    2 direct, switch pipeline, 3 direct, switch targets, 2 direct, 1 indirect, 3 direct, barrier, 1 direct;
+    a barrier separates repetitions. Both target pairs are checked against independent pixel/depth expectations.
+    The default correctness run also covers this mixed case. Indirect/mixed cases print `SKIP` on a device
+    without `drawIndirectFirstInstance`; barrier/pipeline/target benchmarks still run. The fixture uses a
+    hand-written triangle and is not evidence of the frequency of compatible runs in a retail workload.
+
+    `LEONIDA_RENDERING_SCOPE_STATS=1` enables aggregate-only scope diagnostics (D3D-REPLAY-SCOPE-METRICS).
+    The default emitter has no per-draw counter updates; a cached environment check selects an instrumented
+    template once per emitted list, including when device-fault checkpoints are enabled. The instrumented
+    emitter accumulates locally and merges once per list under a process-wide lock. Reports appear at 1/2/4/8/...
+    emitted lists and at normal exit if the totals have changed; abnormal termination can leave a partial report.
+    No identities, addresses, shader contents or title text are recorded.
+
+    - `draws` counts non-skipped application draw commands reaching emission, including indirect commands, each
+      counted once irrespective of GPU arguments or quad expansion. `skipped` counts dropped stateful draw
+      commands separately. `indirect` is a subset of `draws`; `eligible` counts direct commands allowed to carry a
+      scope forward (no skip, indirect arguments, helper or statistics segment endpoint).
+    - `scopes` counts application draw rendering scopes, excluding scopes owned by clears and other helpers.
+      `shared_draws = draws - scopes` counts avoided per-draw scope pairs. `max_run` is the largest number of
+      application draw commands in a scope; `runs` bins scopes at 1/2/3/4–7/8–15/16–63/64–255/256+ commands.
+    - `ends` assigns exactly one reason to each closed draw scope. For an ineligible draw the first applicable
+      reason is skipped/indirect/helper/statistics; otherwise pipeline identity precedes attachment/area/layer
+      changes. Non-draw commands use barrier/copy/clear/query/predicate/dispatch/label/other. An isolated indirect
+      or helper draw can end both its preceding run and its own singleton scope, so reasons count scope ends,
+      rather than boundary commands. `list_end` closes any remaining scope.
+    - Totals count CPU replay attempts across all queues, including re-emitted lists and work that later fails
+      to submit or complete. They measure reuse opportunities, not completed GPU draws, frame time or retail FPS.
+      Disable the counters and validation when collecting benchmark timings.
   - **Viewport:** it is flipped (negative height), because translated vertex shaders write D3D clip coordinates;
     front-face winding then matches D3D12's.
   - Only the first viewport and scissor are used, and primitive restart is not modelled yet.
@@ -3917,8 +3961,9 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
 - Render passes: `BeginRenderPass`/`EndRenderPass` map to `vkCmdBeginRendering`/`vkCmdEndRendering` (dynamic
   rendering). The `D3D12_RENDER_PASS_BEGINNING_ACCESS`/`ENDING_ACCESS` types give the load/store ops and resolve
   targets. Suspending/resuming passes have no direct Vulkan equivalent; split them into two rendering scopes with
-  the same attachments and `LOAD`/`STORE`. If the game does not use render passes, build a rendering scope per draw
-  from the bound RTVs/DSV and let explicit `Clear*View` calls do the clears.
+  the same attachments and `LOAD`/`STORE`. Draws recorded outside explicit render passes use the bound RTVs/DSV
+  with `LOAD`/`STORE`; consecutive compatible direct draws share a scope as described in section 3.2.
+  Explicit `Clear*View` calls still do the clears and end any preceding draw scope.
 
 ### 4.4 Fences, queues and frames in flight
 
