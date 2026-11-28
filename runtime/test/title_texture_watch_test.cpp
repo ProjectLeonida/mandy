@@ -1,6 +1,7 @@
 // TitleTextureWatch (src/title_texture_watch.h): a title texture is looked at only when something says it may have
 // changed. A fake geometry watch stands in for the cells: a "write" bumps a tile's version and queues the tile, as
 // the write-fault handler does through geometry_writes::notify.
+#include "../src/title_texture_refresh.h"
 #include "../src/title_texture_watch.h"
 
 #include <atomic>
@@ -596,9 +597,105 @@ int main() {
         std::printf("86k-tile region index: %.4f ms/iter across %zu tiles (%zu iters, total %lld us)\n",
                     per_iter_ms, sw.tiles(), kIters, static_cast<long long>(elapsed_us));
     }
+    {  // hot_generation() skips watch_.hot_tiles() even while overlapping hot tiles stay active, and non_hot_arms
+       // distinguishes steady-state shared hot-tile pin-checks from real re-arms / concurrent set_hot(false).
+        struct GenHotWatch : FakeWatch {
+            std::uint64_t hot_gen = 0;
+            std::uint64_t hot_tile_calls = 0;
+            bool has_written() const { return !queue.empty() || overflow; }
+            std::uint64_t hot_generation() const { return hot_gen; }
+            void hot_tiles(std::vector<std::uintptr_t>& out) {
+                ++hot_tile_calls;
+                out = hot;
+            }
+        };
+        using GenWatch = leonida::TitleTextureWatch<GenHotWatch>;
+        GenHotWatch f;
+        GenWatch w(f);
+        w.track(1, base, 0x4000);
+        w.track(2, base + 0x8000, 0x4000);            // shares tile 0 with texture 1
+        w.track(3, base + 2 * kTile, kTile);          // tile 2 (separate)
+        w.collect([&](std::uint64_t k) { w.examine(k); });
+
+        // Mark tile 0 + 150 unrelated buffer tiles hot (1 hot_generation bump).
+        f.hot.push_back(base);
+        for (std::size_t i = 0; i < 150; ++i) f.hot.push_back(base + (1000 + i) * kTile);
+        ++f.hot_gen;
+
+        std::vector<std::uint64_t> seen;
+        w.collect([&](std::uint64_t k) { seen.push_back(k); });
+        EXPECT((seen == V{1, 2}));
+        EXPECT(w.hot_overlap() == 1);
+        const std::uint64_t calls_after_sync = f.hot_tile_calls;
+
+        // First examine on shared hot tile increments both arms and non_hot_arms; second examine on the same hot tile
+        // in the same pass still delegates to watch_.arm() (+1 arms) without bumping non_hot_arms (+0 non_hot_arms)!
+        const std::uint64_t arms0 = w.stats().arms, nha0 = w.stats().non_hot_arms;
+        EXPECT(w.examine(1) == GenWatch::Look::armed);
+        EXPECT(w.stats().arms == arms0 + 1 && w.stats().non_hot_arms == nha0 + 1);
+        EXPECT(w.examine(2) == GenWatch::Look::armed);
+        EXPECT(w.stats().arms == arms0 + 2 && w.stats().non_hot_arms == nha0 + 1);
+
+        // Subsequent passes with unchanged hot_generation() MUST NOT call watch_.hot_tiles() even though
+        // active_hot_tiles_ is non-empty AND even when an unrelated tile faults!
+        const std::uint64_t skips_before = w.stats().hot_skips;
+        for (int pass = 0; pass < 5; ++pass) {
+            f.write(base + 2 * kTile);
+            seen.clear();
+            w.collect([&](std::uint64_t k) {
+                seen.push_back(k);
+                w.examine(k);
+            });
+            EXPECT((seen == V{1, 2, 3}));
+        }
+        EXPECT(f.hot_tile_calls == calls_after_sync);
+        EXPECT(w.stats().hot_skips == skips_before + 5);
+
+        // Concurrent set_hot(false) (version bump) between examine(1) and examine(2) MUST bump non_hot_arms!
+        seen.clear();
+        w.collect([&](std::uint64_t k) { seen.push_back(k); });
+        EXPECT((seen == V{1, 2}));
+        const std::uint64_t nha1 = w.stats().non_hot_arms;
+        EXPECT(w.examine(1) == GenWatch::Look::armed && w.stats().non_hot_arms == nha1 + 1);
+        f.cells.at(base).version.fetch_add(1, std::memory_order_release);  // simulate concurrent set_hot(false)
+        EXPECT(w.examine(2) == GenWatch::Look::armed && w.stats().non_hot_arms == nha1 + 2);
+
+        // Cooling tile 0 bumps hot_generation() -> triggers re-poll and drops hot_overlap to 0.
+        f.hot.erase(f.hot.begin());
+        ++f.hot_gen;
+        f.write(base, true);
+        seen.clear();
+        w.collect([&](std::uint64_t k) {
+            seen.push_back(k);
+            w.examine(k);
+        });
+        EXPECT((seen == V{1, 2}));
+        EXPECT(f.hot_tile_calls == calls_after_sync + 1);
+        EXPECT(w.hot_overlap() == 0);
+        EXPECT(!w.may_have_work());
+    }
+    {  // mirror_range_sum_bytes() and mirror_range_sum_from_pieces() parity + single-byte mutation sensitivity.
+        std::vector<std::uint8_t> buf(2 * kTile);
+        for (std::size_t i = 0; i < buf.size(); ++i) buf[i] = static_cast<std::uint8_t>((i * 37u + 11u) & 0xffu);
+        EXPECT(leonida::mirror_range_sum_bytes(buf.data(), 0) == 0);
+        for (const std::uint64_t sz : {std::uint64_t(256), std::uint64_t(4096), std::uint64_t(kTile),
+                                       std::uint64_t(2 * kTile)}) {
+            const std::uint64_t direct = leonida::mirror_range_sum_bytes(buf.data(), sz);
+            std::vector<std::uint64_t> sums;
+            for (std::uint64_t off = 0; off < sz; off += leonida::shadow_keep::kPiece)
+                sums.push_back(leonida::shadow_keep::sum_of(buf.data() + off, leonida::shadow_keep::kPiece));
+            const std::uint64_t combined = leonida::mirror_range_sum_from_pieces(sums.data(), sums.size(), sz);
+            EXPECT(direct != 0 && direct == combined);
+            // Flipping one byte changes the digest.
+            buf[sz - 1] ^= 0x80u;
+            EXPECT(leonida::mirror_range_sum_bytes(buf.data(), sz) != direct);
+            buf[sz - 1] ^= 0x80u;
+            EXPECT(leonida::mirror_range_sum_bytes(buf.data(), sz) == direct);
+        }
+    }
     if (failures) return 1;
     std::puts("title texture watch: new, untouched, one page, two addresses, remap, every frame, unarmable, kernel "
               "write in progress, lost queue, O(1) fast-path, buffer-hot decoupling, 1-tile hash-before-reserve, "
-              "note_changed arm-skip, 86k-tile region index");
+              "note_changed arm-skip, 86k-tile region index, hot_generation skip, non_hot_arms, mirror piece hash");
     return 0;
 }

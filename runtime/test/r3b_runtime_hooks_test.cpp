@@ -16,6 +16,8 @@
 #endif
 
 #include "../src/literal_sampler_spec.h"
+#include "../src/title_mirror.h"
+#include "../src/title_texture_refresh.h"
 #include "../src/vulkan_backend.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_replay.h"
@@ -723,12 +725,234 @@ void test_gpu_live() {
     CHECK(dev.validation_errors() == 0);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Part 4: PassiveWriteBackTracker (overlapping dual-queue seq pruning + split/non-snowballing) & TitleMirror::range_sum
+//         bit-for-bit parity with mirror_range_sum_bytes() (CPU-only)
+
+void test_passive_write_back_tracker() {
+    using leonida::PassiveWriteBackTracker;
+    using Range = std::pair<std::uint64_t, std::uint64_t>;
+
+    const auto collect_promote = [](PassiveWriteBackTracker& tr, std::uint64_t id) {
+        std::vector<Range> out;
+        tr.promote(id, [&](std::uint64_t b, std::uint64_t e) { out.emplace_back(b, e); });
+        return out;
+    };
+
+    // 4a. Single queue: promote clears everything immediately.
+    {
+        PassiveWriteBackTracker tr;
+        const std::uint64_t id1 = tr.begin_execute();
+        tr.note(0x1000, 0x3000);
+        const auto p1 = collect_promote(tr, id1);
+        CHECK(p1.size() == 1 && p1[0] == Range(0x1000, 0x3000));
+        CHECK(tr.empty() && tr.bytes() == 0);
+        tr.end_execute(id1);
+    }
+
+    // 4b. Read-only submission followed by writes_buffer submission: ranges survive end_execute until promoted.
+    {
+        PassiveWriteBackTracker tr;
+        const std::uint64_t ro = tr.begin_execute();
+        tr.note(0x1000, 0x2000);
+        tr.end_execute(ro);  // did not write buffers -> NOT promoted
+        CHECK(!tr.empty() && tr.bytes() == 0x1000);
+
+        const std::uint64_t rw = tr.begin_execute();
+        tr.note(0x4000, 0x6000);
+        const auto p = collect_promote(tr, rw);
+        CHECK(p.size() == 2 && p[0] == Range(0x1000, 0x2000) && p[1] == Range(0x4000, 0x6000));
+        CHECK(tr.empty() && tr.bytes() == 0);
+        tr.end_execute(rw);
+    }
+
+    // 4c. Continuous overlapping dual-queue (direct + compute) over 100 submissions:
+    //     Stale ranges from submission k MUST be evicted on k's promote (never re-promoted on k+2..99!),
+    //     while concurrent newly noted ranges from submission k+1 MUST NOT be lost!
+    {
+        PassiveWriteBackTracker tr;
+        constexpr std::uint64_t kRangeSize = 0x10000;  // 64 KiB each
+        constexpr std::uint64_t kBase = 0x10000000;
+        std::uint64_t prev_id = tr.begin_execute();
+        tr.note(kBase, kBase + kRangeSize);  // sub 0
+
+        std::uint64_t total_promoted_bytes = 0;
+        for (std::size_t step = 1; step < 100; ++step) {
+            const std::uint64_t next_id = tr.begin_execute();
+            const std::uint64_t next_addr = kBase + step * 2 * kRangeSize;
+            tr.note(next_addr, next_addr + kRangeSize);  // concurrent submission notes its own range
+
+            // Previous submission promotes while `next_id` is STILL in flight:
+            const auto promoted = collect_promote(tr, prev_id);
+            tr.end_execute(prev_id);
+
+            // Must have promoted only ranges relevant to prev_id (never accumulating ranges from steps <= step - 2!).
+            CHECK(promoted.size() <= (step == 2 ? 3u : 2u));
+            for (const auto& [b, e] : promoted) total_promoted_bytes += (e - b);
+            // At step == 1 both R0 and R1 are held for next_id (2); for step >= 2 only next_id's freshly noted range remains!
+            const std::size_t expected_left = (step == 1) ? 2u : 1u;
+            CHECK(tr.size() == expected_left && tr.bytes() == expected_left * kRangeSize);
+            prev_id = next_id;
+        }
+        // Final submission promotes its own range and clears completely.
+        const auto last = collect_promote(tr, prev_id);
+        tr.end_execute(prev_id);
+        CHECK(last.size() == 1 && last[0] == Range(kBase + 99 * 2 * kRangeSize, kBase + 99 * 2 * kRangeSize + kRangeSize));
+        CHECK(tr.empty() && tr.bytes() == 0);
+        // Without retire_id pruning, 100 overlapping submits re-promote ~5050 * 64 KiB; with retire_id each range is
+        // promoted at most twice (exactly 200 * 64 KiB across 100 overlapping dual-queue steps).
+        CHECK(total_promoted_bytes == 199 * kRangeSize);
+    }
+
+    // 4d. Pre-existing note(R) + concurrent begin(B) -> begin(A) -> promote(A) -> promote(B):
+    //     BOTH A and B MUST emit R so B's later GPU write is never dropped, a newer queue C started after A's promote
+    //     MUST NOT re-promote R, and R MUST be erased immediately after B promotes!
+    {
+        PassiveWriteBackTracker tr;
+        tr.note(0x10000, 0x20000);                      // pre-existing R
+        const std::uint64_t id_b = tr.begin_execute();  // B starts (id 1)
+        const std::uint64_t id_a = tr.begin_execute();  // A starts (id 2)
+        // A promotes first while B is still in flight: A emits R and stamps R.retire_id = id_b (1).
+        const auto pa = collect_promote(tr, id_a);
+        tr.end_execute(id_a);
+        CHECK(pa.size() == 1 && pa[0] == Range(0x10000, 0x20000));
+        CHECK(tr.size() == 1 && tr.bytes() == 0x10000);  // still held for B
+
+        // A third queue C starts AFTER A's promote (id 3 > retire_id 1): C must NOT re-promote R!
+        const std::uint64_t id_c = tr.begin_execute();
+        const auto pc = collect_promote(tr, id_c);
+        CHECK(pc.empty());
+        CHECK(tr.size() == 1);  // still held for B
+
+        // Now B promotes: B MUST emit R (id_b <= retire_id), and R is immediately erased because min_other (3) > 1!
+        const auto pb = collect_promote(tr, id_b);
+        tr.end_execute(id_b);
+        CHECK(pb.size() == 1 && pb[0] == Range(0x10000, 0x20000));
+        CHECK(tr.empty() && tr.bytes() == 0);
+        tr.end_execute(id_c);
+    }
+
+    // 4e. Read-only overlapping queue ending without promote still prunes already-promoted entries on end_execute(),
+    //     while preserving freshly noted unpromoted entries.
+    {
+        PassiveWriteBackTracker tr;
+        tr.note(0x10000, 0x20000);                      // R_old
+        const std::uint64_t ro = tr.begin_execute();    // read-only queue (id 1)
+        const std::uint64_t rw = tr.begin_execute();    // writes_buffer queue (id 2)
+        const auto p_rw = collect_promote(tr, rw);
+        tr.end_execute(rw);
+        CHECK(p_rw.size() == 1 && p_rw[0] == Range(0x10000, 0x20000));
+        CHECK(tr.size() == 1);  // retained until ro ends
+
+        // ro notes a new range R_new (retire_id = 0) and finishes without promoting: R_old MUST be pruned on
+        // end_execute(ro), while unpromoted R_new MUST survive for a future writes_buffer submission!
+        tr.note(0x30000, 0x34000);
+        tr.end_execute(ro);
+        CHECK(tr.size() == 1 && tr.bytes() == 0x4000);
+        const auto p_later = collect_promote(tr, 0);
+        CHECK(p_later.size() == 1 && p_later[0] == Range(0x30000, 0x34000));
+        CHECK(tr.empty());
+    }
+
+    // 4f. Partial overlap split + adjacent non-snowballing across retire watermarks:
+    {
+        PassiveWriteBackTracker tr;
+        tr.note(0x10000, 0x20000);  // old 64 KiB range (retire_id = 0)
+        const std::uint64_t id_a = tr.begin_execute();  // id 1
+        const std::uint64_t id_b = tr.begin_execute();  // id 2
+        // Queue A promotes first: stamps [0x10000, 0x20000) with retire_id = id_b (2).
+        const auto pa = collect_promote(tr, id_a);
+        tr.end_execute(id_a);
+        CHECK(pa.size() == 1 && pa[0] == Range(0x10000, 0x20000));
+
+        // Queue C starts (id 3 > 2), notes a 4 KiB sub-range inside [0x10000, 0x20000) AND an adjacent 4 KiB range:
+        // left [0x10000, 0x14000) and right [0x15000, 0x20000) keep retire_id = 2, while new ranges get retire_id = 0!
+        const std::uint64_t id_c = tr.begin_execute();
+        tr.note(0x14000, 0x15000);
+        tr.note(0x20000, 0x21000);
+        // Queue C promotes: MUST emit ONLY the 8 KiB new ranges (NOT the old 60 KiB with retire_id = 2 < 3)!
+        const auto pc = collect_promote(tr, id_c);
+        tr.end_execute(id_c);
+        CHECK(pc.size() == 2 && pc[0] == Range(0x14000, 0x15000) && pc[1] == Range(0x20000, 0x21000));
+
+        // Queue B promotes last (id 2): emits everything still relevant to B and clears ALL!
+        const auto pb = collect_promote(tr, id_b);
+        tr.end_execute(id_b);
+        CHECK(pb.size() == 4);
+        CHECK(tr.empty() && tr.bytes() == 0);
+    }
+
+    // 4g. FIFO cap eviction evicts strictly oldest seq first.
+    {
+        PassiveWriteBackTracker tr(4, 0x4000);  // max 4 ranges, 16 KiB
+        tr.note(0x1000, 0x2000);  // seq 1 (4 KiB)
+        tr.note(0x3000, 0x4000);  // seq 2 (4 KiB)
+        tr.note(0x5000, 0x6000);  // seq 3 (4 KiB)
+        tr.note(0x7000, 0x8000);  // seq 4 (4 KiB)
+        tr.note(0x9000, 0xB000);  // seq 5 (8 KiB) -> evicts seq 1 and seq 2
+        CHECK(tr.size() == 3 && tr.bytes() == 0x4000);
+        const auto p = collect_promote(tr, 0);
+        CHECK(p.size() == 3 && p[0] == Range(0x5000, 0x6000) && p[1] == Range(0x7000, 0x8000) &&
+              p[2] == Range(0x9000, 0xB000));
+    }
+}
+
+void test_mirror_range_sum_parity() {
+    constexpr std::uint64_t kPage = leonida::TitleMirror::kPage;
+    std::vector<std::uint8_t> unit_mem(leonida::TitleMirror::kUnitBytes, 0);
+    std::vector<std::uint8_t> page0(kPage), page1(kPage);
+    for (std::size_t i = 0; i < kPage; ++i) {
+        page0[i] = static_cast<std::uint8_t>((i * 29u + 3u) & 0xffu);
+        page1[i] = static_cast<std::uint8_t>((i * 53u + 17u) & 0xffu);
+    }
+    leonida::TitleMirrorHooks hooks{};
+    hooks.make_chunk = [](std::uint64_t, std::uint64_t, VkBuffer& out) {
+        out = fake_handle<VkBuffer>(0x500);
+        return true;
+    };
+    hooks.make_unit = [&](VkDeviceMemory& out, std::uint8_t*& host) {
+        out = fake_handle<VkDeviceMemory>(0x600);
+        host = unit_mem.data();
+        return true;
+    };
+    hooks.bind = [](const std::vector<VkSparseBufferMemoryBindInfo>&, std::uint64_t) { return true; };
+
+    leonida::TitleMirror mirror(std::move(hooks));
+    constexpr std::uint64_t kBase = 0x10000000;
+    CHECK(mirror.cover(kBase, kBase + 2 * kPage));
+    mirror.map(kBase, page0.data(), nullptr);
+    mirror.map(kBase + kPage, page1.data(), nullptr);
+
+    std::vector<std::uint8_t> contiguous(2 * kPage);
+    std::memcpy(contiguous.data(), page0.data(), kPage);
+    std::memcpy(contiguous.data() + kPage, page1.data(), kPage);
+
+    // Verify exact bit-for-bit equality between TitleMirror::range_sum() and mirror_range_sum_bytes() across
+    // sub-page, full-page, and cross-page 256B-aligned ranges!
+    const std::pair<std::uint64_t, std::uint64_t> cases[] = {
+        {0, 256},
+        {256, 4096},
+        {0x4000, 0x8000},
+        {0, kPage},
+        {kPage - 0x2000, 0x12000},  // crosses tile 0 -> tile 1
+        {0, 2 * kPage},
+    };
+    for (const auto& [off, len] : cases) {
+        std::uint64_t mirror_h = 0;
+        CHECK(mirror.range_sum(kBase + off, len, mirror_h));
+        const std::uint64_t cpu_h = leonida::mirror_range_sum_bytes(contiguous.data() + off, len);
+        CHECK(mirror_h != 0 && mirror_h == cpu_h);
+    }
+}
+
 }  // namespace
 
 int main() {
     test_literal_sampler_spec();
     test_replay_hooks();
     test_gpu_live();
+    test_passive_write_back_tracker();
+    test_mirror_range_sum_parity();
     if (failures) {
         std::fprintf(stderr, "r3b_runtime_hooks_test: %d failure(s)\n", failures);
         return 1;
