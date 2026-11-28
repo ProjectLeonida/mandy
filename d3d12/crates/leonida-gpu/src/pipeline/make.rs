@@ -58,10 +58,24 @@ pub(crate) struct Pending {
     variant: OnceLock<Arc<Pending>>,
 }
 
-fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
-    shaders
+/// The compute programs [`left_out`] may leave out, by a name their container
+/// holds. Looked for once per shader (`Shader::facts`): a translated shader
+/// no longer has its container when the title creates another pipeline with it.
+const NAMES: [&[u8]; 2] = [b"CS_RaytracingResolve", b"CS_ScreenProbes_ActivateRays"];
+
+/// Which of [`NAMES`] `container` holds, a bit for each.
+pub(super) fn names(container: &[u8]) -> u8 {
+    NAMES
         .iter()
-        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+        .enumerate()
+        .filter(|(_, name)| container.windows(name.len()).any(|w| w == **name))
+        .fold(0, |bits, (n, _)| bits | 1 << n)
+}
+
+/// Whether one of `shaders` is a compute program with `name`, one of [`NAMES`].
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    let bit = NAMES.iter().position(|n| *n == name).map_or(0, |n| 1 << n);
+    shaders.iter().any(|s| s.facts().named & bit != 0)
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
