@@ -553,6 +553,17 @@ class BootTraceTests(unittest.TestCase):
         ):
             self.assertIn(needle, text)
 
+    def test_file_open_error_histogram_counts_beyond_the_sample_limit(self):
+        self.write(self.startup, [{"kind": "file_open_failed", "error": code, "path": "private-path"}
+                                  for code in (5, 2, 2, 2, True, -1, 2**32, "private-error")])
+        for limit in (0, 1):
+            report = bt.summarize(bt.parse_startup(self.startup, limit), None)
+            counters = bt.counts_only(report)["startup"]
+            self.assertEqual(counters["file_open_errors"], {"5": 1, "2": 3, "unknown": 4})
+            self.assertEqual(sum(counters["file_open_errors"].values()), counters["file_open_failed_count"])
+            self.assertNotIn("private", json.dumps(counters))
+            self.assertEqual(len(report["startup"]["file_open_failed"]), limit)
+
     def test_failed_file_opens_and_skipped_int3_are_listed(self):
         self.write(
             self.startup,

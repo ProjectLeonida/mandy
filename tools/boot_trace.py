@@ -90,6 +90,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "debug_strings": 0,
         "file_open_failed": [],
         "file_open_failed_count": 0,
+        "file_open_errors": {},
         "int3_skipped": [],
         "exceptions": [],
         "exception_count": 0,
@@ -160,6 +161,10 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 trace["debug_strings"] += 1
             elif kind == "file_open_failed":
                 trace["file_open_failed_count"] += 1
+                error = event.get("error")
+                code = str(error) if type(error) is int and 0 <= error < (1 << 32) else "unknown"
+                errors = trace["file_open_errors"]
+                errors[code] = errors.get(code, 0) + 1
                 if len(trace["file_open_failed"]) < limit:
                     trace["file_open_failed"].append(
                         {
@@ -342,6 +347,7 @@ def counts_only(summary: dict) -> dict:
                                              "file_open_failed_count", "exception_count")
         }
         counters["startup"].update(
+            file_open_errors=dict(startup["file_open_errors"]),
             modules=len(startup["modules"]),
             dllmain_failed=startup["dllmain"]["failed"],
             unimplemented_imports=len(startup["unimplemented"]),
@@ -421,6 +427,9 @@ def format_text(summary: dict, limit: int) -> str:
             out.append(f"  debug strings: {startup['debug_strings']} (text not shown)")
         if startup["file_open_failed_count"]:
             out.append(f"  failed file opens: {startup['file_open_failed_count']}")
+            ranked = sorted(startup["file_open_errors"].items(), key=lambda item: (-item[1], item[0]))
+            if limit:
+                out.append("    Win32 errors: " + _tail([f"{code} ({n})" for code, n in ranked], limit))
             for item in startup["file_open_failed"][:limit]:
                 out.append(f"    {item['path']} error {item['error']} from {item['caller']}")
             if startup["file_open_failed_count"] > limit:
