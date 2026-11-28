@@ -176,8 +176,10 @@ void start_title_peek(std::uint8_t* base) {
 
 }  // namespace
 
+#include "avx2_emulation.h"
 #include "base_reservation.h"
 #include "compile_gate_policy.h"
+#include "bmi_emulation.h"
 #include "code_hooks.h"
 #include "cpu_emulation.h"
 #include "host_cpu.h"
@@ -559,6 +561,19 @@ int wmain(int argc, wchar_t** argv) {
     if (!rt::cpu_emulation::install())
         std::fprintf(stderr, "[rt] cpu: AddVectoredExceptionHandler failed (error %lu); instructions this CPU lacks "
                              "will stop the game\n", GetLastError());
+    if (const auto bmi = rt::bmi_emulation::detect_host(); !bmi.bmi1 || !bmi.bmi2 || !bmi.lzcnt || !bmi.movbe)
+        std::fprintf(stderr, "[rt] cpu: this CPU lacks%s%s%s%s; the game's uses are emulated (docs/cpu_features.md)\n",
+                     bmi.bmi1 ? "" : " BMI1", bmi.bmi2 ? "" : " BMI2", bmi.lzcnt ? "" : " LZCNT",
+                     bmi.movbe ? "" : " MOVBE");
+    if (!rt::bmi_emulation::install())
+        std::fprintf(stderr, "[rt] cpu: AddVectoredExceptionHandler (BMI) failed (error %lu); instructions this CPU "
+                             "lacks will stop the game\n", GetLastError());
+    if (const auto avx2 = rt::avx2_emulation::detect_host(); !avx2.avx2 || !avx2.fma || !avx2.f16c)
+        std::fprintf(stderr, "[rt] cpu: this CPU lacks%s%s%s; the game's uses are emulated (docs/cpu_features.md)\n",
+                     avx2.avx2 ? "" : " AVX2", avx2.fma ? "" : " FMA3", avx2.f16c ? "" : " F16C");
+    if (!rt::avx2_emulation::install())
+        std::fprintf(stderr, "[rt] cpu: AddVectoredExceptionHandler (AVX2) failed (error %lu); instructions this CPU "
+                             "lacks will stop the game\n", GetLastError());
 
     try {
         rt::Loader loader(game_dir);
