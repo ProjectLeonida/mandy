@@ -389,21 +389,16 @@ private:
     struct CellGuard {
         static constexpr std::size_t kMaxBatchRunPages = 1024;  // up to 64 MiB per contiguous VirtualProtect run
         static constexpr std::size_t kMaxLockBatchPages = 128;  // pages per pin check + geometry_writes lock hold
-        static constexpr std::size_t kMaxBridgeGap = 32;        // max already-armed cold gap tiles to bridge (2 MiB)
+        static constexpr std::size_t kMaxBridgeGap = 64;        // max already-armed cold gap tiles to bridge (4 MiB)
 
         struct TrackedCell {
             geometry_writes::Cell* cell = nullptr;
             std::uint64_t armed_version = 0;
-            std::uint64_t known_mapping = 0;
-            DWORD known_protect = 0;  // uniform writable protection across all 16 sub-pages (0: unverified)
-            DWORD known_guarded = 0;  // geometry_writes::read_only(known_protect)
             bool is_armed = false;
             bool is_hot = false;
         };
 
         std::unordered_map<std::uint64_t, TrackedCell> cells;
-        std::uint64_t known_protect_gen = 0;
-        bool has_known_protect = false;
         ArmStats arm_stats{};
         // Guarded tiles observed with PAGE_WRITECOMBINE; mutated only under page_mirror.mutex, read-only during upload().
         std::unordered_set<std::uintptr_t> wc_pages;
@@ -450,6 +445,7 @@ private:
         // checked up to (leaf SRWLOCK shared read when generation moved).
         static bool range_clean_since(std::uint64_t since, std::uintptr_t lo, std::uintptr_t hi,
                                       std::uint64_t& gen_out) {
+            if (since == geometry_writes::Cell::kNoMapGen) return false;
             const std::uint64_t cur = title_memory_map::generation();
             if (cur == since) {
                 gen_out = cur;
@@ -467,44 +463,46 @@ private:
             return !overlapped;
         }
 
-        void sync_known_protect() {
-            const std::uint64_t cur = title_memory_map::generation();
-            if (cur == known_protect_gen) return;
-            if (!has_known_protect) {
-                known_protect_gen = cur;
-                return;
+        static bool restore_uniform(const geometry_writes::Cell& c, DWORD expected) noexcept {
+            if (!expected) return false;
+            for (const DWORD r : c.restore)
+                if (r != expected) return false;
+            return true;
+        }
+
+        static bool cell_known_writable(const geometry_writes::Cell& c, DWORD& kp, DWORD& kg,
+                                        std::uint64_t& gen) noexcept {
+            if (c.known_state != MEM_COMMIT || !c.known_protect || !c.known_guarded ||
+                c.known_map_gen == geometry_writes::Cell::kNoMapGen ||
+                c.known_mapping != c.mapping.load(std::memory_order_acquire))
+                return false;
+            kp = c.known_protect;
+            kg = c.known_guarded;
+            gen = c.known_map_gen;
+            return true;
+        }
+
+        // Cross-pass no-guard cache for CellGuard: MEM_RESERVE and PAGE_NOACCESS only (NEVER PAGE_READONLY, because
+        // ShadowPages::reopen() reopens RO->RW without calling title_memory_map::changed()).
+        static bool cell_known_noguard(const geometry_writes::Cell& c, DWORD& st, DWORD& kp,
+                                       std::uint64_t& gen) noexcept {
+            if (c.known_guarded != 0 || c.known_map_gen == geometry_writes::Cell::kNoMapGen ||
+                c.known_mapping != c.mapping.load(std::memory_order_acquire))
+                return false;
+            if (c.known_state == MEM_RESERVE || (c.known_state == MEM_COMMIT && c.known_protect == PAGE_NOACCESS)) {
+                st = c.known_state;
+                kp = c.known_protect;
+                gen = c.known_map_gen;
+                return true;
             }
-            std::uint64_t now = cur;
-            bool invalidate_all = false;
-            if (!title_memory_map::changes_since(known_protect_gen, now, 0, UINTPTR_MAX,
-                                                 [&](std::uintptr_t c_from, std::uintptr_t c_to) {
-                                                     if (invalidate_all || c_from >= c_to) return;
-                                                     constexpr std::uintptr_t kTile = geometry_writes::tile_size;
-                                                     const std::uintptr_t first = c_from & ~(kTile - 1);
-                                                     const std::uintptr_t span = c_to - first;
-                                                     const std::size_t tiles = std::size_t((span - 1) / kTile) + 1;
-                                                     if (tiles > cells.size() / 2 + 64) {
-                                                         invalidate_all = true;
-                                                         return;
-                                                     }
-                                                     for (std::size_t t = 0; t < tiles; ++t) {
-                                                         const auto it = cells.find(first + std::uintptr_t(t) * kTile);
-                                                         if (it != cells.end()) {
-                                                             it->second.known_protect = 0;
-                                                             it->second.known_guarded = 0;
-                                                         }
-                                                     }
-                                                 })) {
-                invalidate_all = true;
-            }
-            if (invalidate_all) {
-                for (auto& entry : cells) {
-                    entry.second.known_protect = 0;
-                    entry.second.known_guarded = 0;
-                }
-                has_known_protect = false;
-            }
-            known_protect_gen = now;
+            return false;
+        }
+
+        static void clear_cell_known(geometry_writes::Cell& c) noexcept {
+            c.known_state = 0;
+            c.known_protect = 0;
+            c.known_guarded = 0;
+            c.known_map_gen = geometry_writes::Cell::kNoMapGen;
         }
 
         // Guarded (cold, or a hot page's probe): no longer hot for this owner, then armed.
@@ -515,10 +513,10 @@ private:
         }
 
         // Batched arming of sorted 64 KiB pages: coalesces both contiguous runs (up to 64 MiB in one VirtualProtect)
-        // and scattered pages (bridging up to kMaxBridgeGap already-armed unpinned cold tiles) into shared pin checks,
-        // shared geometry_writes lock holds, a per-tile known-protection cache synced per lock-batch and range-checked
-        // via title_memory_map::changes_since() (never permanently disabled by unrelated VA changes), and a short-lived
-        // VirtualQuery region cache within each lock hold.
+        // and scattered pages (bridging up to kMaxBridgeGap already-armed unpinned cold tiles, including already-armed
+        // tiles in the same batch or watched by another owner) into shared pin checks, shared geometry_writes lock
+        // holds, shared per-Cell known-protection/state caching validated via title_memory_map::changes_since(), and a
+        // short-lived VirtualQuery region cache within each lock hold.
         void arm_batch(const std::uintptr_t* pages, std::uint8_t* results, std::size_t count) {
             using geometry_writes::Cell;
             constexpr std::uintptr_t kTile = geometry_writes::tile_size;
@@ -536,10 +534,6 @@ private:
             } arm_timer{arm_t0, arm_stats.ns};
 
             for (std::size_t i = 0; i < count;) {
-                // Re-sync known_protect per lock-batch (outside geometry_writes::state().mutex) so concurrent map
-                // changes on unrelated VA ranges never disable the fast path for the rest of arm_batch().
-                sync_known_protect();
-
                 // Extend chunk up to kMaxLockBatchPages, or further across one contiguous or bridgeable run up to
                 // kMaxBatchRunPages so lock-batch cuts never split a bridgeable cluster mid-bridge.
                 std::size_t j = i + 1;
@@ -566,6 +560,7 @@ private:
                 run_pinned_.assign(batch_n, 0);
                 run_backed_.assign(batch_n, 0);
                 run_eligible_.assign(batch_n, 0);
+                run_already_armed_.assign(batch_n, 0);
                 run_failed_.assign(batch_n, 0);
                 run_slow_.assign(batch_n, 0);
                 run_wc_.assign(batch_n, 0);
@@ -657,20 +652,39 @@ private:
                             continue;
                         }
                         // Zero-syscall fast path: all 16 sub-pages already armed read-only (e.g. by another owner).
-                        bool all_armed = true;
-                        for (const DWORD r : c->restore) {
-                            if (!r) {
+                        const DWORD r0 = c->restore[0];
+                        bool all_armed = r0 != 0;
+                        bool uniform_restore = all_armed;
+                        for (std::size_t sp = 1; all_armed && sp < c->restore.size(); ++sp) {
+                            if (!c->restore[sp]) {
                                 all_armed = false;
-                                break;
+                                uniform_restore = false;
+                            } else if (c->restore[sp] != r0) {
+                                uniform_restore = false;
                             }
                         }
                         if (all_armed) {
+                            if (uniform_restore && c->armed_map_gen != Cell::kNoMapGen) {
+                                const std::uint64_t cur_map = c->mapping.load(std::memory_order_acquire);
+                                if (c->known_state == 0 || c->known_mapping != cur_map ||
+                                    c->known_map_gen == Cell::kNoMapGen) {
+                                    const DWORD g = geometry_writes::read_only(r0);
+                                    if (g != 0 && !(r0 & PAGE_GUARD)) {
+                                        c->known_state = MEM_COMMIT;
+                                        c->known_protect = r0;
+                                        c->known_guarded = g;
+                                        c->known_mapping = cur_map;
+                                        c->known_map_gen = c->armed_map_gen;
+                                    }
+                                }
+                            }
+                            run_already_armed_[k] = 1;
                             results[i + k] = 1;
                             tc->is_armed = true;
                             tc->armed_version = run_versions_[k];
                             ++arm_stats.already_armed_skips;
                             ++arm_stats.skip_tiles;
-                            if (c->restore[0] & PAGE_WRITECOMBINE) {
+                            if (r0 & PAGE_WRITECOMBINE) {
                                 ++arm_stats.wc_tiles;
                                 note_wc_page(batch_pages[k], true);
                             }
@@ -699,7 +713,7 @@ private:
                     std::uint64_t cached_gen = 0;
 
                     // Protect each contiguous (or gap-bridged) sub-run of eligible cells with batched VirtualProtect
-                    // (skipping VirtualQuery when per-tile known_protect is valid).
+                    // (skipping VirtualQuery when shared Cell::known_* is valid).
                     for (std::size_t sub_start = 0; sub_start < batch_n;) {
                         if (!run_eligible_[sub_start]) {
                             ++sub_start;
@@ -712,75 +726,101 @@ private:
                         }
 
                         // Gap-bridging fast path: coalesce scattered eligible tiles separated by <= kMaxBridgeGap
-                        // already-armed, unpinned cold tiles sharing identical known_protect/known_guarded/mapping.
-                        // Falls back to eligible-only [sub_start, sub_end) on any failure or unexpected old protect.
-                        TrackedCell* const tc0 = run_entries_[sub_start];
-                        if (tc0->known_protect != 0 &&
-                            tc0->known_mapping == tc0->cell->mapping.load(std::memory_order_acquire)) {
-                            const DWORD kp = tc0->known_protect;
-                            const DWORD kg = tc0->known_guarded;
+                        // already-armed, unpinned cold tiles (both batch `run_already_armed_` skips and intermediate
+                        // tiles in `cells` or `s.cells`) sharing identical Cell::known_protect/known_guarded/mapping
+                        // and uniform restore[0..15] == kp. Falls back to eligible-only [sub_start, sub_end) on any
+                        // failure or unexpected old protect.
+                        DWORD kp = 0, kg = 0;
+                        std::uint64_t gen0 = 0;
+                        if (cell_known_writable(*run_entries_[sub_start]->cell, kp, kg, gen0)) {
                             const std::uintptr_t span_lo = batch_pages[sub_start];
                             std::size_t bridge_end = sub_start + 1;
-                            while (bridge_end < batch_n && run_eligible_[bridge_end]) {
+                            std::size_t last_eligible = sub_start;
+                            std::uint64_t run_min_gen = gen0;
+                            std::uint64_t last_min_gen = gen0;
+                            while (bridge_end < batch_n &&
+                                   (run_eligible_[bridge_end] || run_already_armed_[bridge_end])) {
                                 const std::uintptr_t prev_va = batch_pages[bridge_end - 1];
                                 const std::uintptr_t next_va = batch_pages[bridge_end];
                                 if (prev_va > UINTPTR_MAX - kTile || next_va > UINTPTR_MAX - kTile) break;
                                 const std::uintptr_t prev_end = prev_va + kTile;
                                 if (next_va < prev_end) break;
-                                const std::uintptr_t gap_bytes = next_va - prev_end;
-                                if (gap_bytes > kMaxBridgeGap * kTile) break;
+                                const std::uintptr_t eligible_gap = next_va - (batch_pages[last_eligible] + kTile);
+                                if (eligible_gap > kMaxBridgeGap * kTile) break;
                                 if ((next_va + kTile - span_lo) > kMaxBatchRunPages * kTile) break;
-                                TrackedCell* const tcn = run_entries_[bridge_end];
-                                if (tcn->known_protect != kp || tcn->known_guarded != kg ||
-                                    tcn->known_mapping != tcn->cell->mapping.load(std::memory_order_acquire))
+                                const Cell& cn = *run_entries_[bridge_end]->cell;
+                                DWORD nkp = 0, nkg = 0;
+                                std::uint64_t ngen = 0;
+                                if (!cell_known_writable(cn, nkp, nkg, ngen) || nkp != kp || nkg != kg) break;
+                                if (run_already_armed_[bridge_end] &&
+                                    (run_pinned_[bridge_end] || is_tile_pinned(next_va) || cn.hot ||
+                                     !restore_uniform(cn, kp))) {
                                     break;
+                                }
+                                std::uint64_t cand_min_gen = (std::min)(run_min_gen, ngen);
                                 bool gap_ok = true;
                                 for (std::uintptr_t gap_va = prev_end; gap_va < next_va; gap_va += kTile) {
                                     if (is_tile_pinned(gap_va)) {
                                         gap_ok = false;
                                         break;
                                     }
-                                    const auto git = cells.find(gap_va);
-                                    if (git == cells.end()) {
+                                    const Cell* gc = nullptr;
+                                    if (const auto git = cells.find(gap_va); git != cells.end()) {
+                                        gc = git->second.cell;
+                                    } else if (const auto sit = s.cells.find(gap_va); sit != s.cells.end()) {
+                                        gc = &sit->second;
+                                    }
+                                    if (!gc || gc->hot || !restore_uniform(*gc, kp)) {
                                         gap_ok = false;
                                         break;
                                     }
-                                    const TrackedCell& gtc = git->second;
-                                    if (!gtc.is_armed || gtc.is_hot || gtc.cell->hot ||
-                                        gtc.cell->version.load(std::memory_order_relaxed) != gtc.armed_version ||
-                                        gtc.known_protect != kp || gtc.known_guarded != kg ||
-                                        gtc.known_mapping != gtc.cell->mapping.load(std::memory_order_acquire) ||
-                                        gtc.cell->restore[0] != kp) {
+                                    DWORD gkp = 0, gkg = 0;
+                                    std::uint64_t ggen = 0;
+                                    if (!cell_known_writable(*gc, gkp, gkg, ggen) || gkp != kp || gkg != kg) {
                                         gap_ok = false;
                                         break;
                                     }
+                                    cand_min_gen = (std::min)(cand_min_gen, ggen);
                                 }
                                 if (!gap_ok) break;
+                                run_min_gen = cand_min_gen;
+                                if (run_eligible_[bridge_end]) {
+                                    last_eligible = bridge_end;
+                                    last_min_gen = run_min_gen;
+                                }
                                 ++bridge_end;
                             }
-                            if (bridge_end > sub_end) {
-                                const std::uintptr_t span_hi = batch_pages[bridge_end - 1] + kTile;
+                            const std::size_t bridge_end_eff = last_eligible + 1;
+                            if (bridge_end_eff > sub_end) {
+                                const std::uintptr_t span_hi = batch_pages[last_eligible] + kTile;
                                 std::uint64_t verified_gen = 0;
-                                if (range_clean_since(known_protect_gen, span_lo, span_hi, verified_gen)) {
+                                if (range_clean_since(last_min_gen, span_lo, span_hi, verified_gen)) {
                                     DWORD old{};
                                     ++arm_stats.vp_calls;
                                     if (VirtualProtect(reinterpret_cast<void*>(span_lo), span_hi - span_lo, kg, &old)) {
                                         if (old == kp || old == kg) {
-                                            const std::size_t n_bridged = bridge_end - sub_start;
+                                            std::size_t n_bridged = 0;
+                                            for (std::size_t k = sub_start; k < bridge_end_eff; ++k) {
+                                                TrackedCell* const tc = run_entries_[k];
+                                                if (run_eligible_[k]) {
+                                                    tc->cell->restore.fill(kp);
+                                                    tc->cell->armed_map_gen = verified_gen;
+                                                    tc->cell->known_map_gen = verified_gen;
+                                                    results[i + k] = 1;
+                                                    tc->is_armed = true;
+                                                    tc->armed_version = run_versions_[k];
+                                                    ++n_bridged;
+                                                } else {
+                                                    tc->cell->armed_map_gen = verified_gen;
+                                                    tc->cell->known_map_gen = verified_gen;
+                                                }
+                                            }
                                             ++arm_stats.bridged_runs;
                                             arm_stats.fast_tiles += n_bridged;
                                             if (kp & PAGE_WRITECOMBINE) arm_stats.wc_tiles += n_bridged;
-                                            for (std::size_t k = sub_start; k < bridge_end; ++k) {
-                                                TrackedCell* const tc = run_entries_[k];
-                                                tc->cell->restore.fill(kp);
-                                                tc->cell->armed_map_gen = verified_gen;
-                                                results[i + k] = 1;
-                                                tc->is_armed = true;
-                                                tc->armed_version = run_versions_[k];
-                                            }
                                             if (cached_hi && span_lo >= cached_lo && span_hi <= cached_hi)
                                                 cached_lo = span_hi;
-                                            sub_start = bridge_end;
+                                            sub_start = bridge_end_eff;
                                             continue;
                                         }
                                         // Unexpected prior protection: restore `old` and fall back to eligible-only.
@@ -797,37 +837,52 @@ private:
                         const std::uintptr_t sub_hi = sub_lo + (sub_end - sub_start) * kTile;
 
                         for (std::uintptr_t p = sub_lo; p < sub_hi;) {
-                            // Fast path: tile-aligned repeat arm with verified uniform protection and no map change
-                            // overlapping [p, end) since known_protect_gen -> VirtualProtect directly with 0
-                            // VirtualQuery syscalls.
+                            // Fast path: tile-aligned repeat arm with verified uniform protection or cached no-guard
+                            // state (MEM_RESERVE / PAGE_NOACCESS only; NEVER PAGE_READONLY) and no overlapping map
+                            // change -> 0 VirtualQuery syscalls.
                             if ((p & (kTile - 1)) == 0 && sub_hi - p >= kTile) {
                                 const std::size_t tile_k = sub_start + std::size_t((p - sub_lo) / kTile);
-                                TrackedCell* const tc_fast = run_entries_[tile_k];
-                                if (tc_fast->known_protect != 0 &&
-                                    tc_fast->known_mapping == tc_fast->cell->mapping.load(std::memory_order_acquire)) {
-                                    const DWORD kp = tc_fast->known_protect;
-                                    const DWORD kg = tc_fast->known_guarded;
+                                Cell* const c_fast = run_entries_[tile_k]->cell;
+                                DWORD fkp = 0, fkg = 0;
+                                std::uint64_t fgen0 = 0;
+                                if (cell_known_writable(*c_fast, fkp, fkg, fgen0)) {
                                     std::size_t fast_end = tile_k + 1;
+                                    std::uint64_t min_gen = fgen0, max_gen = fgen0;
                                     while (fast_end < sub_end) {
-                                        TrackedCell* const tcn = run_entries_[fast_end];
-                                        if (tcn->known_protect != kp || tcn->known_guarded != kg ||
-                                            tcn->known_mapping != tcn->cell->mapping.load(std::memory_order_acquire))
+                                        DWORD nkp = 0, nkg = 0;
+                                        std::uint64_t ngen = 0;
+                                        if (!cell_known_writable(*run_entries_[fast_end]->cell, nkp, nkg, ngen) ||
+                                            nkp != fkp || nkg != fkg)
                                             break;
+                                        min_gen = (std::min)(min_gen, ngen);
+                                        max_gen = (std::max)(max_gen, ngen);
                                         ++fast_end;
                                     }
-                                    const std::uintptr_t end = p + (fast_end - tile_k) * kTile;
+                                    std::uintptr_t end = p + (fast_end - tile_k) * kTile;
                                     std::uint64_t verified_gen = 0;
-                                    if (range_clean_since(known_protect_gen, p, end, verified_gen)) {
+                                    bool clean = range_clean_since(min_gen, p, end, verified_gen);
+                                    if (!clean && min_gen != max_gen && fast_end > tile_k + 1) {
+                                        std::size_t prefix_end = tile_k + 1;
+                                        while (prefix_end < fast_end &&
+                                               run_entries_[prefix_end]->cell->known_map_gen == fgen0)
+                                            ++prefix_end;
+                                        fast_end = prefix_end;
+                                        end = p + (fast_end - tile_k) * kTile;
+                                        clean = range_clean_since(fgen0, p, end, verified_gen);
+                                    }
+                                    if (clean) {
                                         DWORD old{};
                                         ++arm_stats.vp_calls;
-                                        if (VirtualProtect(reinterpret_cast<void*>(p), end - p, kg, &old)) {
-                                            if (old == kp || old == kg) {
+                                        if (VirtualProtect(reinterpret_cast<void*>(p), end - p, fkg, &old)) {
+                                            if (old == fkp || old == fkg) {
                                                 const std::size_t n_fast = fast_end - tile_k;
                                                 arm_stats.fast_tiles += n_fast;
-                                                if (kp & PAGE_WRITECOMBINE) arm_stats.wc_tiles += n_fast;
+                                                if (fkp & PAGE_WRITECOMBINE) arm_stats.wc_tiles += n_fast;
                                                 for (std::size_t t = tile_k; t < fast_end; ++t) {
-                                                    run_entries_[t]->cell->restore.fill(kp);
-                                                    run_entries_[t]->cell->armed_map_gen = verified_gen;
+                                                    Cell* const ct = run_entries_[t]->cell;
+                                                    ct->restore.fill(fkp);
+                                                    ct->armed_map_gen = verified_gen;
+                                                    ct->known_map_gen = verified_gen;
                                                 }
                                                 if (cached_hi && p >= cached_lo && end <= cached_hi) cached_lo = end;
                                                 p = end;
@@ -841,11 +896,46 @@ private:
                                         }
                                         // Unexpected protection or VirtualProtect failure: invalidate cached protection
                                         // for these tiles and fall through to VirtualQuery + VirtualProtect.
-                                        for (std::size_t t = tile_k; t < fast_end; ++t) {
-                                            run_entries_[t]->known_protect = 0;
-                                            run_entries_[t]->known_guarded = 0;
-                                        }
+                                        for (std::size_t t = tile_k; t < fast_end; ++t)
+                                            clear_cell_known(*run_entries_[t]->cell);
                                         cached_hi = 0;
+                                    }
+                                } else {
+                                    DWORD ng_st = 0, ng_kp = 0;
+                                    std::uint64_t ng_gen0 = 0;
+                                    if (cell_known_noguard(*c_fast, ng_st, ng_kp, ng_gen0)) {
+                                        std::size_t fast_end = tile_k + 1;
+                                        std::uint64_t min_gen = ng_gen0, max_gen = ng_gen0;
+                                        while (fast_end < sub_end) {
+                                            DWORD nst = 0, nkp = 0;
+                                            std::uint64_t ngen = 0;
+                                            if (!cell_known_noguard(*run_entries_[fast_end]->cell, nst, nkp, ngen) ||
+                                                nst != ng_st || nkp != ng_kp)
+                                                break;
+                                            min_gen = (std::min)(min_gen, ngen);
+                                            max_gen = (std::max)(max_gen, ngen);
+                                            ++fast_end;
+                                        }
+                                        std::uintptr_t end = p + (fast_end - tile_k) * kTile;
+                                        std::uint64_t verified_gen = 0;
+                                        bool clean = range_clean_since(min_gen, p, end, verified_gen);
+                                        if (!clean && min_gen != max_gen && fast_end > tile_k + 1) {
+                                            std::size_t prefix_end = tile_k + 1;
+                                            while (prefix_end < fast_end &&
+                                                   run_entries_[prefix_end]->cell->known_map_gen == ng_gen0)
+                                                ++prefix_end;
+                                            fast_end = prefix_end;
+                                            end = p + (fast_end - tile_k) * kTile;
+                                            clean = range_clean_since(ng_gen0, p, end, verified_gen);
+                                        }
+                                        if (clean) {
+                                            for (std::size_t t = tile_k; t < fast_end; ++t)
+                                                run_entries_[t]->cell->known_map_gen = verified_gen;
+                                            arm_stats.skip_tiles += (fast_end - tile_k);
+                                            if (cached_hi && p >= cached_lo && end <= cached_hi) cached_lo = end;
+                                            p = end;
+                                            continue;
+                                        }
                                     }
                                 }
                             }
@@ -941,7 +1031,7 @@ private:
                                         run_entries_[tile_k]->cell->restore[sub_p] = protect;
                                         run_entries_[tile_k]->cell->armed_map_gen = Cell::kNoMapGen;
                                     }
-                                    // Cache uniform whole-tile protections (and Cell::armed_map_gen) when no map change
+                                    // Cache uniform whole-tile protections on shared Cell when no map change
                                     // overlapped [first_full, last_full) between query_gen and VirtualProtect.
                                     const std::uintptr_t first_full = (p + kTile - 1) & ~(kTile - 1);
                                     const std::uintptr_t last_full = end & ~(kTile - 1);
@@ -952,13 +1042,14 @@ private:
                                         for (std::uintptr_t t = first_full; t < last_full; t += kTile) {
                                             const std::size_t tile_k =
                                                 sub_start + std::size_t((t - sub_lo) / kTile);
-                                            TrackedCell* const tc = run_entries_[tile_k];
-                                            tc->known_protect = protect;
-                                            tc->known_guarded = guarded;
-                                            tc->known_mapping = tc->cell->mapping.load(std::memory_order_acquire);
-                                            tc->cell->armed_map_gen = after_gen;
+                                            Cell* const c = run_entries_[tile_k]->cell;
+                                            c->known_state = MEM_COMMIT;
+                                            c->known_protect = protect;
+                                            c->known_guarded = guarded;
+                                            c->known_mapping = c->mapping.load(std::memory_order_acquire);
+                                            c->known_map_gen = after_gen;
+                                            c->armed_map_gen = after_gen;
                                         }
-                                        has_known_protect = true;
                                     }
                                     if (cached_hi && p >= cached_lo && end <= cached_hi) cached_lo = end;
                                 } else if (from_cache) {
@@ -985,6 +1076,36 @@ private:
                                     }
                                 }
                             } else {
+                                const std::uintptr_t first_full = (p + kTile - 1) & ~(kTile - 1);
+                                const std::uintptr_t last_full = end & ~(kTile - 1);
+                                if (first_full < last_full) {
+                                    const bool cacheable_noguard =
+                                        state == MEM_RESERVE ||
+                                        (state == MEM_COMMIT && !(protect & PAGE_GUARD) &&
+                                         (protect & 255u) == PAGE_NOACCESS);
+                                    std::uint64_t after_gen = 0;
+                                    if (cacheable_noguard && region_base <= first_full && region_end >= last_full &&
+                                        range_clean_since(query_gen, first_full, last_full, after_gen)) {
+                                        for (std::uintptr_t t = first_full; t < last_full; t += kTile) {
+                                            const std::size_t tile_k =
+                                                sub_start + std::size_t((t - sub_lo) / kTile);
+                                            Cell* const c = run_entries_[tile_k]->cell;
+                                            c->known_state = state;
+                                            c->known_protect = (state == MEM_COMMIT) ? PAGE_NOACCESS : 0;
+                                            c->known_guarded = 0;
+                                            c->known_mapping = c->mapping.load(std::memory_order_acquire);
+                                            c->known_map_gen = after_gen;
+                                        }
+                                    } else {
+                                        // NEVER cache PAGE_READONLY / PAGE_EXECUTE_READ (or MEM_FREE / PAGE_GUARD)
+                                        // as no-guard: ShadowPages::reopen() reopens RO->RW without map change.
+                                        for (std::uintptr_t t = first_full; t < last_full; t += kTile) {
+                                            const std::size_t tile_k =
+                                                sub_start + std::size_t((t - sub_lo) / kTile);
+                                            clear_cell_known(*run_entries_[tile_k]->cell);
+                                        }
+                                    }
+                                }
                                 if (cached_hi && p >= cached_lo && end <= cached_hi) cached_lo = end;
                             }
                             p = end;
@@ -1048,6 +1169,7 @@ private:
         std::vector<std::uint8_t> run_pinned_;
         std::vector<std::uint8_t> run_backed_;
         std::vector<std::uint8_t> run_eligible_;
+        std::vector<std::uint8_t> run_already_armed_;
         std::vector<std::uint8_t> run_failed_;
         std::vector<std::uint8_t> run_slow_;
         std::vector<std::uint8_t> run_wc_;

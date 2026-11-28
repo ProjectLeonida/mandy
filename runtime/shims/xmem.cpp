@@ -131,12 +131,14 @@ bool mirror_heap_ready() {
         leonida::TitleHeap::Hooks hooks;
         hooks.commit = [write_watched](uintptr_t at, size_t bytes) {
             if (!VirtualAlloc(reinterpret_cast<void*>(at), bytes, MEM_COMMIT, PAGE_READWRITE)) return false;
+            leonida::title_memory_map::changed(at, at + bytes);
             if (write_watched) leonida::title_write_watch::mark(at, at + bytes);
             feed_heap_pages(at, bytes, true);
             return true;
         };
         hooks.decommit = [write_watched](uintptr_t at, size_t bytes) {
             VirtualFree(reinterpret_cast<void*>(at), bytes, MEM_DECOMMIT);
+            leonida::title_memory_map::changed(at, at + bytes);
             leonida::geometry_writes::notify(at, at + bytes, leonida::geometry_writes::Event::replaced);
             feed_heap_pages(at, bytes, false);
             if (write_watched) leonida::title_write_watch::mark(at, at + bytes);
@@ -186,15 +188,19 @@ size_t block_size(void* p) {
     if (!title_heap()) return _aligned_msize(p, kAlign, 0);
     return (reinterpret_cast<TitleHeapHeader*>(p) - 1)->size;
 }
-void free_block(void* p) {
-    if (!p) return;
+bool free_block(void* p) {
+    if (!p) return false;
     if (mirror_heap_ready() && mirror_heap().owns(p)) {
         mirror_heap().release(p);
-        return;
+        return true;
     }
     const HANDLE heap = title_heap();
-    if (!heap) return _aligned_free(p);
+    if (!heap) {
+        _aligned_free(p);
+        return false;
+    }
     HeapFree(heap, 0, (reinterpret_cast<TitleHeapHeader*>(p) - 1)->raw);
+    return false;
 }
 
 // Every block and range the title gets here is recorded as the title's memory (src/title_va_alias.h): a shader
@@ -218,11 +224,13 @@ void free_title_block(void* p) {
     if(p)leonida::label::memory().release_heap(reinterpret_cast<std::uintptr_t>(p));
     if (p) leonida::title_va_aliases().remove_title_memory(reinterpret_cast<uintptr_t>(p));
     const size_t size = block_size(p);
-    free_block(p);
+    const bool from_mirror_heap = free_block(p);
     if (p) {
         const auto from = reinterpret_cast<uintptr_t>(p);
         const size_t bytes = size ? size : 1;
-        leonida::title_memory_map::changed(p, bytes);
+        // mirror_heap() reports actual OS commit/decommit via TitleHeap::Hooks; releasing a sub-block does not alter
+        // OS page mappings or protections.
+        if (!from_mirror_heap) leonida::title_memory_map::changed(p, bytes);
         leonida::geometry_writes::note_released(from, from + bytes);
     }
 }
@@ -1286,6 +1294,30 @@ bool map_view(uintptr_t address, const View& view, uint64_t* done = nullptr) {
             return false;
         }
         leonida::title_memory_map::changed(target, size);
+        extern bool sections_committed();
+        if (sections_committed() && !view.zero) {
+            const DWORD guarded = leonida::geometry_writes::read_only(view.protect);
+            if (!(view.protect & PAGE_GUARD) && (guarded || (view.protect & 255u) == PAGE_NOACCESS)) {
+                auto& s = leonida::geometry_writes::state();
+                if (s.count.load(std::memory_order_acquire)) {
+                    const std::uintptr_t seed_lo = base;
+                    const std::uintptr_t seed_hi = base + static_cast<std::uintptr_t>(size);
+                    if (seed_lo < s.watched_hi.load(std::memory_order_acquire) &&
+                        seed_hi > s.watched_lo.load(std::memory_order_acquire)) {
+                        const std::uint64_t seed_gen = leonida::title_memory_map::generation();
+                        std::lock_guard lock(s.mutex);
+                        for (auto it = s.cells.lower_bound(seed_lo); it != s.cells.end() && it->first < seed_hi; ++it) {
+                            auto& c = it->second;
+                            c.known_state = MEM_COMMIT;
+                            c.known_protect = guarded ? view.protect : PAGE_NOACCESS;
+                            c.known_guarded = guarded;
+                            c.known_mapping = c.mapping.load(std::memory_order_acquire);
+                            c.known_map_gen = seed_gen;
+                        }
+                    }
+                }
+            }
+        }
         View part = view;
         part.count = count;
         part.offset = offset;

@@ -1800,6 +1800,82 @@ int upload_breakdown_and_unit_sums_slab() {
     return 0;
 }
 
+int fused_copy_and_sum_hook_and_fallback() {
+    EXPECT(TitleMirror::kMaxWorkers == 8);
+    Fixture f_fused, f_ref;
+    auto h_fused = f_fused.hooks();
+    auto h_ref = f_ref.hooks();
+
+    constexpr std::size_t kStrip = TitleMirror::kStripBytes;
+    constexpr std::size_t kStripsPerPage = kPage / kStrip;
+    std::size_t fused_calls = 0, fallback_piece_calls = 0;
+    std::size_t fail_strip_offset = ~std::size_t(0);
+    std::size_t fail_piece_offset = ~std::size_t(0);
+    const std::uint8_t* tracked_frame = nullptr;
+
+    h_fused.copy_and_sum = [&](std::uint8_t* to, const std::uint8_t* from, std::size_t pieces, std::uint64_t* sums) {
+        ++fused_calls;
+        if (tracked_frame && std::size_t(from - tracked_frame) == fail_strip_offset) return false;
+        leonida::shadow_keep::copy_and_sum_256(to, from, pieces, sums);
+        return true;
+    };
+    h_fused.copy = [&](std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
+        ++fallback_piece_calls;
+        if (tracked_frame && std::size_t(from - tracked_frame) == fail_piece_offset) return false;
+        std::memcpy(to, from, bytes);
+        return true;
+    };
+    h_ref.copy = [](std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
+        std::memcpy(to, from, bytes);
+        return true;
+    };
+
+    TitleMirror m_fused(std::move(h_fused));
+    TitleMirror m_ref(std::move(h_ref));
+    EXPECT(m_fused.cover(kBase, kBase + 4 * kPage));
+    EXPECT(m_ref.cover(kBase, kBase + 4 * kPage));
+
+    std::vector<std::uint8_t> frame(kPage);
+    for (std::size_t i = 0; i < frame.size(); ++i) frame[i] = std::uint8_t((i * 73 + 19) & 0xff);
+    tracked_frame = frame.data();
+
+    // Whole fill via fused copy_and_sum: 4 strip calls, 0 fallback copy calls, exact range_sum parity with ref.
+    m_fused.map(kBase, frame.data(), nullptr, 1);
+    m_ref.map(kBase, frame.data(), nullptr, 1);
+    EXPECT(fused_calls == kStripsPerPage && fallback_piece_calls == 0);
+    EXPECT(std::memcmp(m_fused.home_bytes(kBase), m_ref.home_bytes(kBase), kPage) == 0);
+    std::uint64_t hf = 0, hr = 0;
+    EXPECT(m_fused.range_sum(kBase, kPage, hf) && m_ref.range_sum(kBase, kPage, hr) && hf == hr);
+
+    // Incremental dirty upload across strip boundaries: exact changed_pieces parity.
+    frame[3 * 256 + 9] ^= 0x5A;
+    frame[64 * 256 + 17] ^= 0xA5;
+    frame[255 * 256 + 200] ^= 0x3C;
+    std::array<std::uint64_t, 4> mask_f{}, mask_r{};
+    EXPECT(m_fused.dirty(kBase) &&
+           m_fused.upload([&](std::uint8_t*, const std::array<std::uint64_t, 4>& m) { mask_f = m; }) == 1);
+    EXPECT(m_ref.dirty(kBase) &&
+           m_ref.upload([&](std::uint8_t*, const std::array<std::uint64_t, 4>& m) { mask_r = m; }) == 1);
+    EXPECT(fused_calls == 2 * kStripsPerPage && fallback_piece_calls == 0);
+    EXPECT(mask_f == mask_r);
+    EXPECT(m_fused.last_upload_bytes() == 3 * 256 && m_ref.last_upload_bytes() == 3 * 256);
+    EXPECT(std::memcmp(m_fused.home_bytes(kBase), m_ref.home_bytes(kBase), kPage) == 0);
+
+    // Fallback path: strip 1 fails in copy_and_sum -> falls back to 64 per-piece hooks_.copy calls, zeroes only piece 70.
+    fail_strip_offset = kStrip;
+    fail_piece_offset = 70 * 256;
+    frame[65 * 256 + 4] = 0xEE;
+    frame[70 * 256 + 4] = 0xDD;
+    EXPECT(m_fused.dirty(kBase) && m_fused.upload() == 1);
+    EXPECT(fused_calls == 3 * kStripsPerPage && fallback_piece_calls == TitleMirror::kStripPieces);
+    EXPECT(m_fused.counters().upload_failures == 1);
+    EXPECT(m_fused.home_bytes(kBase)[65 * 256 + 4] == 0xEE);
+    EXPECT(m_fused.home_bytes(kBase)[70 * 256 + 4] == 0);
+
+    std::printf("fused_copy_and_sum_hook_and_fallback: AVX2 fused strip hook, fallback, and kMaxWorkers==8 ok\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -1825,6 +1901,7 @@ int main() {
     if (batched_filter_and_page_aware_write_back()) return 1;
     if (multi_chunk_direct_table_boundaries()) return 1;
     if (upload_breakdown_and_unit_sums_slab()) return 1;
+    if (fused_copy_and_sum_hook_and_fallback()) return 1;
     std::printf("title_mirror_hooks_test: ok\n");
     return 0;
 }
