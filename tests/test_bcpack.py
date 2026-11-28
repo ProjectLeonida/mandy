@@ -1,4 +1,6 @@
-"""Tests for tools/bcpack.py, bcpack_tables.py and bcpack_tables_bptc.py.
+"""Tests for the offline bcpack_research.py and legacy format tables.
+
+Production decoding is covered by test_bcpack_standalone.py and test_ttpf_mips.py.
 
 Builds genuine BCPack rANS streams from scratch with a self-contained test
 encoder — no game files or texture bytes are used.
@@ -16,7 +18,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
-import bcpack  # noqa: E402
+import bcpack_research as bcpack  # noqa: E402
 import bcpack_tables as tables  # noqa: E402
 import bcpack_tables_bptc as bptc  # noqa: E402
 

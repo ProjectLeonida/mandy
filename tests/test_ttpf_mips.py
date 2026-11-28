@@ -1478,13 +1478,13 @@ class SyntheticBcpackPoolTest(unittest.TestCase):
         self.assertEqual((total["after_bcpack_full"], total["after_bcpack_skip"],
                           total["bcpack_unlocked_full"]), (1, 0, 1))
 
-    def test_provisional_history_strict_refusal_and_opt_in(self):
+    def test_fixed_history_has_identical_strict_and_legacy_output(self):
         import io
         from contextlib import redirect_stdout
         path = os.path.join(self.tmp.name, "bc1_prov.ttpf")
         layout = ttpf.surface_layout(64, 64, 71, 5, ttpf.tile_bytes(4))
         nblocks = layout["size"] // 8
-        # Block 0 references provisional entry 6 (256 + 0 - 250 = 6).
+        # Block 0 uses a fixed dictionary entry previously marked provisional.
         build_bc1_bcpack_pool(path, ref_dists=[250] + [0] * (nblocks - 1))
         pool = ttpf.Pool(path)
         self.addCleanup(pool.close)
@@ -1492,13 +1492,15 @@ class SyntheticBcpackPoolTest(unittest.TestCase):
         buf = io.StringIO()
         with redirect_stdout(buf):
             code_strict = ttpf.check(pool, 0)
-        self.assertEqual(code_strict, 2)
-        self.assertIn("provisional BCPack history required", json.loads(buf.getvalue())["blocked"])
+        self.assertEqual(code_strict, 0, buf.getvalue())
 
         buf2 = io.StringIO()
         with redirect_stdout(buf2):
             code_prov = ttpf.check(pool, 0, allow_provisional=True)
         self.assertEqual(code_prov, 0, buf2.getvalue())
+        self.assertEqual(json.loads(buf.getvalue()), json.loads(buf2.getvalue()))
+        self.assertEqual(ttpf.texture_dds(pool, ttpf.analyze(pool, 0)),
+                         ttpf.texture_dds(pool, ttpf.analyze(pool, 0), allow_provisional=True))
 
     def test_bc7_bcpack_pool_export_and_scan(self):
         import io
@@ -1589,33 +1591,19 @@ class SyntheticBcpackPoolTest(unittest.TestCase):
         self.assertEqual((total["after_bcpack_full"], total["after_bcpack_skip"],
                           total["bcpack_unlocked_full"]), (1, 0, 1))
 
-    def test_bc7_bcpack_external_history_cli(self):
+    def test_bc7_fixed_dictionary_export_ignores_legacy_history_cli(self):
         import io
         from contextlib import redirect_stderr, redirect_stdout
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import test_bcpack as tb
+        from pathlib import Path
 
         layout = ttpf.surface_layout(64, 64, 98, 1, ttpf.tile_bytes(4))
         mip = layout["mips"][0]
-        nblocks = mip["blocks_w"] * mip["blocks_h"]
-        linear = bytearray()
-        for i in range(nblocks):
-            r0 = (i * 5 + 11) & 0x7F
-            g0 = (i * 3 + 23) & 0x7F
-            b0 = (i * 7 + 41) & 0x7F
-            acc = (1 << 6) | (r0 << 7) | (r0 << 14) | (g0 << 21) | (g0 << 28) | (b0 << 35) | (b0 << 42)
-            acc |= (0x7F << 49) | (0x7F << 56) | (1 << 63) | (1 << 64)
-            linear += acc.to_bytes(16, "little")
-        payload = bytearray(layout["size"])
-        retile_to(layout, mip, bytes(linear), payload)
-        mode6_pad = (1 << 6).to_bytes(16, "little")
-        for off in range(0, len(payload), 16):
-            if payload[off:off + 16] == b"\x00" * 16:
-                payload[off:off + 16] = mode6_pad
-
-        hist_k = 19
-        ep_row = [0x45, 0x22 << 1, 0x33 << 1, 0x7F << 1, 0x45, 0x22 << 1, 0x33 << 1, 0x7F << 1] * 3
-        packed_payload = tb.encode_bc7_mode6_blocks(bytes(payload), first_ep_history=(hist_k, ep_row))
+        fixture = Path(__file__).with_name("fixtures") / "bcpack-standalone.txt"
+        row = next(line.split() for line in fixture.read_text(encoding="utf-8").splitlines()
+                   if line.startswith("7 bc7-gdk-roundtrip-11 "))
+        packed_payload, payload = bytes.fromhex(row[2]), bytes.fromhex(row[3])
+        self.assertEqual(len(payload), layout["size"])
+        linear = ttpf.detile(layout, mip, payload)
 
         path = os.path.join(self.tmp.name, "bc7_hist.ttpf")
         pad = (-len(packed_payload)) % 256
@@ -1648,39 +1636,19 @@ class SyntheticBcpackPoolTest(unittest.TestCase):
             f.write(blob)
 
         hist_json = os.path.join(self.tmp.name, "bc7_history.json")
-        with open(hist_json, "w", encoding="utf-8") as f:
-            json.dump({
-                "bc7": {
-                    "historyEndpoints": {str(hist_k): ep_row},
-                    "historyEndpointBits": {str(hist_k): [8] * 24},
-                    "historyEndpointConfirmedBits": {str(hist_k): [8] * 24},
-                }
-            }, f)
-
-        out_dds = os.path.join(self.tmp.name, "bc7_hist.dds")
-        # Without --history: cleanly refuses with exit 2 and --history hint.
-        err = io.StringIO()
-        with redirect_stdout(io.StringIO()), redirect_stderr(err):
-            rc_no_hist = ttpf.main(["export", path, "0", out_dds])
-        self.assertEqual(rc_no_hist, 2)
-        self.assertIn("--history", err.getvalue())
-        self.assertFalse(os.path.exists(out_dds))
-
-        # With --history: strict export succeeds and matches exact linear blocks.
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            rc_ok = ttpf.main(["export", path, "0", out_dds, "--history", hist_json])
-        self.assertEqual(rc_ok, 0)
-        with open(out_dds, "rb") as f:
-            dds = f.read()
-        self.assertEqual(dds[148:], bytes(linear))
-
-        # Missing --history path: clean exit 2, no traceback.
-        err_missing = io.StringIO()
+        with open(hist_json, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{not a valid profile')
         missing = os.path.join(self.tmp.name, "nope.json")
-        with redirect_stdout(io.StringIO()), redirect_stderr(err_missing):
-            rc_bad = ttpf.main(["export", path, "0", out_dds, "--history", missing])
-        self.assertEqual(rc_bad, 2)
-        self.assertNotIn("Traceback", err_missing.getvalue())
+        out_dds = os.path.join(self.tmp.name, "bc7_hist.dds")
+        for options in ([], ["--history", hist_json], ["--history", missing]):
+            with self.subTest(options=options):
+                err = io.StringIO()
+                with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                    rc = ttpf.main(["export", path, "0", out_dds, "--force", *options])
+                self.assertEqual(rc, 0, err.getvalue())
+                with open(out_dds, "rb") as f:
+                    dds = f.read()
+                self.assertEqual(dds[148:], linear)
 
 
 class BadPoolTest(unittest.TestCase):

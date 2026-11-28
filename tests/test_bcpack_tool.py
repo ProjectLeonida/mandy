@@ -263,15 +263,15 @@ class TestCliErrorPaths(unittest.TestCase):
                 f.write(self.compressed_stream)
             out_dir = os.path.join(tmp_dir, "out_dir")
             os.makedirs(out_dir)
-            with mock.patch.object(bcpack_tool.bcpack, "decode_with_info",
-                                   return_value=(self.original_blocks, frozenset())):
+            with mock.patch.object(bcpack_tool.bcpack, "decode",
+                                   return_value=self.original_blocks):
                 rc, err, _ = self._cli(
                     ["decode", in_file, out_dir, "--codec", "1", "--size", "32"],
                     tmp_dir, "decode_outdir",
                 )
             self._assert_one_error_line(rc, err, "out_dir")
 
-    def test_malformed_history_json(self) -> None:
+    def test_legacy_history_is_not_read(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             in_file = os.path.join(tmp_dir, "sample.bcpack")
             with open(in_file, "wb") as f:
@@ -285,8 +285,10 @@ class TestCliErrorPaths(unittest.TestCase):
                  "--history", history],
                 tmp_dir, "decode_hist",
             )
-            self._assert_one_error_line(rc, err, "hist.json")
-            self.assertFalse(os.path.exists(out_file))
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(err, "")
+            with open(out_file, "rb") as f:
+                self.assertEqual(f.read(), self.original_blocks)
 
     def test_decode_same_input_output_cli_exits_2(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

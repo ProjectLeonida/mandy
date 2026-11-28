@@ -17,10 +17,11 @@ descriptors use the same 16-byte ETPF record with a 7-bit DXGI format
 The layout rules live in `tex_headers.py`; this tool supplies the RDS5 reader,
 decoders and commands. It computes the layout from the descriptor, validates it
 against the native allocation span, then decodes zlib/raw mips and supported
-BCPack codecs (BC1, BC3, BC4, BC5, BC6H and BC7 via `bcpack.py`, strict
-confirmed-history mode by default; pass `--allow-provisional` to opt into
-unconfirmed built-in history entries, and `--history <path>` to supply locally
-generated BC6H/BC7 initial history tables).
+BCPack codecs (BC1 through BC7 via the standalone `bcpack.py`). The decoder
+uses fixed format dictionaries; it needs no calibration or history file.
+`--allow-provisional` and `--history` are accepted for compatibility and do not
+change decoding. Explicit `--calibration` selects the separate offline research
+exporter, which is not used by the normal assets build.
 
 Read-only: no texture bytes are printed or committed. `scan` emits aggregate
 counters only (both the zlib/raw baseline and the BCPack-enabled projection).
@@ -2155,20 +2156,20 @@ def main(argv=None):
     pc.add_argument("pool")
     pc.add_argument("index", type=int)
     pc.add_argument("--allow-provisional", action="store_true",
-                    help="allow unconfirmed built-in BCPack history entries")
+                    help="legacy compatibility flag; standalone decoding always uses fixed dictionaries")
     pc.add_argument("--history",
-                    help="local JSON file or directory supplying BC6H/BC7 (and optional BC1-BC5) initial history tables")
+                    help="legacy compatibility argument; the supplied file is not read")
     pe = sub.add_parser("export", help="write the full chain as DDS")
     pe.add_argument("pool")
     pe.add_argument("index", type=int)
     pe.add_argument("out")
     pe.add_argument("--mips", type=int)
     pe.add_argument("--force", action="store_true")
-    pe.add_argument("--calibration", metavar="PROFILE.json", help="export using an explicit locally fitted profile")
+    pe.add_argument("--calibration", metavar="PROFILE.json", help="offline research export using an explicit locally fitted profile")
     pe.add_argument("--allow-provisional", action="store_true",
-                    help="allow unconfirmed built-in BCPack history entries")
+                    help="legacy compatibility flag; standalone decoding always uses fixed dictionaries")
     pe.add_argument("--history",
-                    help="local JSON file or directory supplying BC6H/BC7 (and optional BC1-BC5) initial history tables")
+                    help="legacy compatibility argument; the supplied file is not read")
     a = ap.parse_args(argv)
     if a.cmd == "scan":
         pools = []

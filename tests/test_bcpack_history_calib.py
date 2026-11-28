@@ -15,12 +15,12 @@ import tempfile
 import unittest
 import zlib
 from contextlib import redirect_stderr, redirect_stdout
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
-import bcpack  # noqa: E402
+import bcpack_research as bcpack  # noqa: E402
 import bcpack_history_calib as calib  # noqa: E402
 import bcpack_tables as tables  # noqa: E402
 import bcpack_tables_bptc as bptc  # noqa: E402
@@ -760,6 +760,8 @@ class ReferenceInversionTest(unittest.TestCase):
                         expected[index] = True
         self.assertEqual(valid, expected)
 
+    # These tests exercise the explicit offline research decoder, not production exports.
+    @patch.object(ttpf, "bcpack", bcpack)
     def test_ref_dds_with_synthetic_ttpf_pool_and_ttpf_export(self):
         with tempfile.TemporaryDirectory() as tmp:
             width, height, mips_n, fmt = 64, 64, 2, 98  # DXGI_FORMAT_BC7_UNORM
@@ -998,6 +1000,8 @@ class Bc6hConfirmationDepthTest(unittest.TestCase):
 
 
 class PoolSelfCalibrationTest(unittest.TestCase):
+    # These tests exercise the explicit offline research decoder, not production exports.
+    @patch.object(ttpf, "bcpack", bcpack)
     def test_mixed_bc7_and_bc6h_pool_self_calibration_unlocks_provisional_check_and_export(self):
         with tempfile.TemporaryDirectory() as tmp:
             width, height, mips_n = 64, 64, 2

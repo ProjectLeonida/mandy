@@ -842,6 +842,13 @@ variant.
 
 ## Clean-room BCPack bitstream specification and decoder
 
+> Historical research implementation: the normal Python exporter and both
+> runtimes now use the [standalone BC1–BC7 decoder](bcpack-standalone.md).
+> Its fixed dictionaries replace provisional/fitted history, and BC2 is supported.
+> The implementation and provenance claims below describe the earlier research
+> decoder, retained as `tools/bcpack_research.py` for explicit offline tools.
+
+
 The unknowns noted in the earlier measurements are resolved in `tools/bcpack.py`,
 `tools/bcpack_tables.py` and `tools/bcpack_tables_bptc.py` (pure Python standard library,
 no GDK/NDA code, no keys, no game assets). The console-side hardware decompressor and GDK

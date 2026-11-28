@@ -17,7 +17,6 @@
 
 #include <span>
 #include "../src/bcpack.h"
-#include "../src/bcpack_stream.h"
 #include "../src/dstorage_hold.h"
 #include "../src/title_geometry_watch.h"
 #include "../src/title_page_watch.h"
@@ -1343,22 +1342,6 @@ struct Vector {
 };
 #include "dstorage_vectors.inc"
 
-leonida::bcpack::Calibration test_profile() {
-    leonida::bcpack::Calibration history{};
-    auto& six = history.bc6[255];
-    for (unsigned c = 0; c < 3; ++c) six.ep[8 * c + 1] = 16;
-    six.ep_class = six.ix_class = 3;
-    six.ep_confirmed.fill(16);
-    six.ix_confirmed.fill(4);
-    auto& seven = history.bc7[255];
-    seven.ep.fill(64);
-    seven.ep_bits.fill(8);
-    seven.ep_confirmed.fill(8);
-    seven.ix_bits.fill(4);
-    seven.ix_confirmed.fill(4);
-    return history;
-}
-
 // Requests whose destination the runtime's own guards keep read-only, written from the queue's worker threads (each
 // through kernel_writes: src/title_page_watch.h):
 //   1. a geometry tile the geometry watch armed (src/title_geometry_watch.h), with the D3D12 layer's opener as far as
@@ -1485,7 +1468,7 @@ void test_extended(Env& env) {
             r.DestinationSize = static_cast<uint32_t>(bytes);
             submit(r, S_OK);
             check(std::equal(v.plain.begin(), v.plain.end(), output.begin()) && output.back() == 0xA5,
-                  "BC blocks equal the Python decoder, including all mode fields");
+                  "BC blocks equal the independent GDK goldens, including BC2 and BPTC");
             if (!zlib) {
                 std::fill(output.begin(), output.end(), 0xA5);
                 r.SourceSize /= 2;
@@ -1495,44 +1478,6 @@ void test_extended(Env& env) {
             }
         }
     }
-    {
-        auto history = test_profile();
-        auto& six = history.bc6[255];
-        auto& seven = history.bc7[255];
-        for (unsigned codec : {6u, 7u}) {
-            const std::span<const uint8_t> raw = codec == 6 ? std::span<const uint8_t>(profile_raw6) : profile_raw7;
-            const uint8_t* first = codec == 6 ? profile_first6 : profile_first7;
-            std::vector<uint8_t> result(512);
-            check(leonida::bcpack::decode(codec, raw, result, false, &history) == leonida::bcpack::Quality::confirmed,
-                  "confirmed local BPTC predictor accepts the stream");
-            bool exact = true;
-            for (size_t j = 0; j < result.size(); ++j) exact &= result[j] == first[j % 16];
-            check(exact, "propagated external BPTC history matches all reference blocks");
-            DSTORAGE_REQUEST from_profile{};
-            from_profile.Options.AsUINT64 = options::kSourceMemory | (uint64_t(codec) << options::kBcpackShift);
-            from_profile.Source = raw.data();
-            from_profile.SourceSize = static_cast<uint32_t>(raw.size());
-            from_profile.Destination = result.data();
-            from_profile.DestinationSize = static_cast<uint32_t>(result.size());
-            std::fill(result.begin(), result.end(), 0xA5);
-            submit(from_profile, S_OK);
-            bool default_exact = true;
-            for (size_t j = 0; j < result.size(); ++j) default_exact &= result[j] == first[j % 16];
-            check(default_exact, "default sidecar next to the shader library supplies exact reference blocks");
-            if (codec == 6) six.ep_class = 1;
-            else seven.ep_confirmed.fill(0);
-            check(leonida::bcpack::decode(codec, raw, result, false, &history) == leonida::bcpack::Quality::failed &&
-                  leonida::bcpack::decode(codec, raw, result, true, &history) == leonida::bcpack::Quality::fitted,
-                  "partially confirmed BPTC profile requires fitted mode");
-        }
-    }
-    std::vector<uint8_t> fitted(512);
-    check(leonida::bcpack::decode(1, fitted_raw, fitted) == leonida::bcpack::Quality::failed,
-          "strict decoding rejects fitted history");
-    check(leonida::bcpack::decode(1, fitted_raw, fitted, true) == leonida::bcpack::Quality::fitted &&
-          std::equal(std::begin(fitted_first), std::end(fitted_first), fitted.begin()),
-          "opt-in fitted history matches the reference and reports its quality");
-
     // Three groups make an accidental per-64-KiB permutation distinguishable from macro-unshuffle.
     const std::vector<std::vector<int>> planes = {{1,1,2},{1,1,6},{1,3,1,1,2},{1,3,1,3}};
     for (unsigned m = 1; m <= 4; ++m) {
@@ -1887,24 +1832,6 @@ int main() {
     write_file(env.game / L"data" / L"b.bin", env.b);
     write_file(env.game / L"data" / L"big.bin", env.big);
     rt::fs::configure(env.game, env.overlay);
-    const auto profile = test_profile();
-    std::vector<uint8_t> packed_profile(8 + sizeof profile);
-    std::memcpy(packed_profile.data(), "BCPHIST1", 8);
-    std::memcpy(packed_profile.data() + 8, &profile, sizeof profile);
-    write_file(env.root / L"shaders/bcpack/history.bcph", packed_profile);
-    SetEnvironmentVariableW(L"LEONIDA_DSTORAGE_HISTORY", nullptr);
-    SetEnvironmentVariableW(L"LEONIDA_SHADERS", (env.root / L"shaders/spirv").c_str());
-
-
-    bool entropy_exact = true;
-    for (int width = 1; width <= 8; ++width) {
-        for (int q = 0; q < 16; ++q) {
-            const auto& model = leonida::bcpack::detail::model_for(width, q);
-            for (uint32_t slot = 0; slot < 65536; ++slot)
-                entropy_exact &= model.symbol(slot, true) == model.symbol(slot, false);
-        }
-    }
-    check(entropy_exact, "fast entropy lookup matches scalar division for every slot in all 128 models");
     test_layout_and_options();
     test_staging_budget();
     test_registry(env);

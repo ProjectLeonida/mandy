@@ -15,7 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tools"))
 sys.path.insert(0, HERE)
 
-import bcpack  # noqa: E402
+import bcpack_research as bcpack  # noqa: E402
 import test_bcpack as synth  # noqa: E402
 
 

@@ -16,7 +16,6 @@ import make_game
 import ttpf_assets
 import ttpf_mips
 import world_build
-from test_calibrated_texture import synthetic_profile
 from test_ttpf_mips import build_bc1_bcpack_pool
 
 
@@ -203,35 +202,28 @@ class TextureAssets(unittest.TestCase):
         self.assertTrue(self.row_after_export()["File"].startswith("000000_bcpack_"))
         self.assertEqual(outside.read_bytes(), b"not this pool's")
 
-    def test_profile_added_after_strict_rejection(self):
+    def test_profiles_cannot_change_a_complete_standalone_export(self):
         build_bc1_bcpack_pool(self.pool, ref_dists=[250] + [0] * 1023)
         self.legacy()
-        self.build()
-        row = self.row_after_export()
-        self.assertIsNone(row["File"])
-        self.assertIn("BCPackLimitation", row)
-        try:
-            from calibrated_texture import native
-            native()
-        except (ImportError, OSError) as exc:
-            self.skipTest(str(exc))
-        profile = self.work / "bcpack-calibration.json"
-        config = synthetic_profile()
-        profile.write_text(json.dumps(config), encoding="utf-8")
         self.build()
         row = self.row_after_export()
         original = self.folder / row["File"]
         original_bytes = original.read_bytes()
         self.assertEqual(original_bytes[:4], b"DDS ")
+        self.assertEqual((row["Mips"], row["BaseMipLevel"]), (5, 0))
         self.assertNotIn("BCPackLimitation", row)
-        config["bc1"]["selectors"][0] = [mask ^ 1 for mask in config["bc1"]["selectors"][0]]
-        profile.write_text(json.dumps(config), encoding="utf-8")
-        self.build()
-        updated = self.folder / self.row_after_export()["File"]
-        self.assertNotEqual(updated, original)
-        self.assertNotEqual(updated.read_bytes(), original_bytes)
-        # The row switched files, so the pass removes the one it replaced (remove_replaced).
-        self.assertFalse(original.exists())
+        with contextlib.closing(ttpf_mips.Pool(self.pool)) as pool:
+            self.assertEqual(original_bytes, ttpf_mips.texture_dds(pool, ttpf_mips.analyze(pool, 0)))
+        stamp = ttpf_assets.load_profile(self.work)
+        profile = self.work / "bcpack-calibration.json"
+        for text in ('{"version":1,"bc1":{"selectors":[[999]]}}', '{bad json'):
+            with self.subTest(profile=text):
+                profile.write_text(text, encoding="utf-8", newline="\n")
+                with mock.patch.object(ttpf_assets.ttpf, "Pool", side_effect=AssertionError("unexpected reopen")):
+                    self.build()
+                self.assertEqual(ttpf_assets.load_profile(self.work), stamp)
+                self.assertEqual(self.row_after_export(), row)
+                self.assertEqual(original.read_bytes(), original_bytes)
 
     @unittest.skipUnless(os.environ.get("RPF9DUMP_DLL"), "requires the built rpf9dump")
     def test_new_base_and_pack_pools(self):
@@ -320,8 +312,8 @@ class CandidateRules(unittest.TestCase):
     def test_a_strict_decoder_claim_is_a_candidate_without_a_profile(self):
         self.assertTrue(ttpf_assets.candidate(synthetic_row(BCPackDecoder="bc1-strict"), None))
 
-    def test_a_calibrated_decoder_claim_needs_a_profile(self):
-        self.assertFalse(ttpf_assets.candidate(synthetic_row(BCPackDecoder="bc1-calibrated"), None))
+    def test_a_calibrated_decoder_claim_is_reprocessed_without_a_profile(self):
+        self.assertTrue(ttpf_assets.candidate(synthetic_row(BCPackDecoder="bc1-calibrated"), None))
         self.assertTrue(ttpf_assets.candidate(synthetic_row(BCPackDecoder="bc1-calibrated"), {"version": 1}))
 
     def test_a_missing_file_is_a_candidate(self):
@@ -372,26 +364,13 @@ class ProfileRules(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "opened"):
                 ttpf_assets.complete_pool("missing.ttpf", self.work, manifest, (new[0], None))
 
-    def test_another_calibration_version_is_an_error(self):
-        self.write(json.dumps({"version": 2}))
-        with self.assertRaises(ValueError):
-            ttpf_assets.load_profile(self.work)
-
-    def test_a_non_object_calibration_is_an_error(self):
-        self.write("[]")
-        with self.assertRaises(ValueError):
-            ttpf_assets.load_profile(self.work)
-
-    def test_malformed_json_is_an_error(self):
-        self.write("{")
-        with self.assertRaises(ValueError):
-            ttpf_assets.load_profile(self.work)
-
-    def test_malformed_json_names_the_profile(self):
-        self.write("{")
-        with self.assertRaises(ValueError) as caught:
-            ttpf_assets.load_profile(self.work)
-        self.assertIn("bcpack-calibration.json", str(caught.exception))
+    def test_legacy_profiles_are_not_read(self):
+        expected = ttpf_assets.strict_stamp(), None
+        for text in ('{"version":2}', '[]', '{', '{"version":1}'):
+            with self.subTest(profile=text):
+                self.write(text)
+                with mock.patch.object(Path, "read_text", side_effect=AssertionError("profile read")):
+                    self.assertEqual(ttpf_assets.load_profile(self.work), expected)
 
 
 class CompletePoolEarlyReturn(unittest.TestCase):
@@ -413,9 +392,8 @@ class CompletePoolEarlyReturn(unittest.TestCase):
         pool.assert_not_called()
 
 
-    def test_a_pool_hashes_the_decoder_sources_once_for_all_its_strict_fallback_rows(self):
-        # With a profile, each row the calibrated decoder can't take falls back to strict decoding; hashing the
-        # sources per row read them 32 times over for 32 rows. A new pass computes the stamp again.
+    def test_a_pool_uses_the_supplied_stamp_without_loading_a_calibrated_decoder(self):
+        # The assets stage has already hashed the fixed decoder sources once for this pass.
         pool = mock.Mock(chunks=[(0,)], virtual_size=64)
         pool.descriptor.return_value = {"base": 0, "dimension": 1, "format": 71}
         pool.span.return_value = 8
@@ -431,7 +409,8 @@ class CompletePoolEarlyReturn(unittest.TestCase):
             for passes in (1, 2):
                 manifest = {"Textures": [synthetic_row(Index=i) for i in range(32)]}
                 self.assertEqual(ttpf_assets.complete_pool("synthetic", out, manifest, ("v1-profile", {})), (0, 32))
-                self.assertEqual(stamps.call_count, passes)
+                stamps.assert_not_called()
+                calibrated.LocalDecoder.assert_not_called()
 
 
 if __name__ == "__main__":

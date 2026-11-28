@@ -1,4 +1,5 @@
-// Shared rANS block stream used by the runtime decoder and the offline history fitter.
+// Legacy rANS block stream for the explicit offline history fitter only.
+// The production runtime uses third_party/x2w-bcpack.
 #pragma once
 #include <algorithm>
 #include <array>

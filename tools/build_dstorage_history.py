@@ -340,7 +340,7 @@ def refine(docs, votes, history):
 def fingerprint(pools, base_history):
     digest = hashlib.sha256()
     for name in ("build_dstorage_history.py", "bcpack_history_train.cpp", "bcpack_history_calib.py",
-                 "bcpack.py", "bcpack_tables.py", "bcpack_tables_bptc.py", "gen_bcpack_runtime_tables.py",
+                 "bcpack_research.py", "bcpack_tables.py", "bcpack_tables_bptc.py", "gen_bcpack_runtime_tables.py",
                  "ttpf_mips.py", "tex_headers.py", "../runtime/src/bcpack_stream.h"):
         digest.update((TOOLS/name).read_bytes())
     for path in pools:

@@ -5,7 +5,7 @@ import sys
 import struct
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import bcpack as bc
+import bcpack_research as bc
 import bcpack_tables as tables
 import bcpack_tables_bptc as bptc
 

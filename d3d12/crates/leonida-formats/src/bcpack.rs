@@ -1,8 +1,7 @@
 //! BCPack: lossless packing of BC1-BC7 block streams, as the console's
-//! DirectStorage hardware unpacks them. Decode only; BC2 is left out (no
-//! title data uses it).
+//! DirectStorage hardware unpacks them. Decode only, BC1 through BC7.
 //!
-//! A packed stream has no header. It is 12 or 16 interleaved rANS *lanes*;
+//! A packed stream has no header. It is 12, 15 or 16 interleaved rANS *lanes*;
 //! each lane is a run of fragments (header byte, length, payload) coded with
 //! one of 128 static models, and a fixed schedule decides which lane takes
 //! the next input byte. The lanes' symbols form one record per block: two
@@ -10,9 +9,14 @@
 //! dictionary that stands in for blocks -1 to -255) and the residuals of the
 //! endpoints and indices against them. The models, the index rank tables,
 //! the BC7 control codes and the dictionaries are constants of the format,
-//! kept in `bcpack-tables.bin` beside this file ([`Tables::builtin`]).
+//! kept in `bcpack-tables.bin` beside this file ([`Tables::builtin`]) and the
+//! generated BC2 companion `bcpack_bc2_tables.rs`. See `docs/bcpack-standalone.md`
+//! for provenance and independent synthetic regression coverage.
 
 use std::fmt;
+
+#[path = "bcpack_bc2_tables.rs"]
+mod bc2_tables;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error(pub &'static str);
@@ -129,8 +133,8 @@ impl Tables {
     /// alpha 64 B and colour 256 B, BC4 64 B, BC5 64 B), 512 u16 BC7 control
     /// words, then 255 dictionary entries per format in format order: BC1
     /// 6 + 16 B, BC3 8 + 32 B, BC4 2 + 16 B, BC5 4 + 32 B, BC6H (u8 mode,
-    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, 2 B,
-    /// 16 + 15 i16; entry 0 has no 2 B and holds 16 + 16 i16). Little-endian,
+    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8,
+    /// 16 + 16 i16). Little-endian,
     /// no padding. Every model must tile 65536.
     pub fn parse(bytes: &[u8]) -> Result<Tables, Error> {
         if bytes.len() != TABLES_SIZE {
@@ -211,7 +215,7 @@ impl Tables {
             })
             .collect();
         let bc7 = (0..DICTIONARY)
-            .map(|k| {
+            .map(|_| {
                 let mut ep = Bc7Ep {
                     ctrl: r.u16(),
                     ..Default::default()
@@ -223,16 +227,9 @@ impl Tables {
                     bits: [r.u8(), r.u8()],
                     ..Default::default()
                 };
-                // Entry 0 holds all 32 indices right after its widths; the
-                // others repeat the widths (unused) and hold 31, as set 1
-                // has only 15 slots, which no entry uses (0 bits).
-                let n = if k == 0 {
-                    32
-                } else {
-                    r.u16();
-                    31
-                };
-                for v in &mut ix.ix.as_flattened_mut()[..n] {
+                // Every entry carries both complete 16-index sets. Skipping
+                // one value shifts all subsequent predictor pixels.
+                for v in ix.ix.as_flattened_mut() {
                     *v = r.u16() as i16;
                 }
                 (ep, ix)
@@ -259,13 +256,13 @@ impl Tables {
     }
 }
 
-/// Unpacks `src` (BC number `bc`, 1 and 3-7) into `dst`, whose length gives
+/// Unpacks `src` (BC number `bc`, 1 through 7) into `dst`, whose length gives
 /// the block count. The stream carries no size: bytes after the last one the
-/// lanes need are ignored, a stream that runs out is an error.
+/// lanes need may be zero padding; a truncated stream or nonzero tail is an error.
 pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(), Error> {
     let block = match bc {
         1 | 4 => 8,
-        3 | 5 | 6 | 7 => 16,
+        2 | 3 | 5 | 6 | 7 => 16,
         _ => return Err(Error("unsupported BC format")),
     };
     if dst.is_empty() || !dst.len().is_multiple_of(block) {
@@ -274,6 +271,7 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
     let blocks = dst.len() / block;
     let (widths, per): (&[u8], usize) = match bc {
         1 => (&[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
+        2 => (&[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 5, 4, 7, 7], 2),
         3 => (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
         4 => (&[7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 1),
         5 => (&[3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 2),
@@ -281,14 +279,21 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
     };
     let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
+    let count = blocks
+        .checked_mul(stride)
+        .ok_or(Error("symbol count overflow"))?;
+    let mut records = vec![0u8; count];
     let mut next = src.iter().copied();
     lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
+    if next.any(|b| b != 0) {
+        return Err(Error("nonzero data after the stream"));
+    }
     let records = records.chunks_exact(stride);
     let out = dst.chunks_exact_mut(block);
     let t = tables;
     match bc {
         1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
+        2 => bc2(records, out),
         3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
         4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
         5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
@@ -299,6 +304,7 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
 
 // Lanes.
 
+#[cfg(test)]
 #[derive(Clone, Copy, Default)]
 struct Lane {
     /// Symbol bits - 1 at the full alphabet.
@@ -307,15 +313,16 @@ struct Lane {
     phase: u8,
     long: bool,
     reset: bool,
+    virtual_zeros: u8,
     model: u8,
     need: bool,
     latch: Option<u8>,
     out: Option<u8>,
-    stalled: bool,
     x: u32,
     left: u32,
 }
 
+#[cfg(test)]
 impl Lane {
     /// One step: take the latched byte (header, length or payload) and
     /// decode at most one symbol.
@@ -331,6 +338,7 @@ impl Lane {
                     let group = self.width - (b >> 6);
                     self.model = group * 16 + (b & 15);
                     self.reset = b & 0x10 != 0;
+                    self.virtual_zeros = 0;
                     self.long = b & 0x20 != 0;
                     self.left = 0;
                     self.phase = 1;
@@ -358,6 +366,14 @@ impl Lane {
             x = x << 8 | u32::from(b);
         }
         self.need = self.left != 0 && self.latch.is_none();
+        // A flushed fragment can omit up to two final zero bytes. Restore
+        // them after its byte budget ends; they do not consume stream bytes.
+        if self.reset && self.left == 0 {
+            while x != 0 && x < LOW && self.virtual_zeros < 2 {
+                x <<= 8;
+                self.virtual_zeros += 1;
+            }
+        }
         if x > LOW {
             let freq = &t.freq[usize::from(self.model)];
             let start = &t.start[usize::from(self.model)];
@@ -406,13 +422,136 @@ fn bucket_of(t: &Tables, model: u8, slot: u32) -> usize {
     b
 }
 
-/// Decodes `per` symbols per block on every lane into `records` (one record
-/// of `widths.len() * per` symbols per block), taking input from `fetch`
-/// (given the lane that takes the byte) in the order of the schedule: each
-/// round the lanes step in order and take at most 8 bytes between them.
-// shortcut: one lane step at a time (BC1 roughly 30-60 MB/s, BC7 15-20 MB/s
-// on one core); if texture streaming needs more, run the schedule only to
-// split the input per lane and decode the lanes apart.
+/// A complete lane tracks its output budget independently. Finished lanes must
+/// stop asking for bytes while other lanes drain their final symbols.
+#[derive(Clone, Copy, Default)]
+struct StreamLane {
+    phase: u8, // 0/1/2 header, 3 payload, 4 drain, 5 finished
+    model: u8,
+    x: u32,
+    left: u32,
+    remaining: usize,
+    written: usize,
+    reset: bool,
+    long: bool,
+    zeros: u8,
+    latch: Option<u8>,
+    out: Option<u8>,
+    final_state: u32,
+}
+
+impl StreamLane {
+    fn step(&mut self, t: &Tables, width: u8) -> Result<(), Error> {
+        if self.phase < 3 {
+            let Some(b) = self.latch.take() else {
+                return Ok(());
+            };
+            match self.phase {
+                0 => {
+                    let group = width
+                        .checked_sub(b >> 6)
+                        .filter(|&g| g < 8)
+                        .ok_or(Error("invalid lane alphabet"))?;
+                    self.model = group * 16 + (b & 15);
+                    self.reset = b & 0x10 != 0;
+                    self.long = b & 0x20 != 0;
+                    self.zeros = 0;
+                    self.left = 0;
+                    self.phase = 1;
+                }
+                1 if self.long => {
+                    self.left = b.into();
+                    self.phase = 2;
+                }
+                1 => {
+                    self.left = u32::from(b) + 1;
+                    self.phase = 3;
+                }
+                _ => {
+                    self.left = (u32::from(b) << 8 | self.left) + 257;
+                    self.phase = 3;
+                }
+            }
+            return Ok(());
+        }
+        if self.phase == 5 {
+            return Ok(());
+        }
+        if self.phase == 3
+            && self.x < LOW
+            && self.left > 0
+            && let Some(b) = self.latch.take()
+        {
+            self.x = self.x << 8 | u32::from(b);
+            self.left -= 1;
+        }
+        if self.reset && self.left == 0 {
+            while self.x != 0 && self.x < LOW && self.zeros < 2 {
+                self.x <<= 8;
+                self.zeros += 1;
+            }
+        }
+        let before = self.x;
+        if before > LOW && self.remaining > 0 {
+            let model = usize::from(self.model);
+            let slot = before & 0xffff;
+            if slot == 0 {
+                return Err(Error("unused rANS slot"));
+            }
+            let b = bucket_of(t, self.model, slot);
+            let (sym, freq, rem) = if b == 0 {
+                (0, t.freq[model][0] - 1, slot - 1)
+            } else {
+                let offset = slot - t.start[model][b];
+                let q = ((u64::from(offset) * t.recip[model][b]) >> 32) as u32;
+                (
+                    (1u32 << (b - 1)) + q,
+                    t.freq[model][b],
+                    offset - q * t.freq[model][b],
+                )
+            };
+            if sym >= 1u32 << (u32::from(self.model / 16) + 1) {
+                return Err(Error("symbol outside lane alphabet"));
+            }
+            self.x = (before >> 16).wrapping_mul(freq).wrapping_add(rem);
+            self.out = Some(sym as u8);
+            self.remaining -= 1;
+        }
+        if self.phase == 3 && self.left == 0 {
+            if self.remaining == 0 {
+                self.phase = 5;
+                self.final_state = self.x;
+            } else if before == LOW {
+                self.phase = 0;
+                self.zeros = 0;
+                if self.reset {
+                    self.x = 0;
+                }
+            } else {
+                self.phase = 4;
+            }
+        } else if self.phase == 4 && before <= LOW {
+            if self.remaining == 0 {
+                self.phase = 5;
+                self.final_state = self.x;
+            } else {
+                if self.reset && before != LOW {
+                    return Err(Error("invalid flushed fragment"));
+                }
+                self.phase = 0;
+                self.zeros = 0;
+                if self.reset {
+                    self.x = 0;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The two phases of each eight-byte scheduling round, ported from the
+/// independently verified Xbox2Windows reference decoder. Output slots impose
+/// backpressure; a lane consumes its entire fragment before it finishes.
 fn lanes(
     t: &Tables,
     widths: &[u8],
@@ -421,59 +560,90 @@ fn lanes(
     mut fetch: impl FnMut(usize) -> Option<u8>,
     records: &mut [u8],
 ) -> Result<(), Error> {
-    let mut lanes = [Lane::default(); 16];
-    let lanes = &mut lanes[..widths.len()];
-    for (lane, &width) in lanes.iter_mut().zip(widths) {
-        lane.width = width;
-        lane.need = true;
+    let target = blocks
+        .checked_mul(per)
+        .ok_or(Error("symbol count overflow"))?;
+    if target == 0
+        || widths.is_empty()
+        || widths.len() > 16
+        || records.len()
+            != target
+                .checked_mul(widths.len())
+                .ok_or(Error("symbol count overflow"))?
+    {
+        return Err(Error("invalid lane dimensions"));
     }
-    let stride = widths.len() * per;
-    let full = (1u32 << widths.len()) - 1;
-    let (mut pos, mut done, mut idle) = (0, 0u32, 0);
-    // Where symbol `pos` of lane 0 goes; lane j's is `per * j` further on.
-    let mut at = 0;
-    while pos < blocks * per {
-        let (mut taken, mut moved) = (0, false);
-        for (j, lane) in lanes.iter_mut().enumerate() {
-            let bit = 1 << j;
-            let before = taken;
-            if !lane.stalled {
-                lane.step(t)?;
-            }
-            let waiting = lane.out.is_some() && done & bit != 0;
-            if lane.need && !waiting && taken < ROUND_BYTES {
-                // Past the end nothing arrives; in a valid stream only finished lanes ask there.
-                if let Some(b) = fetch(j) {
-                    lane.latch = Some(b);
-                    taken += 1;
+    let mut state = [StreamLane::default(); 16];
+    let state = &mut state[..widths.len()];
+    for lane in state.iter_mut() {
+        lane.remaining = target;
+    }
+    let mut slots = 0u32;
+    let mut exhausted = 0u32;
+    let mut idle = 0;
+    loop {
+        let mut taken = 0;
+        let mut stalled = 0u32;
+        let mut progress = false;
+        for (j, lane) in state.iter_mut().enumerate() {
+            let bit = 1u32 << j;
+            let blocked = lane.out.is_some() && slots & bit != 0;
+            let need = lane.latch.is_none() && (lane.phase < 3 || lane.phase == 3 && lane.left > 0);
+            let byte = if need && !blocked && taken < ROUND_BYTES && exhausted & bit == 0 {
+                let b = fetch(j);
+                if b.is_none() {
+                    exhausted |= bit;
                 }
-            }
-            lane.stalled = (lane.need && before >= ROUND_BYTES) || waiting;
-            if !lane.stalled
-                && let Some(sym) = lane.out.take()
-            {
-                records[at + j * per] = sym;
-                done |= bit;
-                moved = true;
-            }
-        }
-        if done == full {
-            pos += 1;
-            at += if pos.is_multiple_of(per) {
-                stride - per + 1
+                b
             } else {
-                1
+                None
             };
-            done = 0;
-            moved = true;
+            if blocked || need && byte.is_none() {
+                stalled |= bit;
+                continue;
+            }
+            if let Some(b) = byte {
+                lane.latch = Some(b);
+                taken += 1;
+                progress = true;
+            }
+            if let Some(sym) = lane.out.take() {
+                let pos = lane.written;
+                records[(pos / per) * widths.len() * per + j * per + pos % per] = sym;
+                lane.written += 1;
+                slots |= bit;
+                progress = true;
+            }
         }
-        // Nothing read and nothing delivered for a few rounds: no lane can go on.
-        idle = if taken > 0 || moved { 0 } else { idle + 1 };
-        if idle > 3 {
+        let mut active = 0u32;
+        let mut finished = true;
+        for (j, (lane, &width)) in state.iter_mut().zip(widths).enumerate() {
+            if stalled & (1 << j) == 0 {
+                let phase = lane.phase;
+                lane.step(t, width)?;
+                progress |= phase != lane.phase;
+            }
+            if !(lane.phase == 5 && lane.out.is_none() && slots & (1 << j) == 0) {
+                active |= 1 << j;
+            }
+            finished &= lane.phase == 5 && lane.out.is_none();
+        }
+        if slots != 0 && slots & active == active {
+            slots = 0;
+        }
+        if finished {
+            if state.iter().any(|lane| {
+                !matches!(lane.final_state, LOW | 0x10000 | 0x100) || lane.written != target
+            }) {
+                return Err(Error("invalid lane terminal state"));
+            }
+            return Ok(());
+        }
+        idle = if progress { 0 } else { idle + 1 };
+        if idle > 64 {
             return Err(Error("the stream ends early or is corrupt"));
         }
     }
-    Ok(())
 }
 
 // Blocks.
@@ -665,6 +835,45 @@ fn bc4_pack(v: &Plain, out: &mut [u8]) {
 fn bc5_pack(v: &Plain, out: &mut [u8]) {
     bc4_alpha(v.ep[0], v.ep[1], &v.ix[..16], &mut out[..8]);
     bc4_alpha(v.ep[2], v.ep[3], &v.ix[16..], &mut out[8..]);
+}
+
+/// Explicit BC2 alpha follows endpoint history; colour indices select their
+/// own predictor. Ported from Xbox2Windows' MIT standalone reconstruction.
+fn bc2<'a>(
+    records: impl Iterator<Item = &'a [u8]>,
+    out: impl Iterator<Item = &'a mut [u8]>,
+) -> Result<(), Error> {
+    let zero = ([0u8; 16], [0u8; 6], [0u8; 16]);
+    let mut history = [zero; HISTORY];
+    for (i, (s, dst)) in records.zip(out).enumerate() {
+        let (er, xr) = references(s, true);
+        let ep = *pick(i, er, &history, &bc2_tables::DICTIONARY, &zero);
+        let ix = *pick(i, xr, &history, &bc2_tables::DICTIONARY, &zero);
+        let mut state = zero;
+        let mut alpha = 0u64;
+        for p in 0..16 {
+            state.0[p] = ep.0[p].wrapping_add(zz(s[4 + p], 4)) & 15;
+            alpha |= u64::from(state.0[p] ^ 8) << (4 * p);
+        }
+        for c in 0..3 {
+            let bits = if c == 1 { 6 } else { 5 };
+            for e in 0..2 {
+                let p = 3 * e + c;
+                state.1[p] = ep.1[p].wrapping_add(zz(s[20 + 2 * c + e], bits)) & ((1 << bits) - 1);
+            }
+        }
+        for q in 0..4 {
+            let base = (q >> 1) * 8 + (q & 1) * 2;
+            for (k, offset) in [0, 1, 4, 5].into_iter().enumerate() {
+                let p = base + offset;
+                state.2[p] = ix.2[p].wrapping_add(bc2_tables::RANK[usize::from(s[26 + q])][k]) & 3;
+            }
+        }
+        dst[..8].copy_from_slice(&alpha.to_le_bytes());
+        bc1_color(&state.1, &state.2, &mut dst[8..]);
+        history[i % HISTORY] = state;
+    }
+    Ok(())
 }
 
 /// A byte's even and odd bits as two zigzag-coded 4-bit residuals.
@@ -1369,7 +1578,7 @@ mod tests {
         assert!(decode(4, &src, &mut [], &t).is_err());
         assert!(decode(4, &src, &mut vec![0u8; 65 * 8], &t).is_err());
         // Unsupported formats, bad tables.
-        assert!(decode(2, &src, &mut dst, &t).is_err());
+        assert!(decode(8, &src, &mut dst, &t).is_err());
         assert!(Tables::parse(&[0; 16]).is_err());
         let mut no_tiling = tables();
         no_tiling[0] = 1;
@@ -1390,7 +1599,7 @@ mod tests {
                     seed as u8
                 })
                 .collect();
-            for bc in [1, 3, 4, 5, 6, 7] {
+            for bc in 1..=7 {
                 let mut dst = vec![0u8; 16 * (1 + round % 40)];
                 let _ = decode(bc, &src, &mut dst, &t);
             }
@@ -1601,21 +1810,65 @@ mod tests {
         assert!(n > 0);
     }
 
-    /// A dictionary entry stands in for a block the decoder made: a set with
-    /// 0 index bits holds no indices, and pixel 0 is the anchor (top bit clear).
+    /// Predictors contain signed residual-domain indices, including unused
+    /// sets. Read every fixed-size record without dropping an i16 at its start.
     #[test]
     fn bc7_dictionary_indices_line_up() {
         let t = Tables::builtin().unwrap();
-        // Entry 0 keeps its leading index (no repeated widths before it).
-        let (ep0, ix0) = &t.bc7[0];
-        assert_eq!(ep0.ctrl, 0);
-        assert_eq!(ix0.bits, [4, 0]);
-        assert_eq!(ix0.ix[0], [2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(ix0.ix[1], [0; 16]);
-        for (k, (_, ix)) in t.bc7.iter().enumerate() {
-            let anchor = 0..1 << (ix.bits[0] - 1);
-            let ok = (ix.bits[1] != 0 || ix.ix[1] == [0; 16]) && anchor.contains(&ix.ix[0][0]);
-            assert!(ok, "entry {k}: {:?}", ix.ix);
+        let bytes = include_bytes!("bcpack-tables.bin");
+        let start = TABLES_SIZE - DICTIONARY * 116;
+        for (k, (ep, ix)) in t.bc7.iter().enumerate() {
+            let record = &bytes[start + k * 116..start + (k + 1) * 116];
+            assert_eq!(ep.ctrl, u16::from_le_bytes([record[0], record[1]]));
+            assert_eq!(ix.bits, [record[50], record[51]]);
+            for p in 0..32 {
+                let at = 52 + 2 * p;
+                assert_eq!(
+                    ix.ix[p / 16][p % 16],
+                    i16::from_le_bytes([record[at], record[at + 1]]),
+                    "entry {k} index {p}"
+                );
+            }
         }
+        assert_eq!(
+            t.bc7[0].1.ix[0],
+            [2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+    #[test]
+    fn independent_synthetic_goldens() {
+        let t = Tables::builtin().unwrap();
+        let source = include_str!("../../../../tests/fixtures/bcpack-standalone.txt");
+        let hex = |s: &str| -> Vec<u8> {
+            s.as_bytes()
+                .chunks_exact(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect()
+        };
+        let mut cases = 0;
+        for line in source
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let codec = fields[0].parse().unwrap();
+            let packed = hex(fields[2]);
+            let expected = hex(fields[3]);
+            let mut output = vec![0; expected.len()];
+            decode(codec, &packed, &mut output, &t).expect(fields[1]);
+            assert_eq!(output, expected, "{}", fields[1]);
+            if fields[1].ends_with("-request") {
+                for cut in [0, 1, packed.len() / 2] {
+                    output.fill(0xa5);
+                    assert!(decode(codec, &packed[..cut], &mut output, &t).is_err());
+                    assert!(output.iter().all(|v| *v == 0xa5));
+                }
+                let mut extra = packed.clone();
+                extra.push(0xff);
+                assert!(decode(codec, &extra, &mut output, &t).is_err());
+            }
+            cases += 1;
+        }
+        assert!(cases >= 950);
     }
 }

@@ -2654,12 +2654,6 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         f.write(os.path.abspath(game))
     if work is not None:
         shader_dir = os.path.join(os.path.abspath(work), "shaders", "spirv")
-        from ttpf_mips import find_pools
-        if find_pools(game):
-            profile = os.path.join(os.path.dirname(shader_dir), "bcpack", "history.bcph")
-            native = os.path.join(build, "bcpack_history_train.exe")
-            trainer = ["--trainer", native] if os.name == "nt" and os.path.isfile(native) else []
-            py("build_dstorage_history.py", game, "--out", profile, "--if-needed", *trainer)
         # Wine's path converter takes the original Unix filename bytes. The Windows reader expects UTF-8.
         encoded = shader_dir.encode("utf-8") if os.name == "nt" else os.fsencode(shader_dir)
         pending = tempfile.NamedTemporaryFile(dir=out, delete=False)
