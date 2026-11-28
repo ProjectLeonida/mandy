@@ -422,6 +422,18 @@ public:
     // No deadlock: a create holds the gate only across its vkCreate*Pipelines and a submission only across its
     // vkQueueSubmit, and neither driver call waits for anything of ours.
     //
+    // A speculative create (a warm-up or a prewarm: nobody waits for its pipeline yet) of a compute pipeline, with the
+    // adaptive gate, does not hold submissions: they wait only for the demanded creates in the driver. It still never
+    // enters while a submission is in the driver or waits there, and at most warmup_max of them are in the driver at
+    // once, so the creates beside a submission stay bounded (HasiKe and MoonEyes, #2233 / #1608: a cold boot crawled at
+    // about one submission a second behind 290 s of warm-ups). Every other speculative create holds submissions as a
+    // demanded create does (warmup_passes): with the classic gate or LEONIDA_COMPILE_GATE=1, which are in use where the
+    // driver holds a submission behind a create or that is not known (auto's calibration, 630.20), and no probe ever
+    // tells otherwise; a graphics or mesh one, since the calibration measures only a compute create and a submission
+    // was held 54 s beside a mesh create on 621.40; and one of a kind the adaptive gate found to hold submissions
+    // (is_blocking). LEONIDA_COMPILE_GATE_WARMUPS=1: speculative creates always hold the gate (the behaviour before);
+    // =0: a compute one passes with every gate, the classic one and =1 too.
+    //
     // By default (classic) only compute creates pass the gate and a submission waits for them however long they take,
     // as before the adaptive gate; LEONIDA_COMPILE_GATE_WAIT_MS bounds that too. With the adaptive gate
     // (LEONIDA_COMPILE_GATE=adaptive) the wait is bounded (gate_wait_limit_ms, LEONIDA_COMPILE_GATE_WAIT_MS): a
@@ -502,16 +514,20 @@ public:
     using GateAhead = CompileGateAhead;
     class CompileTurn {  // around vkCreate*Pipelines
     public:
-        explicit CompileTurn(SubmitMutex& gate, const CreateInfo& info = {})
-            : gate_(gate), waited_(gate.enter_compile(seq_, info)) {}
+        // `speculative`: asked for; speculative() says whether the gate let it pass as one (warmup_passes).
+        explicit CompileTurn(SubmitMutex& gate, const CreateInfo& info = {}, bool speculative = false)
+            : gate_(gate), waited_(gate.enter_compile(seq_, info, speculative, &speculative_)) {}
         ~CompileTurn() { gate_.leave_compile(seq_); }
         CompileTurn(const CompileTurn&) = delete;
         CompileTurn& operator=(const CompileTurn&) = delete;
         std::int64_t waited_ms() const { return waited_; }
 
+        bool speculative() const { return speculative_; }
+
     private:
         SubmitMutex& gate_;
         std::uint64_t seq_ = 0;  // declared before waited_: enter_compile sets it
+        bool speculative_ = false;  // declared before waited_: enter_compile sets it
         std::int64_t waited_;
     };
     class SubmitTurn {  // around vkQueueSubmit, with the submit lock held
@@ -698,6 +714,41 @@ public:
         return logged_held_waits_;
     }
 
+    // Whether speculative creates may pass the gate without holding submissions (see CompileTurn), and how many may be
+    // in the driver at once. LEONIDA_COMPILE_GATE_WARMUPS: unset, compute ones with the adaptive gate; 1, none (they
+    // hold it as demanded creates do); 0, compute ones with every gate (`everywhere`). LEONIDA_COMPILE_GATE_WARMUP_MAX
+    // =<n>: n at once (1-64, default 1). Read once; a test sets them per gate (set_warmup_policy).
+    static constexpr unsigned kMaxWarmups = 64;
+    struct WarmupPolicy {
+        bool free = true;
+        unsigned max = 1;
+        bool everywhere = false;  // with the classic gate and LEONIDA_COMPILE_GATE=1 too
+    };
+    static WarmupPolicy warmup_policy_from_environment() {
+        WarmupPolicy policy;
+        if (const char* warmups = std::getenv("LEONIDA_COMPILE_GATE_WARMUPS")) {
+            policy.free = std::strcmp(warmups, "1") != 0;
+            policy.everywhere = !std::strcmp(warmups, "0");
+        }
+        if (const char* max = std::getenv("LEONIDA_COMPILE_GATE_WARMUP_MAX")) {
+            char* end = nullptr;
+            const unsigned long n = std::strtoul(max, &end, 10);
+            if (end != max && !*end && n >= 1 && n <= kMaxWarmups) policy.max = unsigned(n);
+        }
+        return policy;
+    }
+    // max is clamped to 1-64: 0 would keep every speculative create waiting for a place.
+    void set_warmup_policy(WarmupPolicy policy) {
+        policy.max = (std::clamp)(policy.max, 1u, kMaxWarmups);
+        std::lock_guard lock(gate_mutex_);
+        policy_ = policy;
+    }
+    // Speculative creates in the driver now (they are not counted in what a submission waits for).
+    unsigned speculative_compiles() {
+        std::lock_guard lock(gate_mutex_);
+        return speculative_;
+    }
+
     // The thread waiting in enter_submit for creates to leave the driver, or 0.
     std::uint32_t gate_waiter() const { return gate_waiter_.load(std::memory_order_relaxed); }
 
@@ -713,8 +764,12 @@ public:
         return stats_;
     }
 
-    // `seq` receives the create's number, which leave_compile takes back.
-    std::int64_t enter_compile(std::uint64_t& seq, const CreateInfo& info = {}) {
+    // `seq` receives the create's number, which leave_compile takes back. `speculative`: a warm-up or prewarm, which
+    // passes without holding submissions where warmup_passes says so (CompileTurn) and then also waits for a free
+    // place among the warmup_max speculative ones; `passed` (optional) is told whether it did.
+    std::int64_t enter_compile(std::uint64_t& seq, const CreateInfo& info = {}, bool speculative = false,
+                               bool* passed = nullptr) {
+        if (passed) *passed = false;
         if (!compile_gate_enabled()) return 0;
         std::unique_lock lock(gate_mutex_);
         std::int64_t waited = 0;
@@ -722,31 +777,40 @@ public:
             seq = 0;
             return 0;
         }
+        speculative = speculative && warmup_passes(info.kind);
+        if (passed) *passed = speculative;
         // Not behind this thread's own submission (it holds the submit lock: none of its submissions is in the
         // driver now, and waiting for them would never end).
         const bool own = owner_.load(std::memory_order_relaxed) == diagnostic_thread_id();
-        if (submits_ && !own && !kind_off(info.kind)) {
+        const auto blocked = [&] {
+            return (submits_ && !own && !kind_off(info.kind)) || (speculative && speculative_ >= policy_.max);
+        };
+        if (blocked()) {
             const std::int64_t start = diagnostic_ms();
-            gate_changed_.wait(lock, [&] { return submits_ == 0 || kind_off(info.kind); });
+            gate_changed_.wait(lock, [&] { return !blocked(); });
             waited = diagnostic_ms() - start;
             ++stats_.creates;
             stats_.create_ms += waited;
             stats_.create_max_ms = (std::max)(stats_.create_max_ms, waited);
         }
         seq = ++last_create_;
-        in_driver_.push_back(InDriver{seq, info, diagnostic_ms(), diagnostic_thread_id()});
+        in_driver_.push_back(InDriver{seq, info, diagnostic_ms(), diagnostic_thread_id(), speculative});
+        if (speculative) ++speculative_;
         return waited;
     }
     void leave_compile(std::uint64_t seq) {
         if (!compile_gate_enabled()) return;
         std::lock_guard lock(gate_mutex_);
+        bool speculative = false;
         for (auto it = in_driver_.begin(); it != in_driver_.end(); ++it)
             if (it->seq == seq) {
                 recent_leaves_[leave_count_++ % kRecentLeaves] = Leave{seq, diagnostic_ms(), it->info.kind};
+                speculative = it->speculative;
+                if (speculative) --speculative_;
                 in_driver_.erase(it);
                 break;
             }
-        if (submits_) gate_changed_.notify_all();
+        if (submits_ || speculative) gate_changed_.notify_all();  // speculative: a warm-up waiting for a place
     }
 
     // `ahead` (optional) is told whether the submission entered the driver alongside creates the gate does not wait
@@ -901,17 +965,23 @@ private:
         CreateInfo info;
         std::int64_t since_ms;
         std::uint32_t thread;
+        bool speculative = false;  // a warm-up (CompileTurn): submissions do not wait for it
     };
 
     // With gate_mutex_ held.
+    // Whether a speculative create of this kind passes without holding submissions (see CompileTurn).
+    bool warmup_passes(CreateKind kind) const {
+        return policy_.free && kind == CreateKind::compute && (adaptive_ || policy_.everywhere);
+    }
     bool kind_off(CreateKind kind) const {
         return verdict_[std::size_t(kind)] == GateVerdict::driver_does_not_hold;
     }
     // A create a submission waits for: of a kind whose gate is on, and either of a kind that holds submissions or not
-    // gone past at the limit or the budget.
+    // gone past at the limit or the budget and not a warm-up.
     bool is_blocking(const InDriver& c) const {
         if (kind_off(c.info.kind)) return false;
         if (verdict_[std::size_t(c.info.kind)] == GateVerdict::driver_holds) return c.seq > held_overdue_through_;
+        if (c.speculative) return false;  // a warm-up, of a kind not known to hold submissions
         return c.seq > overdue_through_;
     }
     bool held_blocking() const {
@@ -1104,6 +1174,8 @@ private:
     std::uint64_t overdue_through_ = 0;  // creates up to this number were in the driver when a submission went ahead
     std::uint64_t held_overdue_through_ = 0;  // the same, for creates of a kind that holds (at the held limit)
     std::int64_t held_limit_ms_ = default_gate_held_limit_ms();  // 0: no limit
+    unsigned speculative_ = 0;  // warm-up creates in the driver, while warm-ups are free (policy_)
+    WarmupPolicy policy_ = warmup_policy_from_environment();
     std::uint32_t submits_ = 0;   // submissions waiting for them or in the driver
     std::int64_t wait_limit_ms_ = default_gate_wait_limit_ms();  // 0: no limit
     std::int64_t probe_budget_ms_ = default_gate_probe_budget_ms();  // 0: no early probes

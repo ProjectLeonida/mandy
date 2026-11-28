@@ -3041,8 +3041,29 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   `after_running` and the teardown rules hold as they were. `LEONIDA_COMPILE_THREADS=1` is the layout before the pool:
   one general worker and the graphics-only one; there too a PSO has one build running at a time (two variants of one
   graphics PSO, one on each worker, let its last release delete it under the other build, qhukz13). A submission still
-  waits at the compile gate for every compute create in flight (and graphics creates too with `LEONIDA_COMPILE_GATE=adaptive` or `1`; the classic default gates compute builds only), so more workers
+  waits at the compile gate for every demanded compute create in flight (and graphics creates too with `LEONIDA_COMPILE_GATE=adaptive` or `1`; the
+  classic default gates compute builds only; warm-ups: next paragraph), so more workers
   do not shorten that wait (`SubmitMutex::CompileTurn`; `LEONIDA_COMPILE_GATE=0` turns it off).
+- **Warm-ups do not hold the compile gate** (RT-COMPILE-GATE-WARMUP-FREE). With the adaptive gate, a submission
+  waits at the compile gate (`SubmitMutex::CompileTurn`) only for the demanded creates in the driver, not for a
+  warm-up's: a compute create made by a compile worker's speculative job (`compile_job_speculative`: the compute
+  warm-up) passes the gate as speculative. The checkpoint is
+  a speculative job too, but makes no create. A warm-up's pipeline is simply not ready yet; whoever needs it builds or
+  waits for it as before. A warm-up still never enters the driver while a submission is in it or waits at the gate,
+  and at most `LEONIDA_COMPILE_GATE_WARMUP_MAX` of them (default 1) are in the driver at once, so the creates beside a
+  submission stay bounded: the pool's demanded builds plus that many warm-ups, and the pool starts no warm-up while a
+  demanded build runs. Why: on HasiKe's RTX 2070 SUPER (#2233) a cold boot crawled at about one submission a second
+  behind 290 s of serial warm-ups with the gate on, and ran at about 100 frames a second with `LEONIDA_COMPILE_GATE=0`;
+  MoonEyes measured 142 s of submission waits behind warm-ups (#1608). The gate stays for demanded creates, which the
+  title waits for anyway. A speculative create holds the gate as a demanded one does (`SubmitMutex::warmup_passes`,
+  lixonik's review of #2275): with the classic gate and with `LEONIDA_COMPILE_GATE=1`, which are in use where the
+  driver holds a submission behind a create or that is not known (`auto`'s calibration on 630.20), and where no probe
+  ever says otherwise; as a graphics or mesh prewarm (`LEONIDA_PIPELINE_PREWARM_ORDER`, also a speculative job), since the calibration measures only a compute create and a
+  submission was held 54 s beside a mesh create on 621.40; and as a create of a kind the adaptive gate found to hold
+  submissions, where a submission beside it would wait in the driver instead. `LEONIDA_COMPILE_GATE_WARMUPS=1` makes
+  every warm-up hold the gate, as before; `=0` lets compute ones pass with every gate, the classic one and `=1` too;
+  `LEONIDA_COMPILE_GATE=0` still turns the whole gate off. The paragraphs above and below that say a warm-up holds the
+  gate for its whole create describe those cases.
 - **Only the large ones asynchronous** (`LEONIDA_ASYNC_MIN_BYTES=<n>`, with `LEONIDA_ASYNC_PIPELINES=1`). With every
   pipeline asynchronous, the small lighting and post programs are skipped with the large ones until the worker gets to
   them, and on an RTX 4070 Laptop (NVIDIA 621.40) the world phase was reached with the screen black; with none, a

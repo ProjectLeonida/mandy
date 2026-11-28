@@ -6,6 +6,8 @@
 //   - demanded jobs go first, in the order they came, then warm-ups by size, and a checkpoint only when nothing runs;
 //   - a checkpoint's second look sees a demanded build that started on another worker meanwhile;
 //   - one job of a PSO at a time, also with one worker plus the graphics-only one;
+//   - a warm-up's and the checkpoint's creates pass the compile gate as speculative, a demanded build's do not, through
+//     DriverTurn as the runtime makes them;
 //   - the last release with jobs running and queued: the queued ones are dropped, the running ones finish, the
 //     workers are joined; a device's cancel waits for its running jobs; stop_for_exit does not wait past its limit.
 #include "../shims/d3d12_pipeline_compile.h"
@@ -18,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <thread>
 #include <vector>
 
@@ -390,6 +393,87 @@ void test_a_checkpoint_sees_a_demand_that_started_during_it() {
     pool.release();
 }
 
+// What a job's pipeline creates tell the compile gate (DriverTurn, compile_job_speculative): a warm-up and the checkpoint
+// are speculative and do not hold submissions; a demanded build is not, also on a worker that ran a warm-up before.
+void test_jobs_tell_the_gate_whether_they_are_speculative() {
+    for (const unsigned threads : {1u, 3u}) {
+        auto& pool = make_pool(threads, threads > 1 ? threads - 1 : 1);
+        Log log;
+        std::mutex mutex;
+        std::vector<std::pair<std::string, bool>> seen;
+        Owners owner;
+        const auto job = [&](const void* who, const std::string& name, std::size_t priority) {
+            EXPECT(pool.submit(who, device, priority, [&, name] {
+                std::lock_guard lock(mutex);
+                seen.emplace_back(name, rt::d3d12::compile_job_speculative);
+                log.start(name, false);
+                log.finish(name, false);
+            }));
+        };
+        job(owner[0], "warm", 100);
+        EXPECT(log.wait_finished(1));
+        job(owner[1], "demand", 0);
+        EXPECT(log.wait_finished(2));
+        job(device, "checkpoint", SIZE_MAX);
+        EXPECT(log.wait_finished(3));
+        job(owner[2], "demand again", 0);
+        EXPECT(log.wait_finished(4));
+        EXPECT(!rt::d3d12::compile_job_speculative);  // this thread is no worker
+        std::lock_guard lock(mutex);
+        const std::vector<std::pair<std::string, bool>> want{
+            {"warm", true}, {"demand", false}, {"checkpoint", true}, {"demand again", false}};
+        EXPECT(seen == want);
+        pool.release();
+    }
+}
+
+// The one line that turns the warm-up-free gate on in the runtime: a pipeline create's DriverTurn on a thread whose job is
+// speculative passes the gate as speculative, so a submission does not wait for it; on any other thread it holds
+// submissions as before (qhukz13, #2275).
+void test_a_driver_turn_passes_the_speculative_flag_to_the_gate() {
+    if (!leonida::SubmitMutex::compile_gate_enabled()) return;  // LEONIDA_COMPILE_GATE=0: no gate to check
+    leonida::SubmitMutex gate;
+    gate.set_gate_adaptive(true);  // warm-ups pass only the adaptive gate (submit_mutex_test has the other modes)
+    gate.set_gate_wait_limit_ms(0);
+    gate.set_gate_probe_budget_ms(0);
+    gate.set_gate_graphics(true);  // graphics creates pass the gate, as with the adaptive gate
+    gate.set_warmup_policy({true, 1});
+    // A speculative compute create (a warm-up), a demanded one, and a speculative graphics one (a prewarm of
+    // LEONIDA_PIPELINE_PREWARM_ORDER, which holds submissions: the calibration measures only compute creates).
+    struct Case {
+        bool speculative;
+        leonida::SubmitMutex::CreateKind kind;
+        bool passes;
+    };
+    for (const Case c : {Case{true, leonida::SubmitMutex::CreateKind::compute, true},
+                         Case{false, leonida::SubmitMutex::CreateKind::compute, false},
+                         Case{true, leonida::SubmitMutex::CreateKind::graphics, false}}) {
+        const bool speculative = c.speculative;
+        std::atomic<bool> inside{false}, release{false}, submitted{false};
+        std::thread create([&] {
+            rt::d3d12::compile_job_speculative = speculative;
+            {
+                const rt::d3d12::DriverTurn turn(gate, "warmup", "vkCreateComputePipelines", true, nullptr, c.kind);
+                inside = true;
+                while (!release) std::this_thread::sleep_for(1ms);
+            }
+            rt::d3d12::compile_job_speculative = false;
+        });
+        for (int i = 0; i < 2000 && !inside; ++i) std::this_thread::sleep_for(1ms);
+        EXPECT(inside.load());
+        std::thread submit([&] {
+            const leonida::SubmitMutex::SubmitTurn turn(gate);
+            submitted = true;
+        });
+        std::this_thread::sleep_for(150ms);
+        EXPECT(submitted.load() == c.passes);  // past a warm-up at once; behind a demanded create or a prewarm
+        release = true;
+        create.join();
+        submit.join();
+        EXPECT(submitted.load());
+    }
+}
+
 void test_one_job_of_a_pso_at_a_time() {
     auto& pool = make_pool(4, 3);
     Log log;
@@ -526,6 +610,8 @@ int main() {
     test_order();
     test_a_checkpoint_sees_a_demand_that_started_during_it();
     test_one_job_of_a_pso_at_a_time();
+    test_jobs_tell_the_gate_whether_they_are_speculative();
+    test_a_driver_turn_passes_the_speculative_flag_to_the_gate();
     test_a_finished_job_wakes_the_idle_workers();
     test_release_with_jobs_running_and_queued();
     test_cancel_waits_for_a_devices_running_jobs();

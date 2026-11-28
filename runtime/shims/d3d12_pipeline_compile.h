@@ -182,9 +182,17 @@ inline bool compile_worker_trigger(const char* trigger) {
 //     waits only for the holder, and only before a pipeline create (it may wait out a vkDeviceWaitIdle or a present:
 //     waits of 50 ms or more are logged).
 //   - a pipeline create passes the compile gate (SubmitMutex::CompileTurn) for the length of the call, as its kind
-//     (compute, or graphics with mesh): the adaptive gate keeps a verdict per kind.
+//     (compute, or graphics with mesh): the adaptive gate keeps a verdict per kind. As speculative when a compile worker
+//     runs it for a speculative job (compile_job_speculative); the gate decides whether that lets it pass without
+//     holding submissions (SubmitMutex::warmup_passes: a compute create, with the adaptive gate).
 //   - the compile worker, which runs below normal priority, runs the call at normal priority, so a preempted worker
 //     does not sit on a driver lock a submit waits for.
+// True on a compile worker while it runs a speculative job (any job of a priority other than 0: today the compute warm-up,
+// the graphics and mesh prewarms of LEONIDA_PIPELINE_PREWARM_ORDER, and the checkpoint, which makes no create;
+// PipelineCompiler::run): its pipeline creates ask the compile gate to pass them as speculative, which a compute one
+// with the adaptive gate does without holding submissions (SubmitMutex::CompileTurn, warmup_passes).
+inline thread_local bool compile_job_speculative = false;
+
 class DriverTurn {
 public:
     DriverTurn(leonida::SubmitMutex& submits, const char* trigger, const char* call, bool pipeline,
@@ -205,7 +213,8 @@ public:
             if (waited >= 50) note("waited for the submit lock", trigger, call, name, waited);
         }
         if (pipeline) {
-            gate_.emplace(submits, leonida::SubmitMutex::CreateInfo{kind, name, trigger, bytes});
+            gate_.emplace(submits, leonida::SubmitMutex::CreateInfo{kind, name, trigger, bytes},
+                          compile_job_speculative);
             if (gate_->waited_ms() >= 50) note("waited at the compile gate", trigger, call, name, gate_->waited_ms());
         }
     }
@@ -623,12 +632,14 @@ private:
             stats_.most_running = (std::max)(stats_.most_running, running_.size());
             const auto probe = probe_;
             lock.unlock();
+            compile_job_speculative = speculative;  // its creates pass the gate as speculative (DriverTurn)
             try {
                 if (probe) probe(job.owner);
                 job.work();
             } catch (...) {
                 std::fprintf(stderr, "[rt] pipeline compile worker: a job threw\n");
             }
+            compile_job_speculative = false;
             job.work = nullptr;  // its captures go before the job counts as done
             lock.lock();
             ++stats_.completed;
