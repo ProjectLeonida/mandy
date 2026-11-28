@@ -11,11 +11,14 @@ set LEONIDA_GAME_DIR=C:\path\to\package
 set LEONIDA_MOVIE=C:\path\to\stream.bk2
 set LEONIDA_GOTO=200          # optional
 set LEONIDA_RUN_DLLMAIN=1     # optional; not needed for the measured streams
+set "LEONIDA_KEEP_BINK_OUTPUT=1"
 runtime\build\bink_decode_test.exe
 ```
 
-With either required variable unset it prints `SKIP (no package/movie)` and exits 0, so `ctest` is green on a machine
-without the package. Frames are written as raw BGRA and PPM under `%TEMP%\leonida_bink`; they are never committed.
+With either required variable unset it prints `SKIP (no package/movie)` and exits 77, which CTest treats as a skip.
+Raw BGRA and PPM diagnostics use a per-process `leonida_bink_<pid>` scratch directory that is removed on normal
+exit, including handled failures. The optional `LEONIDA_KEEP_BINK_OUTPUT=1` setting keeps that directory and prints
+its path. These files stay local.
 
 ## Measured on 1.0.2.1
 

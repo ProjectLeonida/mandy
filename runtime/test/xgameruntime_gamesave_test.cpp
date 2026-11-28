@@ -20,6 +20,7 @@
 #include <XTaskQueue.h>
 
 #include "shims.h"
+#include "test_temp_dir.h"
 
 namespace rt::shims {
 long xgameruntime_gamesave_open_handles();
@@ -145,9 +146,9 @@ int trace_index(const std::vector<std::string>& lines, const char* a, const char
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // a crash still shows the checks before it
     std::printf("xgameruntime_gamesave_test: XGameSaveImpl through QueryApiImpl\n");
-    const std::filesystem::path root = std::filesystem::temp_directory_path() / L"leonida_gamesave_test";
+    const testfiles::ScratchDir scratch("leonida_gamesave_test");
+    const auto& root = scratch.path();
     std::error_code ec;
-    std::filesystem::remove_all(root, ec);
     SetEnvironmentVariableW(L"LEONIDA_SAVE_DIR", root.c_str());
 
     auto query = reinterpret_cast<Query>(rt::shims::find("xgameruntime.dll", "QueryApiImpl"));
@@ -572,7 +573,6 @@ int main() {
     check(at<Quota>(save, 7)(save, provider, &quota) == E_GS_HANDLE_EXPIRED, "a closed provider is refused");
     check(rt::shims::xgameruntime_gamesave_open_handles() == 0, "every handle the test opened is closed");
 
-    std::filesystem::remove_all(root, ec);
     std::printf("xgameruntime_gamesave_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

@@ -4,8 +4,9 @@
 //   LEONIDA_GAME_DIR=<package root>       (contains Bink2Scarlett.dll)
 //   LEONIDA_MOVIE_AUDIO=<file.bk2>        (a carved Bink 2 stream with audio)
 //   LEONIDA_AUDIO_FRAMES=<n>              (optional: stop after n video frames; default all)
+//   LEONIDA_KEEP_BINK_OUTPUT=1           (optional: retain diagnostic PCM and WAV files)
 //
-// Output stays under %TEMP%\leonida_bink_audio. No movie, packet or PCM is committed.
+// Output uses a per-process scratch folder. No movie, packet or PCM is committed.
 #include <windows.h>
 
 #include <algorithm>
@@ -21,6 +22,7 @@
 
 #include "../shims/shims.h"
 #include "../src/pe_loader.h"
+#include "test_temp_dir.h"
 
 namespace {
 
@@ -193,7 +195,7 @@ void write_wav(const std::filesystem::path& path, const std::vector<uint8_t>& pc
     const uint32_t byte_rate = rate * block;
     const uint32_t data_size = (uint32_t)pcm.size();
     std::ofstream f(path, std::ios::binary);
-    if (!f) fatal("cannot write " + path.string());
+    if (!f) throw std::runtime_error("cannot write " + path.string());
     f.write("RIFF", 4);
     write_u32(f, 36 + data_size);
     f.write("WAVEfmt ", 8);
@@ -207,6 +209,8 @@ void write_wav(const std::filesystem::path& path, const std::vector<uint8_t>& pc
     f.write("data", 4);
     write_u32(f, data_size);
     f.write(reinterpret_cast<const char*>(pcm.data()), (std::streamsize)pcm.size());
+    f.close();
+    if (!f) throw std::runtime_error("cannot finish writing " + path.string());
 }
 
 }  // namespace
@@ -423,8 +427,12 @@ int main() {
             }
         }
 
-        const std::filesystem::path out_dir = std::filesystem::temp_directory_path() / "leonida_bink_audio";
-        std::filesystem::create_directories(out_dir, ec);
+        testfiles::ScratchDir output("leonida_bink_audio");
+        const auto& out_dir = output.path();
+        if (env("LEONIDA_KEEP_BINK_OUTPUT") == "1") {
+            output.keep();
+            std::printf("keeping Bink diagnostic output in %s\n", out_dir.string().c_str());
+        }
         const std::string stem = movie.stem().string();
         for (auto& t : tracks) {
             std::printf("track %u: calls=%u bytes=%u", t.index, t.calls, t.bytes);
@@ -439,6 +447,8 @@ int main() {
                 {
                     std::ofstream f(raw, std::ios::binary);
                     f.write(reinterpret_cast<const char*>(t.pcm.data()), (std::streamsize)t.pcm.size());
+                    f.close();
+                    if (!f) throw std::runtime_error("cannot write " + raw.string());
                 }
                 const uint32_t rate = header.rates[t.index];
                 const uint32_t channels = (header.flags[t.index] & 0x2000) ? 2 : 1;
