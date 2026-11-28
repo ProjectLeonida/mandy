@@ -146,14 +146,16 @@ def scrub(text, limit=240):
     # Consume a same-prefix sibling too, so shown() can redact its entire path.
     checkout_path = rf"{checkout}[^\s'\"]*"
     # A quoted drive path ends at its quote. An unquoted one goes on over spaces while a later part still has its
-    # separator, so `D:\My work\name` is one path and the prose after a path stays. The other separator continues it
-    # too (`D:/My work\name`), but only after a part with no dot or punctuation: the prose after a file has slashes.
+    # separator, so `D:\My work\name` is one path, but only after a part with no dot or punctuation: the prose after
+    # a file name stays, slashes included (`D:/work/a.txt and tests/test_x.py`). The other separator continues it too
+    # (`D:/My work\name`), with no punctuation in the words before that part.
     drive = r"\b[a-z]:"
     quoted_path = rf"(?i:(?<='){drive}[\\/][^']*(?=')|(?<=\"){drive}[\\/][^\"]*(?=\"))"
-    more = r"(?:(?: +(?![a-z]:[\\/])[^\s'\"\\/]+)*? +(?![a-z]:[\\/])[^\s'\"\\/]+{sep}[^\s'\"]*)*"
     folder = r"(?:[^\s'\"]*[\\/])?[^\s'\"\\/.,;:]*"
-    mixed = rf"(?:{folder}(?: +[^\s'\"\\/.,;:]+)*? +[^\s'\"\\/:]+[\\/])*"
-    drive_path = "(?i:" + "|".join(rf"{drive}{sep}{mixed}[^\s'\"]*" + more.format(sep=sep) for sep in (r"\\", "/")) + ")"
+    mixed = r"(?: +[^\s'\"\\/.,;:]+)*? +[^\s'\"\\/:]+[\\/]"
+    more = r"(?: +(?![a-z]:[\\/])[^\s'\"\\/]+)*? +(?![a-z]:[\\/])[^\s'\"\\/]+{sep}"
+    drive_path = "(?i:" + "|".join(rf"{drive}{sep}(?:{folder}(?:{mixed}|{more.format(sep=sep)}))*[^\s'\"]*"
+                                   for sep in (r"\\", "/")) + ")"
     posix_path = r"(?<![\w.:/~])/[^\s/'\"][^\s'\"]*"
     line = re.sub(rf"{quoted_path}|{checkout_path}|{drive_path}|{posix_path}", shown, line)
     if HOME and len(HOME) > 3:

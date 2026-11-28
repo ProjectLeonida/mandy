@@ -533,6 +533,11 @@ class Scrub(unittest.TestCase):
             (r"D:\work\a.txt, then tests/test_x.py failed", "<path> then tests/test_x.py failed"),
             (r"D:\work\a.txt and tests/test_x.py failed", "<path> and tests/test_x.py failed"),
             (r"D:\work\a.txt is 3/4 done", "<path> is 3/4 done"),
+            # The same separator, after a file name: the prose stays too.
+            ("D:/work/a.txt and tests/test_x.py failed", "<path> and tests/test_x.py failed"),
+            (r"D:\work\a.txt and tests\test_x.py failed", r"<path> and tests\test_x.py failed"),
+            ("D:/work/a.txt is 3/4 done", "<path> is 3/4 done"),
+            (f"D:/My work/Python 3.12 x/{SENTINEL}.fssm line 3", "<path> line 3"),
         ):
             with self.subTest(line=line):
                 self.assertEqual(pd.scrub(line), want)
