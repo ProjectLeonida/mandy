@@ -37,6 +37,8 @@ struct Ref {
 };
 
 constexpr std::uint64_t kFaulted = 0xFA017EDull;  // the call raised an exception
+constexpr std::uint64_t kNoChild = 0xC41DFA11ull;  // the child process couldn't run the step: a broken test, not a
+                                                 // host fault (as in d3d12_residency_test.cpp)
 
 struct Context {
     ID3D12Device1* device = nullptr;
@@ -290,22 +292,92 @@ void report_host_adapter(ID3D12Device1* host) {
 // Step `index` on the host, in a child process (this executable with --host-step) with a fresh device: a call the
 // host runtime faults on (Serialize(nullptr, n)) leaves it broken, and in-process the next call failed fast, which no
 // exception handler survives.
+// An infrastructure failure means no child process ran the step at all: kNoChild, which fails the comparison
+// (as in d3d12_residency_test.cpp), with the Win32 error that caused it.
+void no_child(std::size_t index, const char* what, DWORD error) {
+    std::fprintf(stderr, "pipeline library host step %zu: %s failed, GetLastError %lu\n", index, what,
+                 static_cast<unsigned long>(error));
+}
+
 void isolated(std::size_t index, const std::vector<std::uint8_t>& other, std::uint64_t& hr, std::uint64_t& output) {
     hr = output = kFaulted;
     char exe[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    const std::string command = "\"\"" + std::string(exe) + "\" --host-step " + std::to_string(index) + " " +
-                                hex(other) + "\"";
-    FILE* child = _popen(command.c_str(), "r");
-    if (!child) return;
-    unsigned long long a = 0, b = 0;
-    char line[256];
-    while (std::fgets(line, sizeof(line), child))
-        if (sscanf_s(line, "result %llx %llx", &a, &b) == 2) {
+    // CreateProcess parses the first quoted token as the image, so no command shell is involved: _popen resolves
+    // the shell through COMSPEC and a PATH search for cmd.exe, and fast-fails the process (0xc0000409) when
+    // neither finds one, which a stripped environment (an agent shell, ctest inheriting it) can be.
+    const std::string command = "\"" + std::string(exe) + "\" --host-step " + std::to_string(index) + " " +
+                                hex(other);
+    std::vector<char> cmdline(command.begin(), command.end());
+    cmdline.push_back('\0');
+
+    SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
+    HANDLE read_pipe = nullptr, write_pipe = nullptr;
+    if (!CreatePipe(&read_pipe, &write_pipe, &inherit, 0)) {
+        const DWORD error = GetLastError();
+        no_child(index, "CreatePipe", error);
+        hr = output = kNoChild;
+        return;
+    }
+    STARTUPINFOA startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = write_pipe;
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr,
+                        &startup, &process)) {
+        const DWORD error = GetLastError();
+        CloseHandle(read_pipe);
+        CloseHandle(write_pipe);
+        no_child(index, "CreateProcess", error);
+        hr = output = kNoChild;
+        return;
+    }
+    CloseHandle(write_pipe);
+    CloseHandle(process.hThread);
+    std::string text;
+    char buffer[512];
+    DWORD count = 0;
+    bool read_failed = false;
+    DWORD read_error = 0;
+    for (;;) {
+        count = 0;
+        if (!ReadFile(read_pipe, buffer, sizeof(buffer), &count, nullptr)) {
+            read_failed = true;
+            read_error = GetLastError();
+            break;
+        }
+        if (count == 0) break;  // every write end is closed: the child exited
+        text.append(buffer, count);
+    }
+    CloseHandle(read_pipe);
+    // ERROR_BROKEN_PIPE is how a byte pipe reports its writer going away, the same end as count == 0.
+    if (read_failed && read_error != ERROR_BROKEN_PIPE) {
+        no_child(index, "ReadFile", read_error);
+        WaitForSingleObject(process.hProcess, INFINITE);
+        CloseHandle(process.hProcess);
+        hr = output = kNoChild;
+        return;
+    }
+    if (WaitForSingleObject(process.hProcess, INFINITE) == WAIT_FAILED) {
+        const DWORD error = GetLastError();
+        CloseHandle(process.hProcess);
+        no_child(index, "WaitForSingleObject", error);
+        hr = output = kNoChild;
+        return;
+    }
+    CloseHandle(process.hProcess);
+    // The last "result <hr> <output>" line wins, as with the old line-by-line scan. A child that crashed or
+    // exited without one leaves kFaulted, the same reading as before.
+    for (std::size_t at = 0; (at = text.find("result ", at)) != std::string::npos; ++at) {
+        unsigned long long a = 0, b = 0;
+        if (sscanf_s(text.c_str() + at, "result %llx %llx", &a, &b) == 2) {
             hr = a;
             output = b;
         }
-    _pclose(child);
+    }
 }
 
 // Records the script on `device` (in-process), or on the host with every step in a child process.
@@ -401,6 +473,12 @@ int main(int argc, char** argv) {
             int mismatches = 0, skipped = 0;
             for (std::size_t i = 0; i < ours.values.size(); ++i) {
                 const bool own_format = ours.names[i].find("[own format]") != std::string::npos;
+                // A step whose child process never ran is a broken test, not a skippable host fault.
+                if (theirs.values[i] == kNoChild) {
+                    std::printf("pipeline library %s: the host step's child process didn't run it\n",
+                                ours.names[i].c_str());
+                    EXPECT(theirs.values[i] != kNoChild);
+                }
                 if (theirs.values[i] == kFaulted || own_format) {
                     std::printf("pipeline library %s: ours 0x%llx host 0x%llx (%s; not compared)\n",
                                 ours.names[i].c_str(), static_cast<unsigned long long>(ours.values[i]),
