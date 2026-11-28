@@ -1908,7 +1908,7 @@ void update_keyboard_pad() {
     }
     clip_cursor(active && g_raw_ready && g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
-    // LEONIDA_INPUT_SCRIPT="a@70,a@85,start@120" (with LEONIDA_KEYBOARD_PAD=always): timed presses on the keyboard
+    // LEONIDA_INPUT_SCRIPT="a@70,a@85,start@120" (with the keyboard pad on, 1 or always): timed presses on the keyboard
     // pad, in seconds since the pad's first update, each held 300 ms or its own button@seconds:hold, and then until the
     // title has read the pads kReads times since it began (never past kMaxHold seconds, or the hold if it is longer, so
     // a title that stops reading does not keep the button). For unattended boots: the title's first prompt

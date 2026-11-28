@@ -51,7 +51,10 @@
 .PARAMETER InputScript
     LEONIDA_INPUT_SCRIPT: timed pad presses, seconds since the pad's first poll (button@seconds, comma-separated;
     buttons a b x y start back lb rb up down left right). Each press is held 300 ms; button@seconds:hold holds it
-    longer, e.g. b@1100:3 for a title that reads its pad only every few seconds. Sets LEONIDA_KEYBOARD_PAD=always. Builds older than
+    longer, e.g. b@1100:3 for a title that reads its pad only every few seconds. Sets LEONIDA_KEYBOARD_PAD=1:
+    scripted presses run with or without focus (docs/gameinput.md), while the keyboard and mouse of whoever uses
+    the machine reach the title only through its focused window (with `always` they reached an unattended boot from
+    any window). Builds older than
     main @ 8146ef690 ignore a script longer than 63 characters. Default 'a@45,a@60,a@75,a@90'.
 
 .PARAMETER NoInput
@@ -248,7 +251,7 @@ $defaults = [ordered]@{
     DISABLE_RTSS_LAYER                = "1"            # third-party Vulkan overlay layers off
     DISABLE_VULKAN_OBS_CAPTURE        = "1"
 }
-if ($InputScript) { $defaults["LEONIDA_KEYBOARD_PAD"] = "always" }
+if ($InputScript) { $defaults["LEONIDA_KEYBOARD_PAD"] = "1" }
 $gameStateRva = "$env:LEONIDA_GAME_STATE_RVA".ToLowerInvariant() -replace '^0x', ''
 $sessionStateRva = "$env:LEONIDA_SESSION_STATE_RVA".ToLowerInvariant() -replace '^0x', ''
 if ($gameStateRva -and $sessionStateRva) { $defaults["LEONIDA_PEEK"] = "0x$gameStateRva,0x$sessionStateRva" }
