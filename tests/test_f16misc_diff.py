@@ -22,7 +22,7 @@ import re
 import sys
 import unittest
 from collections import Counter
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -40,6 +40,22 @@ BY_HAND = (   # (x, y, z, single rounding, double rounding)
 
 def base_op(line):
     return re.sub(r"_e(32|64)$", "", line.split()[0])
+
+
+def run_main(*argv):
+    """(return code, stdout, stderr) of main() with these arguments."""
+    out, err = io.StringIO(), io.StringIO()
+    real = sys.argv
+    try:
+        sys.argv = ["f16misc_diff.py"] + [str(a) for a in argv]
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                rc = f.main()
+            except SystemExit as e:
+                rc = e.code
+    finally:
+        sys.argv = real
+    return rc, out.getvalue(), err.getvalue()
 
 
 def measured(rows):
@@ -348,6 +364,38 @@ class Translated(unittest.TestCase):
             self.assertIn(f"expected 0x0000{single:04x}, actual 0x0000{double:04x}", f.check(lines))
         finally:
             f.translate_listing = real
+
+
+class CommandLine(unittest.TestCase):
+    """A zero or negative --programs / --max-ops is a usage error (exit 2), checked before any work."""
+
+    def assert_rejected(self, argv, message):
+        rc, out, err = run_main(*argv)
+        self.assertEqual(rc, 2, (argv, out, err))
+        self.assertIn(message, err)
+        self.assertEqual(out, "")            # nothing ran: a zero --programs used to print sweep stats only
+        self.assertTrue(err.startswith("usage: "), err)
+
+    def test_max_ops_zero_is_rejected(self):
+        self.assert_rejected(["--programs", 1, "--no-sweep", "--max-ops", 0], "--max-ops must be at least 1")
+
+    def test_max_ops_negative_is_rejected(self):
+        self.assert_rejected(["--programs", 1, "--no-sweep", "--max-ops", -3], "--max-ops must be at least 1")
+
+    def test_programs_zero_is_rejected(self):
+        self.assert_rejected(["--programs", 0, "--no-sweep"], "--programs must be at least 1")
+
+    def test_programs_negative_is_rejected(self):
+        self.assert_rejected(["--programs", -1, "--no-sweep"], "--programs must be at least 1")
+
+    def test_validation_comes_before_list_ops(self):
+        self.assert_rejected(["--list-ops", "--programs", 0], "--programs must be at least 1")
+
+    def test_the_smallest_valid_run_passes(self):
+        rc, out, err = run_main("--programs", 1, "--no-sweep", "--max-ops", 1, "--ops", "v_ldexp_f16")
+        self.assertEqual(rc, 0, (out, err))
+        self.assertIn("f16 misc family: 1/1 judged programs match", out)
+        self.assertEqual(err, "")
 
 
 if __name__ == "__main__":

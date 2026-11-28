@@ -67,11 +67,12 @@ Stages:
 exponents in turn).
 
 Exit code 0 when every judged program matches, 1 on a mismatch (the first one is printed with its listing) or a
-translator skip (every generated form is one the translator takes), 2 on a harness error.
+translator skip (every generated form is one the translator takes), 2 on a usage error or a harness error.
+--programs and --max-ops must be at least 1 (checked before any work).
 
 Usage:
     python -I tools/f16misc_diff.py [--programs N] [--seed S] [--max-ops N] [--ops v_ldexp_f16,v_fma_mix_f32]
-    python -I tools/f16misc_diff.py --exhaustive-f16 --programs 0 --no-sweep
+    python -I tools/f16misc_diff.py --exhaustive-f16 --programs 1 --no-sweep
     python -I tools/f16misc_diff.py --list-ops
     python -I tools/f16misc_diff.py --self-test
 """
@@ -1189,7 +1190,7 @@ def self_test():
     return ok
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--programs", type=int, default=300, help="random programs after the sweep")
     ap.add_argument("--seed", type=int, default=1)
@@ -1199,7 +1200,14 @@ def main():
     ap.add_argument("--exhaustive-f16", action="store_true", help="also run every f16 input through frexp/ldexp")
     ap.add_argument("--list-ops", action="store_true")
     ap.add_argument("--self-test", action="store_true")
-    args = ap.parse_args()
+    if argv is None:
+        argv = sys.argv[1:]
+    args = ap.parse_args(argv)
+    # Before any work: a zero --programs silently did nothing and a zero --max-ops reached randint(1, 0)'s traceback.
+    if args.max_ops < 1:
+        ap.error("--max-ops must be at least 1")
+    if args.programs < 1:
+        ap.error("--programs must be at least 1")
     if args.list_ops:
         for op in FAMILY:
             print(f"{op:22s} {OP_FORMS[op]}")
@@ -1218,8 +1226,7 @@ def main():
         stages += [("sweep", lambda: run_sweep(args.seed, ops)), ("edge grid", lambda: run_grid(ops))]
     if args.exhaustive_f16:
         stages.append(("exhaustive f16", lambda: run_exhaustive(ops)))
-    if args.programs > 0:
-        stages.append(("random", lambda: run_suite(args.programs, args.seed, args.max_ops, ops)))
+    stages.append(("random", lambda: run_suite(args.programs, args.seed, args.max_ops, ops)))
     total = {"pass": 0, "mismatch": 0, "skip": 0, "unjudged": Counter(), "ops": Counter(), "events": {}}
     first = None
     try:
