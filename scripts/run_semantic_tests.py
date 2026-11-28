@@ -20,6 +20,11 @@ line, and exits 1 if a file fails, none is found, or no test ran. Standard libra
 
 The count of tests comes from unittest's own result object, not from its output: a module that writes a line shaped like unittest's summary to stderr - a nested runner, or an atexit handler that runs after unittest's own summary - cannot change it.
 
+In a parallel run the processes share the modules they compile through a temporary folder that is removed when the
+run ends, so the translator is compiled once per job, by the files a run starts with, instead of once per file
+(BYTECODE_CACHE_PROGRAM has the reason). Nothing is written into the tree for it, and a file's own
+`sys.dont_write_bytecode` still keeps `__pycache__` out of it.
+
 `--timeout SECONDS` limits each module subprocess in parallel mode, or the entire discover subprocess with
 `-j 1`. The value must be positive and at most 86400 seconds (24 hours), keeping it within platform wait limits.
 A timeout fails the run and reports any output already produced; other parallel modules keep running.
@@ -86,11 +91,72 @@ def _terminate_active_processes():
         except (subprocess.TimeoutExpired, OSError):
             pass
 
+# Where the children find the bytecode another child has already compiled (the folder is the run's own, see main()).
+BYTECODE_CACHE_VARIABLE = "LEONIDA_BYTECODE_CACHE"
+
+# Installed in every child before it imports its test module. A source module whose own bytecode file is missing or
+# stale, or was never written because the importing file sets `sys.dont_write_bytecode` (most of this suite does, to
+# keep `__pycache__` out of the tree), is compiled by the first child that needs it and read back by the others. A
+# child that needs it before that entry is written compiles it too: the jobs of a run start together, so the
+# translator is compiled once per job (4 times in a run of 16 files with 4 jobs, 8 times with 8) and read by every
+# file after those.
+#
+# It matters because CPython from 3.12 up to 3.13.15 and 3.14.7 tokenizes a source *string* in time quadratic in its
+# f-string replacement fields: every `{` copies the rest of the buffer (`update_fstring_expr` in 3.12's
+# Parser/tokenizer.c). 3.13.16, 3.14.8 and 3.15.0 fixed that (gh-155525); 3.12.16 still has it, and CI runs 3.12.
+# Importing tools/rdna2spirv.py, 1.2 MB with some 4,800 f-strings, takes 7.2 s on 3.14.7 and 7.5 s on 3.13.13
+# (Windows 11; 0.1 s of it is code generation) against under 0.1 s from bytecode, and each file of the suite paid
+# that. Run as a script the same file starts in 0.4 s, because a file is tokenized line by line.
+#
+# `source_to_code` is what the import system calls when it has no valid bytecode file for a module, so a module whose
+# `__pycache__` entry is current never comes here. An entry is named after the path and the bytes of the source it was
+# compiled from, so a source that changes during a run, or a second copy of tools/, gets one of its own and no entry is
+# ever stale; an entry that cannot be read or written just means compiling, as before.
+BYTECODE_CACHE_PROGRAM = (
+    "import importlib.machinery, importlib.util, marshal, os, sys\n"
+    "class SharedBytecodeLoader(importlib.machinery.SourceFileLoader):\n"
+    "    def source_to_code(self, data, path, **options):\n"
+    "        if options or not isinstance(data, bytes):\n"
+    "            return super().source_to_code(data, path, **options)\n"
+    "        key = importlib.util.source_hash(os.fsencode(path) + b'\\0' + data).hex()\n"
+    "        entry = os.path.join(SHARED_BYTECODE, '%s-%d-%s.marshal' % (\n"
+    "            self.name.rpartition('.')[2], sys.flags.optimize, key))\n"
+    "        try:\n"
+    "            with open(entry, 'rb') as handle:\n"
+    "                code = marshal.load(handle)\n"
+    "        except (OSError, EOFError, ValueError, TypeError):\n"
+    "            code = None\n"
+    "        if isinstance(code, type(compile('', path, 'exec'))):\n"
+    "            return code\n"
+    "        code = super().source_to_code(data, path)\n"
+    "        mine = '%s.%d' % (entry, os.getpid())\n"
+    "        try:\n"
+    "            with open(mine, 'wb') as handle:\n"
+    "                marshal.dump(code, handle)\n"
+    "            os.replace(mine, entry)\n"
+    "        except OSError:\n"
+    "            try:\n"
+    "                os.remove(mine)\n"
+    "            except OSError:\n"
+    "                pass\n"
+    "        return code\n"
+    "class SharedBytecodeFinder:\n"
+    "    @staticmethod\n"
+    "    def find_spec(name, path=None, target=None):\n"
+    "        spec = importlib.machinery.PathFinder.find_spec(name, path, target)\n"
+    "        if spec is not None and type(spec.loader) is importlib.machinery.SourceFileLoader:\n"
+    "            spec.loader = SharedBytecodeLoader(spec.loader.name, spec.loader.path)\n"
+    "        return spec\n"
+    f"SHARED_BYTECODE = os.environ.get({BYTECODE_CACHE_VARIABLE!r})\n"
+    # Ahead of the path finder only: built-in and frozen modules keep their own finders.
+    "if SHARED_BYTECODE and importlib.machinery.PathFinder in sys.meta_path:\n"
+    "    sys.meta_path.insert(sys.meta_path.index(importlib.machinery.PathFinder), SharedBytecodeFinder)\n")
+
 # The child runs the module through unittest's own program and writes the result to a file, so the count of tests
 # comes from the result object and nothing the module writes can change it. The exit codes are unittest's own: 1
 # when a test failed, 5 when nothing ran at all, 0 otherwise. The module is left unset, as `python -m unittest` leaves it, so
 # the name is imported and not looked up as an attribute of the program itself.
-CHILD_PROGRAM = (
+CHILD_PROGRAM = BYTECODE_CACHE_PROGRAM + (
     "import json, os, sys, unittest\n"
     "program = unittest.TestProgram(module=None, argv=['unittest'] + sys.argv[1:], exit=False)\n"
     "result = program.result\n"
@@ -149,8 +215,11 @@ def read_count(path):
         return 0
 
 
-def run_module(directory, module, verbose, timeout=None):
-    """(return code, tests run, output) of `python -m unittest <target>` run from `directory`."""
+def run_module(directory, module, verbose, timeout=None, bytecode_cache=None):
+    """(return code, tests run, output) of `python -m unittest <target>` run from `directory`.
+
+    `bytecode_cache` is the folder this child shares compiled modules through (BYTECODE_CACHE_PROGRAM); without one
+    it compiles what it imports itself."""
     # `python -m unittest pkg.__init__` imports pkg and then runs the same file again as pkg.__init__, so a
     # registration in the initializer happens twice. Running the package itself imports it once; module_path() is
     # still the initializer's path, so the jobs stay sorted by the file they run.
@@ -159,6 +228,11 @@ def run_module(directory, module, verbose, timeout=None):
     with tempfile.TemporaryDirectory() as scratch:
         count_path = os.path.join(scratch, "count.json")
         env = dict(os.environ, LEONIDA_TEST_COUNT=count_path)
+        # Never the folder of a runner further up (this runner started from a test of another run): it is not ours
+        # to fill, and it is removed when that run ends.
+        env.pop(BYTECODE_CACHE_VARIABLE, None)
+        if bytecode_cache is not None:
+            env[BYTECODE_CACHE_VARIABLE] = bytecode_cache
         proc = subprocess.Popen(cmd, cwd=directory, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, errors="replace")
         _register_process(proc)
@@ -237,12 +311,20 @@ def main(argv=None):
             _unregister_process(proc)
     # Largest files first: they tend to run longest, and one started last would set the wall time alone.
     modules.sort(key=lambda m: -os.path.getsize(module_path(directory, m)))
+    # One folder of compiled modules for the whole run, outside the tree and gone when the run ends (a file a
+    # stopped child still holds open on Windows must not turn a finished run into a traceback).
+    with tempfile.TemporaryDirectory(prefix="leonida-bytecode-", ignore_cleanup_errors=True) as bytecode_cache:
+        return run_parallel(directory, modules, a, bytecode_cache)
+
+
+def run_parallel(directory, modules, a, bytecode_cache):
+    """Exit code of the run: the modules, `a.jobs` at a time, each in its own process."""
     start, total, failed = time.monotonic(), 0, []
     pool = concurrent.futures.ThreadPoolExecutor(a.jobs)
     jobs = {}
     try:
         for m in modules:
-            jobs[pool.submit(run_module, directory, m, a.verbose, a.timeout)] = m
+            jobs[pool.submit(run_module, directory, m, a.verbose, a.timeout, bytecode_cache)] = m
         pending = set(jobs)
         while pending:
             done, _ = concurrent.futures.wait(pending, timeout=0.2, return_when=concurrent.futures.FIRST_COMPLETED)

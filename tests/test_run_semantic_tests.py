@@ -5,7 +5,9 @@ or unimportable file always makes it exit 1 with that file named, in parallel an
 """
 import contextlib
 import io
+import marshal
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -40,6 +42,19 @@ LATE_SUMMARY = ("import atexit\nimport sys\nimport unittest\n"
 # A test that runs a nested unittest runner: that runner writes its own summary to stderr while the test runs.
 NESTED = ("import sys\nimport unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n"
           "        unittest.TextTestRunner(stream=sys.stderr, verbosity=0).run(unittest.TestSuite())\n")
+# What most files of tests/semantic do: bytecode writing is off before the module under test is imported, so its own
+# `__pycache__` never holds it and every file would compile it again.
+USES_HELPER = ("import sys\nsys.dont_write_bytecode = True\nimport unittest\nimport helper\n"
+               "class T(unittest.TestCase):\n    def test_a(self): self.assertEqual(helper.X, {x})\n")
+SHOWS_FOLDER = ("import os\nimport unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n"
+                f"        folder = os.environ.get({r.BYTECODE_CACHE_VARIABLE!r})\n"
+                "        print('shared-folder=%s exists=%s' % (folder, bool(folder) and os.path.isdir(folder)))\n")
+
+
+def shared_entries(folder, module):
+    """The shared bytecode files of one module, one per source it was compiled from."""
+    name = re.compile(re.escape(module) + r"-\d+-[0-9a-f]+\.marshal")
+    return sorted(entry for entry in os.listdir(folder) if name.fullmatch(entry))
 
 
 def suite(tmp, files):
@@ -61,6 +76,99 @@ def run(*argv):
 def cli(*argv):
     return subprocess.run([sys.executable, "-I", os.path.join(ROOT, "scripts", "run_semantic_tests.py"), *argv],
                           capture_output=True, text=True, timeout=15)
+
+
+class SharedBytecodeTest(unittest.TestCase):
+    """A module the files of a run have in common is compiled by the first file that imports it and read by the
+    others: tools/rdna2spirv.py takes seconds to compile, and it used to be compiled once per file."""
+
+    def helper_suite(self, tmp, second):
+        suite(tmp, {"helper.py": "X = 1\n", "test_first.py": USES_HELPER.format(x=1),
+                    "test_second.py": USES_HELPER.format(x=second)})
+        return os.path.join(tmp, "helper.py")
+
+    def test_a_module_one_file_compiled_is_read_by_the_next(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as shared:
+            helper = self.helper_suite(tmp, second=2)
+            code, ran, out = r.run_module(tmp, "test_first", False, None, shared)
+            self.assertEqual((code, ran), (0, 1), out)
+            entries = shared_entries(shared, "helper")
+            self.assertEqual(len(entries), 1, os.listdir(shared))
+            # A file's result does not say whether it compiled helper.py or read the entry, so the entry is swapped
+            # for code that says X = 2: test_second passes only by running the entry.
+            with open(os.path.join(shared, entries[0]), "wb") as f:
+                marshal.dump(compile("X = 2\n", helper, "exec"), f)
+            code, ran, out = r.run_module(tmp, "test_second", False, None, shared)
+            self.assertEqual((code, ran), (0, 1), out)
+            self.assertEqual(shared_entries(shared, "helper"), entries)
+            # The file switched bytecode writing off, and that still holds for the tree.
+            self.assertFalse(os.path.exists(os.path.join(tmp, "__pycache__", "helper." + sys.implementation.cache_tag
+                                                         + ".pyc")))
+
+    def test_a_changed_source_is_compiled_again(self):
+        # Same length and same modification time as the source the entry came from: a `__pycache__` file is trusted
+        # on those two alone and would run the old code. An entry is named after the bytes it was compiled from.
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as shared:
+            helper = self.helper_suite(tmp, second=3)
+            before = os.stat(helper)
+            self.assertEqual(r.run_module(tmp, "test_first", False, None, shared)[:2], (0, 1))
+            with open(helper, "w", encoding="utf-8", newline="\n") as f:
+                f.write("X = 3\n")
+            os.utime(helper, ns=(before.st_atime_ns, before.st_mtime_ns))
+            code, ran, out = r.run_module(tmp, "test_second", False, None, shared)
+            self.assertEqual((code, ran), (0, 1), out)
+            self.assertEqual(len(shared_entries(shared, "helper")), 2, os.listdir(shared))
+
+    def test_an_entry_that_is_not_bytecode_is_compiled_again_and_replaced(self):
+        for damage in (b"", b"not marshal data", marshal.dumps("a string, not code")):
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as tmp, \
+                    tempfile.TemporaryDirectory() as shared:
+                self.helper_suite(tmp, second=1)
+                self.assertEqual(r.run_module(tmp, "test_first", False, None, shared)[:2], (0, 1))
+                (entry,) = shared_entries(shared, "helper")
+                with open(os.path.join(shared, entry), "wb") as f:
+                    f.write(damage)
+                code, ran, out = r.run_module(tmp, "test_second", False, None, shared)
+                self.assertEqual((code, ran), (0, 1), out)
+                with open(os.path.join(shared, entry), "rb") as f:
+                    self.assertEqual(marshal.load(f).co_filename, os.path.join(tmp, "helper.py"))
+
+    def test_a_folder_that_is_gone_only_means_compiling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.helper_suite(tmp, second=1)
+            code, ran, out = r.run_module(tmp, "test_first", False, None, os.path.join(tmp, "no", "such", "folder"))
+            self.assertEqual((code, ran), (0, 1), out)
+
+    def test_a_parallel_run_shares_one_folder_and_removes_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_one.py": SHOWS_FOLDER, "test_two.py": SHOWS_FOLDER})
+            result = cli(tmp, "-j", "2", "-v")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            folders = re.findall(r"shared-folder=(.+) exists=True", result.stdout)
+            self.assertEqual(len(folders), 2, result.stdout)
+            self.assertEqual(len(set(folders)), 1, result.stdout)
+            self.assertFalse(os.path.exists(folders[0]))
+            # Outside the suite's folder: nothing is written into the tree for it.
+            self.assertNotEqual(os.path.commonpath([os.path.realpath(tmp), os.path.realpath(folders[0])]),
+                                os.path.realpath(tmp))
+
+    def test_a_child_is_not_given_the_folder_of_another_run(self):
+        # This runner started from a test of an outer run: that run's folder is in the environment, and it is
+        # neither ours to fill nor there for as long as our children run.
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outer:
+            suite(tmp, {"test_one.py": SHOWS_FOLDER})
+            saved = os.environ.get(r.BYTECODE_CACHE_VARIABLE)
+            os.environ[r.BYTECODE_CACHE_VARIABLE] = outer
+            try:
+                code, ran, out = r.run_module(tmp, "test_one", False)
+            finally:
+                if saved is None:
+                    del os.environ[r.BYTECODE_CACHE_VARIABLE]
+                else:
+                    os.environ[r.BYTECODE_CACHE_VARIABLE] = saved
+            self.assertEqual((code, ran), (0, 1), out)
+            self.assertIn("shared-folder=None exists=False", out)
+            self.assertEqual(os.listdir(outer), [])
 
 
 class RunnerTest(unittest.TestCase):
