@@ -2145,7 +2145,9 @@ if(TARGET Vulkan::Headers)
     if(Python3_FOUND)
       add_test(NAME xdxr_build_check COMMAND "${Python3_EXECUTABLE}" -I
                "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xdxr_bvh.py" check-build "${LEONIDA_XDXR_OUT}" --rays 1000)
-      set_tests_properties(xdxr_build_check PROPERTIES FIXTURES_REQUIRED xdxr_build_cases SKIP_RETURN_CODE 77)
+      # CPU-bound (validates every case and traces 1000 rays in Python): 61-79 s on a desktop CPU, 212 s measured on a
+      # slower host. Its own TIMEOUT wins over a `ctest --timeout 120` (docs/testing.md), which would cut it short.
+      set_tests_properties(xdxr_build_check PROPERTIES FIXTURES_REQUIRED xdxr_build_cases SKIP_RETURN_CODE 77 TIMEOUT 600)
     endif()
   endif()
   # VulkanQueue/VulkanContext query-state synchronization (remove_query_pool vs commit, cross-queue plan/commit)
