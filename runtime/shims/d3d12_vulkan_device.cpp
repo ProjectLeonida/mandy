@@ -5925,7 +5925,6 @@ struct DeviceState {
         SRWLOCK feed_lock = SRWLOCK_INIT;
         leonida::host_heap::vector<Change> feed;
         std::atomic<bool> feed_pending{false};
-        std::atomic<std::uint64_t> feed_seq{0};
         std::atomic<std::uint64_t> space_gen_atomic{0};
         std::atomic<bool> in_place_pending{false};
         std::atomic<std::uint32_t> refresh_in_flight{0};
@@ -6049,7 +6048,6 @@ struct DeviceState {
         AcquireSRWLockExclusive(&m.feed_lock);
         m.feed.push_back({page, frame, keep});
         m.feed_pending.store(true, std::memory_order_release);
-        m.feed_seq.fetch_add(1, std::memory_order_release);
         ReleaseSRWLockExclusive(&m.feed_lock);
     }
 
@@ -7081,6 +7079,103 @@ struct DeviceState {
             const std::uint64_t retire_ticket = context->note_mirror_bind(m.timeline, m.value);
             m.mirror->stamp_freed(retire_ticket);
         }
+    }
+
+    // Lightweight feed-only drain for coalesced submissions: applies any pending CopyPageMappingsBatchX / xmem
+    // remaps and lazy 2 GiB chunk creations + sparse binds without running write_back, arm_batch, incremental
+    // upload, shadow refresh, or title texture refresh (avoiding full-pass single-flight convoys).
+    // Returns true if any slow-path work ran under page_mirror.mutex.
+    bool drain_page_mirror_feed_only() {
+        auto& m = page_mirror;
+        if (!m.mirror) return false;
+        if (!m.feed_pending.load(std::memory_order_acquire) &&
+            leonida::title_mirror_space::generation() == m.space_gen_atomic.load(std::memory_order_acquire) &&
+            !m.mirror->has_pending_binds() &&
+            m.refresh_in_flight.load(std::memory_order_seq_cst) == 0 &&
+            m.flush_in_flight.load(std::memory_order_seq_cst) == 0) {
+            return false;
+        }
+        std::unique_lock lock(m.mutex, std::defer_lock);
+        leonida::submit_phases::lock_timed(lock);
+        m.refresh_in_flight.fetch_add(1, std::memory_order_seq_cst);
+        m.flush_in_flight.fetch_add(1, std::memory_order_seq_cst);
+        struct FeedDrainGuard {
+            std::atomic<std::uint32_t>& r;
+            std::atomic<std::uint32_t>& f;
+            ~FeedDrainGuard() {
+                f.fetch_sub(1, std::memory_order_release);
+                r.fetch_sub(1, std::memory_order_release);
+            }
+        } in_flight{m.refresh_in_flight, m.flush_in_flight};
+        sync_mirror_space_locked();
+        m.taken.clear();
+        AcquireSRWLockExclusive(&m.feed_lock);
+        for (auto& change : m.feed) m.taken.push_back(std::move(change));
+        m.feed.clear();
+        m.feed_pending.store(false, std::memory_order_release);
+        ReleaseSRWLockExclusive(&m.feed_lock);
+        bool did_work = false;
+        if (!m.taken.empty()) {
+            did_work = true;
+            m.fed += m.taken.size();
+            if (m.readback_in_flight) {
+                for (const auto& change : m.taken) {
+                    note_readback_frame_invalidated_locked(m.mirror->frame_at(change.page));
+                    note_readback_frame_invalidated_locked(change.frame);
+                }
+            }
+            if (m.taken.size() == 1) {
+                auto& change = m.taken[0];
+                if (!change.frame) m.tracking->unwatch(change.page);
+                else if (m.mirror->covers(change.page)) m.tracking->watch(change.page);
+                // defer_fill=false so newly created homes and aliased pages are filled/filtered before flush().
+                m.mirror->map(change.page, change.frame, std::move(change.keep), leonida::TitleMirror::kUnstamped,
+                              false);
+            } else {
+                m.feed_order.resize(m.taken.size());
+                for (std::size_t idx = 0; idx < m.taken.size(); ++idx)
+                    m.feed_order[idx] = {m.taken[idx].page, static_cast<std::uint32_t>(idx)};
+                std::sort(m.feed_order.begin(), m.feed_order.end(), [](const auto& a, const auto& b) {
+                    return a.page != b.page ? (a.page < b.page) : (a.seq < b.seq);
+                });
+                m.feed_collapsed.clear();
+                m.feed_unwatch.clear();
+                m.feed_watch.clear();
+                for (std::size_t r = 0; r < m.feed_order.size();) {
+                    std::size_t r_end = r + 1;
+                    while (r_end < m.feed_order.size() && m.feed_order[r_end].page == m.feed_order[r].page) ++r_end;
+                    const std::uint32_t last_seq = m.feed_order[r_end - 1].seq;
+                    const bool had_prior = (r_end - r) > 1;
+                    const auto& final_change = m.taken[last_seq];
+                    m.feed_collapsed.push_back({last_seq, had_prior});
+                    if (!final_change.frame) m.feed_unwatch.push_back(final_change.page);
+                    else if (m.mirror->covers(final_change.page)) m.feed_watch.push_back(final_change.page);
+                    r = r_end;
+                }
+                if (!m.feed_unwatch.empty()) m.tracking->unwatch_batch(m.feed_unwatch.data(), m.feed_unwatch.size());
+                if (!m.feed_watch.empty()) m.tracking->watch_batch(m.feed_watch.data(), m.feed_watch.size());
+                std::sort(m.feed_collapsed.begin(), m.feed_collapsed.end(),
+                          [](const auto& a, const auto& b) { return a.seq < b.seq; });
+                for (const auto& entry : m.feed_collapsed) {
+                    auto& change = m.taken[entry.seq];
+                    const bool same_frame_after_churn =
+                        entry.had_prior && change.frame && m.mirror->frame_at(change.page) == change.frame;
+                    m.mirror->map(change.page, change.frame, std::move(change.keep), leonida::TitleMirror::kUnstamped,
+                                  false);
+                    if (same_frame_after_churn && m.mirror->dirty(change.page)) ++m.dirty;
+                }
+            }
+            m.taken.clear();
+        }
+        if (m.mirror->has_pending_binds() && m.mirror->flush(m.value + 1)) {
+            did_work = true;
+            ++m.value;
+            ++m.batches;
+            m.binds += m.mirror->last_batch();
+            const std::uint64_t retire_ticket = context->note_mirror_bind(m.timeline, m.value);
+            m.mirror->stamp_freed(retire_ticket);
+        }
+        return did_work;
     }
 
     void destroy_page_mirror() {
@@ -20943,7 +21038,6 @@ public:
             std::condition_variable cv;
             bool in_flight = false;
             std::uint64_t completed_seq = 0;
-            std::uint64_t completed_feed_seq = 0;
             std::uint64_t ran = 0;
             std::uint64_t coalesced = 0;
             std::uint64_t wait_count = 0;
@@ -20953,6 +21047,8 @@ public:
             std::uint64_t shadows_ns = 0;
             std::uint64_t flush_ns = 0;
             std::uint64_t tex_ns = 0;
+            std::atomic<std::uint64_t> feed_drains{0};
+            std::atomic<std::uint64_t> feed_drain_ns{0};
             std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
         };
         auto before_coalescer = std::make_shared<BeforeExecuteCoalescer>();
@@ -20986,7 +21082,6 @@ public:
             struct LeaderGuard {
                 BeforeExecuteCoalescer* c = nullptr;
                 std::uint64_t pass_seq = 0;
-                std::uint64_t pass_feed_seq = 0;
                 std::uint64_t wb_ns = 0;
                 std::uint64_t mirror_ns = 0;
                 std::uint64_t shadows_ns = 0;
@@ -20998,11 +21093,11 @@ public:
                     bool log = false;
                     std::uint64_t ran = 0, coalesced = 0, waits = 0, wait_ns = 0;
                     std::uint64_t s_wb = 0, s_mirror = 0, s_shadows = 0, s_flush = 0, s_tex = 0;
+                    std::uint64_t fd_cnt = 0, fd_ns = 0;
                     double secs = 0.0;
                     {
                         std::lock_guard lock(c->mutex);
                         if (completed && pass_seq > c->completed_seq) c->completed_seq = pass_seq;
-                        if (completed && pass_feed_seq > c->completed_feed_seq) c->completed_feed_seq = pass_feed_seq;
                         ++c->ran;
                         c->wb_ns += wb_ns;
                         c->mirror_ns += mirror_ns;
@@ -21022,6 +21117,8 @@ public:
                             s_shadows = c->shadows_ns;
                             s_flush = c->flush_ns;
                             s_tex = c->tex_ns;
+                            fd_cnt = c->feed_drains.exchange(0, std::memory_order_relaxed);
+                            fd_ns = c->feed_drain_ns.exchange(0, std::memory_order_relaxed);
                             c->ran = c->coalesced = c->wait_count = c->wait_ns = 0;
                             c->wb_ns = c->mirror_ns = c->shadows_ns = c->flush_ns = c->tex_ns = 0;
                             c->since = now;
@@ -21035,47 +21132,39 @@ public:
                         const double sum_ms = double(s_wb + s_mirror + s_shadows + s_flush + s_tex) * inv_ran;
                         std::fprintf(stderr,
                                      "[rt] before-execute: %llu ran, %llu coalesced (%.0f%% skipped) in %.1f s; "
-                                     "%llu single-flight waits (%.2f ms avg); leader avg %.2f ms "
-                                     "(wb %.2f, mirror %.2f, shadows %.2f, flush %.2f, tex %.2f)\n",
+                                     "%llu single-flight waits (%.2f ms avg); %llu feed-only drains (%.2f ms avg); "
+                                     "leader avg %.2f ms (wb %.2f, mirror %.2f, shadows %.2f, flush %.2f, tex %.2f)\n",
                                      static_cast<unsigned long long>(ran), static_cast<unsigned long long>(coalesced),
                                      total ? 100.0 * double(coalesced) / double(total) : 0.0, secs,
                                      static_cast<unsigned long long>(waits),
-                                     waits ? double(wait_ns) * 1e-6 / double(waits) : 0.0, sum_ms,
+                                     waits ? double(wait_ns) * 1e-6 / double(waits) : 0.0,
+                                     static_cast<unsigned long long>(fd_cnt),
+                                     fd_cnt ? double(fd_ns) * 1e-6 / double(fd_cnt) : 0.0, sum_ms,
                                      double(s_wb) * inv_ran, double(s_mirror) * inv_ran, double(s_shadows) * inv_ran,
                                      double(s_flush) * inv_ran, double(s_tex) * inv_ran);
                     }
                 }
             } leader_guard{};
             if (use_coalesce) {
-                // Do not fast-skip while a page-mirror remap feed is pending, being drained
-                // (`refresh_in_flight > 0`; mirrors refresh_page_mirror's own settle check since feed_pending
-                // clears at drain start before chunk creation), or drained by an in-flight leader whose sparse
-                // binds, texture refresh, and shadow/heap refilter have not yet completed (`completed_feed_seq`).
-                const auto feed_settled = [&] {
-                    return !state_.page_mirror.feed_pending.load(std::memory_order_acquire) &&
-                           state_.page_mirror.refresh_in_flight.load(std::memory_order_seq_cst) == 0;
-                };
-                const std::uint64_t req_feed_seq = state_.page_mirror.feed_seq.load(std::memory_order_acquire);
                 std::unique_lock lock(coalescer->mutex);
-                for (;;) {
-                    if (coalescer->completed_seq >= req_seq &&
-                        coalescer->completed_feed_seq >= req_feed_seq &&
-                        feed_settled()) {
-                        ++coalescer->coalesced;
-                        return;
-                    }
-                    if (!coalescer->in_flight) break;
+                while (coalescer->in_flight && coalescer->completed_seq < req_seq) {
                     const std::int64_t wait_start = phases::now_ns();
-                    coalescer->cv.wait(lock, [&] {
-                        return !coalescer->in_flight ||
-                               (coalescer->completed_seq >= req_seq &&
-                                coalescer->completed_feed_seq >= req_feed_seq &&
-                                feed_settled());
-                    });
+                    coalescer->cv.wait(lock, [&] { return !coalescer->in_flight || coalescer->completed_seq >= req_seq; });
                     const std::uint64_t waited = std::uint64_t(phases::now_ns() - wait_start);
                     phases::add_part(phases::part_lock_wait, waited);
                     ++coalescer->wait_count;
                     coalescer->wait_ns += waited;
+                }
+                if (coalescer->completed_seq >= req_seq) {
+                    ++coalescer->coalesced;
+                    lock.unlock();
+                    const std::int64_t fd0 = phases::now_ns();
+                    if (state_.drain_page_mirror_feed_only()) {
+                        const std::uint64_t fd_ns = std::uint64_t((std::max)(std::int64_t(0), phases::now_ns() - fd0));
+                        coalescer->feed_drains.fetch_add(1, std::memory_order_relaxed);
+                        coalescer->feed_drain_ns.fetch_add(fd_ns, std::memory_order_relaxed);
+                    }
+                    return;
                 }
                 coalescer->in_flight = true;
                 leader_guard.c = coalescer.get();
@@ -21091,12 +21180,11 @@ public:
                 state_.write_back_titles();
                 t1 = phases::now_ns();
                 if (use_coalesce) {
-                    // Acquire current visibility epoch and feed_seq AFTER write_back_titles() and immediately BEFORE
+                    // Acquire current visibility epoch AFTER write_back_titles() and immediately BEFORE
                     // refresh_page_mirror() so batches enqueued during write_back_titles() coalesce into this single
-                    // pass and completed_feed_seq covers every remap drained by refresh_page_mirror().
+                    // pass.
                     pass_seq = (std::max)(req_seq, state_.context->current_visibility_seq());
                     leader_guard.pass_seq = pass_seq;
-                    leader_guard.pass_feed_seq = state_.page_mirror.feed_seq.load(std::memory_order_acquire);
                 }
                 mirror_serial = leonida::geometry_writes::state().serial.load(std::memory_order_acquire);
                 state_.refresh_page_mirror();  // what this submission's title-written addresses read
