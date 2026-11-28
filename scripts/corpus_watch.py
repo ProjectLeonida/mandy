@@ -18,6 +18,7 @@ Standard library only; all text writes name their line ending.
 """
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -47,16 +48,20 @@ def corpus_counts(work):
         dxbc = old_dxbc
         spirv_path = os.path.join(work, "spirv", "index.json")
 
-    with open(dxbc, encoding="utf-8") as f:
+    with open(dxbc, encoding="utf-8-sig") as f:
         carved = json.load(f)
+    if not isinstance(carved, (list, dict)):
+        raise ValueError(f"{dxbc}: expected a JSON list or object")
     entries = carved if isinstance(carved, list) else list(carved.values())
 
     per_stage = {}
     validated = 0
     spirv_entries = 0
     if os.path.isfile(spirv_path):
-        with open(spirv_path, encoding="utf-8") as f:
+        with open(spirv_path, encoding="utf-8-sig") as f:
             spirv = json.load(f)
+        if not isinstance(spirv, dict):
+            raise ValueError(f"{spirv_path}: expected a JSON object")
         spirv_entries = len(spirv)
         for meta in spirv.values():
             if isinstance(meta, dict) and "error" not in meta:
@@ -71,20 +76,29 @@ def corpus_counts(work):
             "validated": validated, "per_stage": per_stage}
 
 
-def outputs_collide(work, report, results, log):
+def outputs_collide(work, report, results, log, game=None, out=None):
     """Refuse an output that names an input or another output."""
-    outputs = [p for p in (report, results, log) if p]
+    outputs = [p for p in (report, results, log, out) if p]
     for i, first in enumerate(outputs):
         for second in outputs[i + 1:]:
             if same_report_path(first, second):
                 return True
-    for out in outputs:
-        if same_report_path(out, work):
-            return True
+    inputs = [p for p in (work, game) if p]
+    if work:
+        inputs.extend([
+            os.path.join(work, "shaders", "dxbc", "index.json"),
+            os.path.join(work, "shaders", "spirv", "index.json"),
+            os.path.join(work, "dxbc", "index.json"),
+            os.path.join(work, "spirv", "index.json"),
+        ])
+    for target_out in outputs:
+        for inp in inputs:
+            if same_report_path(target_out, inp):
+                return True
     return False
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--game", required=True, help="your package folder")
     ap.add_argument("--work", required=True, help="work folder (outside the repo)")
@@ -98,9 +112,16 @@ def main():
     ap.add_argument("--pull", action="store_true", help="git pull --ff-only before each run")
     ap.add_argument("--github", action="store_true", help="also refresh dashboard PR/CI panels")
     ap.add_argument("--jobs", type=int)
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
+    if not math.isfinite(a.interval) or a.interval < 0:
+        ap.error("--interval must be a finite nonnegative number")
     if not a.once and a.interval <= 0:
         ap.error("use --once or --interval HOURS")
+    if a.jobs is not None and a.jobs < 1:
+        ap.error("--jobs must be at least 1")
+    for flag, val in (("--results", a.results), ("--log", a.log)):
+        if val and (os.path.isdir(val) or val.endswith(("/", "\\"))):
+            ap.error(f"{flag} must name a file, not a directory: {val}")
 
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     log_path = a.log
@@ -112,7 +133,7 @@ def main():
             with open(log_path, "a", encoding="utf-8", newline="\n") as f:
                 f.write(line + "\n")
 
-    if outputs_collide(a.work, a.report, a.results, log_path):
+    if outputs_collide(a.work, a.report, a.results, log_path, game=a.game, out=a.out):
         ap.error("an output names the work folder or another output")
 
     for tool in ("llvm-mc", "spirv-val", "git"):
@@ -123,13 +144,19 @@ def main():
     probe = subprocess.run(
         ["llvm-mc", "-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1013",
          "-filetype=obj", "-o", os.devnull],
-        input="s_nop 0\n", text=True, capture_output=True)
+        input="s_nop 0\n", text=True, encoding="utf-8", errors="replace", capture_output=True)
     if probe.returncode != 0:
         ap.error("llvm-mc cannot assemble gfx1013 (AMDGPU target missing)")
 
+    for file_out in (a.results, log_path):
+        if file_out:
+            parent = os.path.dirname(os.path.abspath(file_out))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
     def run(cmd, timeout):
-        return subprocess.run(cmd, cwd=repo, text=True, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, timeout=timeout)
+        return subprocess.run(cmd, cwd=repo, text=True, encoding="utf-8", errors="replace",
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
 
     def run_once():
         if a.pull:
@@ -170,7 +197,7 @@ def main():
                 f"validated={counts['validated']}")
             for stage, (nc, nv) in sorted(counts["per_stage"].items()):
                 log(f"  {stage}: {nv}/{nc} validated")
-            with open(a.results, encoding="utf-8") as f:
+            with open(a.results, encoding="utf-8-sig") as f:
                 previous = [json.loads(x) for x in f if x.strip()]
             if len(previous) >= 2:
                 before = previous[-2].get("counts") or {}
