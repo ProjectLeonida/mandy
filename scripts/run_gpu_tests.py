@@ -948,9 +948,18 @@ def run_suite(a, work: str) -> int:
         Path(spirv_dir, f"{name}.spv").unlink(missing_ok=True)
 
     # 2. Translate this run's inputs only. The translator looks for metadata one level above the input directory.
-    with tempfile.TemporaryDirectory(prefix="disasm-", dir=work) as selected_disasm:
-        for path in disasm_files:
-            shutil.copyfile(path, os.path.join(selected_disasm, os.path.basename(path)))
+    try:
+        staging = tempfile.TemporaryDirectory(prefix="disasm-", dir=work)
+    except OSError as exc:
+        print(f"error: cannot create a disassembly staging directory in {work}: {exc}", file=sys.stderr)
+        return 2
+    with staging as selected_disasm:
+        try:
+            for path in disasm_files:
+                shutil.copyfile(path, os.path.join(selected_disasm, os.path.basename(path)))
+        except OSError as exc:
+            print(f"error: cannot stage disassembly for translation: {exc}", file=sys.stderr)
+            return 2
         cmd = [sys.executable, "-I", TRANSLATOR, selected_disasm, "--out", spirv_dir]
         if assembler == "python":
             cmd += ["--assembler", "python"]

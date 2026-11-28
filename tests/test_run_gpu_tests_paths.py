@@ -50,6 +50,33 @@ class DrawShaders(unittest.TestCase):
 
 
 class FilterSelection(unittest.TestCase):
+    def test_cannot_create_disassembly_staging_directory(self):
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("sys.stderr", err), \
+                patch.object(run_gpu_tests, "assemble_to_s"), \
+                patch.object(run_gpu_tests.tempfile, "TemporaryDirectory", side_effect=PermissionError("access denied")), \
+                patch.object(run_gpu_tests, "run_cmd") as run:
+            args = SimpleNamespace(filter="cs_lds", llvm_mc="unused")
+            self.assertEqual(run_gpu_tests.run_suite(args, tmp), 2)
+        self.assertIn("cannot create a disassembly staging directory", err.getvalue())
+        self.assertIn("access denied", err.getvalue())
+        run.assert_not_called()
+
+    def test_cannot_copy_disassembly_into_staging_directory(self):
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("sys.stderr", err), \
+                patch.object(run_gpu_tests, "assemble_to_s"), \
+                patch.object(run_gpu_tests.shutil, "copyfile", side_effect=PermissionError("access denied")), \
+                patch.object(run_gpu_tests, "run_cmd") as run:
+            args = SimpleNamespace(filter="cs_lds", llvm_mc="unused")
+            self.assertEqual(run_gpu_tests.run_suite(args, tmp), 2)
+            self.assertEqual(list(Path(tmp).glob("disasm-*")), [])
+        self.assertIn("cannot stage disassembly for translation", err.getvalue())
+        self.assertIn("access denied", err.getvalue())
+        run.assert_not_called()
+
     def test_reused_work_translates_only_selected_shaders_and_dependencies(self):
         passes = []
 
