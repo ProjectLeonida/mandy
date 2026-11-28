@@ -172,7 +172,7 @@ int main() {
 
     // Values a 4-bit channel holds exactly (n / 15), plus a 4-bit tie (0.5 -> 8/15 = 0x88), out-of-range and NaN
     // executed under FE_DOWNWARD so FP-mode-dependent rounding (std::nearbyint -> 7/15 = 0x77) fails.
-    const FLOAT outside_color[4] = {1.0f, 0.0f, 5.0f / 15, 1.0f};  // -> FF 00 55 FF
+    const FLOAT outside_color[4] = {1.0f, 10.0f / 15.0f, 5.0f / 15.0f, 1.0f};
     const FLOAT inside_color[4] = {0.5f, -1.0f, 2.0f, std::numeric_limits<float>::quiet_NaN()};  // -> 88 00 FF 00
     const D3D12_RECT rect{8, 4, 24, 12};
     list->ClearRenderTargetView(rtv, outside_color, 0, nullptr);
@@ -202,7 +202,7 @@ int main() {
             std::memcpy(texel, static_cast<const std::uint8_t*>(mapped) + y * kPitch + x * 4, sizeof(texel));
             const bool inside = x >= UINT(rect.left) && x < UINT(rect.right) && y >= UINT(rect.top) &&
                                 y < UINT(rect.bottom);
-            const std::uint8_t want[4] = {std::uint8_t(inside ? 0x88 : 0xFF), std::uint8_t(inside ? 0x00 : 0x00),
+            const std::uint8_t want[4] = {std::uint8_t(inside ? 0x88 : 0xFF), std::uint8_t(inside ? 0x00 : 0xAA),
                                           std::uint8_t(inside ? 0xFF : 0x55), std::uint8_t(inside ? 0x00 : 0xFF)};
             if (std::memcmp(texel, want, 4) != 0 && wrong++ < 4)
                 std::fprintf(stderr, "texel (%u, %u) = %02x %02x %02x %02x, want %02x %02x %02x %02x\n", x, y,
