@@ -5,7 +5,7 @@ the corpus is correct. The CPU differential oracle in `tools/shader_diff.py` is 
 tested (`tests/test_shader_diff.py`): it compares the ISA model in `tools/cpu_ref.py` against
 translated SPIR-V run in `tests/semantic/spirv_mini_interp.py` over seeded straight-line programs.
 Run it with `python -I tools/shader_diff.py --programs 200 --seed 7` (`--self-test` checks the
-harness itself). The GPU-side runners are described below: `tools/valu_fuzz.py` (16-bit and memory ops), `tools/lds_fuzz.py`, `tools/crosslane_fuzz.py`, `tools/cf_diff.py` and `tools/ab_control_flow.py` (corpus pixel shaders in both control-flow forms).
+harness itself). The GPU-side runners are described below: `tools/valu_fuzz.py` (16-bit and memory ops), `tools/lds_fuzz.py`, `tools/crosslane_fuzz.py`, `tools/cf_diff.py`, `tools/cf_gpu_run.py` (its programs on a GPU) and `tools/ab_control_flow.py` (corpus pixel shaders in both control-flow forms).
 
 ## Why `spirv-val` is not enough
 
@@ -1668,6 +1668,29 @@ Measured on an RX 6700 (gfx1031, AMD Windows driver 32.0.21045.29003, ROCm wheel
 each value is staged once, and that the kernels assemble for gfx1031. A fake oracle plays the GPU to check the exit
 codes. On a GFX10 GPU the test runs UNORM8 and checks the controls.
 
+### d16 rounding of image loads and samples (`tools/d16_image_probe.py`)
+
+The image counterpart to `tools/d16_format_probe.py` checks how a GFX10 GPU (RDNA1/RDNA2, through `tools/hw_oracle`)
+rounds d16 image results to f16 across three paths: `image_load` (unnormalized integer coordinates), point-filtered
+`image_sample_lz`, and bilinear `image_sample_lz` (`--frac` texels to the right of the texel centre), in wave32 and
+wave64. It covers `unorm8`, `snorm8`, `unorm16`, `snorm16`, `float16` (control: returns its own bits), and `float32`
+(1,024 patterns starting with exact f16 halfway points such as `0x3f7ff000` and `0x3f7fb000` plus their neighbours).
+Point loads and point samples are compared against the candidate rules of `tools/d16_format_probe.py` (`rte`,
+`f32_rte`, and their toward-zero and denormal-flushing variants), while bilinear d16 samples are compared against the
+hardware's own f32 bilinear sample rounded to nearest even or toward zero.
+
+```
+python -I tools/d16_image_probe.py --formats unorm8,unorm16 --waves 32,64 --frac 0.5 --json out.json
+python -I tools/d16_image_probe.py --hw-arch gfx1031 --json out.json
+python -I tools/d16_image_probe.py --self-test
+python -I tests/test_d16_image_probe.py
+```
+
+Exit status is 0 when the sweep ran, 1 when wave32 and wave64 disagree, 2 on a harness or control error (f32 load
+mismatch, point sample differing from load, `float16` mismatch, or misaligned texture), and 77 when the hardware oracle
+is unavailable or the GPU is not GFX10. `tests/test_d16_image_probe.py` covers the rules, texel generators, descriptors,
+and exit codes without a GPU or game files.
+
 ### Widening a 16-bit float NaN in a typed buffer load (`tools/f16_widen_probe.py`)
 
 A typed buffer load of a half NaN had never been measured: `tools/mem_diff.py` decoded 16_FLOAT with
@@ -2329,6 +2352,27 @@ completing draws (`89` non-clear exact + `64` clear-only exact across `573/573` 
 `ps_sweep.py compare --exact`. All `3` whole-corpus shaders combining raw barycentrics and `v_interp_*_f16` also draw
 bit-for-bit identically (`3/3` draws, `11/11` targets) against `default` on the RX 6650 XT.
 
+### Op-scoped mutation testing for `tests/semantic` (`tools/semantic_mutants.py`)
+
+`tools/semantic_mutants.py` checks which one-line bugs in `tools/rdna2spirv.py` a given `tests/semantic` file would
+miss. You scope the slice by instruction branch (`--op`), translator method (`--function`), or 1-based line range
+(`--lines`); it generates one-line mutants (swapped SPIR-V and `GLSL.std.450` opcode pairs, comparison polarity and
+signedness flips, `self.cu(N)` off-by-one constants, swapped `OpSelect` arms, and duplicated trailing operands) in a
+private temporary copy of `tools/` and runs the test file against each copy through `LEONIDA_TOOLS_DIR` (the same hook
+used by `tests/semantic/test_mutations.py`), leaving the repository untouched.
+
+```
+python -I tools/semantic_mutants.py tests/semantic/test_alu_sad.py --op v_sad_u8
+python -I tools/semantic_mutants.py tests/semantic/test_alu_sad.py --op v_sad_u8 --list
+python -I tools/semantic_mutants.py tests/semantic/test_alu_sad.py --op v_sad_u8 --timeout 120
+python -I tests/test_semantic_mutants.py
+```
+
+Any mutant the test file still passes is reported as `SURVIVED` (read each lead before adding cases, since some mutants
+are equivalent). Exit status is 0 when every mutant is caught, 1 when any survives, and 2 on a usage error or when the
+unmutated baseline fails. Synthetic only (no GPU or game files); `tests/test_semantic_mutants.py` covers mutant
+generation, scoping, and CLI exit codes.
+
 ## Coverage plan and cost
 
 Start with straight-line scalar/vector ALU because it is deterministic, needs no descriptors and
@@ -2346,6 +2390,14 @@ covers the operations most shaders use. Then add, in order:
    loops, two-entry cycles), run by `tools/cf_ref.py` (cpu_ref plus branches, compares and saveexec)
    and by `tests/semantic/spirv_wave_interp.py` (every invocation of a subgroup, with structured
    reconvergence), compared lane by lane in both the structured and the dispatch-loop form.
+   `tools/cf_gpu_run.py` runs the same generated programs on a Vulkan GPU, each as a one-wave compute
+   program that stores v8..v11 of every lane, and compares every lane with `cf_ref`: it shows what the
+   driver makes of the translated control flow (reconvergence after a divergent if/else, per-lane loops
+   with a break mask, the saveexec idioms). It needs `runtime/build/vk_compute_test` and no `llvm-mc`
+   (the listings carry `cf_diff`'s `; encoding:` byte counts), runs wave64 programs on a 32-wide GPU
+   with `LEONIDA_W64_EMULATE=1`, and checks itself before each campaign with a deliberately wrong
+   reference (a flipped branch must show as a mismatch). It exits 1 on a mismatch, 2 when nothing ran
+   and 3 when that check fails; a skipped program is counted with its reason, never as a pass.
    The corpus-side counterpart is `tools/ab_control_flow.py`: it renders branchy pixel shaders
    translated both ways (real loops and conditionals, and `--dispatch-loop`) and compares the two
    images byte for byte. It needs a finished shaders stage and `runtime/build/vk_texture_test`, and

@@ -540,6 +540,7 @@ class BootTraceTests(unittest.TestCase):
         for needle in (
             "pid 123",
             "modules (2)",
+            "game.exe, x.dll (relocated)",
             "dllmain: 1 ok, 1 failed",
             "unimplemented: 2 unique",
             "x.dll!Foo from game.exe+0x10",
@@ -646,6 +647,19 @@ class BootTraceTests(unittest.TestCase):
                 else:
                     self.assertNotIn("more", text)
 
+    def test_counts_only_includes_all_xmem_physical_page_observations(self):
+        self.write(self.startup, [
+            {"kind": "xmem_physical_pages", "api": "private-api", "attributes": "0x20",
+             "pages": 4, "caller": "private-caller"},
+        ] * 3)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main([self.startup, "--counts-only", "--limit", "1"]), 0)
+        summary = json.loads(out.getvalue())["startup"]
+        self.assertEqual(summary["xmem_physical_pages_count"], 3)
+        self.assertNotIn("xmem_physical_pages", summary)
+        self.assertNotIn("private-", out.getvalue())
+
     def test_xmem_physical_pages_handles_missing_and_malformed_fields(self):
         unknown = {"api": None, "attributes": None, "pages": None, "caller": None}
         nbsp_caller = "fixture\u00a0one.dll+0x20"
@@ -664,6 +678,73 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(text.count("    ? attributes ? requested ? pages from ?\n"), 2)
         self.assertIn("    XMemAllocatePhysicalPages attributes 0x10 requested ? pages from fixture.dll+0x50\n", text)
         self.assertIn(f"    XMemAllocatePhysicalPages attributes 0x20 requested 4 pages from {nbsp_caller}\n", text)
+
+    def test_pipeline_timing_counts_overlapping_compiles_and_waits(self):
+        self.write_lines(self.d3d12, [
+            D3D12[1],
+            "fixture.exe : [rt] pipeline-compile-begin trigger=draw tid=7 bytes=512 "
+            "variant=0 begin_ms=100 key=synthetic-key shaders=private_vs,private_ps",
+            "[rt] pipeline-compile-begin trigger=draw tid=8 bytes=512 "
+            "variant=0 begin_ms=101 key=synthetic-key shaders=private_vs,private_ps",
+            "[rt] pipeline-compile trigger=draw tid=8 start_us=1500 us=800 hit=1 bytes=512 "
+            "variant=0 result=0 end_ms=102 key=synthetic-key shaders=private_vs,private_ps",
+            "[rt] pipeline-compile trigger=dispatch tid=9 start_us=1600 us=5000 hit=-1 bytes=512 "
+            "variant=0 result=-4 end_ms=106 key=other-key shaders=private_cs",
+            "[rt] pipeline-use trigger=draw tid=10 us=6000 ready=0 end_ms=107",
+            "[rt] pipeline-use trigger=draw tid=11 us=1000 ready=1 end_ms=107",
+        ])
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertEqual(trace["ignored_lines"], 0)
+        self.assertEqual(trace["pipeline_timing"], {
+            "started": 2, "completed": 2, "completions_without_start": 1, "non_success_results": 1,
+            "cache_hits": 1, "max_compile_us": 5000, "logged_waits": 2, "waits_not_ready": 1,
+            "max_wait_us": 6000, "starts_without_completion": 1,
+        })
+        summary = bt.summarize(None, trace)
+        text = bt.format_text(summary, 10)
+        safe_json = json.dumps(bt.counts_only(summary))
+        self.assertIn("1 without a recorded completion", text)
+        self.assertIn("longest 6000 us", text)
+        self.assertEqual(bt.counts_only(summary)["d3d12"]["pipeline_timing"], trace["pipeline_timing"])
+        for raw in ("private_", "synthetic-key", "other-key"):
+            self.assertNotIn(raw, text)
+            self.assertNotIn(raw, safe_json)
+
+    def test_frame_pacing_summary_parsed_formatted_and_kept_in_counts_only(self):
+        self.write_lines(self.d3d12, [
+            "[d3d12-trace] #1 XboxPresentation::PresentX ok",
+            "gta6rt.exe : [rt] present: pacing summary frames=101 samples=100 target_us=16667 "
+            "mean_us=16712.5 drift_us=+45.5 p50_us=16667 p95_us=17100 p99_us=18200 "
+            "latency_samples=101 latency_p50_us=4200 latency_p95_us=6100 latency_p99_us=7900",
+        ])
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertEqual(trace["ignored_lines"], 0)
+        self.assertEqual(trace["frame_pacing"], {
+            "frames": 101,
+            "samples": 100,
+            "target_us": 16667,
+            "mean_us": 16712.5,
+            "drift_us": 45.5,
+            "p50_us": 16667,
+            "p95_us": 17100,
+            "p99_us": 18200,
+            "latency_samples": 101,
+            "latency_p50_us": 4200,
+            "latency_p95_us": 6100,
+            "latency_p99_us": 7900,
+        })
+        text = bt.format_text(bt.summarize(None, trace), 10)
+        self.assertIn(
+            "frame pacing: 101 frame(s), 100 interval(s), target 16667 us, mean 16712.5 us (drift +45.5 us), "
+            "p50/p95/p99 16667/17100/18200 us; origin-to-present p50/p95/p99 4200/6100/7900 us",
+            text,
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main(["--d3d12", self.d3d12, "--counts-only"]), 0)
+        counts = json.loads(out.getvalue())
+        self.assertEqual(counts["d3d12"]["frame_pacing"]["drift_us"], 45.5)
+        self.assertEqual(counts["d3d12"]["frame_pacing"]["p99_us"], 18200)
 
 
 if __name__ == "__main__":

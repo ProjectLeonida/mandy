@@ -87,9 +87,10 @@ class GuestSceneReferenceTest(unittest.TestCase):
             (root / "spirv").mkdir()
             placeholder = root / "placeholder.txt"
             placeholder.write_bytes(b"synthetic input")
-            out = placeholder / "output"
+            out = placeholder / "output-\u00f8"
             result = subprocess.run(
-                [sys.executable, "-I", str(path), "--wine", sys.executable,
+                # UTF-8 mode: a piped stderr is the ANSI code page on Windows, and the error names the path.
+                [sys.executable, "-I", "-X", "utf8", str(path), "--wine", sys.executable,
                  "--loader", str(placeholder), "--guest", str(placeholder),
                  "--shaders", str(root), "--out", str(out)],
                 capture_output=True, encoding="utf-8", errors="replace", timeout=20,
@@ -112,7 +113,9 @@ class GuestSceneReferenceTest(unittest.TestCase):
                    "--shaders", str(root), "--out", str(out)]
             if sys.platform != "win32":
                 cmd += ["--wine", str(bad_loader), "--wine-arg=-a", "--wine-arg=path with spaces/wine"]
-            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", timeout=20)
+            # The runner's "could not launch" line carries the OS error text, which Windows localizes and the child
+            # prints in the ANSI code page (cp1251 on a Russian host): a strict UTF-8 decode would leave stdout None.
+            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=20)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             report = json.loads((out / "report.json").read_text(encoding="utf-8"))
             self.assertIn("could not launch", report["error"])

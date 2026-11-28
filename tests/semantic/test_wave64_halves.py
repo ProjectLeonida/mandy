@@ -475,6 +475,16 @@ class Execution(unittest.TestCase):
         want = [(7 * k if k % 8 == 1 else 1000, int(k % 8 < 4)) for k in range(64)]
         self.assertEqual([w[:2] for w in whole], want)
 
+    def test_float_equality_cannot_select_a_descriptor_word(self):
+        # +0 and -0 compare equal, but a first-lane read returns their different raw bits.
+        tier, whole, halves = self.run_both("vs_float_waterfall", vs([
+            "v_lshrrev_b32_e32 v4, 5, v0", "v_lshlrev_b32_e32 v4, 31, v4",
+            "v_readfirstlane_b32 s20, v4", "v_cmp_eq_f32_e32 vcc, s20, v4",
+            "s_and_saveexec_b64 s[12:13], vcc", "v_mov_b32_e32 v6, s20",
+            "s_mov_b64 exec, s[10:11]"]))
+        self.assertNotEqual(whole, halves)
+        self.assertEqual(tier, "C")
+
     def test_b_waterfall_invariant(self):
         tier, whole, halves = self.run_both("vs_b_wf", vs([
             "v_and_b32_e32 v4, 7, v0", "v_readfirstlane_b32 s20, v4", "v_cmp_eq_u32_e32 vcc, s20, v4",
@@ -1336,6 +1346,26 @@ class PixelShaders(unittest.TestCase):
                     slots32 = {mem32[0x100 + 4 * k] for k in range(16)}
                     self.assertEqual(len(slots64), 16)
                     self.assertEqual(slots64, slots32)
+
+
+class VcmpxDppExec(unittest.TestCase):
+    """SHADER-VOPCX-DPP review: a v_cmpx in DPP form writes EXEC like any v_cmpx, and the cross-lane branch of the
+    analysis must not drop that write. The repro from the review: after the compare, v5 = s4 is not one value in every
+    lane, so v_readlane_b32 of it is not a uniform read."""
+
+    BODY = ["v_mov_b32_e32 v5, 0", "s_mov_b64 s[10:11], exec", None, "v_mov_b32_e32 v5, s4", "s_mov_b64 exec, s[10:11]",
+            "v_readlane_b32 s5, v5, 0", "v_mov_b32_e32 v6, s5"]
+
+    def meta(self, compare):
+        body = [compare if line is None else line for line in self.BODY]
+        return meta_of("ps_vcmpx_dpp_exec", ps(body))[0]
+
+    def test_dpp_form_is_classified_as_the_e32_form(self):
+        e32 = self.meta("v_cmpx_gt_f32_e32 v1, v2")
+        dpp = self.meta("v_cmpx_gt_f32_dpp v1, -v1 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:1 fi:1")
+        self.assertEqual(e32, ("C", ["cross-lane"], []))
+        self.assertEqual(dpp, e32)
+        self.assertNotIn("readlane-uniform", dpp[2])
 
 
 if __name__ == "__main__":
