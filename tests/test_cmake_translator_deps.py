@@ -18,7 +18,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.append(str(ROOT / "tests" / "semantic"))
 import make_game  # noqa: E402
+import piecewise_parse  # noqa: E402  (ast.parse takes 7 s for tools/rdna2spirv.py on CPython 3.12)
 
 TOOLS = ROOT / "tools"
 SHADERS = ROOT / "runtime" / "test" / "shaders"
@@ -46,7 +48,7 @@ def reached():
         if path in seen:
             continue
         seen.add(path)
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):     # function-level imports too
+        for node in ast.walk(piecewise_parse.parse(path.read_text(encoding="utf-8"))):  # function-level imports too
             if isinstance(node, ast.Import):
                 mods = [a.name for a in node.names]
             elif isinstance(node, ast.ImportFrom) and node.module and not node.level:

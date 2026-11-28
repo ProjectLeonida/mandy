@@ -23,11 +23,19 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS_DIR = os.path.join(ROOT, "tools")
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
+sys.path.append(os.path.join(ROOT, "tests", "semantic"))
 
 import isa_coverage as ic  # noqa: E402
+import piecewise_parse  # noqa: E402
 
 TRANSLATOR = os.path.join(TOOLS_DIR, "rdna2spirv.py")
 REAL_XML = os.environ.get(ic.ENV_XML)
+
+
+def in_pieces():
+    """While this is entered, the tool's `ast.parse` of the real translator is tests/semantic/piecewise_parse.py's:
+    the same tree in 1 s, where parsing the 1.2 MB file whole takes 7 s on CPython 3.12 (twice per scan pair)."""
+    return patch.object(ic.ast, "parse", lambda source, filename="<unknown>": piecewise_parse.parse(source, filename))
 
 
 def _ins(name, *encodings):
@@ -279,7 +287,8 @@ class TranslatorScanTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.scan = ic.scan_translator(TRANSLATOR)
+        with in_pieces():
+            cls.scan = ic.scan_translator(TRANSLATOR)
 
     def test_finds_well_known_rules(self):
         for name in ("v_mov_b32", "s_mov_b32", "v_cndmask_b32", "v_add_f32", "s_endpgm", "exp"):
@@ -292,7 +301,8 @@ class TranslatorScanTests(unittest.TestCase):
         self.assertGreater(len(self.scan["exact"]), 300)
 
     def test_accepted_names_matches_non_refused_exact(self):
-        accepted = ic.accepted_names(TRANSLATOR)
+        with in_pieces():
+            accepted = ic.accepted_names(TRANSLATOR)
         self.assertEqual(set(self.scan["exact"]) - accepted, set(self.scan["refused"]))
 
 
@@ -319,8 +329,9 @@ class RealIsaTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.rep = ic.build_report(ic.read_isa(REAL_XML), ic.scan_translator(TRANSLATOR),
-                                  ic.accepted_names(TRANSLATOR))
+        with in_pieces():
+            cls.rep = ic.build_report(ic.read_isa(REAL_XML), ic.scan_translator(TRANSLATOR),
+                                      ic.accepted_names(TRANSLATOR))
 
     def test_translator_names_exist_in_rdna2(self):
         stray = sorted(e["name"] for e in self.rep["not_in_rdna2"] if e["name"] not in self.KNOWN_NOT_IN_XML)
