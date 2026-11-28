@@ -382,6 +382,22 @@ class PeInspectTest(unittest.TestCase):
         self.assertEqual(r["pdata_functions"], 0)
         self.assertFalse(r["has_relocs"])
 
+    def test_case_only_spelling_of_a_missing_report_is_one_path(self):
+        # normcase keeps case on macOS, and samefile cannot see a report that has not been written yet.
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "Reports")
+            os.mkdir(folder)
+            probe = os.path.join(folder, "Probe.tmp")
+            with open(probe, "wb"):
+                pass
+            insensitive = os.path.exists(os.path.join(folder, "probe.tmp"))
+            os.remove(probe)
+            if not insensitive:
+                self.skipTest("volume keeps case")
+            first = os.path.join(tmp, "Reports", "game.exe.json")
+            second = os.path.join(tmp, "reports", "game.exe.json")
+            self.assertTrue(pe_inspect.same_output_path(first, second))
+
     def test_cli_reports_an_unusable_output_directory(self):
         out = os.path.join(self.dir, "report-file")
         with open(out, "w", encoding="utf-8") as f:

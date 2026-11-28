@@ -32,6 +32,11 @@ import sys
 from collections import Counter
 from collections.abc import Iterator
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
+same_output_path = same_report_path  # True when writing the second would truncate the first
+
 SYSTEM32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
 # Whether this host is Windows: there SYSTEM32 and the OS API-set schema answer `system`; elsewhere a Wine prefix's
 # system32 does (classify_dll). A module flag so that a test can stand in for either host.
@@ -976,16 +981,6 @@ def version_summary(r: dict) -> str | None:
     numbers = f"file {f['file_version']}, product {f['product_version']}" if f else "no fixed info"
     return (f"{r['file']}: version block {numbers}, {v['string_count']} string keys (values not shown)"
             + (f", problems: {len(res['problems'])}" if res["problems"] else ""))
-
-
-def same_output_path(first: str, second: str) -> bool:
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def main(argv: list[str] | None = None) -> int:
