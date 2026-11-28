@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <limits>
 
 #include "shims.h"
 #include "silent_audio.h"
@@ -424,11 +425,31 @@ void test_render_stream() {
     if (!render || !clock || !simple || !stream) return;
     UINT32 channels = 0;
     float level = 0.0f;
+    BOOL muted = FALSE;
     check(stream->GetChannelCount(&channels) == S_OK && channels == 8 && stream->SetChannelVolume(7, 0.5f) == S_OK &&
               stream->GetChannelVolume(7, &level) == S_OK && level == 0.5f,
           "IAudioStreamVolume keeps a channel volume");
     check(simple->SetMasterVolume(0.25f, nullptr) == S_OK && simple->GetMasterVolume(&level) == S_OK && level == 0.25f,
           "ISimpleAudioVolume keeps the master volume");
+    // NaN is no volume (kevincommits' finding in #1608): `level < 0 || level > 1` let it through and stored it.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    check(simple->SetMasterVolume(nan, nullptr) == E_INVALIDARG && simple->GetMasterVolume(&level) == S_OK &&
+              level == 0.25f,
+          "SetMasterVolume(NaN) is refused and keeps the master volume");
+    check(stream->SetChannelVolume(7, nan) == E_INVALIDARG && stream->GetChannelVolume(7, &level) == S_OK &&
+              level == 0.5f,
+          "SetChannelVolume(NaN) is refused and keeps the channel volume");
+    {
+        float before = -1.0f;
+        stream->GetChannelVolume(0, &before);
+        float levels[8] = {0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, nan};
+        check(stream->SetAllVolumes(8, levels) == E_INVALIDARG && stream->GetChannelVolume(0, &level) == S_OK &&
+                  level == before && before != 0.125f,
+              "SetAllVolumes with a NaN level is refused and sets none");
+    }
+    check(simple->SetMute(TRUE, nullptr) == S_OK && simple->GetMute(&muted) == S_OK && muted == TRUE &&
+              simple->SetMute(FALSE, nullptr) == S_OK && simple->GetMute(&muted) == S_OK && muted == FALSE,
+          "ISimpleAudioVolume keeps the mute state");
     UINT64 freq = 0;
     check(clock->GetFrequency(&freq) == S_OK && freq == 48000, "IAudioClock counts frames at 48 kHz");
 

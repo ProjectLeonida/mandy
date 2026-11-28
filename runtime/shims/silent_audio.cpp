@@ -415,8 +415,23 @@ public:
         Lock l(lock_);
         if (i < kMaxChannels) channel_volume_[i] = v;
     }
-    float master_ = 1.0f;
-    BOOL mute_ = FALSE;
+    // ISimpleAudioVolume's state, under the same lock as the channel volumes.
+    float master() {
+        Lock l(lock_);
+        return master_;
+    }
+    void set_master(float v) {
+        Lock l(lock_);
+        master_ = v;
+    }
+    BOOL mute() {
+        Lock l(lock_);
+        return mute_;
+    }
+    void set_mute(BOOL m) {
+        Lock l(lock_);
+        mute_ = m;
+    }
 
 private:
     struct Lock {
@@ -511,6 +526,8 @@ private:
     uint64_t played_at_anchor_ = 0;
     int64_t anchor_qpc_ = 0;
     float channel_volume_[kMaxChannels]{};
+    float master_ = 1.0f;
+    BOOL mute_ = FALSE;
 };
 
 // The services hold their client.
@@ -551,26 +568,29 @@ public:
     }
 };
 
+// A volume level in [0, 1]. Written so NaN fails too: `level < 0 || level > 1` is false for NaN.
+bool volume_level(float level) { return level >= 0.0f && level <= 1.0f; }
+
 class SimpleVolume final : public Service<ISimpleAudioVolume> {
 public:
     using Service::Service;
     HRESULT STDMETHODCALLTYPE SetMasterVolume(float level, LPCGUID) override {
-        if (level < 0.0f || level > 1.0f) return E_INVALIDARG;
-        client_->master_ = level;
+        if (!volume_level(level)) return E_INVALIDARG;
+        client_->set_master(level);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetMasterVolume(float* level) override {
         if (!level) return E_POINTER;
-        *level = client_->master_;
+        *level = client_->master();
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetMute(BOOL mute, LPCGUID) override {
-        client_->mute_ = mute;
+        client_->set_mute(mute);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetMute(BOOL* mute) override {
         if (!mute) return E_POINTER;
-        *mute = client_->mute_;
+        *mute = client_->mute();
         return S_OK;
     }
 };
@@ -584,7 +604,7 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetChannelVolume(UINT32 index, const float level) override {
-        if (index >= client_->channels() || level < 0.0f || level > 1.0f) return E_INVALIDARG;
+        if (index >= client_->channels() || !volume_level(level)) return E_INVALIDARG;
         client_->set_volume(index, level);
         return S_OK;
     }
@@ -598,7 +618,7 @@ public:
         if (!levels) return E_POINTER;
         if (count != client_->channels()) return E_INVALIDARG;
         for (UINT32 i = 0; i < count; ++i) {
-            if (levels[i] < 0.0f || levels[i] > 1.0f) return E_INVALIDARG;
+            if (!volume_level(levels[i])) return E_INVALIDARG;
         }
         for (UINT32 i = 0; i < count; ++i) client_->set_volume(i, levels[i]);
         return S_OK;
