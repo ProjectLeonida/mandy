@@ -5,6 +5,7 @@
 // sent message (WM_GETTEXT, what GetWindowTextW sends across threads, times out), so a lookup that sent one would block.
 
 #include "title_window.h"
+#include "window_station.h"
 
 #include <chrono>
 #include <cstdio>
@@ -32,6 +33,10 @@ HWND make(const wchar_t* name, DWORD ex_style, DWORD style, int width, int heigh
 }  // namespace
 
 int main() {
+    if (!has_interactive_window_station()) {
+        std::printf("SKIP: no interactive window station (an SSH or service session): no window is visible here\n");
+        return 77;
+    }
     WNDCLASSW window_class{};
     window_class.lpfnWndProc = DefWindowProcW;
     window_class.hInstance = GetModuleHandleW(nullptr);
