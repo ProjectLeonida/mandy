@@ -34,11 +34,14 @@ import os
 import re
 import struct
 import sys
+import tempfile
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 GLB_MAGIC = b"glTF"
@@ -48,6 +51,7 @@ CHUNK_TYPE_BIN = 0x004E4942
 
 WEIGHT_SUM_TOLERANCE = 1e-4
 WEIGHT_RANGE_TOLERANCE = 1e-6
+MAX_ZERO_ACCESSOR_COUNT = 1_000_000
 
 TYPE_COMPONENTS = {
     "SCALAR": 1,
@@ -311,8 +315,12 @@ class _Reader:
             meta[label] = [float(v) for v in value]
 
         if "bufferView" not in accessor:
+            if count > MAX_ZERO_ACCESSOR_COUNT:
+                raise GlbSkinError(
+                    f"accessors[{index}] without bufferView has count {count} > {MAX_ZERO_ACCESSOR_COUNT}"
+                )
             zero = 0.0 if component_type == 5126 else 0
-            values = [tuple(zero for _ in range(components)) for _ in range(count)]
+            values = [(zero,) * components] * count
             return values, meta
 
         view_index = _int_field(accessor, "bufferView", f"accessors[{index}]")
@@ -1109,10 +1117,25 @@ def format_report(report):
 
 
 def write_json(path, report):
-    """Write LF-only JSON without ever guessing values that JSON cannot hold."""
-    payload = json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
-    with open(path, "wb") as handle:
-        handle.write(payload.encode("utf-8"))
+    """Atomically write LF-only JSON without ever guessing values that JSON cannot hold."""
+    payload = (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".glb_skinning_", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+        os.chmod(tmp_path, published_mode(path))
+        replace_retry(tmp_path, path)
+    except BaseException:
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def main(argv=None):
@@ -1123,9 +1146,13 @@ def main(argv=None):
     parser.add_argument("--json", metavar="FILE", help="write the report as LF-only JSON")
     args = parser.parse_args(argv)
 
-    if args.json and same_report_path(args.glb, args.json):
-        print("ERROR: --json must not overwrite the input GLB", file=sys.stderr)
-        return 2
+    if args.json:
+        if os.path.isdir(args.json):
+            print(f"ERROR: --json is a directory: {args.json}", file=sys.stderr)
+            return 2
+        if same_report_path(args.glb, args.json):
+            print("ERROR: --json must not overwrite the input GLB", file=sys.stderr)
+            return 2
     try:
         with open(args.glb, "rb") as handle:
             data = handle.read()
