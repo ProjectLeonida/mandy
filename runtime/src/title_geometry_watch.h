@@ -11,6 +11,13 @@ namespace leonida::geometry_writes {
 constexpr std::uintptr_t tile_size = 65536, page_size = 4096;
 using Aliases = void (*)(std::uintptr_t, std::vector<std::uintptr_t>&);
 inline std::atomic<Aliases> aliases{};
+// Who makes the layer's slot-133 shadows reopen [from, to) when a tile's pages are made writable here with no write
+// fault to tell them (release). A page of a geometry tile can also be one a shadow keeps read-only, and a shadow that
+// is not told takes it for unchanged and writes its older copy back over the title's write. Called with this watch's
+// mutex released, so the handler's order (shadow lock, then this mutex) is not inverted.
+using Reopener = void (*)(std::uintptr_t from, std::uintptr_t to);
+inline std::atomic<Reopener> reopener{};
+inline void set_reopener(Reopener reopen_ranges) { reopener.store(reopen_ranges, std::memory_order_release); }
 
 struct Cell {
     std::atomic<std::uint64_t> version{1}, mapping{1};
@@ -155,14 +162,24 @@ inline bool reopen(std::uintptr_t va, Cell& c) {
 }
 inline void release(std::uintptr_t va) {
     auto& s = state();
-    std::lock_guard lock(s.mutex);
-    auto it = s.cells.find(va);
-    if (it != s.cells.end() && !--it->second.refs) {
+    bool opened = false;
+    {
+        std::lock_guard lock(s.mutex);
+        auto it = s.cells.find(va);
+        if (it == s.cells.end() || --it->second.refs) return;
         // A page reopened here may also be one a slot-133 shadow keeps read-only (both guard the title's geometry):
-        // it is writable now with no fault to tell that shadow, which then walks its pages again.
-        if (reopen(va, it->second)) title_memory_map::changed(va, va + tile_size);
+        // it is writable now with no fault to tell that shadow, which then walks its pages again. The journal entry
+        // below reaches it at its next refresh, and the reopener reaches it now: a write-back between the two would
+        // otherwise copy the shadow's older bytes over the title's write. Both run outside s.mutex, so a fault that
+        // holds a shadow's lock and asks this watch cannot deadlock against this one.
+        opened = reopen(va, it->second);
         s.cells.erase(it);
         s.count.store(s.cells.size(), std::memory_order_release);
+    }
+    if (opened) {
+        if (const auto reopen_ranges = reopener.load(std::memory_order_acquire))
+            reopen_ranges(va, va + tile_size);
+        title_memory_map::changed(va, va + tile_size);
     }
 }
 enum class Event { write, open, fault, mapping, replaced };
