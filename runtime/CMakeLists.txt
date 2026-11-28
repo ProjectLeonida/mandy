@@ -4925,6 +4925,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(geometry_views_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
       target_compile_options(geometry_views_test PRIVATE /W4 /permissive- /EHsc /utf-8)
       add_test(NAME geometry_views COMMAND geometry_views_test)
+      # TitleBufferWindows reuses earlier blocks for every kind of request, and the slots of destroyed blocks for the
+      # lock-free readers (shims/d3d12_title_buffer_windows.h).
+      add_executable(title_buffer_windows_reuse_test test/title_buffer_windows_reuse_test.cpp)
+      target_link_libraries(title_buffer_windows_reuse_test PRIVATE Vulkan::Headers)
+      target_compile_definitions(title_buffer_windows_reuse_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(title_buffer_windows_reuse_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+      add_test(NAME title_buffer_windows_reuse COMMAND title_buffer_windows_reuse_test)
     endif()
   endif()
 else()

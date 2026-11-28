@@ -43,13 +43,22 @@ class TitleBufferWindows {
     int system_memory_ = 0;
     bool system_memory_logged_ = false;
     std::uint64_t quick_refusals_ = 0;
-    // The blocks' (device address, capacity), readable without the owner's lock: published in order, a slot never
-    // reused before release(). A destroyed block's slot keeps its other fields and only its address goes to 0 (the
-    // readers skip it), so a reader never sees a slot half rewritten. Blocks are destroyed only once their last
-    // range was freed, which GeometryViews does after the GPU work that used them completed.
+    // The blocks' (device address, capacity), readable without the owner's lock. A destroyed block's slot gets
+    // address 0 (the readers skip it) and is reused for a later block, so only the live blocks are limited to
+    // kPublished, not those made over the pool's lifetime. Each slot is a seqlock: the owner makes its version odd
+    // while it rewrites the slot, and a reader drops a slot whose version changed while it read it, so it never takes
+    // one block's address with another's capacity, mapping or buffer. Blocks are destroyed only once their last range
+    // was freed, which GeometryViews does after the GPU work that used them completed.
     static constexpr std::size_t kPublished = 4096;
     struct Published {
+        std::atomic<std::uint64_t> version{0};
         std::atomic<VkDeviceAddress> address{0};
+        std::atomic<VkDeviceSize> capacity{0};
+        std::atomic<std::uint8_t*> mapped{nullptr};
+        std::atomic<VkBuffer> buffer{VK_NULL_HANDLE};
+    };
+    struct Snapshot {
+        VkDeviceAddress address{};
         VkDeviceSize capacity{};
         std::uint8_t* mapped{};
         VkBuffer buffer{};
@@ -57,14 +66,56 @@ class TitleBufferWindows {
     std::array<Published, kPublished> published_{};
     std::atomic<std::size_t> published_count_{0};
     std::atomic<std::uint64_t> layout_generation_{0};  // bumped by every block made or destroyed
+    bool published_full_logged_ = false;
+
+    // The owner's side (under its lock): rewrites slot `s` with block `b`, or empties it when `b` is null.
+    static void write_slot(Published& s, const Block* b) {
+        const std::uint64_t v = s.version.load(std::memory_order_relaxed);
+        s.version.store(v + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        s.address.store(b ? b->address : 0, std::memory_order_relaxed);
+        s.capacity.store(b ? b->capacity : 0, std::memory_order_relaxed);
+        s.mapped.store(b ? b->mapped : nullptr, std::memory_order_relaxed);
+        s.buffer.store(b ? b->buffer : VK_NULL_HANDLE, std::memory_order_relaxed);
+        s.version.store(v + 2, std::memory_order_release);
+    }
+    // A reader's side, from any thread: false for an empty slot or one rewritten while it was read.
+    static bool read_slot(const Published& s, Snapshot& out) {
+        const std::uint64_t v = s.version.load(std::memory_order_acquire);
+        if (v & 1) return false;
+        out.address = s.address.load(std::memory_order_relaxed);
+        out.capacity = s.capacity.load(std::memory_order_relaxed);
+        out.mapped = s.mapped.load(std::memory_order_relaxed);
+        out.buffer = s.buffer.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return out.address && s.version.load(std::memory_order_relaxed) == v;
+    }
+    // Publishes a new block: into the first slot a destroyed block left, else the next one.
+    void publish(const Block& b) {
+        const std::size_t n = published_count_.load(std::memory_order_relaxed);
+        for (std::size_t i = 0; i < n; ++i)
+            if (!published_[i].address.load(std::memory_order_relaxed)) {
+                write_slot(published_[i], &b);
+                return;
+            }
+        if (n < kPublished) {
+            write_slot(published_[n], &b);
+            published_count_.store(n + 1, std::memory_order_release);
+        } else if (!published_full_logged_) {
+            published_full_logged_ = true;
+            std::fprintf(stderr, "[rt] d3d12: title buffer windows: %zu live blocks, the most the lock-free readers "
+                                 "see; later blocks are not in the backed table\n", kPublished);
+        }
+    }
 
     template<class Device>
     void destroy_block(Device& d, std::vector<Block>::iterator it) {
         // Unpublished first, so no lock-free reader picks it up again; then the owner is told, so tables built from
         // for_each_block (the console heap pass's backed table) cut it before the next submission.
         for (std::size_t i = 0, n = published_count_.load(std::memory_order_relaxed); i < n; ++i)
-            if (published_[i].buffer == it->buffer && published_[i].address.load(std::memory_order_relaxed)) {
-                published_[i].address.store(0, std::memory_order_release);
+            if (published_[i].buffer.load(std::memory_order_relaxed) == it->buffer &&
+                published_[i].address.load(std::memory_order_relaxed)) {
+                write_slot(published_[i], nullptr);
                 break;
             }
         layout_generation_.fetch_add(1, std::memory_order_release);
@@ -114,18 +165,18 @@ public:
     template <class F>
     void for_each_block(F&& f) const {
         const std::size_t n = published_count_.load(std::memory_order_acquire);
+        Snapshot s;
         for (std::size_t i = 0; i < n; ++i)
-            if (const VkDeviceAddress address = published_[i].address.load(std::memory_order_acquire))
-                f(address, published_[i].capacity);
+            if (read_slot(published_[i], s)) f(s.address, s.capacity);
     }
     // Changes whenever a block is made or destroyed; from any thread.
     std::uint64_t layout_generation() const { return layout_generation_.load(std::memory_order_acquire); }
     // The block whose mapping holds [p, p + bytes): its buffer and the offset of p in it. From any thread.
     bool find_mapped(const std::uint8_t* p, std::size_t bytes, VkBuffer& buffer, VkDeviceSize& offset) const {
         const std::size_t n = published_count_.load(std::memory_order_acquire);
+        Snapshot b;
         for (std::size_t i = 0; i < n; ++i) {
-            const Published& b = published_[i];
-            if (!b.address.load(std::memory_order_acquire)) continue;
+            if (!read_slot(published_[i], b)) continue;
             if (p >= b.mapped && p - b.mapped < std::ptrdiff_t(b.capacity) &&
                 bytes <= std::size_t(b.capacity) - std::size_t(p - b.mapped)) {
                 buffer = b.buffer;
@@ -167,9 +218,11 @@ public:
             return false;
         };
         if (!blocks_.empty() && take(blocks_.back())) return true;
-        // A large view may start a new slab while smaller views still fit earlier tails or freed holes.
-        // Use those even after the budget can no longer accommodate another slab.
-        if (device_local && blocks_.size() > 1)
+        // A large view may start a new slab while smaller views still fit earlier tails or freed holes, and the spare
+        // block free() keeps need not be the last one. Use those even after the budget can no longer accommodate
+        // another slab. All requests to one instance are of one kind (GeometryViews' are device_local, the device's
+        // title windows are not), so an earlier block was made for the same kind of request.
+        if (blocks_.size() > 1)
             for (std::size_t i = blocks_.size() - 1; i != 0; --i)
                 if (take(blocks_[i - 1])) return true;
         auto& vk = d.context->vk;
@@ -259,13 +312,7 @@ public:
                 b.mapped = static_cast<std::uint8_t*>(host);
                 b.reserved_bytes = req.size;
                 b.free_ranges.emplace(0, b.capacity);
-                if (const std::size_t n = published_count_.load(std::memory_order_relaxed); n < kPublished) {
-                    published_[n].capacity = b.capacity;
-                    published_[n].mapped = b.mapped;
-                    published_[n].buffer = b.buffer;
-                    published_[n].address.store(b.address, std::memory_order_relaxed);
-                    published_count_.store(n + 1, std::memory_order_release);
-                }
+                publish(b);
                 layout_generation_.fetch_add(1, std::memory_order_release);
                 blocks_.push_back(std::move(b));
                 reserved_ += req.size;
@@ -349,7 +396,7 @@ public:
         }
         blocks_.clear();
         for (std::size_t i = 0, n = published_count_.load(std::memory_order_relaxed); i < n; ++i)
-            published_[i].address.store(0, std::memory_order_relaxed);
+            write_slot(published_[i], nullptr);
         published_count_.store(0, std::memory_order_release);
         layout_generation_.fetch_add(1, std::memory_order_release);
         reserved_ = 0;
