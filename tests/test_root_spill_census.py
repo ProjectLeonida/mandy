@@ -267,5 +267,38 @@ class CliTest(unittest.TestCase):
             self.assertIn("containers: 1, with an RTS0 part: 1", result.stdout)
 
 
+class WrongInputTests(unittest.TestCase):
+    """An index that is not UTF-8 JSON, or a folder, is one ERROR line and exit 2, not a traceback."""
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, timeout=120)
+
+    def check_one_error(self, p, name):
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
+        self.assertIn(f"ERROR: cannot read {name}", p.stderr)
+
+    def test_index_not_utf8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = os.path.join(tmp, "index.json")
+            with open(index, "wb") as f:
+                f.write(b"\xe6\x00\xff")
+            self.check_one_error(self.run_tool(index), index)
+
+    def test_index_is_a_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.check_one_error(self.run_tool(tmp), tmp)
+
+    def test_carve_not_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = os.path.join(tmp, "index.json")
+            carve = os.path.join(tmp, "carve.json")
+            with open(index, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}")
+            with open(carve, "w", encoding="utf-8", newline="\n") as f:
+                f.write("not json")
+            self.check_one_error(self.run_tool(index, "--carve", carve), carve)
+
 if __name__ == "__main__":
     unittest.main()
