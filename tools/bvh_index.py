@@ -38,12 +38,12 @@ import struct
 import sys
 import tempfile
 import time
-import unicodedata
 import zlib
 from contextlib import suppress
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from report_paths import path_key, same_report_path  # noqa: E402
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -471,45 +471,16 @@ def offset(text):
     return value
 
 
-_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
-
-
-def _case_insensitive_volume(path):
-    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
-    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
-    if sys.platform != "darwin":
-        return False
-    while not os.path.exists(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    try:
-        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
-    except (OSError, ValueError):
-        return True  # the macOS default; folding can only refuse a pair, never overwrite one
-
-
-def _path_key(path):
-    path = os.path.normcase(os.path.realpath(path))
-    if _case_insensitive_volume(path):
-        # APFS and HFS+ also treat composed and decomposed accents as one name.
-        path = unicodedata.normalize("NFD", path.casefold())
-    return path
-
-
 def same_output_path(first, second):
-    if _path_key(first) == _path_key(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
+    """True when writing ``second`` would truncate ``first``: one name (case-folded on a folding volume) or one
+    file through a hard link. `tools/report_paths.same_report_path` owns that answer; this keeps the name the rest
+    of the tool and `tests/test_report_path_case.py` call."""
+    return same_report_path(first, second)
 
 
 def _inside(path, folder):
     """True when `path` is `folder` or lies below it, compared as the report check compares paths."""
-    path, folder = _path_key(path), _path_key(folder)
+    path, folder = path_key(path), path_key(folder)
     try:
         return os.path.commonpath([path, folder]) == folder
     except ValueError:   # different drives on Windows
