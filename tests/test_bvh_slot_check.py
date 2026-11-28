@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 from collections import Counter
 from pathlib import Path
@@ -203,6 +204,23 @@ class SlotControls(unittest.TestCase):
         self.assertEqual(bodies, [body, None, body])
         with self.assertRaises(ValueError):
             S.slots(desc, block)
+
+    def test_save_evidence_cleanup_restores_write_mode_on_replace_failure(self):
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(path, mode, *args, **kwargs):
+            chmod_calls.append((str(path), mode))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            out_path = Path(directory) / "evidence.json"
+            with mock.patch("os.replace", side_effect=OSError("replace failed")), \
+                 mock.patch("os.chmod", side_effect=track_chmod):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    S.save_evidence(out_path, {"test": 123})
+
+        self.assertTrue(any(mode == 0o600 for _, mode in chmod_calls), chmod_calls)
 
 
 if __name__ == "__main__":
