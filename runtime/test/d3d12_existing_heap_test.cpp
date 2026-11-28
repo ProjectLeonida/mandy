@@ -1528,6 +1528,65 @@ int check_pending_stream_views(ID3D12Device* device) {
     return 0;
 }
 
+// --title-show-after-upload (LEONIDA_TITLE_FILL_ASYNC=1 and a slow fill worker, set by the test itself): a slot-70
+// texture of readable pages, filled through the staged upload, is made by its first view, and its upload runs later on
+// the fill worker. Its T# must not name the image before then: a shader would sample an image never written, in
+// UNDEFINED layout (the RT-TITLE-TEXTURE-SHOW-AFTER-UPLOAD race; codec-d/cool_fox docs/findings.md, idea only). Once
+// the upload is submitted the T# names it.
+// With `unstaged` (LEONIDA_TITLE_IMAGE_STAGING=0 on a device without host copies) the texture is neither staged nor
+// host-copied: the fill worker fills it through WriteToSubresource's waited staging copy, and it starts UNDEFINED all
+// the same (lixonik's review).
+int check_title_show_after_upload(ID3D12Device* device, bool unstaged = false) {
+    const char* who = unstaged ? "unstaged slot-70 view shown after its upload" : "slot-70 view shown after its upload";
+    if (!rt::d3d12::bindless_set_layout(device)) return 0;
+    constexpr UINT width = 64, height = 8;
+    constexpr SIZE_T bytes = 65536;
+    void* pages = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    EXPECT(pages);
+    std::memset(pages, 73, bytes);
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = desc.Format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    leonida::gfx10::ImageWords slot{};
+    std::array<UINT, 14> resource{};
+    std::array<UINT, 16> words{};
+    std::memcpy(resource.data(), &desc, sizeof(desc));
+    std::memcpy(words.data(), &srv, sizeof(srv));
+    auto index = [&] {
+        std::uint32_t key[8];
+        std::memcpy(key, slot.data(), sizeof(key));
+        return rt::d3d12::bindless_hash_lookup(device, key);
+    };
+    EXPECT(rt::d3d12::write_placed_texture_view(device, false, resource.data(), words.data(),
+                                                reinterpret_cast<UINT64>(pages), {reinterpret_cast<SIZE_T>(slot.data())}));
+    // The fill worker sleeps before it fills: the T# is written, the upload has not run.
+    const bool shown_early = index() != 0;
+    if (shown_early) std::fprintf(stderr, "%s: the T# names the image before its upload\n", who);
+    EXPECT(!shown_early);
+    bool shown = false;
+    for (int i = 0; i < 300 && !(shown = index() != 0); ++i) Sleep(20);
+    EXPECT(shown);
+    std::printf("%s: hidden until the fill worker's upload, then shown\n", who);
+    // Replace the synthetic owner before releasing the CPU pages.
+    Ref<ID3D12Resource> placement;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&placement.p)), S_OK);
+    EXPECT(!index());
+    placement.p->Release();
+    placement.p = nullptr;
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return 0;
+}
+
 namespace {
 std::atomic<DWORD> g_view_av_thread{0};
 std::atomic<unsigned> g_view_avs{0};
@@ -2397,8 +2456,16 @@ void print_cases(const std::vector<Case>& cases, const char* who) {
 int main(int argc, char** argv) {
     const bool prefix_only = argc == 2 && std::strcmp(argv[1], "--host-prefix-only") == 0;
     const bool async_plane = argc == 2 && std::strcmp(argv[1], "--mapped-plane-async") == 0;
-    if (argc != 1 && !prefix_only && !async_plane) return 2;
+    const bool show_after_unstaged = argc == 2 && std::strcmp(argv[1], "--title-show-after-upload-unstaged") == 0;
+    const bool show_after =
+        show_after_unstaged || (argc == 2 && std::strcmp(argv[1], "--title-show-after-upload") == 0);
+    if (argc != 1 && !prefix_only && !async_plane && !show_after) return 2;
     if (async_plane) _putenv_s("LEONIDA_TEXTURE_REFRESH_ASYNC", "1");  // read once, at the device's first refresh
+    if (show_after) {  // all read once
+        if (show_after_unstaged) _putenv_s("LEONIDA_TITLE_IMAGE_STAGING", "0");
+        _putenv_s("LEONIDA_TITLE_FILL_ASYNC", "1");
+        _putenv_s("LEONIDA_TITLE_FILL_DELAY_MS", "500");
+    }
     _putenv_s("LEONIDA_TITLE_TEXTURE_PERIOD_MS", "0");
     _putenv_s("LEONIDA_TITLE_TEXTURE_CHECK_KB", "0");
     vktest::Device vk;
@@ -2433,6 +2500,14 @@ int main(int argc, char** argv) {
             Ref<ID3D12Device> staged;
             if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
             result += check_mapped_plane_first_use(staged.p);
+            return result || vk.validation_errors() ? 1 : 0;
+        }
+        if (show_after) {
+            auto no_host_copy = info;  // a title image filled through the staged upload
+            no_host_copy.host_image_copy = false;
+            Ref<ID3D12Device> staged;
+            if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
+            const int result = check_title_show_after_upload(staged.p, show_after_unstaged);
             return result || vk.validation_errors() ? 1 : 0;
         }
         failures += check(ours.p, "vulkan");

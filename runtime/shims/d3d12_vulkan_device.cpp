@@ -9868,6 +9868,27 @@ public:
                 std::fprintf(stderr, "[rt] mem-probe: %s no-host-bits=0x%x type=%u\n", key, without.memoryTypeBits, type);
             }
         }
+        // A slot-70 texture of our own that starts UNDEFINED (filled through the staged upload, or through
+        // WriteToSubresource's waited staging copy: a format without host-image transfer, LEONIDA_TITLE_IMAGE_STAGING=0
+        // on a device without host copies, the retry_host fallback there; lixonik) is shown only once its first upload
+        // has been submitted (publish_streamed_texture, after fill_title_texture or the fill worker's fill_unlocked).
+        // A host-transfer image is made GENERAL and filled on the host, so it is shown at once as before.
+        // Until then its T#s stay pending and read the fallback at index 0. Before, its T#s named the image from the
+        // view on: a draw before the first fill (always with LEONIDA_TITLE_FILL_ASYNC=1, and whenever an inline fill is
+        // skipped) sampled an image never written and still UNDEFINED, and one on another queue could run while the
+        // upload's UNDEFINED -> TRANSFER_DST transition rewrote it. The upload orders every later submission behind it:
+        // the image barrier on its own queue, a semaphore wait on the others (TitleImageUpload::submit). Idea from
+        // codec-d/cool_fox docs/findings.md (VICTORY_SHOW_AFTER: a slot shows a new texture only after its upload ran);
+        // no code taken. LEONIDA_TITLE_SHOW_AFTER_UPLOAD=0 shows it at once, as before.
+        static const bool show_after_upload = [] {
+            const char* value = std::getenv("LEONIDA_TITLE_SHOW_AFTER_UPLOAD");
+            return !value || std::strcmp(value, "0");
+        }();
+        if (show_after_upload && origin == TitleImageOrigin::streamed && !host_transfer_ && !deferred_stream_) {
+            deferred_stream_ = true;
+            std::lock_guard lock(device_.descriptor_mutex);
+            device_.pending_image_keys.try_emplace(image_);
+        }
         leonida::ResourceBinding binding{};
         if (deferred_attachment_) {
             binding.residency_owner = this;
@@ -9919,7 +9940,8 @@ public:
             device_.context->add_resource(id(), binding_, host_transfer_ ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED);
             return S_OK;
         }
-        return deferred_stream_ ? S_OK : register_bound_texture();
+        // A pending stream without memory registers once it has some (back_streamed_texture).
+        return deferred_stream_ && deferred_bytes_ ? S_OK : register_bound_texture();
     }
 
     // Called with title_texture_mutex held, after a guarded read of the console texture (its smaller mips at least).
@@ -16905,6 +16927,12 @@ private:
             }
             if (refresh) refresh_title_textures();
             if (!fill) continue;
+            // LEONIDA_TITLE_FILL_DELAY_MS (tests): a slow fill, so a view is written well before its texture's upload.
+            static const auto delay = std::chrono::milliseconds([] {
+                const char* v = std::getenv("LEONIDA_TITLE_FILL_DELAY_MS");
+                return v && *v ? std::strtoll(v, nullptr, 10) : 0ll;
+            }());
+            if (delay.count() > 0) std::this_thread::sleep_for(delay);
             bool filled = false;
             // A staged texture is filled without the registry lock (the title's threads creating views wait for
             // it: speed-31, 12 % of the main thread): its bytes, layout and resource are taken under the lock, the
