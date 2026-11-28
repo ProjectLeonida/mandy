@@ -795,6 +795,7 @@ public:
                 immediate_fn = signal_event_;
             } else {
                 pending_.push_back({sem, value, event_handle, {}});
+                pending_count_.store(pending_.size(), std::memory_order_release);
                 if (!thread_.joinable() && wakeup_sem_) thread_ = std::thread([this] { run(); });
                 signal_wakeup_locked();
             }
@@ -815,6 +816,7 @@ public:
                 immediate_cb = std::move(cb);
             } else {
                 pending_.push_back({sem, value, nullptr, std::move(cb)});
+                pending_count_.store(pending_.size(), std::memory_order_release);
                 if (!thread_.joinable() && wakeup_sem_) thread_ = std::thread([this] { run(); });
                 signal_wakeup_locked();
             }
@@ -824,6 +826,17 @@ public:
             return;
         }
         cv_.notify_one();
+    }
+
+    // Returns the largest pending waited value <= `value` for `sem`, or 0 when no CPU waiter awaits <= `value`.
+    std::uint64_t max_wait_value_le(VkSemaphore sem, std::uint64_t value) const {
+        if (!sem || pending_count_.load(std::memory_order_acquire) == 0) return 0;
+        std::lock_guard lock(mutex_);
+        std::uint64_t best = 0;
+        for (const Entry& e : pending_) {
+            if (e.semaphore == sem && e.value <= value && e.value > best) best = e.value;
+        }
+        return best;
     }
 
     // Wakes run() when another path marks the device lost so pending waits complete and stop()/cancel() never hang.
@@ -855,6 +868,7 @@ public:
                 }
             }
             pending_.resize(write);
+            pending_count_.store(pending_.size(), std::memory_order_release);
             // Entries already taken out of pending_ but not yet started belong to a live ready batch. Mark them
             // cancelled so dispatch skips them; this is how a re-entrant cancel() from another callback in the
             // same batch is completed without waiting on the callback that is already on this thread's stack.
@@ -969,6 +983,7 @@ private:
             if (device_lost_.load(std::memory_order_acquire)) {
                 std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
+                pending_count_.store(0, std::memory_order_release);
                 dispatch_outside_lock(lock, drained, signal_event_);
                 return;
             }
@@ -1008,6 +1023,7 @@ private:
                 set_device_lost(device_lost_, "vkWaitSemaphores in the fence dispatcher returned VK_ERROR_DEVICE_LOST");
                 std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
+                pending_count_.store(0, std::memory_order_release);
                 dispatch_outside_lock(lock, drained, signal_event_);
                 return;
             }
@@ -1037,12 +1053,14 @@ private:
                 pending_.resize(write);
                 for (Entry& e : pending_) ready.push_back(std::move(e));
                 pending_.clear();
+                pending_count_.store(0, std::memory_order_release);
                 set_device_lost(device_lost_,
                                 "vkGetSemaphoreCounterValue in the fence dispatcher returned VK_ERROR_DEVICE_LOST");
                 dispatch_outside_lock(lock, ready, signal_event_);
                 return;
             }
             pending_.resize(write);
+            pending_count_.store(pending_.size(), std::memory_order_release);
             if (!ready.empty()) {
                 dispatch_outside_lock(lock, ready, signal_event_);
                 if (stop_) return;
@@ -1058,10 +1076,11 @@ private:
     VkSemaphore wakeup_sem_ = VK_NULL_HANDLE;
     std::uint64_t wakeup_val_ = 0;
 
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::condition_variable epoch_cv_;
     std::vector<Entry> pending_;
+    std::atomic<std::size_t> pending_count_{0};
     std::vector<std::shared_ptr<DispatchSlot>> dispatching_;  // ready-batch callbacks outside mutex_
     std::vector<VkSemaphore> semaphores_;
     std::vector<std::uint64_t> values_;
@@ -1668,6 +1687,63 @@ public:
         std::unique_lock lock(pipeline_mutex_);
         large_compile_budget_ = std::move(budget);
         large_compile_demand_ = std::move(demand);
+    }
+    using BatchCompileFn = std::function<void(std::size_t, const std::function<void(std::size_t)>&)>;
+    void set_batch_compile_runner(BatchCompileFn runner) {
+        std::unique_lock lock(pipeline_mutex_);
+        batch_compile_runner_ = std::move(runner);
+    }
+    // Tracks pending queue Wait(semaphore, value) calls across all queues on this context so same-queue coalescing
+    // can merge [execute, signal(F, V), execute] when no waiter awaits (F, <= V), while splitting right after
+    // Signal(F, V) whenever any queue or CPU wait awaits a value <= V that is still pending in QueueHolds.
+    void note_wait_added(VkSemaphore semaphore, std::uint64_t value) {
+        if (!semaphore) return;
+        std::lock_guard lock(wait_tracker_mutex_);
+        pending_waits_.push_back({semaphore, value});
+        pending_wait_count_.store(pending_waits_.size(), std::memory_order_release);
+    }
+    void note_wait_removed(VkSemaphore semaphore, std::uint64_t value) {
+        if (!semaphore) return;
+        std::lock_guard lock(wait_tracker_mutex_);
+        for (auto it = pending_waits_.begin(); it != pending_waits_.end(); ++it) {
+            if (it->first == semaphore && it->second == value) {
+                *it = pending_waits_.back();
+                pending_waits_.pop_back();
+                break;
+            }
+        }
+        pending_wait_count_.store(pending_waits_.size(), std::memory_order_release);
+    }
+    void note_waits_removed(std::span<const VkSemaphore> semaphores, std::span<const std::uint64_t> values) {
+        const std::size_t n = (std::min)(semaphores.size(), values.size());
+        if (!n || pending_wait_count_.load(std::memory_order_acquire) == 0) return;
+        std::lock_guard lock(wait_tracker_mutex_);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!semaphores[i]) continue;
+            for (auto it = pending_waits_.begin(); it != pending_waits_.end(); ++it) {
+                if (it->first == semaphores[i] && it->second == values[i]) {
+                    *it = pending_waits_.back();
+                    pending_waits_.pop_back();
+                    break;
+                }
+            }
+        }
+        pending_wait_count_.store(pending_waits_.size(), std::memory_order_release);
+    }
+    bool has_unsatisfied_waiter(VkSemaphore semaphore, std::uint64_t value) const {
+        if (!semaphore) return false;
+        std::uint64_t max_waited = 0;
+        if (pending_wait_count_.load(std::memory_order_acquire) != 0) {
+            std::lock_guard lock(wait_tracker_mutex_);
+            for (const auto& [sem, waited] : pending_waits_) {
+                if (sem == semaphore && waited <= value && waited > max_waited) max_waited = waited;
+            }
+        }
+        if (fence_dispatcher_) {
+            const std::uint64_t cpu_max = fence_dispatcher_->max_wait_value_le(semaphore, value);
+            if (cpu_max > max_waited) max_waited = cpu_max;
+        }
+        return max_waited != 0 && holds_.pending(semaphore, max_waited);
     }
     PipelineWorkers::Stats pipeline_worker_stats() {
         std::shared_lock lock(pipeline_mutex_);
@@ -2410,8 +2486,12 @@ private:
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unique_ptr<PipelineWorkers> pipeline_workers_;
+    BatchCompileFn batch_compile_runner_;
     std::function<std::uint64_t()> large_compile_budget_;
     std::function<std::shared_ptr<void>()> large_compile_demand_;
+    mutable std::mutex wait_tracker_mutex_;
+    std::vector<std::pair<VkSemaphore, std::uint64_t>> pending_waits_;
+    std::atomic<std::size_t> pending_wait_count_{0};
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
     std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ and zero_pending_ only
@@ -2685,6 +2765,15 @@ public:
             exec_cv_.wait(state, [this] { return !executing_; });
         }
         report_held_at_teardown();
+        {
+            std::lock_guard state(state_mutex_);
+            if (!waits_.empty()) {
+                context_.note_waits_removed(waits_, wait_values_);
+                waits_.clear();
+                wait_values_.clear();
+                wait_pins_.clear();
+            }
+        }
         context_.holds().pump_ready();  // presents queued behind what was just dropped can run
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
@@ -3071,13 +3160,16 @@ public:
             call.fence = fence;
             call.value = value;
             if (pin) call.pin = pin();
+            context_.note_wait_added(fence, value);
             enqueue(std::move(call));
             return;
         }
         wait_sync(fence, value, pin);
     }
 
-    void wait_sync(VkSemaphore fence, std::uint64_t value, const PinFn& pin, std::shared_ptr<void> async_pin = {}) {
+    void wait_sync(VkSemaphore fence, std::uint64_t value, const PinFn& pin, std::shared_ptr<void> async_pin = {},
+                   bool already_tracked = false) {
+        if (!already_tracked) context_.note_wait_added(fence, value);
         std::vector<std::shared_ptr<void>> retired;  // fences whose submission has completed: released unlocked
         {
             std::lock_guard state(state_mutex_);
@@ -3430,8 +3522,14 @@ private:
         return ReplayResult::success;
     }
 
+    struct PendingSignal {
+        VkSemaphore fence = VK_NULL_HANDLE;
+        std::uint64_t value = 0;
+    };
+
     ReplayResult execute_now(std::span<const CommandList* const> lists, std::uint64_t execute_call,
-                             std::span<const std::size_t> batch_breaks = {}) {
+                             std::span<const std::size_t> batch_breaks = {},
+                             std::span<const PendingSignal> trailing_signals = {}) {
         const bool skip_before = skip_before_execute_.load(std::memory_order_acquire);
         // The "submit frame" line and the floor: this submission from before its first phase to after its last.
         std::optional<submit_phases::Submission> submission;
@@ -3579,8 +3677,8 @@ private:
             }
             const bool ended = context_.observe_result(context_.vk.vkEndCommandBuffer(command_buffer),
                                                        "vkEndCommandBuffer") == VK_SUCCESS;
-            const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0,
-                                                   execute_call ? &diagnostics : nullptr);
+            const bool submitted = ended && submit_multi(command_buffer, trailing_signals,
+                                                         execute_call ? &diagnostics : nullptr);
             if (!submitted && !zero_buffers.empty()) {
                 std::lock_guard lock(context_.storage_mutex_);
                 context_.zero_pending_.insert(context_.zero_pending_.end(), zero_buffers.begin(), zero_buffers.end());
@@ -3683,11 +3781,29 @@ private:
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
         std::uint32_t segments = 0, statistics_segments = 0;
         bool has_queries = false;
+        const bool has_parallel_compiler = bool(context_.batch_compile_runner_) || bool(context_.pipeline_workers_);
         const auto run_compiles = [this](std::size_t count, const std::function<void(std::size_t)>& job) {
-            context_.pipeline_workers_->run(count, job);
+            if (context_.batch_compile_runner_) context_.batch_compile_runner_(count, job);
+            else context_.pipeline_workers_->run(count, job);
         };
         PipelineCompiles prior_compiles;
         bool has_prior_compiles = false;
+        // Fast pre-pass before acquiring resource_mutex_ or running prepare(): collect all unique unbuilt synchronous
+        // graphics (pipeline, unbound_mask) and compute pipelines across the batch and compile them concurrently so
+        // prepare() completes in one pass with zero wasted transient allocations or skipped draws.
+        if (has_parallel_compiler && runs_shaders) {
+            PipelineCompiles pre_compiles;
+            collect_unbuilt_pipelines(lists, context_.replay_, pre_compiles);
+            if (!pre_compiles.empty()) {
+                submit_phases::note_change(submit_phases::change_pipelines);
+                std::shared_ptr<void> demand;
+                if (context_.large_compile_demand_ && pre_compiles.any_large()) demand = context_.large_compile_demand_();
+                pre_compiles.build(run_compiles, context_.large_compile_budget_);
+                demand.reset();
+                prior_compiles = std::move(pre_compiles);
+                has_prior_compiles = true;
+            }
+        }
         for (int pass = 0;; ++pass) {
             submit_phases::lock_timed(resource_lock);
             bindless_commit = !skip_shader_prep ? context_.bindless_commit_ : std::function<void(bool)>{};
@@ -3865,7 +3981,17 @@ private:
                 statistics_segments += prepared[i].statistics_segment_count;
                 has_queries = has_queries || !prepared[i].queries.empty();
             }
-            if (pass == 0 && !compiles.empty()) {
+            bool needs_unlock_compile = !compiles.empty();
+            if (needs_unlock_compile && has_prior_compiles) {
+                needs_unlock_compile = false;
+                for (const PipelineCompiles::Use& u : compiles.uses()) {
+                    if (!prior_compiles.contains_ticket(compiles, u.ticket)) {
+                        needs_unlock_compile = true;
+                        break;
+                    }
+                }
+            }
+            if (pass == 0 && needs_unlock_compile) {
                 submit_phases::note_change(submit_phases::change_pipelines);  // not a floor submission
                 if (depth24_guard.active) {
                     context_.depth24_->retire(progress_, 0);
@@ -3891,7 +4017,7 @@ private:
 
                 std::shared_ptr<void> demand;
                 if (context_.large_compile_demand_ && compiles.any_large()) demand = context_.large_compile_demand_();
-                if (context_.pipeline_workers_)
+                if (has_parallel_compiler)
                     compiles.build(run_compiles, context_.large_compile_budget_);
                 else
                     compiles.build_serial();
@@ -3903,7 +4029,7 @@ private:
                 continue;
             }
             const PipelineCompiles* prior = has_prior_compiles ? &prior_compiles : nullptr;
-            prepare_result = context_.pipeline_workers_
+            prepare_result = has_parallel_compiler
                                  ? build_pipelines(compiles, std::span(prepared).first(lists.size()), prepare_result,
                                                    run_compiles, context_.large_compile_budget_, prior)
                                  : build_pipelines_serial(compiles, std::span(prepared).first(lists.size()),
@@ -4240,8 +4366,8 @@ private:
             exec_waits_.push_back(progress_);
             exec_wait_values_.push_back(submitted_);
         }
-        const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0,
-                                               execute_call ? &diagnostics : nullptr);
+        const bool submitted = ended && submit_multi(command_buffer, trailing_signals,
+                                                     execute_call ? &diagnostics : nullptr);
         if (submitted && wrote_buffer && context_.on_buffer_write_submitted_)
             context_.on_buffer_write_submitted_(context_.submitted_retire_ticket());
         if (profile && submitted) {
@@ -4429,6 +4555,7 @@ private:
 
     // Moves pending waits (state_mutex_-owned) into execution-local storage (owned by executing_). state_mutex_ held.
     void take_waits_to_exec_locked() {
+        exec_user_wait_count_ += waits_.size();
         exec_waits_.insert(exec_waits_.end(), waits_.begin(), waits_.end());
         exec_wait_values_.insert(exec_wait_values_.end(), wait_values_.begin(), wait_values_.end());
         for (auto& p : wait_pins_) exec_wait_pins_.push_back(std::move(p));
@@ -4441,7 +4568,10 @@ private:
     // matching run()'s semantics so a held Signal behind the failed batch keeps its own waits and the retry gets these.
     // Called with state_mutex_ held.
     void restore_exec_waits_locked() {
-        if (exec_waits_.empty()) return;
+        if (exec_waits_.empty()) {
+            exec_user_wait_count_ = 0;
+            return;
+        }
         waits_.insert(waits_.begin(), exec_waits_.begin(), exec_waits_.end());
         wait_values_.insert(wait_values_.begin(), exec_wait_values_.begin(), exec_wait_values_.end());
         wait_pins_.insert(wait_pins_.begin(), std::make_move_iterator(exec_wait_pins_.begin()),
@@ -4449,6 +4579,7 @@ private:
         exec_waits_.clear();
         exec_wait_values_.clear();
         exec_wait_pins_.clear();
+        exec_user_wait_count_ = 0;
     }
 
     // The waits are consumed: submitted as `ticket` (0: dropped on device loss). Called by the thread owning
@@ -4456,6 +4587,11 @@ private:
     // by the caller after state_mutex_ is released (drain_pins): the last release of a fence waits for a running
     // release, which must not be waiting for state_mutex_.
     void clear_exec_waits(std::uint64_t ticket = 0) {
+        if (exec_user_wait_count_) {
+            const std::size_t n = (std::min)(exec_user_wait_count_, exec_waits_.size());
+            context_.note_waits_removed(std::span(exec_waits_).first(n), std::span(exec_wait_values_).first(n));
+            exec_user_wait_count_ = 0;
+        }
         exec_waits_.clear();
         exec_wait_values_.clear();
         retire_exec_pins(exec_wait_pins_, ticket);
@@ -4626,6 +4762,7 @@ private:
                 Deferred op = std::move(held_.front());
                 held_.pop_front();
                 set_active_seq_locked(op.seq);
+                if (!op.waits.empty()) context_.note_waits_removed(op.waits, op.wait_values);
                 for (auto& p : op.pins) retired.push_back(std::move(p));
                 for (auto& p : op.wait_pins) retired.push_back(std::move(p));
                 EnqueueSerial dropped = std::move(op.enqueue_serial);
@@ -4642,28 +4779,43 @@ private:
 
             if (held_.front().kind == Deferred::Kind::batch) {
                 const std::uint64_t bseq = barrier_seq_.load(std::memory_order_acquire);
-                std::vector<Deferred> batch_ops;
-                batch_ops.push_back(std::move(held_.front()));
+                std::vector<Deferred> group_ops;
+                group_ops.push_back(std::move(held_.front()));
                 held_.pop_front();
-                while (!batch_ops.back().barrier_after && !held_.empty() &&
-                       held_.front().kind == Deferred::Kind::batch && held_.front().waits.empty() &&
-                       !crosses_barrier(batch_ops.back().seq, held_.front().seq, batch_ops.back().present_epoch,
-                                        held_.front().present_epoch, bseq) &&
-                       ready(held_.front())) {
-                    batch_ops.push_back(std::move(held_.front()));
-                    held_.pop_front();
+                std::size_t batch_count = 1;
+                bool stop_after_signal = false;
+                while (!group_ops.back().barrier_after && !held_.empty()) {
+                    const Deferred& next = held_.front();
+                    if (!next.waits.empty()) break;
+                    if (crosses_barrier(group_ops.back().seq, next.seq, group_ops.back().present_epoch,
+                                        next.present_epoch, bseq))
+                        break;
+                    if (!ready(next)) break;
+                    if (next.kind == Deferred::Kind::batch) {
+                        if (stop_after_signal) break;
+                        group_ops.push_back(std::move(held_.front()));
+                        held_.pop_front();
+                        ++batch_count;
+                    } else if (next.kind == Deferred::Kind::signal) {
+                        group_ops.push_back(std::move(held_.front()));
+                        held_.pop_front();
+                        if (context_.has_unsatisfied_waiter(group_ops.back().fence, group_ops.back().value))
+                            stop_after_signal = true;
+                    } else {
+                        break;
+                    }
                 }
 
-                HeldCountGuard held_guard{context_.holds(), -static_cast<std::int64_t>(batch_ops.size())};
+                HeldCountGuard held_guard{context_.holds(), -static_cast<std::int64_t>(group_ops.size())};
 
-                const std::uint64_t last_seq = batch_ops.back().seq;
-                const std::uint64_t last_epoch = batch_ops.back().present_epoch;
+                const std::uint64_t last_seq = group_ops.back().seq;
+                const std::uint64_t last_epoch = group_ops.back().present_epoch;
                 bool stop_for_barrier =
-                    batch_ops.back().barrier_after ||
+                    group_ops.back().barrier_after ||
                     (!held_.empty() &&
                      crosses_barrier(last_seq, held_.front().seq, last_epoch, held_.front().present_epoch, bseq));
 
-                Deferred& first = batch_ops.front();
+                Deferred& first = group_ops.front();
                 set_active_seq_locked(first.seq);
 
                 const bool log_latency = gpu_latency::enabled();
@@ -4677,6 +4829,7 @@ private:
                         }
                 }
 
+                exec_user_wait_count_ += first.waits.size();
                 exec_waits_.insert(exec_waits_.end(), first.waits.begin(), first.waits.end());
                 exec_wait_values_.insert(exec_wait_values_.end(), first.wait_values.begin(), first.wait_values.end());
                 for (auto& p : first.wait_pins) exec_wait_pins_.push_back(std::move(p));
@@ -4687,60 +4840,103 @@ private:
                 state.unlock();
 
                 if (log_latency) {
-                    for (const Deferred& op : batch_ops)
+                    for (const Deferred& op : group_ops)
                         gpu_latency::held(int(kind_), int(op.kind), op.held_at, latency_fence, latency_value);
                 }
 
                 exec_list_ptrs_.clear();
                 exec_batch_breaks_.clear();
-                for (const Deferred& op : batch_ops) {
-                    if (!exec_list_ptrs_.empty() && !op.lists.empty())
-                        exec_batch_breaks_.push_back(exec_list_ptrs_.size());
-                    for (const auto& list : op.lists) exec_list_ptrs_.push_back(list.get());
+                exec_pending_signals_.clear();
+                for (const Deferred& op : group_ops) {
+                    if (op.kind == Deferred::Kind::batch) {
+                        if (!exec_list_ptrs_.empty() && !op.lists.empty())
+                            exec_batch_breaks_.push_back(exec_list_ptrs_.size());
+                        for (const auto& list : op.lists) exec_list_ptrs_.push_back(list.get());
+                    } else if (op.kind == Deferred::Kind::signal) {
+                        exec_pending_signals_.push_back({op.fence, op.value});
+                    }
                 }
 
                 const ReplayResult result =
-                    execute_now(exec_list_ptrs_, first.execute_call, exec_batch_breaks_);
+                    execute_now(exec_list_ptrs_, first.execute_call, exec_batch_breaks_, exec_pending_signals_);
                 if (result == ReplayResult::success) {
-                    note_coalesced_submit(batch_ops.size());
-                    for (Deferred& op : batch_ops) {
+                    note_coalesced_submit(batch_count);
+                    for (Deferred& op : group_ops) {
                         retire_exec_pins(op.pins, submitted_);
                         op.enqueue_serial.finish();
                         op.lists.clear();
                     }
-                } else if (batch_ops.size() > 1 && !context_.is_device_lost()) {
-                    // Isolate the failing batch so valid peers still submit in FIFO order.
-                    for (Deferred& op : batch_ops) {
-                        exec_list_ptrs_.clear();
-                        for (const auto& list : op.lists) exec_list_ptrs_.push_back(list.get());
-                        const ReplayResult sub = execute_now(exec_list_ptrs_, op.execute_call);
-                        note_coalesced_submit(1);
-                        if (sub != ReplayResult::success) {
-                            int none = static_cast<int>(ReplayResult::success);
-                            held_failure_.compare_exchange_strong(none, static_cast<int>(sub));
-                            std::fprintf(stderr,
-                                         "[rt] d3d12: a held ExecuteCommandLists failed when it was released "
-                                         "(result %d); nothing was submitted for it, and a Signal behind it still "
-                                         "signals\n",
-                                         static_cast<int>(sub));
+                } else if (batch_count > 1 && !context_.is_device_lost()) {
+                    // Isolate the failing batch so valid peers and trailing Signals still submit in FIFO order.
+                    for (Deferred& op : group_ops) {
+                        if (op.kind == Deferred::Kind::batch) {
+                            exec_list_ptrs_.clear();
+                            for (const auto& list : op.lists) exec_list_ptrs_.push_back(list.get());
+                            const ReplayResult sub = execute_now(exec_list_ptrs_, op.execute_call);
+                            note_coalesced_submit(1);
+                            if (sub != ReplayResult::success) {
+                                int none = static_cast<int>(ReplayResult::success);
+                                held_failure_.compare_exchange_strong(none, static_cast<int>(sub));
+                                std::fprintf(stderr,
+                                             "[rt] d3d12: a held ExecuteCommandLists failed when it was released "
+                                             "(result %d); nothing was submitted for it, and a Signal behind it still "
+                                             "signals\n",
+                                             static_cast<int>(sub));
+                            }
+                            retire_exec_pins(op.pins, sub == ReplayResult::success ? submitted_ : 0);
+                            op.enqueue_serial.finish();
+                            op.lists.clear();
+                        } else if (op.kind == Deferred::Kind::signal) {
+                            // Preserve any unconsumed waits from a preceding failed batch rather than letting this
+                            // trailing Signal (which carried no waits of its own) consume them.
+                            auto saved_waits = std::move(exec_waits_);
+                            auto saved_values = std::move(exec_wait_values_);
+                            auto saved_pins = std::move(exec_wait_pins_);
+                            const std::size_t saved_user = std::exchange(exec_user_wait_count_, 0);
+                            exec_waits_.clear();
+                            exec_wait_values_.clear();
+                            exec_wait_pins_.clear();
+                            const bool ok = submit(VK_NULL_HANDLE, op.fence, op.value);
+                            if (!ok) std::fprintf(stderr, "[rt] d3d12: a held Signal failed when it was released\n");
+                            retire_exec_pins(op.pins, ok ? submitted_ : 0);
+                            exec_waits_ = std::move(saved_waits);
+                            exec_wait_values_ = std::move(saved_values);
+                            exec_wait_pins_ = std::move(saved_pins);
+                            exec_user_wait_count_ = saved_user;
                         }
-                        retire_exec_pins(op.pins, sub == ReplayResult::success ? submitted_ : 0);
-                        op.enqueue_serial.finish();
-                        op.lists.clear();
                     }
                 } else {
-                    note_coalesced_submit(batch_ops.size());
+                    note_coalesced_submit(batch_count);
                     int none = static_cast<int>(ReplayResult::success);
                     held_failure_.compare_exchange_strong(none, static_cast<int>(result));
                     std::fprintf(stderr,
                                  "[rt] d3d12: a held ExecuteCommandLists failed when it was released "
                                  "(result %d); nothing was submitted for it, and a Signal behind it still signals\n",
                                  static_cast<int>(result));
-                    for (Deferred& op : batch_ops) {
-                        retire_exec_pins(op.pins, 0);
-                        op.enqueue_serial.finish();
-                        op.lists.clear();
+                    // Single batch failed (do NOT re-run it); preserve its unconsumed waits for retry, and still submit
+                    // any trailing Signals that rode along with it (unless device is lost).
+                    auto saved_waits = std::move(exec_waits_);
+                    auto saved_values = std::move(exec_wait_values_);
+                    auto saved_pins = std::move(exec_wait_pins_);
+                    const std::size_t saved_user = std::exchange(exec_user_wait_count_, 0);
+                    exec_waits_.clear();
+                    exec_wait_values_.clear();
+                    exec_wait_pins_.clear();
+                    for (Deferred& op : group_ops) {
+                        if (op.kind == Deferred::Kind::signal && !context_.is_device_lost()) {
+                            const bool ok = submit(VK_NULL_HANDLE, op.fence, op.value);
+                            if (!ok) std::fprintf(stderr, "[rt] d3d12: a held Signal failed when it was released\n");
+                            retire_exec_pins(op.pins, ok ? submitted_ : 0);
+                        } else {
+                            retire_exec_pins(op.pins, 0);
+                            op.enqueue_serial.finish();
+                            op.lists.clear();
+                        }
                     }
+                    exec_waits_ = std::move(saved_waits);
+                    exec_wait_values_ = std::move(saved_values);
+                    exec_wait_pins_ = std::move(saved_pins);
+                    exec_user_wait_count_ = saved_user;
                 }
 
                 state.lock();
@@ -4790,6 +4986,7 @@ private:
             }
 
             // Move this op's waits into execution-local storage.
+            exec_user_wait_count_ += op.waits.size();
             exec_waits_.insert(exec_waits_.end(), op.waits.begin(), op.waits.end());
             exec_wait_values_.insert(exec_wait_values_.end(), op.wait_values.begin(), op.wait_values.end());
             for (auto& p : op.wait_pins) exec_wait_pins_.push_back(std::move(p));
@@ -4905,6 +5102,7 @@ private:
                 }
                 std::fprintf(stderr, "[rt] d3d12: a fence was released while a queue still held work that names it; "
                                      "that work is dropped\n");
+                if (!it->waits.empty()) context_.note_waits_removed(it->waits, it->wait_values);
                 dropped.push_back(std::move(*it));
                 it = held_.erase(it);
                 context_.holds().held_changed(-1);
@@ -4989,8 +5187,10 @@ private:
                                  "fence value (%llu) that no Signal reached; the fence was never signaled%s\n",
                          held_.size(), static_cast<unsigned long long>(value),
                          signals ? "; CPU waits on the fences of its held Signals are completed" : "");
-            for (const Deferred& op : held_)
+            for (const Deferred& op : held_) {
                 if (op.kind == Deferred::Kind::signal) context_.cancel_fence_waits(op.fence);
+                if (!op.waits.empty()) context_.note_waits_removed(op.waits, op.wait_values);
+            }
             context_.holds().held_changed(-static_cast<std::int64_t>(held_.size()));
             dropped.swap(held_);
             set_active_seq_locked(0);
@@ -5306,6 +5506,15 @@ private:
 
     bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value,
                 CheckpointSubmission* diagnostics = nullptr) {
+        if (fence) {
+            const PendingSignal sig{fence, value};
+            return submit_multi(command_buffer, {&sig, 1}, diagnostics);
+        }
+        return submit_multi(command_buffer, {}, diagnostics);
+    }
+
+    bool submit_multi(VkCommandBuffer command_buffer, std::span<const PendingSignal> extra_signals,
+                      CheckpointSubmission* diagnostics = nullptr) {
         if (context_.is_device_lost()) return false;
         const std::uint64_t ticket = submitted_ + 1;
         if (last_sparse_) {
@@ -5334,6 +5543,34 @@ private:
             submit_stages_.assign(semaphores.size(), kAllCmds);
             stages_ptr = submit_stages_.data();
         }
+        // Deduplicate extra_signals by VkSemaphore, keeping the highest timeline value per fence so VkSubmitInfo never
+        // names the same timeline semaphore twice (VUID-VkSubmitInfo-pSignalSemaphores-03242).
+        PendingSignal stack_dedup[16];
+        std::size_t dedup_count = 0;
+        std::vector<PendingSignal> heap_dedup;
+        auto add_dedup = [&](VkSemaphore f, std::uint64_t v) {
+            if (!f || f == progress_) return;
+            PendingSignal* data = heap_dedup.empty() ? stack_dedup : heap_dedup.data();
+            const std::size_t count = heap_dedup.empty() ? dedup_count : heap_dedup.size();
+            for (std::size_t i = 0; i < count; ++i) {
+                if (data[i].fence == f) {
+                    if (v > data[i].value) data[i].value = v;
+                    return;
+                }
+            }
+            if (heap_dedup.empty()) {
+                if (dedup_count < 16) {
+                    stack_dedup[dedup_count++] = {f, v};
+                    return;
+                }
+                heap_dedup.assign(stack_dedup, stack_dedup + dedup_count);
+            }
+            heap_dedup.push_back({f, v});
+        };
+        for (const PendingSignal& sig : extra_signals) add_dedup(sig.fence, sig.value);
+        const PendingSignal* const dedup_ptr = heap_dedup.empty() ? stack_dedup : heap_dedup.data();
+        const std::size_t dedup_size = heap_dedup.empty() ? dedup_count : heap_dedup.size();
+
         std::uint64_t mirror_bind_waited = 0;
         VkResult res = VK_SUCCESS;
         {
@@ -5358,24 +5595,45 @@ private:
                     stages_ptr = submit_stages_.data();
                 }
             }
-            VkSemaphore signals[2]{progress_, VK_NULL_HANDLE};
-            std::uint64_t signal_values[2]{ticket, 0};
+            VkSemaphore stack_signals[17]{progress_};
+            std::uint64_t stack_signal_values[17]{ticket};
+            VkSemaphore* signals_ptr = stack_signals;
+            std::uint64_t* signal_values_ptr = stack_signal_values;
             std::uint32_t signal_count = 1;
+            if (dedup_size + 1 > 17) {
+                submit_signals_.clear();
+                submit_signal_values_.clear();
+                submit_signals_.reserve(dedup_size + 1);
+                submit_signal_values_.reserve(dedup_size + 1);
+                submit_signals_.push_back(progress_);
+                submit_signal_values_.push_back(ticket);
+            }
             // Decided under the submit lock, so the order of the checks is the order of the submissions. A Signal
             // that is not above what was already submitted for this fence (a held Signal(F, 2) released after an
             // unheld Signal(F, 3)) leaves the Vulkan signal out: the timeline cannot go down, and waits for 2 pass.
             // The value counts as submitted only after the submit succeeded (below).
-            const bool signals_fence = fence && context_.holds().would_signal(fence, value);
-            if (signals_fence) {
-                signals[signal_count] = fence;
-                signal_values[signal_count] = value;
+            for (std::size_t i = 0; i < dedup_size; ++i) {
+                const VkSemaphore f = dedup_ptr[i].fence;
+                const std::uint64_t v = dedup_ptr[i].value;
+                if (!context_.holds().would_signal(f, v)) continue;
+                if (dedup_size + 1 > 17) {
+                    submit_signals_.push_back(f);
+                    submit_signal_values_.push_back(v);
+                } else {
+                    stack_signals[signal_count] = f;
+                    stack_signal_values[signal_count] = v;
+                }
                 ++signal_count;
+            }
+            if (dedup_size + 1 > 17) {
+                signals_ptr = submit_signals_.data();
+                signal_values_ptr = submit_signal_values_.data();
             }
             VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
             timeline.waitSemaphoreValueCount = std::uint32_t(values.size());
             timeline.pWaitSemaphoreValues = values.data();
             timeline.signalSemaphoreValueCount = signal_count;
-            timeline.pSignalSemaphoreValues = signal_values;
+            timeline.pSignalSemaphoreValues = signal_values_ptr;
             VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
             submit.waitSemaphoreCount = std::uint32_t(semaphores.size());
             submit.pWaitSemaphores = semaphores.data();
@@ -5383,7 +5641,7 @@ private:
             submit.commandBufferCount = command_buffer ? 1 : 0;
             submit.pCommandBuffers = &command_buffer;
             submit.signalSemaphoreCount = signal_count;
-            submit.pSignalSemaphores = signals;
+            submit.pSignalSemaphores = signals_ptr;
             // LEONIDA_PASS_TRACE=<n> (with LEONIDA_DEVICE_FAULT=1): in the frame after every n-th present, each
             // submission logs its compute programs in order (repeats folded), for the frame's pass order.
             if (diagnostics) pass_trace(*diagnostics);
@@ -5400,9 +5658,9 @@ private:
                 record.progress = progress_;
                 record.ticket = ticket;
                 record.buffers = submit.commandBufferCount;
-                if (signals_fence) {
-                    record.fence = fence;
-                    record.fence_value = value;
+                if (signal_count > 1) {
+                    record.fence = signals_ptr[signal_count - 1];
+                    record.fence_value = signal_values_ptr[signal_count - 1];
                 }
                 record.waits = std::uint32_t(semaphores.size());
                 for (std::size_t i = 0; i < semaphores.size() && i < SubmitRecord::max_waits; ++i) {
@@ -5419,7 +5677,8 @@ private:
             if (ring) ring->end_submit(ring_at, diagnostic_ms() - submit_start, res);
             if (res == VK_SUCCESS) {
                 context_.record_submit_locked(progress_, ticket);
-                if (signals_fence) context_.holds().signaled(fence, value);
+                for (std::uint32_t i = 1; i < signal_count; ++i)
+                    context_.holds().signaled(signals_ptr[i], signal_values_ptr[i]);
             }
         }
         if (res == VK_ERROR_DEVICE_LOST) {
@@ -5510,6 +5769,40 @@ private:
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
     };
 
+    // Counts pending coalesced submission groups (plus 1 when the worker is busy): consecutive execute calls separated
+    // only by non-barrier Signals within the same present_epoch coalesce into ONE submission, so a frame submitting
+    // 17+ direct batches + Signals does not stall title threads on room_cv_ while async_depth_ still bounds distinct
+    // submission groups (e.g. Present frames or Wait-separated phases). inbox_mutex_ held.
+    std::size_t pending_submit_groups_locked() const {
+        std::size_t groups = worker_busy_ ? 1 : 0;
+        bool in_group = false;
+        std::uint64_t prev_epoch = kUnsetEpoch;
+        bool prev_barrier = false;
+        for (const Call& c : inbox_) {
+            if (c.kind == Call::Kind::execute) {
+                if (!in_group || prev_barrier || c.present_epoch != prev_epoch) {
+                    ++groups;
+                    in_group = true;
+                }
+                prev_epoch = c.present_epoch;
+                prev_barrier = c.barrier_after;
+            } else if (c.kind == Call::Kind::signal) {
+                if (in_group) {
+                    if (prev_barrier || c.present_epoch != prev_epoch) {
+                        in_group = false;
+                    } else {
+                        prev_epoch = c.present_epoch;
+                        prev_barrier = c.barrier_after;
+                    }
+                }
+            } else {
+                in_group = false;
+                prev_barrier = false;
+            }
+        }
+        return groups;
+    }
+
     void enqueue(Call&& call) {
         const bool batch = call.kind == Call::Kind::execute;
         std::unique_lock lock(inbox_mutex_);
@@ -5517,15 +5810,25 @@ private:
             worker_ = std::thread([this] { async_worker(); });
             async_started_.store(true, std::memory_order_release);
         }
-        // n batches, and 4n calls of any kind (a title that signals after every small job must not queue Signals
-        // without bound). n = 1 makes each caller wait for the batch before it: n should be 2 or more.
-        const auto room = [this, batch] {
-            return async_stop_ ||
-                   ((!batch || inbox_batches_ < async_depth_) && inbox_.size() < 4 * std::size_t(async_depth_));
+        // n submission groups, with generous batch room for coalesced frames (max(8n, 32) batches, 4x calls when n >= 2;
+        // n = 1 keeps strict single-batch backpressure).
+        const std::size_t max_batches =
+            async_depth_ <= 1 ? std::size_t(async_depth_)
+                              : (std::max)(std::size_t(async_depth_) * 8, std::size_t(32));
+        const std::size_t max_calls = max_batches * 4;
+        const auto room = [this, batch, max_batches, max_calls] {
+            if (async_stop_) return true;
+            if (inbox_.size() >= max_calls) return false;
+            if (!batch) return true;
+            if (inbox_batches_ < async_depth_) return true;
+            if (async_depth_ <= 1 || inbox_batches_ >= max_batches) return false;
+            return pending_submit_groups_locked() < async_depth_;
         };
         if (!room()) {
             const auto start = std::chrono::steady_clock::now();
+            ++room_waiters_;
             room_cv_.wait(lock, room);
+            --room_waiters_;
             ++async_stats_.room_waits;
             async_stats_.room_wait_ns += std::uint64_t(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
@@ -5541,20 +5844,21 @@ private:
         context_.holds().held_changed(1);
         context_.holds().work_changed(1);
         inbox_.push_back(std::move(call));
-        async_stats_.depth_max = std::max(async_stats_.depth_max, inbox_.size());
+        async_stats_.depth_max = (std::max)(async_stats_.depth_max, inbox_.size());
         lock.unlock();
         inbox_cv_.notify_one();
     }
 
     void async_worker() {
         t_worker_of_ = this;
-        std::vector<Call> batch_calls;
-        batch_calls.reserve(8);
+        std::vector<Call> group_calls;
+        group_calls.reserve(16);
         for (;;) {
             Call single_call;
-            batch_calls.clear();
+            group_calls.clear();
             bool have_single = false;
             bool release = false;
+            std::size_t exec_count = 0;
             std::int64_t consumed_work = 0;
             {
                 std::unique_lock lock(inbox_mutex_);
@@ -5564,30 +5868,44 @@ private:
                 if (!inbox_.empty()) {
                     if (inbox_.front().kind == Call::Kind::execute) {
                         const std::uint64_t bseq = barrier_seq_.load(std::memory_order_acquire);
-                        batch_calls.push_back(std::move(inbox_.front()));
+                        group_calls.push_back(std::move(inbox_.front()));
                         inbox_.pop_front();
+                        exec_count = 1;
                         ++consumed_work;
-                        while (!batch_calls.back().barrier_after && !inbox_.empty() &&
-                               inbox_.front().kind == Call::Kind::execute &&
-                               !crosses_barrier(batch_calls.back().seq, inbox_.front().seq,
-                                                batch_calls.back().present_epoch, inbox_.front().present_epoch, bseq)) {
-                            batch_calls.push_back(std::move(inbox_.front()));
-                            inbox_.pop_front();
-                            ++consumed_work;
+                        bool stop_after_signal = false;
+                        while (!group_calls.back().barrier_after && !inbox_.empty()) {
+                            const Call& next = inbox_.front();
+                            if (crosses_barrier(group_calls.back().seq, next.seq, group_calls.back().present_epoch,
+                                                next.present_epoch, bseq))
+                                break;
+                            if (next.kind == Call::Kind::execute) {
+                                if (stop_after_signal) break;
+                                group_calls.push_back(std::move(inbox_.front()));
+                                inbox_.pop_front();
+                                ++exec_count;
+                                ++consumed_work;
+                            } else if (next.kind == Call::Kind::signal) {
+                                group_calls.push_back(std::move(inbox_.front()));
+                                inbox_.pop_front();
+                                ++consumed_work;
+                                if (context_.has_unsatisfied_waiter(group_calls.back().fence, group_calls.back().value))
+                                    stop_after_signal = true;
+                            } else {
+                                break;
+                            }
                         }
-                        running_seq_ = batch_calls.front().seq;
-                        // A coalesced group executes as ONE in-flight submission; release the (K - 1) merged batch
-                        // slots immediately so enqueue() can accumulate the next coalescing window without stalling.
-                        if (batch_calls.size() > 1) {
-                            inbox_batches_ -= (batch_calls.size() - 1);
-                            room_cv_.notify_all();
-                        }
+                        running_seq_ = group_calls.front().seq;
+                        // A coalesced group executes as ONE in-flight submission; release the (exec_count - 1) merged
+                        // batch slots immediately so enqueue() can accumulate the next coalescing window without stalling.
+                        if (exec_count > 1) inbox_batches_ -= (exec_count - 1);
+                        if (room_waiters_ > 0) room_cv_.notify_all();
                     } else {
                         single_call = std::move(inbox_.front());
                         inbox_.pop_front();
                         running_seq_ = single_call.seq;
                         have_single = true;
                         ++consumed_work;
+                        if (room_waiters_ > 0) room_cv_.notify_all();
                     }
                 } else if (!release) {
                     return;  // stopping, nothing queued
@@ -5600,19 +5918,19 @@ private:
                 QueueHolds<VkSemaphore>& holds;
                 ~WorkerTurnGuard() { holds.work_changed(-1); }
             } turn_guard{context_.holds()};
-            const std::size_t batch_count = batch_calls.size();
-            const bool have = have_single || batch_count != 0;
+            const std::size_t group_count = group_calls.size();
+            const bool have = have_single || group_count != 0;
             HeldCountGuard inbox_held_guard{
-                context_.holds(), have ? -static_cast<std::int64_t>(batch_count ? batch_count : 1) : 0};
+                context_.holds(), have ? -static_cast<std::int64_t>(group_count ? group_count : 1) : 0};
             // Wrap the entire worker turn (release_held, call execution, and pump_ready) so gate-released batches and
             // deferred presents running on async_worker are attributed to worker_submit, never to title threads.
             const submit_phases::WorkerScope busy(submit_phases::worker_submit);
             DrainInfo rel_info{};
             const bool released = release && release_held(/*from_pump=*/false, &rel_info);
             if (released && have) {
-                const std::uint64_t next_seq = batch_count ? batch_calls.front().seq : single_call.seq;
+                const std::uint64_t next_seq = group_count ? group_calls.front().seq : single_call.seq;
                 const std::uint64_t next_epoch =
-                    batch_count ? batch_calls.front().present_epoch : single_call.present_epoch;
+                    group_count ? group_calls.front().present_epoch : single_call.present_epoch;
                 const std::uint64_t bseq = barrier_seq_.load(std::memory_order_acquire);
                 if (rel_info.stopped_for_barrier ||
                     crosses_barrier(rel_info.last_seq, next_seq, rel_info.last_epoch, next_epoch, bseq)) {
@@ -5623,10 +5941,10 @@ private:
             }
             if (have) {
                 const auto start = std::chrono::steady_clock::now();
-                if (batch_count == 1) {
-                    run_call(batch_calls[0]);
-                } else if (batch_count > 1) {
-                    run_coalesced_calls(batch_calls);
+                if (group_count == 1) {
+                    run_call(group_calls[0]);
+                } else if (group_count > 1) {
+                    run_coalesced_calls(group_calls, exec_count);
                 } else {
                     run_call(single_call);
                 }
@@ -5635,42 +5953,44 @@ private:
                     std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
                 std::lock_guard lock(inbox_mutex_);
                 async_stats_.run_ns += ran_ns;
-                if (batch_count != 0) {
-                    for (const Call& c : batch_calls) {
+                if (group_count != 0) {
+                    for (const Call& c : group_calls) {
                         const auto lag = std::uint64_t(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(start - c.queued_at).count());
                         async_stats_.lag_ns += lag;
-                        async_stats_.lag_max_ns = std::max(async_stats_.lag_max_ns, lag);
+                        async_stats_.lag_max_ns = (std::max)(async_stats_.lag_max_ns, lag);
                     }
                 } else {
                     const auto lag = std::uint64_t(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(start - single_call.queued_at).count());
                     async_stats_.lag_ns += lag;
-                    async_stats_.lag_max_ns = std::max(async_stats_.lag_max_ns, lag);
+                    async_stats_.lag_max_ns = (std::max)(async_stats_.lag_max_ns, lag);
                 }
             }
             {
                 std::lock_guard lock(inbox_mutex_);
                 running_seq_ = 0;
                 worker_busy_ = false;
-                if (batch_count != 0) --inbox_batches_;
-                if (have) room_cv_.notify_all();
+                if (exec_count != 0) --inbox_batches_;
+                if (have && room_waiters_ > 0) room_cv_.notify_all();
                 idle_cv_.notify_all();
                 report_async_locked();
             }
             inbox_held_guard.release();
             single_call = Call{};
-            batch_calls.clear();  // the snapshots, pins, and serials go before the pump, outside the lock
+            group_calls.clear();  // the snapshots, pins, and serials go before the pump, outside the lock
             if (have || released) context_.holds().pump_ready();
         }
     }
 
-    // Coalesces 2+ consecutive Call::Kind::execute items from async_worker's inbox into ONE before_execute_() + ONE
-    // vkQueueSubmit (or moves them into held_ in exact FIFO order when blocked by an unmet Wait so they still coalesce
-    // when released). Falls back per-call on non-device-lost replay failure so valid peers are never dropped.
-    void run_coalesced_calls(std::vector<Call>& calls) {
+    // Coalesces consecutive execute and Signal items from async_worker's inbox into ONE before_execute_() + ONE
+    // vkQueueSubmit (with all Signals attached to that submit's timeline signaling, deduplicated to the highest value
+    // per fence), or moves them into held_ in exact FIFO order when blocked by an unmet Wait so they still coalesce
+    // when released. Falls back per-call in exact FIFO order on non-device-lost replay failure so valid peers and
+    // trailing Signals are never dropped.
+    void run_coalesced_calls(std::vector<Call>& calls, std::size_t exec_count) {
         try {
-            run_coalesced_calls_unguarded(calls);
+            run_coalesced_calls_unguarded(calls, exec_count);
         } catch (const std::exception& e) {
             worker_threw(calls.front(), e.what());
         } catch (...) {
@@ -5679,7 +5999,7 @@ private:
         async_seq_ = 0;
     }
 
-    void run_coalesced_calls_unguarded(std::vector<Call>& calls) {
+    void run_coalesced_calls_unguarded(std::vector<Call>& calls, std::size_t exec_count) {
         QueueHolds<VkSemaphore>::WorkGuard work_guard;
         std::vector<std::shared_ptr<void>> retired;
         std::vector<EnqueueSerial> dropped_serials;
@@ -5687,12 +6007,18 @@ private:
             for (Call& call : calls) {
                 async_seq_ = call.seq;
                 Deferred op;
-                op.kind = Deferred::Kind::batch;
                 op.barrier_after = call.barrier_after;
                 op.present_epoch = call.present_epoch;
-                op.execute_call = call.execute_call;
-                op.enqueue_serial = std::move(call.enqueue_serial);
-                op.lists = std::move(call.lists);
+                if (call.kind == Call::Kind::signal) {
+                    op.kind = Deferred::Kind::signal;
+                    op.fence = call.fence;
+                    op.value = call.value;
+                } else {
+                    op.kind = Deferred::Kind::batch;
+                    op.execute_call = call.execute_call;
+                    op.enqueue_serial = std::move(call.enqueue_serial);
+                    op.lists = std::move(call.lists);
+                }
                 if (call.pin) op.pins.push_back(std::move(call.pin));
                 hold(std::move(op));
             }
@@ -5738,16 +6064,21 @@ private:
 
                     exec_list_ptrs_.clear();
                     exec_batch_breaks_.clear();
+                    exec_pending_signals_.clear();
                     for (const Call& call : calls) {
-                        if (!exec_list_ptrs_.empty() && !call.lists.empty())
-                            exec_batch_breaks_.push_back(exec_list_ptrs_.size());
-                        for (const auto& list : call.lists) exec_list_ptrs_.push_back(list.get());
+                        if (call.kind == Call::Kind::execute) {
+                            if (!exec_list_ptrs_.empty() && !call.lists.empty())
+                                exec_batch_breaks_.push_back(exec_list_ptrs_.size());
+                            for (const auto& list : call.lists) exec_list_ptrs_.push_back(list.get());
+                        } else if (call.kind == Call::Kind::signal) {
+                            exec_pending_signals_.push_back({call.fence, call.value});
+                        }
                     }
 
-                    const ReplayResult result =
-                        execute_now(exec_list_ptrs_, calls.front().execute_call, exec_batch_breaks_);
+                    const ReplayResult result = execute_now(exec_list_ptrs_, calls.front().execute_call,
+                                                            exec_batch_breaks_, exec_pending_signals_);
                     if (result == ReplayResult::success) {
-                        note_coalesced_submit(calls.size());
+                        note_coalesced_submit(exec_count);
                         for (Call& call : calls) {
                             if (call.pin) {
                                 if (submitted_) exec_ticketed_pins_.push_back({submitted_, std::move(call.pin)});
@@ -5755,43 +6086,105 @@ private:
                             }
                             call.enqueue_serial.finish();
                         }
-                    } else if (!context_.is_device_lost()) {
+                    } else if (exec_count > 1 && !context_.is_device_lost()) {
                         for (Call& call : calls) {
-                            exec_list_ptrs_.clear();
-                            for (const auto& list : call.lists) exec_list_ptrs_.push_back(list.get());
-                            const ReplayResult sub = execute_now(exec_list_ptrs_, call.execute_call);
-                            note_coalesced_submit(1);
-                            if (sub != ReplayResult::success) {
-                                int none = static_cast<int>(ReplayResult::success);
-                                held_failure_.compare_exchange_strong(none, static_cast<int>(sub));
-                                std::fprintf(stderr,
-                                             "[rt] d3d12: a queued ExecuteCommandLists failed on the queue's worker "
-                                             "(result %d); nothing was submitted for it\n",
-                                             static_cast<int>(sub));
+                            if (call.kind == Call::Kind::execute) {
+                                exec_list_ptrs_.clear();
+                                for (const auto& list : call.lists) exec_list_ptrs_.push_back(list.get());
+                                const ReplayResult sub = execute_now(exec_list_ptrs_, call.execute_call);
+                                note_coalesced_submit(1);
+                                if (sub != ReplayResult::success) {
+                                    int none = static_cast<int>(ReplayResult::success);
+                                    held_failure_.compare_exchange_strong(none, static_cast<int>(sub));
+                                    std::fprintf(stderr,
+                                                 "[rt] d3d12: a queued ExecuteCommandLists failed on the queue's worker "
+                                                 "(result %d); nothing was submitted for it\n",
+                                                 static_cast<int>(sub));
+                                }
+                                if (call.pin) {
+                                    if (sub == ReplayResult::success && submitted_)
+                                        exec_ticketed_pins_.push_back({submitted_, std::move(call.pin)});
+                                    else
+                                        exec_retired_pins_.push_back(std::move(call.pin));
+                                }
+                                call.enqueue_serial.finish();
+                            } else if (call.kind == Call::Kind::signal) {
+                                auto saved_waits = std::move(exec_waits_);
+                                auto saved_values = std::move(exec_wait_values_);
+                                auto saved_pins = std::move(exec_wait_pins_);
+                                const std::size_t saved_user = std::exchange(exec_user_wait_count_, 0);
+                                exec_waits_.clear();
+                                exec_wait_values_.clear();
+                                exec_wait_pins_.clear();
+                                const bool ok = submit(VK_NULL_HANDLE, call.fence, call.value);
+                                if (!ok) {
+                                    int none = static_cast<int>(ReplayResult::success);
+                                    held_failure_.compare_exchange_strong(none, static_cast<int>(ReplayResult::unsupported));
+                                    std::fprintf(stderr, "[rt] d3d12: a queued Signal failed on the queue's worker\n");
+                                }
+                                if (call.pin) {
+                                    if (ok && submitted_)
+                                        exec_ticketed_pins_.push_back({submitted_, std::move(call.pin)});
+                                    else
+                                        exec_retired_pins_.push_back(std::move(call.pin));
+                                }
+                                exec_waits_ = std::move(saved_waits);
+                                exec_wait_values_ = std::move(saved_values);
+                                exec_wait_pins_ = std::move(saved_pins);
+                                exec_user_wait_count_ = saved_user;
                             }
-                            if (call.pin) {
-                                if (sub == ReplayResult::success && submitted_)
-                                    exec_ticketed_pins_.push_back({submitted_, std::move(call.pin)});
-                                else
-                                    exec_retired_pins_.push_back(std::move(call.pin));
-                            }
-                            call.enqueue_serial.finish();
                         }
                     } else {
-                        note_coalesced_submit(calls.size());
+                        note_coalesced_submit(exec_count);
                         int none = static_cast<int>(ReplayResult::success);
                         held_failure_.compare_exchange_strong(none, static_cast<int>(result));
+                        auto saved_waits = std::move(exec_waits_);
+                        auto saved_values = std::move(exec_wait_values_);
+                        auto saved_pins = std::move(exec_wait_pins_);
+                        const std::size_t saved_user = std::exchange(exec_user_wait_count_, 0);
+                        exec_waits_.clear();
+                        exec_wait_values_.clear();
+                        exec_wait_pins_.clear();
                         for (Call& call : calls) {
-                            if (call.pin) exec_retired_pins_.push_back(std::move(call.pin));
-                            call.enqueue_serial.finish();
+                            if (call.kind == Call::Kind::signal && !context_.is_device_lost()) {
+                                const bool ok = submit(VK_NULL_HANDLE, call.fence, call.value);
+                                if (!ok) {
+                                    int none_s = static_cast<int>(ReplayResult::success);
+                                    held_failure_.compare_exchange_strong(none_s, static_cast<int>(ReplayResult::unsupported));
+                                    std::fprintf(stderr, "[rt] d3d12: a queued Signal failed on the queue's worker\n");
+                                }
+                                if (call.pin) {
+                                    if (ok && submitted_)
+                                        exec_ticketed_pins_.push_back({submitted_, std::move(call.pin)});
+                                    else
+                                        exec_retired_pins_.push_back(std::move(call.pin));
+                                }
+                            } else {
+                                if (call.pin) exec_retired_pins_.push_back(std::move(call.pin));
+                                call.enqueue_serial.finish();
+                            }
                         }
+                        exec_waits_ = std::move(saved_waits);
+                        exec_wait_values_ = std::move(saved_values);
+                        exec_wait_pins_ = std::move(saved_pins);
+                        exec_user_wait_count_ = saved_user;
                     }
 
                     state.lock();
                     restore_exec_waits_locked();
                     flush_exec_pins_locked(retired);
                     set_active_seq_locked(0);
-                    drain_held_while_executing(state, retired);
+                    const std::uint64_t bseq_after = barrier_seq_.load(std::memory_order_acquire);
+                    const bool barrier_after_group =
+                        calls.back().barrier_after ||
+                        (!held_.empty() &&
+                         crosses_barrier(calls.back().seq, held_.front().seq, calls.back().present_epoch,
+                                         held_.front().present_epoch, bseq_after));
+                    if (barrier_after_group) {
+                        if (!held_.empty()) pause_release_for_barrier_.store(true, std::memory_order_release);
+                    } else {
+                        drain_held_while_executing(state, retired);
+                    }
                 }
                 exec_guard.release();
             } else {
@@ -5865,7 +6258,7 @@ private:
                 std::fprintf(stderr, "[rt] d3d12: a queued Signal failed on the queue's worker\n");
             }
             break;
-        case Call::Kind::wait: wait_sync(call.fence, call.value, {}, std::move(call.pin)); break;
+        case Call::Kind::wait: wait_sync(call.fence, call.value, {}, std::move(call.pin), /*already_tracked=*/true); break;
         case Call::Kind::marker: marker_sync(call.marker_kind, call.label.c_str(), call.present_epoch); break;
         }
     }
@@ -5938,6 +6331,7 @@ private:
     std::condition_variable inbox_cv_, room_cv_, idle_cv_;
     std::deque<Call> inbox_;
     std::size_t inbox_batches_ = 0;
+    std::size_t room_waiters_ = 0;
     std::uint64_t running_seq_ = 0;      // oldest seq of the call(s) the worker runs now
     bool worker_busy_ = false, release_requested_ = false, async_stop_ = false;
     AsyncStats async_stats_;
@@ -5974,17 +6368,21 @@ private:
     // Execution-owned wait, pin & scratch staging (touched only by the single thread owning executing_ == true).
     std::vector<VkSemaphore> exec_waits_;
     std::vector<std::uint64_t> exec_wait_values_;
+    std::size_t exec_user_wait_count_ = 0;
     std::vector<std::shared_ptr<void>> exec_wait_pins_;
     std::vector<std::shared_ptr<void>> exec_retired_pins_;
     std::vector<TicketedPin> exec_ticketed_pins_;
     std::vector<const CommandList*> exec_list_ptrs_;
     std::vector<std::size_t> exec_batch_breaks_;
+    std::vector<PendingSignal> exec_pending_signals_;
     std::vector<VulkanContext::GeometryUpload> geometry_uploads_;
     std::vector<ResourceId> storage_images_scratch_;
     std::vector<VulkanContext::PendingZero> zero_buffers_scratch_;
     std::vector<VkSemaphore> sparse_waits_;
     std::vector<std::uint64_t> sparse_values_;
     std::vector<VkPipelineStageFlags> submit_stages_;
+    std::vector<VkSemaphore> submit_signals_;
+    std::vector<std::uint64_t> submit_signal_values_;
     std::atomic<int> held_failure_{0};                 // a ReplayResult: the first held batch that failed
 };
 
