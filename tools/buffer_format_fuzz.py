@@ -597,11 +597,16 @@ def main():
     ap.add_argument("--formats", default="", help="GFX10 codes or names, comma separated (default: every GFX10 code "
                                                    "the GPU family has)")
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--budget", type=int, default=40, help="random elements per format on top of the sweeps")
+    ap.add_argument("--budget", type=int, default=40,
+                    help="random elements per format on top of the sweeps (0: none; --self-test uses its own patterns)")
     ap.add_argument("--hw-arch", default=None)
     ap.add_argument("--negative-control", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
+    # A negative --budget is a usage error, not "no random elements": `range(-1)` runs zero times, so -1 used to be
+    # silently the run of 0, and --self-test never reads the value at all, so 0 and -1000000 both printed "ok".
+    if a.budget < 0:
+        ap.error("--budget cannot be negative")
     if a.self_test:
         return self_test()
     if a.oracle != "hw":
