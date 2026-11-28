@@ -71,6 +71,31 @@ void test_provider_handles_and_validation() {
           "BCryptGenRandom rejects null handle without BCRYPT_USE_SYSTEM_PREFERRED_RNG");
     check(gen_random(h, buf, sizeof(buf), BCRYPT_USE_SYSTEM_PREFERRED_RNG) == kStatusInvalidParameter,
           "BCryptGenRandom rejects non-null handle with BCRYPT_USE_SYSTEM_PREFERRED_RNG");
+    // Flags the host does not take are STATUS_INVALID_PARAMETER and write nothing, also for zero bytes and next to
+    // BCRYPT_USE_SYSTEM_PREFERRED_RNG; a bad handle is still reported first (measured on Windows 11). In both modes:
+    // the seeded stream and the SystemFunction036 fallback do not read the flags.
+    {
+        bool refused = true;
+        for (const ULONG flags : {0x4ul, 0x10ul, 0x80000000ul}) {
+            std::memset(buf, 0xA5, sizeof(buf));
+            const NTSTATUS st = gen_random(h, buf, sizeof(buf), flags);
+            bool untouched = true;
+            for (uint8_t b : buf) untouched = untouched && b == 0xA5;
+            if (st != kStatusInvalidParameter || !untouched) {
+                std::printf("  flags 0x%lx: status 0x%08lx%s\n", flags, static_cast<unsigned long>(st),
+                            untouched ? "" : ", buffer written");
+                refused = false;
+            }
+        }
+        check(refused, "BCryptGenRandom refuses unknown flags with STATUS_INVALID_PARAMETER and writes nothing");
+        check(gen_random(h, buf, 0, 0x4) == kStatusInvalidParameter, "an unknown flag is refused for zero bytes too");
+        check(gen_random(nullptr, buf, sizeof(buf), BCRYPT_USE_SYSTEM_PREFERRED_RNG | 0x4) == kStatusInvalidParameter,
+              "an unknown flag next to BCRYPT_USE_SYSTEM_PREFERRED_RNG is refused");
+        check(gen_random(nullptr, buf, sizeof(buf), 0x4) == kStatusInvalidHandle,
+              "a null handle with an unknown flag is still STATUS_INVALID_HANDLE, as on the host");
+        check(gen_random(h, buf, sizeof(buf), BCRYPT_RNG_USE_ENTROPY_IN_BUFFER) == kStatusSuccess,
+              "BCRYPT_RNG_USE_ENTROPY_IN_BUFFER is accepted, as on the host");
+    }
 
     std::memset(buf, 0, sizeof(buf));
     check(gen_random(h, buf, sizeof(buf), 0) == kStatusSuccess,
