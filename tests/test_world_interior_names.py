@@ -370,6 +370,28 @@ class CliTest(unittest.TestCase):
                 self.assertEqual(f.read(), data, p)
         self.assertFalse(os.path.exists(os.path.join(folder, "r.json")))
 
+    def test_out_inside_another_case_of_the_carve_folder_is_refused(self):
+        # normcase(realpath()) keeps the typed case on macOS, so CARVED/r.json used to be outside carved.
+        folder = os.path.join(self.tmp.name, "carved")
+        os.makedirs(folder)
+        probe = os.path.join(folder, "Probe.tmp")
+        with open(probe, "wb"):
+            pass
+        insensitive = os.path.exists(os.path.join(folder, "probe.tmp"))
+        os.remove(probe)
+        if not insensitive:
+            self.skipTest("volume keeps case")
+        out = os.path.join(self.tmp.name, "CARVED", "r.json")
+        err = io.StringIO()
+        sys.stderr, saved = err, sys.stderr
+        try:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(T.main([folder, "--names", self.names, "--out", out]), 2)
+        finally:
+            sys.stderr = saved
+        self.assertIn("would overwrite an input", err.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(folder, "r.json")))
+
     def fails_with_one_line(self, argv):
         """main(argv) returns 2 with exactly one stderr line, prints nothing and writes no report."""
         out = os.path.join(self.tmp.name, "fail", "r.json")

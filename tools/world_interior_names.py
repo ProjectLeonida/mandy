@@ -45,7 +45,7 @@ if _TOOLS_DIR not in sys.path:
 import world_archetypes as WA  # noqa: E402
 import world_index as WI  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
-from report_paths import same_report_path  # noqa: E402
+from report_paths import path_key, same_report_path  # noqa: E402
 from world_names import hash64, joaat  # noqa: E402
 
 J = WA.joaat_cs
@@ -363,11 +363,16 @@ def _inside(folder, path):
     """True when ``folder`` is a folder and ``path`` lies in it (a report there would be read as a carved file)."""
     if not os.path.isdir(folder):
         return False
-    root = os.path.normcase(os.path.realpath(folder))
+    # path_key folds case on a volume that ignores it. normcase(realpath()) keeps the typed case on macOS.
     try:
-        return os.path.commonpath([root, os.path.normcase(os.path.realpath(path))]) == root
-    except ValueError:  # different drives on Windows
+        root = path_key(folder)
+        target = path_key(path)
+    except OSError:
         return False
+    if target == root:
+        return True
+    prefix = root if root.endswith(os.sep) else root + os.sep
+    return target.startswith(prefix)
 
 
 def main(argv=None):
