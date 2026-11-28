@@ -215,7 +215,16 @@ impl Pool {
         state.coming += 1;
         state.workers += 1;
         drop(state);
-        std::thread::spawn(move || self.work());
+        if let Err(error) = std::thread::Builder::new().spawn(move || self.work()) {
+            // A worker that never came must not stay counted as coming, or no
+            // task queued later would start another. The tasks waiting now
+            // go to the next worker that finishes a task, or to the worker
+            // the next queued task tries to start.
+            let mut state = lock(&self.state);
+            state.coming -= 1;
+            state.workers -= 1;
+            tracing::warn!(%error, "task pool: a worker could not be started");
+        }
     }
 
     fn work(&'static self) {
