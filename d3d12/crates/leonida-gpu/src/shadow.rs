@@ -6328,8 +6328,10 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
 /// side, so its bytes are in the PC's memory once. That side was a buffer
 /// of the same size with the same bytes, which every refresh compared with
 /// the arena: 64 MiB more commit per arena, and with the structure builder
-/// (`LEONIDA_BVH_BUILDER=1`) up to 48 arenas. If the host does not open the
-/// memory, the copy is made as [`by_address`] makes it.
+/// (`LEONIDA_BVH_BUILDER=1`) up to 48 arenas. Its caller resends all of it
+/// once it keeps the copy, as a new copy's first refresh sends it. If the
+/// host does not open the memory, the copy is made as [`by_address`] makes
+/// it.
 pub(crate) fn by_address_opened(start: u64, len: u64) -> Option<Arc<Shadow>> {
     by_address_with(start, len, true)
 }
@@ -6393,12 +6395,6 @@ fn by_address_with(start: u64, len: u64, open: bool) -> Option<Arc<Shadow>> {
     let shadow = Arc::new(shadow);
     note_carded(&shadow);
     elide::made(&shadow);
-    if shadow.opened.is_some() {
-        // All of it goes up once, as a new copy's first refresh sends it.
-        // (Once it is noted: the queue of changed copies names it by its
-        // place.)
-        shadow.resend(0, len as usize);
-    }
     Some(shadow)
 }
 
@@ -6406,22 +6402,22 @@ fn by_address_with(start: u64, len: u64, open: bool) -> Option<Arc<Shadow>> {
 /// a buffer placed over it from its first byte, so that the buffer's offsets
 /// are the copy's (the card's side is filled from it at the same offsets).
 fn opened_side(host: &crate::host::Host, start: u64, len: u64) -> Option<crate::inplace::Placed> {
-    match crate::inplace::place_part(&host.device, start, len) {
-        Ok(placed) if placed.bias == 0 => Some(placed),
-        Ok(_) => None,
-        Err(e) => {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(
-                    start = format_args!("{start:#x}"),
-                    len,
-                    error = ?e,
-                    "memory by address not opened as its copy's CPU side: that side is a buffer of its own, as before"
-                );
-            });
-            None
-        }
-    }
+    let why = match crate::inplace::place_part(&host.device, start, len) {
+        Ok(placed) if placed.bias == 0 => return Some(placed),
+        // (Not for an arena: `upload::reserve` gives 64 KiB lines.)
+        Ok(placed) => format!("it begins {:#x} bytes after a 64 KiB line", placed.bias),
+        Err(e) => format!("{e:?}"),
+    };
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            start = format_args!("{start:#x}"),
+            len,
+            why = %why,
+            "memory by address not opened as its copy's CPU side: that side is a buffer of its own, as before"
+        );
+    });
+    None
 }
 
 /// Copies of title memory outside buffers, by (start, length).

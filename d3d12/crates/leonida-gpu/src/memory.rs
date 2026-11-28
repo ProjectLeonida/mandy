@@ -407,6 +407,11 @@ impl Memory {
         let Some(n) = crate::shadow::by_address_opened(at as u64, ARENA).and_then(|s| self.number(s)) else {
             return false;
         };
+        if self.copies[n].side_is_memory() {
+            // All of it goes up once, as a new copy's first refresh sends it.
+            // (Once it is numbered: a copy refused here is dropped.)
+            self.copies[n].resend(0, ARENA as usize);
+        }
         self.arenas.push((n, at));
         // The lowest first.
         self.free.extend((0..(ARENA / PAGE) as usize).rev().map(|i| (n, at + i * PAGE as usize)));
@@ -1359,7 +1364,9 @@ mod tests {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
         // SAFETY: our own process and a sized structure.
-        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+        let read = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+        // (Failed, every reading would be 0 and nothing measured.)
+        assert_ne!(read, 0, "the process's memory counters");
         c.PagefileUsage as u64
     }
 
@@ -1379,6 +1386,15 @@ mod tests {
     fn an_arena_is_in_the_pcs_memory_once() {
         let Some(host) = host() else { return };
         if !crate::shadow::cards() || !host.card_ready() {
+            return;
+        }
+        // A host that does not open memory as a heap of its own (no
+        // ID3D12Device13, or a driver that refuses) keeps the CPU's side a
+        // buffer of its own, as designed. (The block is never let go: the
+        // heap lets go of its pages a moment after its last reference.)
+        let block = crate::upload::reserve(1 << 16).expect("a block");
+        if let Err(e) = crate::inplace::place_part(&host.device, block as u64, 1 << 16) {
+            eprintln!("memory is not opened as a heap here ({e:?}): an arena's copy keeps a CPU side of its own");
             return;
         }
         let _turn = arenas_turn();
