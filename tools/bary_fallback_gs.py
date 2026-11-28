@@ -253,8 +253,18 @@ def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | N
                 r = subprocess.run(cmd, capture_output=True, text=True)
                 if r.returncode:
                     raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
-            os.replace(staged_asm, asm)
-            os.replace(staged_spv, spv)
+            os.chmod(staged_asm, published_mode(asm))
+            os.chmod(staged_spv, published_mode(spv))
+            try:
+                os.replace(staged_asm, asm)
+                os.replace(staged_spv, spv)
+            except BaseException:
+                for s in (staged_asm, staged_spv):
+                    try:
+                        os.chmod(s, 0o600)
+                    except OSError:
+                        pass
+                raise
         built.append(spv)
     return built
 
