@@ -117,6 +117,45 @@ class CensusTests(unittest.TestCase):
         self.assertIn("x87", md)
 
 
+def build_pe_insertq() -> bytes:
+    """build_pe() with fn1 replaced by F2 0F 78 (insertq) + ret.
+
+    SSE4a F2 0F 78 /r reads two imm8 bytes. A decoder that reads one stops in the
+    middle of the second immediate where fn1's ret begins, so the rest of the
+    function decodes as garbage and its ret is never seen.
+    """
+    buf = bytearray(build_pe())
+    at = TEXT_RAW + (0x1000 - TEXT_RVA)
+    buf[at:at + 7] = bytes.fromhex("f20f78c11010c3")
+    struct.pack_into("<I", buf, TEXT_RAW + (0x2004 - TEXT_RVA), 0x1007)  # fn1 end
+    return bytes(buf)
+
+
+class InsertqCensusTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.path = os.path.join(cls.tmp, "insertq.exe")
+        with open(cls.path, "wb") as f:
+            f.write(build_pe_insertq())
+        cls.r = rc.census(cls.path)
+
+    def test_insertq_fn1_decodes_to_end(self):
+        with open(self.path, "rb") as f:
+            img = pe_inspect.PeImage(f.read())
+        st = rc.census_function(img, 0x1000, 0x1007, IMAGE_BASE)
+        self.assertEqual(dict(st["mnem"]), {"sse": 1, "ret": 1})
+
+    def test_insertq_census_has_no_resync_garbage(self):
+        r = self.r
+        mnems = {k for k, _ in r["top_mnemonics"]}
+        self.assertIn("sse", mnems)
+        self.assertNotIn("adc", mnems)  # the second immediate byte, mis-decoded
+        self.assertEqual(r["decode_errors"], 0)
+        # fn1's ret is only counted when both immediate bytes are consumed
+        self.assertEqual(r["indirect_control_flow"].get("ret"), 4)
+
+
 class EdgeTests(unittest.TestCase):
     def test_non_x64_rejected(self):
         buf = bytearray(build_pe())
