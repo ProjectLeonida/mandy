@@ -338,17 +338,18 @@ int fill_copy_and_fallback() {
     std::vector<std::uint8_t> frame(kPage, 0x42);
     tracked_frame = frame.data();
 
-    // Fast path: 16 x 4 KiB L1-hot strip hooks_.copy calls, 0 per-piece calls.
+    // Fast path: 4 x 16 KiB L1-hot strip hooks_.copy calls, 0 per-piece calls.
+    EXPECT(kStrip == 16384 && TitleMirror::kStripPieces == 64 && kStripsPerPage == 4);
     mirror.map(kBase, frame.data(), nullptr, 1);
     EXPECT(strip_calls == kStripsPerPage && piece_calls == 0 && mirror.counters().upload_failures == 0);
     EXPECT(mirror.home_bytes(kBase)[0] == 0x42 && mirror.home_bytes(kBase)[kPage - 1] == 0x42);
 
-    // Dirty refill also uses 16 x 4 KiB strip hooks_.copy calls.
+    // Dirty refill also uses 4 x 16 KiB strip hooks_.copy calls.
     frame[1024] = 0x99;
     EXPECT(mirror.dirty(kBase) && mirror.upload() == 1);
     EXPECT(strip_calls == 2 * kStripsPerPage && piece_calls == 0 && mirror.home_bytes(kBase)[1024] == 0x99);
 
-    // Fallback path: strip 0 fails -> falls back to ONLY 16 per-piece copies in strip 0; unreadable piece 5 is zeroed.
+    // Fallback path: strip 0 fails -> falls back to ONLY 64 per-piece copies in strip 0; unreadable piece 5 is zeroed.
     fail_strip_offset = 0;
     fail_piece_offset = 5 * 256;
     frame[0] = 0x77;
@@ -359,7 +360,7 @@ int fill_copy_and_fallback() {
     EXPECT(mirror.home_bytes(kBase)[0] == 0x77);
     EXPECT(mirror.home_bytes(kBase)[5 * 256 + 10] == 0);
     EXPECT(mirror.home_bytes(kBase)[6 * 256 + 10] == 0xBB);
-    std::printf("fill_copy_and_fallback: 4 KiB L1-hot strips on fast path, per-strip 16-piece fallback on failure\n");
+    std::printf("fill_copy_and_fallback: 16 KiB L1-hot strips on fast path, per-strip 64-piece fallback on failure\n");
     return 0;
 }
 
@@ -1755,6 +1756,50 @@ int multi_chunk_direct_table_boundaries() {
     return 0;
 }
 
+int upload_breakdown_and_unit_sums_slab() {
+    Fixture f;
+    TitleMirror mirror(f.hooks());
+    EXPECT(mirror.cover(kBase, kBase + 8 * kPage));
+    const VkBuffer arena = fake<VkBuffer>(0xE5);
+    mirror.alias(kBase, kBase + 2 * kPage, arena, 0);
+
+    std::vector<std::uint8_t> f0(kPage, 0x11), f1(kPage, 0x22), f2(kPage, 0x33), f3(kPage, 0x44);
+    mirror.map(kBase + 0 * kPage, f0.data(), nullptr, 1);                             // aliased (filled immediately)
+    mirror.map(kBase + 2 * kPage, f1.data(), nullptr, 1, /*defer_fill=*/true);        // deferred whole fill
+    mirror.map(kBase + 3 * kPage, f2.data(), nullptr, 1, /*defer_fill=*/true);        // deferred whole fill
+    f0[63 * 256 + 5] = 0xA5;  // cross-strip boundary piece 63 (last piece of strip 0)
+    f0[64 * 256 + 5] = 0x77;  // first piece of strip 1
+    EXPECT(mirror.dirty(kBase + 0 * kPage));
+    EXPECT(mirror.upload() == 3);
+    EXPECT(mirror.last_whole_pages() == 2 && mirror.last_inc_pages() == 1 && mirror.last_aliased_pages() == 1);
+    EXPECT(mirror.copy_bytes(kBase)[63 * 256 + 5] == 0x5A && mirror.copy_bytes(kBase)[64 * 256 + 5] == 0x77);
+    EXPECT(mirror.flush(1));
+
+    // Empty upload resets breakdown counts to 0.
+    EXPECT(mirror.upload() == 0);
+    EXPECT(mirror.last_whole_pages() == 0 && mirror.last_inc_pages() == 0 && mirror.last_aliased_pages() == 0);
+
+    // Slot recycling over contiguous Unit::sums slab: unmap + retire frees slot, next map reuses it cleanly.
+    std::uint64_t h_old = 0;
+    EXPECT(mirror.range_sum(kBase + 2 * kPage, kPage, h_old));
+    mirror.map(kBase + 2 * kPage, nullptr, nullptr, 5);
+    EXPECT(mirror.flush(2));
+    mirror.retire(5);
+    EXPECT(mirror.counters().homes_freed == 1);
+    mirror.map(kBase + 2 * kPage, f3.data(), nullptr, 6);
+    EXPECT(mirror.flush(3));
+    std::uint64_t h_new = 0;
+    EXPECT(mirror.range_sum(kBase + 2 * kPage, kPage, h_new) && h_new != h_old);
+    EXPECT(!std::memcmp(mirror.home_bytes(kBase + 2 * kPage), f3.data(), kPage));
+    // Verify incremental diff on reused slot detects single-byte changes across all 4 x 16 KiB strips.
+    for (std::size_t s = 0; s < 4; ++s) f3[s * 16384 + 256] = std::uint8_t(0xC0 + s);
+    EXPECT(mirror.dirty(kBase + 2 * kPage) && mirror.upload() == 1);
+    EXPECT(mirror.last_upload_bytes() == 4 * 256);
+    EXPECT(!std::memcmp(mirror.home_bytes(kBase + 2 * kPage), f3.data(), kPage));
+    std::printf("upload_breakdown_and_unit_sums_slab: breakdown counts, 16 KiB strips, and Unit::sums slab reuse ok\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -1779,6 +1824,7 @@ int main() {
     if (deferred_map_fill_and_on_changed()) return 1;
     if (batched_filter_and_page_aware_write_back()) return 1;
     if (multi_chunk_direct_table_boundaries()) return 1;
+    if (upload_breakdown_and_unit_sums_slab()) return 1;
     std::printf("title_mirror_hooks_test: ok\n");
     return 0;
 }

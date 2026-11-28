@@ -181,6 +181,7 @@ public:
         ++frame_;
         const bool probe = frame_ % kProbe == 0;
         demoted_.clear();
+        to_disarm_.clear();
         for (std::size_t i = 0; i < hot_list_.size();) {
             const PageRef ref = hot_list_[i];
             Page& p = *ref.page;
@@ -196,7 +197,7 @@ public:
                 } else {
                     // Written during probe (fault handler may already have cleared p.armed): re-establish hot
                     // ownership in Guard unconditionally so CellGuard::hot stays synchronized.
-                    guard_.disarm(ref.addr);
+                    to_disarm_.push_back(ref.addr);
                     p.armed = false;
                 }
             } else if (probe && !p.probe) {
@@ -231,7 +232,7 @@ public:
                 add_hot(ref.addr, p);
                 erase_dirty(p);
                 // Re-establish hot ownership in Guard unconditionally (even if written() already cleared p.armed).
-                guard_.disarm(ref.addr);
+                to_disarm_.push_back(ref.addr);
                 p.armed = false;
                 p.history = std::uint16_t((p.history << 1) & kHistoryMask);
                 erase_history_at(i);
@@ -241,6 +242,7 @@ public:
                 else ++i;
             }
         }
+        if (!to_disarm_.empty()) disarm_pages(to_disarm_.data(), to_disarm_.size());
         for (const PageRef ref : demoted_) add_history(ref.addr, *ref.page);
         demoted_.clear();
     }
@@ -352,6 +354,16 @@ private:
         }
     }
 
+    void disarm_pages(const std::uintptr_t* pages, std::size_t count) {
+        if constexpr (requires(Guard& g, const std::uintptr_t* p, std::size_t n) {
+                          g.disarm_batch(p, n);
+                      }) {
+            guard_.disarm_batch(pages, count);
+        } else {
+            for (std::size_t i = 0; i < count; ++i) guard_.disarm(pages[i]);
+        }
+    }
+
     Guard& guard_;
     std::unordered_map<std::uintptr_t, Page> pages_;
     std::vector<PageRef> hot_list_;
@@ -361,6 +373,7 @@ private:
     std::vector<PageRef> to_arm_;
     std::vector<std::uintptr_t> to_arm_addrs_;
     std::vector<std::uint8_t> arm_results_;
+    std::vector<std::uintptr_t> to_disarm_;
     std::vector<PageRef> demoted_;
     std::uint64_t frame_ = 0;
     Stats stats_;

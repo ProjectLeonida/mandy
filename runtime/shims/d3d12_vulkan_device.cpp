@@ -5660,6 +5660,15 @@ struct DeviceState {
         std::uint64_t write_back_calls = 0, read_back_bytes = 0;
         double write_back_ms = 0, write_back_wait_ms = 0, write_back_max_ms = 0;
         double ms = 0;
+        // 7-part sub-split telemetry since the last 10 s log (ns / counts, under `mutex`).
+        std::uint64_t split_lock_ns = 0, split_feed_ns = 0, split_collect_ns = 0;
+        std::uint64_t split_arm_ns = 0, split_upload_ns = 0, split_filter_ns = 0, split_other_ns = 0;
+        std::uint64_t split_vp_calls = 0, split_vq_calls = 0;
+        std::uint64_t split_fast_tiles = 0, split_slow_tiles = 0, split_skip_tiles = 0;
+        std::uint64_t split_bridged_runs = 0, split_wc_tiles = 0;
+        std::uint64_t split_whole_pages = 0, split_inc_pages = 0, split_alias_pages = 0;
+        std::uint64_t retire_poll_skip = 0;
+        std::vector<std::uint64_t> resolve_watch;
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
         // The console heaps read in place (add_heap_in_place): their filter state is under this mutex too.
         std::vector<ConsoleHeap*> in_place;
@@ -5806,8 +5815,10 @@ struct DeviceState {
             if (result == VK_ERROR_DEVICE_LOST) context->mark_device_lost();
             return result == VK_SUCCESS;
         };
-        hooks.copy = [](std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
-            return copy_guarded_host(to, from, bytes, false);
+        hooks.copy = [this](std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
+            const bool streaming =
+                page_mirror.tracking && page_mirror.tracking->is_wc_page(reinterpret_cast<std::uintptr_t>(from));
+            return copy_guarded_host(to, from, bytes, streaming);
         };
         // The pages of a console heap read in place (add_heap_in_place): their home holds the filtered slots.
         hooks.filter = [this](std::uint64_t va, std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool fresh) {
@@ -5987,7 +5998,7 @@ struct DeviceState {
         }
         m.space_gen_atomic.store(g, std::memory_order_release);
     }
-    bool page_mirror_resolve_locked(std::uint64_t va, std::uint64_t bytes, bool make) {
+    bool page_mirror_resolve_locked(std::uint64_t va, std::uint64_t bytes, bool make, bool defer_fill = false) {
         auto& m = page_mirror;
         if (!bytes || va + bytes < va) return false;
         sync_mirror_space_locked();
@@ -5998,22 +6009,28 @@ struct DeviceState {
         auto it = m.plain.upper_bound(va);
         if (it != m.plain.begin() && std::prev(it)->second > va) --it;
         for (; it != m.plain.end() && it->first < end; ++it) {
-            const std::uint64_t from = std::max(it->first, va) & ~(kPage - 1);
-            const std::uint64_t to = (std::min(it->second, end) + kPage - 1) & ~(kPage - 1);
+            const std::uint64_t from = (std::max)(it->first, va) & ~(kPage - 1);
+            const std::uint64_t to = ((std::min)(it->second, end) + kPage - 1) & ~(kPage - 1);
             if (ensured_covers(from, to)) continue;
             if (!make) return false;
             if (to - from > kMirrorNameMax) {
                 ++m.resolve_refused;
                 return false;
             }
+            m.resolve_watch.clear();
             for (std::uint64_t page = from; page < to; page += kPage) {
-                if (m.mirror->mirrored(page)) continue;
-                auto* const frame = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(page));
-                note_readback_frame_invalidated_locked(frame);
-                m.tracking->watch(page);  // before the fill: a write after it is in the next collect
-                m.mirror->map(page, frame, nullptr);
-                m.identity.insert(page);
-                ++m.identity_mapped;
+                if (!m.mirror->mirrored(page)) m.resolve_watch.push_back(page);
+            }
+            if (!m.resolve_watch.empty()) {
+                // Watch before filling so any write after the fill is in the next collect.
+                m.tracking->watch_batch(m.resolve_watch.data(), m.resolve_watch.size());
+                for (const std::uint64_t page : m.resolve_watch) {
+                    auto* const frame = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(page));
+                    note_readback_frame_invalidated_locked(frame);
+                    m.mirror->map(page, frame, nullptr, leonida::TitleMirror::kUnstamped, defer_fill);
+                    m.identity.insert(page);
+                    ++m.identity_mapped;
+                }
             }
             ensure_run(from, to);
         }
@@ -6047,7 +6064,8 @@ struct DeviceState {
     bool page_mirror_chunk(std::uint64_t va, std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
         if (!page_mirror.mirror || !bytes) return false;
         std::lock_guard lock(page_mirror.mutex);
-        if (!page_mirror_resolve_locked(va, bytes, true) || !page_mirror.mirror->chunk_at(va, buffer, offset) ||
+        if (!page_mirror_resolve_locked(va, bytes, true, /*defer_fill=*/true) ||
+            !page_mirror.mirror->chunk_at(va, buffer, offset) ||
             bytes > leonida::TitleMirror::kChunk - offset)
             return false;
         ++page_mirror.buffers;
@@ -6711,8 +6729,8 @@ struct DeviceState {
             page_mirror.resolve_cache.ensured.clear();
             page_mirror.resolve_cache.space_generation = 0;
         }
-        page_mirror.tracking.reset();
         page_mirror.mirror.reset();
+        page_mirror.tracking.reset();
         destroy_readback_locked();
         for (VkBuffer chunk : page_mirror.chunks) context->vk.vkDestroyBuffer(info.device, chunk, nullptr);
         page_mirror.chunks.clear();
@@ -6749,8 +6767,10 @@ struct DeviceState {
                 return;
             }
         }
+        const std::int64_t t_start = leonida::submit_phases::now_ns();
         std::unique_lock lock(m.mutex, std::defer_lock);
         leonida::submit_phases::lock_timed(lock);
+        const std::int64_t t_lock = leonida::submit_phases::now_ns();
         m.refresh_in_flight.fetch_add(1, std::memory_order_seq_cst);
         struct RefreshGuard {
             std::atomic<std::uint32_t>& n;
@@ -6851,6 +6871,7 @@ struct DeviceState {
             std::unique_lock rc_lock(m.resolve_cache.mutex);
             m.resolve_cache.ensured = m.ensured;
         }
+        const std::int64_t t_feed = leonida::submit_phases::now_ns();
         m.tracking->collect(m.written);  // re-watched before the copies below
         const bool have_fed = !m.fed_now.empty();
         for (const std::uint64_t page : m.written)
@@ -6859,13 +6880,19 @@ struct DeviceState {
                 ++m.dirty;
             }
         m.arm_failures += m.tracking->take_refused();
+        const std::int64_t t_collect = leonida::submit_phases::now_ns();
         // The changes noted since (a buffer released, a texture come): the slots of heaps read in place they touch are
         // filtered again into their homes now, before the pages written since are.
         for (ConsoleHeap* heap : m.in_place) apply_in_place_changes(*heap);
         m.in_place_pending.store(false, std::memory_order_release);
+        const std::int64_t t_in_place = leonida::submit_phases::now_ns();
+        std::uint64_t filter_batch_ns = 0;
         const auto filter_batch = [&](leonida::TitleMirror::AliasedPageJob* jobs, std::size_t count,
                                       leonida::TitleMirror::WorkerPool* pool, std::uint8_t* ok_out) {
+            const std::int64_t fb0 = leonida::submit_phases::now_ns();
             filter_heap_pages_batch_locked(jobs, count, pool, ok_out);
+            const std::int64_t fb1 = leonida::submit_phases::now_ns();
+            if (fb1 > fb0) filter_batch_ns += std::uint64_t(fb1 - fb0);
         };
         if (m.readback_in_flight && !m.readback_slice_frames.empty()) {
             m.uploads += m.mirror->upload(
@@ -6876,9 +6903,52 @@ struct DeviceState {
         } else {
             m.uploads += m.mirror->upload([](std::uint8_t*, const std::array<std::uint64_t, 4>&) {}, filter_batch);
         }
+        const std::int64_t t_upload = leonida::submit_phases::now_ns();
         if (m.mirror->last_upload_bytes() != 0 || !m.fed_now.empty())
             leonida::submit_phases::note_change(leonida::submit_phases::change_pages);
-        if (m.mirror->has_retired_homes() && !m.readback_in_flight) m.mirror->retire(context->completed_retire_ticket());
+        if (m.mirror->has_retired_homes() && !m.readback_in_flight) {
+            std::uint64_t completed = context->cached_completed_retire_ticket();
+            if (m.mirror->has_retired_homes(completed)) {
+                m.mirror->retire(completed);
+                m.retire_poll_skip = 0;
+            } else if (++m.retire_poll_skip >= 16) {
+                completed = context->completed_retire_ticket();
+                m.mirror->retire(completed);
+                m.retire_poll_skip = 0;
+            }
+        }
+        const std::int64_t t_end = leonida::submit_phases::now_ns();
+        {
+            const auto arm_s = m.tracking->last_arm_stats();
+            const std::uint64_t lock_ns = std::uint64_t((std::max)(std::int64_t(0), t_lock - t_start));
+            const std::uint64_t feed_ns = std::uint64_t((std::max)(std::int64_t(0), t_feed - t_lock));
+            const std::uint64_t collect_total_ns = std::uint64_t((std::max)(std::int64_t(0), t_collect - t_feed));
+            const std::uint64_t arm_ns = (std::min)(arm_s.ns, collect_total_ns);
+            const std::uint64_t collect_ns = collect_total_ns - arm_ns;
+            const std::uint64_t in_place_ns = std::uint64_t((std::max)(std::int64_t(0), t_in_place - t_collect));
+            const std::uint64_t upload_total_ns = std::uint64_t((std::max)(std::int64_t(0), t_upload - t_in_place));
+            const std::uint64_t fb_clamped = (std::min)(filter_batch_ns, upload_total_ns);
+            const std::uint64_t filter_ns = in_place_ns + fb_clamped;
+            const std::uint64_t upload_ns = upload_total_ns - fb_clamped;
+            const std::uint64_t other_ns = std::uint64_t((std::max)(std::int64_t(0), t_end - t_upload));
+            m.split_lock_ns += lock_ns;
+            m.split_feed_ns += feed_ns;
+            m.split_collect_ns += collect_ns;
+            m.split_arm_ns += arm_ns;
+            m.split_upload_ns += upload_ns;
+            m.split_filter_ns += filter_ns;
+            m.split_other_ns += other_ns;
+            m.split_vp_calls += arm_s.vp_calls;
+            m.split_vq_calls += arm_s.vq_calls;
+            m.split_fast_tiles += arm_s.fast_tiles;
+            m.split_slow_tiles += arm_s.slow_tiles;
+            m.split_skip_tiles += arm_s.skip_tiles;
+            m.split_bridged_runs += arm_s.bridged_runs;
+            m.split_wc_tiles += arm_s.wc_tiles;
+            m.split_whole_pages += m.mirror->last_whole_pages();
+            m.split_inc_pages += m.mirror->last_inc_pages();
+            m.split_alias_pages += m.mirror->last_aliased_pages();
+        }
         ++m.refreshes;
         const auto now = std::chrono::steady_clock::now();
         m.ms += std::chrono::duration<double, std::milli>(now - start).count();
@@ -6934,6 +7004,37 @@ struct DeviceState {
                          m.write_back_calls ? m.write_back_ms / double(m.write_back_calls) : 0.0,
                          m.write_back_calls ? m.write_back_wait_ms / double(m.write_back_calls) : 0.0,
                          m.write_back_max_ms, double(m.read_back_bytes) / double(1 << 20));
+            const double denom = m.refreshes ? double(m.refreshes) : 1.0;
+            const double ns_to_ms = m.refreshes ? (1.0 / (1e6 * double(m.refreshes))) : 0.0;
+            const double split_total_ms =
+                double(m.split_lock_ns + m.split_feed_ns + m.split_collect_ns + m.split_arm_ns + m.split_upload_ns +
+                       m.split_filter_ns + m.split_other_ns) *
+                ns_to_ms;
+            std::fprintf(stderr,
+                         "[rt] d3d12: page mirror split (ms/refresh): total %.3f = lock %.3f + feed %.3f + collect "
+                         "%.3f + arm %.3f + upload %.3f + filter %.3f + other %.3f; arm: %.1f VP, %.1f VQ, %.1f fast/"
+                         "%.1f slow/%.1f skip, %.1f bridged, %.1f WC; upload: %.1f whole + %.1f inc (%.1f alias) "
+                         "pages\n",
+                         split_total_ms, double(m.split_lock_ns) * ns_to_ms, double(m.split_feed_ns) * ns_to_ms,
+                         double(m.split_collect_ns) * ns_to_ms, double(m.split_arm_ns) * ns_to_ms,
+                         double(m.split_upload_ns) * ns_to_ms, double(m.split_filter_ns) * ns_to_ms,
+                         double(m.split_other_ns) * ns_to_ms,
+                         m.refreshes ? double(m.split_vp_calls) / denom : 0.0,
+                         m.refreshes ? double(m.split_vq_calls) / denom : 0.0,
+                         m.refreshes ? double(m.split_fast_tiles) / denom : 0.0,
+                         m.refreshes ? double(m.split_slow_tiles) / denom : 0.0,
+                         m.refreshes ? double(m.split_skip_tiles) / denom : 0.0,
+                         m.refreshes ? double(m.split_bridged_runs) / denom : 0.0,
+                         m.refreshes ? double(m.split_wc_tiles) / denom : 0.0,
+                         m.refreshes ? double(m.split_whole_pages) / denom : 0.0,
+                         m.refreshes ? double(m.split_inc_pages) / denom : 0.0,
+                         m.refreshes ? double(m.split_alias_pages) / denom : 0.0);
+            m.split_lock_ns = m.split_feed_ns = m.split_collect_ns = 0;
+            m.split_arm_ns = m.split_upload_ns = m.split_filter_ns = m.split_other_ns = 0;
+            m.split_vp_calls = m.split_vq_calls = 0;
+            m.split_fast_tiles = m.split_slow_tiles = m.split_skip_tiles = 0;
+            m.split_bridged_runs = m.split_wc_tiles = 0;
+            m.split_whole_pages = m.split_inc_pages = m.split_alias_pages = 0;
             m.write_back_calls = m.read_back_bytes = 0;
             m.write_back_ms = m.write_back_wait_ms = m.write_back_max_ms = 0;
             m.uploaded_seen = c.uploaded_bytes;
@@ -19942,11 +20043,8 @@ public:
                     return;
                 }
                 coalescer->in_flight = true;
-                // Acquire current visibility epoch BEFORE scanning any CPU memory so this single pass covers
-                // every batch already enqueued (and every CPU fence already signaled) up through pass_seq.
-                pass_seq = (std::max)(req_seq, state_.context->current_visibility_seq());
                 leader_guard.c = coalescer.get();
-                leader_guard.pass_seq = pass_seq;
+                leader_guard.pass_seq = req_seq;
             }
             const std::int64_t t0 = phases::now_ns();
             std::int64_t t1 = t0, t2 = t0;
@@ -19957,6 +20055,12 @@ public:
                 // sums: copy retired GPU writes back to their physical frames.
                 state_.write_back_titles();
                 t1 = phases::now_ns();
+                if (use_coalesce) {
+                    // Acquire current visibility epoch AFTER write_back_titles() and immediately BEFORE scanning any
+                    // CPU memory so batches enqueued during write_back_titles() coalesce into this single pass.
+                    pass_seq = (std::max)(req_seq, state_.context->current_visibility_seq());
+                    leader_guard.pass_seq = pass_seq;
+                }
                 mirror_serial = leonida::geometry_writes::state().serial.load(std::memory_order_acquire);
                 state_.refresh_page_mirror();  // what this submission's title-written addresses read
                 t2 = phases::now_ns();
