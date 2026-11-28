@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -759,6 +760,31 @@ class ManifestOutGuardTest(unittest.TestCase):
 class ManifestBelowNormalTest(unittest.TestCase):
     def test_below_normal_callable(self):
         manifest.below_normal()
+
+
+class ManifestStageCleanupTest(unittest.TestCase):
+    def test_stage_cleanup_restores_write_mode_on_replace_failure(self):
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(path, mode, *args, **kwargs):
+            chmod_calls.append((str(path), mode))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = os.path.join(tmp, "pkg")
+            os.makedirs(pkg)
+            with open(os.path.join(pkg, "sample.dat"), "wb") as f:
+                f.write(b"data")
+            out = os.path.join(tmp, "manifest.json")
+
+            with patch("os.replace", side_effect=OSError("replace failed")), \
+                 patch("os.chmod", side_effect=track_chmod):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        manifest.create(pkg, out, jobs=1)
+
+        self.assertTrue(any(mode == 0o600 for _, mode in chmod_calls), chmod_calls)
 
 
 if __name__ == "__main__":
