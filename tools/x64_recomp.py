@@ -1915,7 +1915,8 @@ class FunctionTranslator:
         sf = 1 if sz == 8 else 0
         width = sz * 8
         if m in ("rcl", "rcr"):
-            raise UnhandledInsn(ins, m)
+            self._emit_rcl_rcr(ins)
+            return
         need = self.needed.get(ins.addr, set())
         flaggy = bool(need) or ins.addr in self.mat
         need_c = "C" in need or ins.addr in self.mat
@@ -2013,6 +2014,126 @@ class FunctionTranslator:
             a.lsr(T3, T0, width - 1, sf=0)
         a.and_i(T3, T3, 1, sf=0)
         self._set_cf(T3)
+
+    def _set_rc_of(self, m, res_reg, new_cf_reg, width):
+        """Set arm V (x86 OF) for count-1 rcl/rcr, keeping N/Z/C intact."""
+        a = self.asm
+        a.ubfx(T2, res_reg, width - 1, 1, sf=1)
+        if m == "rcl":
+            a.eor_r(T2, T2, new_cf_reg, sf=0)
+        else:
+            a.ubfx(T3, res_reg, width - 2, 1, sf=1)
+            a.eor_r(T2, T2, T3, sf=0)
+        a.mrs_nzcv(GTMP)
+        a.bfi(GTMP, T2, 28, 1)
+        a.msr_nzcv(GTMP)
+
+    def _emit_rcl_rcr(self, ins):
+        a = self.asm
+        m = ins.mnem
+        dst, cnt = ins.ops
+        sz = self._op_size(dst)
+        width = sz * 8
+        # Extract incoming x86 CF (0 or 1) into T3 without touching NZCV.
+        prod = self.arm_path.get(ins.addr)
+        if prod is not None and "C" in FLAG_WRITERS.get(prod.mnem, ""):
+            if prod.mnem in ("ucomiss", "ucomisd", "comiss", "comisd"):
+                x86c = "lt"
+            else:
+                x86c = "cc" if prod.mnem in SUB_KIND else "cs"
+            a.cset(T3, x86c, sf=0)
+        else:
+            a.ldur(T3, CTX_REG, CTX_EFLAGS, size=8)
+            a.and_i(T3, T3, EF_CF, sf=0)
+
+        if cnt[0] == "i":
+            raw = (cnt[1] & 0x3F) if width == 64 else (cnt[1] & 0x1F)
+            cval = raw % (width + 1)
+            if cval == 0:
+                return
+            self._load(ins, dst, T2)
+            if m == "rcl":
+                a.ubfx(4, T2, width - cval, 1, sf=1)       # x4 = new CF
+                if cval == width:
+                    a.movz(T0, 0, 0)
+                else:
+                    a.lsl(T0, T2, cval, sf=1)
+                if cval == 1:
+                    a.orr_r(T0, T0, T3, sf=1)
+                else:
+                    a.orr_r(T0, T0, T3, sf=1, shift=0, imm6=cval - 1)
+                    a.lsr(T1, T2, width + 1 - cval, sf=1)
+                    a.orr_r(T0, T0, T1, sf=1)
+            else:
+                a.ubfx(4, T2, cval - 1, 1, sf=1)           # x4 = new CF
+                a.lsr(T0, T2, cval, sf=1)
+                if width - cval == 0:
+                    a.orr_r(T0, T0, T3, sf=1)
+                else:
+                    a.orr_r(T0, T0, T3, sf=1, shift=0, imm6=width - cval)
+                if cval >= 2:
+                    a.lsl(T1, T2, width + 1 - cval, sf=1)
+                    a.orr_r(T0, T0, T1, sf=1)
+            if width == 8:
+                a.uxtb(T0, T0)
+            elif width == 16:
+                a.uxth(T0, T0)
+            elif width == 32:
+                a.mov(T0, T0, sf=0)
+            self._store(ins, dst, T0)
+            self._set_cf(4)
+            if cval == 1:
+                self._set_rc_of(m, T0, 4, width)
+            self._maybe_mkflags(ins)
+            return
+
+        # Variable count in CL: reduce modulo (width + 1) without touching NZCV so count==0 is a true no-op.
+        a.mov(T1, GMAP[1], sf=0)
+        a.and_i(T1, T1, 0x3F if width == 64 else 0x1F, sf=0)
+        if width < 32:
+            a.movz(T2, width + 1, 0, sf=0)
+            a.udiv(4, T1, T2, sf=0)
+            a.msub(T1, 4, T2, T1, sf=0)
+        skip = self._skip_lbl()
+        a.cbz(T1, skip, sf=0)
+        self._load(ins, dst, T2)
+        a.movz(GTMP, width, 0)
+        a.sub_r(GTMP, GTMP, T1)                            # GTMP = width - c (in 0..width-1)
+        if m == "rcl":
+            a.lsrv(4, T2, GTMP, sf=1)
+            a.and_i(4, 4, 1, sf=0)                         # x4 = new CF
+            a.lslv(T0, T2, T1, sf=1)
+            a.sub(ADDR_T, T1, 1)
+            a.lslv(ADDR_T, T3, ADDR_T, sf=1)
+            a.orr_r(T0, T0, ADDR_T, sf=1)
+            a.lsr(ADDR_T, T2, 1, sf=1)
+            a.lsrv(ADDR_T, ADDR_T, GTMP, sf=1)
+            a.orr_r(T0, T0, ADDR_T, sf=1)
+        else:
+            a.sub(4, T1, 1)
+            a.lsrv(4, T2, 4, sf=1)
+            a.and_i(4, 4, 1, sf=0)                         # x4 = new CF
+            a.lsrv(T0, T2, T1, sf=1)
+            a.lslv(ADDR_T, T3, GTMP, sf=1)
+            a.orr_r(T0, T0, ADDR_T, sf=1)
+            a.lsl(ADDR_T, T2, 1, sf=1)
+            a.lslv(ADDR_T, ADDR_T, GTMP, sf=1)
+            a.orr_r(T0, T0, ADDR_T, sf=1)
+        if width == 8:
+            a.uxtb(T0, T0)
+        elif width == 16:
+            a.uxth(T0, T0)
+        elif width == 32:
+            a.mov(T0, T0, sf=0)
+        self._store(ins, dst, T0)
+        self._set_cf(4)
+        a.sub(T1, T1, 1, sf=0)
+        skip_of = self._skip_lbl()
+        a.cbnz(T1, skip_of, sf=0)
+        self._set_rc_of(m, T0, 4, width)
+        a.label(skip_of)
+        self._maybe_mkflags(ins)
+        a.label(skip)
 
     def _emit_mul(self, ins):
         a = self.asm
