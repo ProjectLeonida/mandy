@@ -4894,6 +4894,18 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_xdxr_postbuild_readback COMMAND vk_xdxr_postbuild_readback_test)
     set_tests_properties(vk_xdxr_postbuild_readback PROPERTIES SKIP_RETURN_CODE 77)
 
+    # BAR-aware memory fallback for PresentComposer, OcclusionResolve, and KHR/XDXR staging,
+    # plus bounded caps and best-fit reuse on VulkanQueue's KHR stage and postbuild query pools.
+    add_executable(vk_memory_fallback_and_pools_test test/vk_memory_fallback_and_pools_test.cpp)
+    target_link_libraries(vk_memory_fallback_and_pools_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    if(WIN32)
+      target_compile_definitions(vk_memory_fallback_and_pools_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      if(MSVC)
+        target_compile_options(vk_memory_fallback_and_pools_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+      endif()
+    endif()
+    add_test(NAME vk_memory_fallback_and_pools COMMAND vk_memory_fallback_and_pools_test)
+
     # Title-placed buffer VAs (device slot 133) and the console VA shaders reach them by (src/title_va_alias.h).
     add_executable(title_va_alias_test test/title_va_alias_test.cpp)
     add_test(NAME title_va_alias COMMAND title_va_alias_test)

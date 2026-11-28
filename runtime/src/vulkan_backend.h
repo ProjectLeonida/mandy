@@ -24,6 +24,7 @@
 #include "vulkan_title_image_pool.h"
 #include "vulkan_indirect_dispatch_count.h"
 #include "vulkan_indirect_clamp.h"
+#include "vulkan_memory.h"
 #include "vulkan_scratch.h"
 #include "vulkan_replay.h"
 #include "queue_families.h"
@@ -172,6 +173,68 @@ struct VulkanDeviceFunctions {
     bool transform_feedback = false;
 };
 
+namespace detail {
+
+// Ordered candidate memory types for never-mapped device-only helpers (compose targets, occlusion scratch):
+// prefer non-BAR DEVICE_LOCAL memory when Resizable BAR is absent, then BAR DEVICE_LOCAL, then host fallback.
+// Skips heaps smaller than `size` (VUID-vkAllocateMemory-pAllocateInfo-01713) when heap metadata is present;
+// synthetic mocks that leave memoryHeapCount == 0 still fall back cleanly across matching memory types.
+inline std::vector<std::uint32_t> device_memory_order(const VkPhysicalDeviceMemoryProperties& memory,
+                                                      std::uint32_t type_bits, VkDeviceSize size) {
+    if (memory.memoryHeapCount > 0) {
+        auto order = memory_type_order(memory, type_bits, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, size);
+        if (!resizable_bar(memory)) {
+            std::stable_partition(order.begin(), order.end(), [&](std::uint32_t i) {
+                const VkMemoryType& t = memory.memoryTypes[i];
+                const bool device_local = (t.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+                const bool small_bar = (t.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 &&
+                                       t.heapIndex < memory.memoryHeapCount &&
+                                       memory.memoryHeaps[t.heapIndex].size <= kBarWindowBytes;
+                return device_local && !small_bar;
+            });
+        }
+        return order;
+    }
+    std::vector<std::uint32_t> order;
+    for (const VkMemoryPropertyFlags flags : {VkMemoryPropertyFlags{VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT},
+                                              VkMemoryPropertyFlags{0}}) {
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount && i < VK_MAX_MEMORY_TYPES; ++i) {
+            if (!(type_bits & (1u << i)) || (memory.memoryTypes[i].propertyFlags & flags) != flags) continue;
+            if (std::find(order.begin(), order.end(), i) == order.end()) order.push_back(i);
+        }
+    }
+    return order;
+}
+
+// Ordered candidate memory types for host-visible, host-coherent staging (TLAS/XDXR staging):
+// prefer DEVICE_LOCAL when Resizable BAR is present, and system RAM (!DEVICE_LOCAL) when it is not,
+// retrying all remaining compatible types on allocation failure.
+inline std::vector<std::uint32_t> host_stage_memory_order(const VkPhysicalDeviceMemoryProperties& memory,
+                                                          std::uint32_t type_bits, VkDeviceSize size) {
+    constexpr VkMemoryPropertyFlags host_flags =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (memory.memoryHeapCount > 0) {
+        const bool rebar = resizable_bar(memory);
+        auto order = memory_type_order(
+            memory, type_bits, host_flags,
+            rebar ? VkMemoryPropertyFlags{VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT} : VkMemoryPropertyFlags{0}, size);
+        if (!rebar) {
+            std::stable_partition(order.begin(), order.end(), [&](std::uint32_t i) {
+                return !(memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            });
+        }
+        return order;
+    }
+    std::vector<std::uint32_t> order;
+    for (std::uint32_t i = 0; i < memory.memoryTypeCount && i < VK_MAX_MEMORY_TYPES; ++i) {
+        if (!(type_bits & (1u << i)) || (memory.memoryTypes[i].propertyFlags & host_flags) != host_flags) continue;
+        order.push_back(i);
+    }
+    return order;
+}
+
+}  // namespace detail
+
 // Both kinds of compute resolve use the same storage buffer, descriptor set and pipeline layout.
 // The destination needs transfer usage only. Pipelines are created on first use.
 class OcclusionResolve {
@@ -207,22 +270,21 @@ public:
         if (vk_.vkCreateBuffer(device_, &buffer, nullptr, &scratch_) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vk_.vkGetBufferMemoryRequirements(device_, scratch_, &requirements);
-        auto type = memory.memoryTypeCount;
-        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
-            if (!(requirements.memoryTypeBits & (1u << i))) continue;
-            if (type == memory.memoryTypeCount) type = i;
-            if (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
-                type = i;
-                break;
-            }
-        }
-        if (type == memory.memoryTypeCount) return false;
+        const auto order = detail::device_memory_order(memory, requirements.memoryTypeBits, requirements.size);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
-        allocation.memoryTypeIndex = type;
-        if (vk_.vkAllocateMemory(device_, &allocation, nullptr, &memory_) != VK_SUCCESS ||
-            vk_.vkBindBufferMemory(device_, scratch_, memory_, 0) != VK_SUCCESS)
+        for (const std::uint32_t type : order) {
+            allocation.memoryTypeIndex = type;
+            if (vk_.vkAllocateMemory(device_, &allocation, nullptr, &memory_) == VK_SUCCESS) break;
+            memory_ = VK_NULL_HANDLE;
+        }
+        if (!memory_ || vk_.vkBindBufferMemory(device_, scratch_, memory_, 0) != VK_SUCCESS) {
+            if (memory_) {
+                vk_.vkFreeMemory(device_, memory_, nullptr);
+                memory_ = VK_NULL_HANDLE;
+            }
             return false;
+        }
 
         const VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                                                    VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -2940,6 +3002,9 @@ private:
     std::vector<KhrAsQueryPool> khr_as_query_pool_;
     std::vector<TitleVaAliases::Mapping> xdxr_ranges_;  // stage_xdxr_table's snapshot, kept for its capacity
 
+    static constexpr std::size_t kMaxPooledKhrStages = 8;
+    static constexpr std::size_t kMaxPooledKhrAsQueries = 8;
+
     void destroy_khr_stages(std::vector<KhrInstanceStage>& stages) {
         for (const auto& stage : stages) {
             if (stage.memory) context_.vk.vkFreeMemory(context_.device(), stage.memory, nullptr);
@@ -2949,8 +3014,31 @@ private:
     }
 
     // A stage returns to the pool only after its submission has completed, so rewriting it cannot race the GPU.
+    // Keep at most kMaxPooledKhrStages largest stages so steadily growing TLAS/XDXR tables do not accumulate
+    // obsolete VkDeviceMemory allocations forever.
     void recycle_khr_stages(std::vector<KhrInstanceStage>& stages) {
-        for (auto& stage : stages) khr_stage_pool_.push_back(std::move(stage));
+        for (auto& stage : stages) {
+            if (khr_stage_pool_.size() < kMaxPooledKhrStages) {
+                khr_stage_pool_.push_back(std::move(stage));
+                continue;
+            }
+            auto smallest = khr_stage_pool_.end();
+            for (auto it = khr_stage_pool_.begin(); it != khr_stage_pool_.end(); ++it) {
+                if (it->usage != stage.usage) continue;
+                if (smallest == khr_stage_pool_.end() || it->size < smallest->size) smallest = it;
+            }
+            if (smallest == khr_stage_pool_.end()) {
+                smallest = std::min_element(
+                    khr_stage_pool_.begin(), khr_stage_pool_.end(),
+                    [](const KhrInstanceStage& a, const KhrInstanceStage& b) { return a.size < b.size; });
+            }
+            if (smallest != khr_stage_pool_.end() && stage.size > smallest->size) {
+                destroy_stage(*smallest);
+                *smallest = std::move(stage);
+            } else {
+                destroy_stage(stage);
+            }
+        }
         stages.clear();
     }
 
@@ -2966,9 +3054,42 @@ private:
     void recycle_khr_as_queries(std::vector<KhrAsQueryPool>& pools) {
         for (auto& entry : pools) {
             entry.used = 0;
-            khr_as_query_pool_.push_back(entry);
+            if (khr_as_query_pool_.size() < kMaxPooledKhrAsQueries) {
+                khr_as_query_pool_.push_back(entry);
+                continue;
+            }
+            auto smallest = std::min_element(
+                khr_as_query_pool_.begin(), khr_as_query_pool_.end(),
+                [](const KhrAsQueryPool& a, const KhrAsQueryPool& b) { return a.capacity < b.capacity; });
+            if (smallest != khr_as_query_pool_.end() && entry.capacity > smallest->capacity) {
+                if (context_.vk.vkDestroyQueryPool && smallest->pool)
+                    context_.vk.vkDestroyQueryPool(context_.device(), smallest->pool, nullptr);
+                *smallest = entry;
+            } else if (context_.vk.vkDestroyQueryPool && entry.pool) {
+                context_.vk.vkDestroyQueryPool(context_.device(), entry.pool, nullptr);
+            }
         }
         pools.clear();
+    }
+
+    // Reclaims completed slots' KHR stages and postbuild query pools before prepare() allocates fresh ones,
+    // so steady frame-to-frame TLAS/XDXR/postbuild traffic reuses finished allocations instead of doubling them.
+    void recycle_completed_khr_pools() {
+        bool has_pending = false;
+        for (const auto& slot : buffers_) {
+            if (!slot.khr_instances.empty() || !slot.khr_as_queries.empty()) {
+                has_pending = true;
+                break;
+            }
+        }
+        if (!has_pending) return;
+        const auto done = completed();
+        if (context_.is_device_lost()) return;
+        for (auto& slot : buffers_) {
+            if (slot.ticket > done) continue;
+            recycle_khr_stages(slot.khr_instances);
+            recycle_khr_as_queries(slot.khr_as_queries);
+        }
     }
 
     bool allocate_khr_as_queries(std::uint32_t count, std::vector<KhrAsQueryPool>& active, VkQueryPool& out_pool,
@@ -2983,16 +3104,20 @@ private:
                 return true;
             }
         }
+        recycle_completed_khr_pools();
+        auto best = khr_as_query_pool_.end();
         for (auto it = khr_as_query_pool_.begin(); it != khr_as_query_pool_.end(); ++it) {
-            if (it->capacity >= count) {
-                KhrAsQueryPool entry = *it;
-                khr_as_query_pool_.erase(it);
-                entry.used = count;
-                active.push_back(entry);
-                out_pool = entry.pool;
-                out_first = 0;
-                return true;
-            }
+            if (it->capacity >= count && (best == khr_as_query_pool_.end() || it->capacity < best->capacity))
+                best = it;
+        }
+        if (best != khr_as_query_pool_.end()) {
+            KhrAsQueryPool entry = *best;
+            khr_as_query_pool_.erase(best);
+            entry.used = count;
+            active.push_back(entry);
+            out_pool = entry.pool;
+            out_first = 0;
+            return true;
         }
         const std::uint32_t capacity = std::max<std::uint32_t>(count, 16u);
         VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -3013,21 +3138,27 @@ private:
         stage = {};
     }
 
-    // A host-visible, device-addressable stage of at least `bytes`: a completed one of the same usage from the pool
-    // when one is large enough (a per-frame TLAS rebuild then reuses the same buffer and memory instead of making a
-    // new vkAllocateMemory call every frame), a new one otherwise. False, with `stage` empty, when none can be made.
+    // A host-visible, device-addressable stage of at least `bytes`: the smallest fitting completed one of the same
+    // usage from the pool when one is large enough (a per-frame TLAS rebuild then reuses the same buffer and memory
+    // instead of making a new vkAllocateMemory call every frame), a new one otherwise. False, with `stage` empty,
+    // when none can be made.
     bool acquire_stage(std::uint64_t bytes, VkBufferUsageFlags usage, KhrInstanceStage& stage) {
         const auto& funcs = context_.vk;
         stage = {};
         if (!funcs.vkCreateBuffer || !funcs.vkDestroyBuffer || !funcs.vkGetBufferMemoryRequirements ||
             !funcs.vkAllocateMemory || !funcs.vkFreeMemory || !funcs.vkBindBufferMemory || !bytes)
             return false;
+        recycle_completed_khr_pools();
+        auto best = khr_stage_pool_.end();
         for (auto it = khr_stage_pool_.begin(); it != khr_stage_pool_.end(); ++it) {
-            if (it->size >= bytes && it->usage == usage) {
-                stage = std::move(*it);
-                khr_stage_pool_.erase(it);
-                return true;
-            }
+            if (it->size >= bytes && it->usage == usage &&
+                (best == khr_stage_pool_.end() || it->size < best->size))
+                best = it;
+        }
+        if (best != khr_stage_pool_.end()) {
+            stage = std::move(*best);
+            khr_stage_pool_.erase(best);
+            return true;
         }
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = bytes;
@@ -3038,24 +3169,18 @@ private:
         }
         VkMemoryRequirements requirements{};
         funcs.vkGetBufferMemoryRequirements(context_.device(), stage.buffer, &requirements);
-        const auto& memory = context_.occlusion_resolve_memory_;
-        constexpr VkMemoryPropertyFlags host_flags =
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        std::uint32_t type = memory.memoryTypeCount;
-        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
-            if (!(requirements.memoryTypeBits & (1u << i))) continue;
-            if ((memory.memoryTypes[i].propertyFlags & host_flags) == host_flags) {
-                type = i;
-                break;
-            }
-        }
+        const auto order = detail::host_stage_memory_order(
+            context_.occlusion_resolve_memory_, requirements.memoryTypeBits, requirements.size);
         VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
         flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
         allocation.allocationSize = requirements.size;
-        allocation.memoryTypeIndex = type;
-        if (type == memory.memoryTypeCount ||
-            funcs.vkAllocateMemory(context_.device(), &allocation, nullptr, &stage.memory) != VK_SUCCESS ||
+        for (const std::uint32_t type : order) {
+            allocation.memoryTypeIndex = type;
+            if (funcs.vkAllocateMemory(context_.device(), &allocation, nullptr, &stage.memory) == VK_SUCCESS) break;
+            stage.memory = VK_NULL_HANDLE;
+        }
+        if (!stage.memory ||
             funcs.vkBindBufferMemory(context_.device(), stage.buffer, stage.memory, 0) != VK_SUCCESS) {
             destroy_stage(stage);
             return false;
