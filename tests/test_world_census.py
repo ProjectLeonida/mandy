@@ -1037,6 +1037,28 @@ class CensusSourceTest(unittest.TestCase):
         self.assertTrue(rebuilt["census_exact"])
         self.assertEqual(new_rows, rows)
 
+    def test_staged_json_restores_write_mode_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "out.json")
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write("{}")
+            os.chmod(dest, 0o444)
+
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def track_chmod(p, mode, **kwargs):
+                chmod_calls.append((p, mode))
+                return real_chmod(p, mode, **kwargs)
+
+            with mock.patch.object(WC.os, "chmod", side_effect=track_chmod):
+                try:
+                    with WC._staged_json(dest, {"test": 1}) as staged:
+                        raise RuntimeError("simulated write failure")
+                except RuntimeError:
+                    pass
+            self.assertTrue(any(mode == 0o600 for p, mode in chmod_calls))
+
 
 def setUpModule():
     # The tools' main() prints its summary JSON; keep it out of the test log (tests that check it redirect again).
