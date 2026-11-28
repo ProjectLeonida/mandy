@@ -22,6 +22,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode
 from mc_command import install_hint, mc_command, not_found  # noqa: E402
 from report_paths import path_key, same_report_path  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
@@ -340,9 +341,15 @@ def one(path, out, mcpu, backend="llvm-mc"):
             listing.write(asm)
             if err.strip():
                 listing.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
-        os.replace(listing.name, output_path(path, out))
+        out_file = output_path(path, out)
+        os.chmod(listing.name, published_mode(out_file))
+        os.replace(listing.name, out_file)
     finally:
         if os.path.exists(listing.name):
+            try:
+                os.chmod(listing.name, 0o600)
+            except OSError:
+                pass
             os.unlink(listing.name)
     return "clean" if bad == 0 else "invalid words"
 

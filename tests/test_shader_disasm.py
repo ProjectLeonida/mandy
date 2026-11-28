@@ -502,6 +502,28 @@ class DisasmOutputCollisionTest(unittest.TestCase):
         self.assert_unchanged(inp, data)
         self.assertTrue(os.path.isfile(os.path.join(self.dir, "foo.s")))
 
+    def test_stage_cleanup_restores_write_mode_on_replace_failure(self):
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import shader_disasm
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(path, mode, *args, **kwargs):
+            chmod_calls.append((str(path), mode))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        inp = os.path.join(self.src, "sample.fssm")
+        self.write(inp)
+        out_dir = os.path.join(self.dir, "out_test")
+        os.makedirs(out_dir, exist_ok=True)
+
+        with mock.patch("os.replace", side_effect=OSError("replace failed")), \
+             mock.patch("os.chmod", side_effect=track_chmod):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                shader_disasm.one(inp, out_dir, "gfx1013", backend="python")
+
+        self.assertTrue(any(mode == 0o600 for _, mode in chmod_calls), chmod_calls)
+
 
 class DisasmAutoBackendTest(unittest.TestCase):
     @staticmethod
