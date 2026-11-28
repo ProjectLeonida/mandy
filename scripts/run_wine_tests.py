@@ -229,14 +229,17 @@ def properties(test: dict) -> dict:
     return {p["name"]: p["value"] for p in test.get("properties", [])}
 
 
-def fixture_dependencies(tests: list[dict]) -> dict[int, tuple[int, ...]]:
-    """Find the listed setup tests that must finish before each fixture consumer."""
+def fixture_dependencies(tests: list[dict]) -> tuple[dict[int, tuple[int, ...]], dict[int, tuple[int, ...]]]:
+    """Return setup-success dependencies and teardown ordering dependencies."""
     metadata = [properties(test) for test in tests]
     setups: dict[str, list[int]] = {}
+    consumers: dict[str, list[int]] = {}
     for index, props in enumerate(metadata):
         for fixture in props.get("FIXTURES_SETUP", []):
             setups.setdefault(fixture, []).append(index)
-    return {
+        for fixture in props.get("FIXTURES_REQUIRED", []):
+            consumers.setdefault(fixture, []).append(index)
+    required_setups = {
         index: tuple(dict.fromkeys(
             setup
             for fixture in props.get("FIXTURES_REQUIRED", [])
@@ -245,6 +248,18 @@ def fixture_dependencies(tests: list[dict]) -> dict[int, tuple[int, ...]]:
         ))
         for index, props in enumerate(metadata)
     }
+    # A cleanup waits for setup and consumers to finish, including failed
+    # or skipped tests. It must not inherit their setup-success gates.
+    cleanup_order = {
+        index: tuple(dict.fromkeys(
+            other
+            for fixture in props.get("FIXTURES_CLEANUP", [])
+            for other in (*setups.get(fixture, ()), *consumers.get(fixture, ()))
+            if other != index
+        ))
+        for index, props in enumerate(metadata)
+    }
+    return required_setups, cleanup_order
 
 
 def truthy(value) -> bool:
@@ -529,12 +544,13 @@ def main() -> int:
         return 2
     names = [test.get("name", "?") for test in tests]
     indices = {name: index for index, name in enumerate(names)}
-    setups = fixture_dependencies(tests)
+    setups, cleanup_order = fixture_dependencies(tests)
     sorter = TopologicalSorter(setups)
     before = {index: set(setups[index]) for index in range(len(tests))}
     for index, test in enumerate(tests):
         # DEPENDS controls order. Only failed fixture setups block a consumer.
         depends = [indices[name] for name in properties(test).get("DEPENDS", []) if name in indices]
+        depends.extend(cleanup_order[index])
         sorter.add(index, *depends)
         before[index].update(depends)
     try:
