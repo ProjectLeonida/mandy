@@ -1721,6 +1721,9 @@ int main(int argc, char** argv) {
                              SDL_HINT_JOYSTICK_GAMEINPUT, SDL_HINT_XINPUT_ENABLED, SDL_HINT_JOYSTICK_DIRECTINPUT})
         SDL_SetHintWithPriority(hint, "0", SDL_HINT_OVERRIDE);
     set_env("LEONIDA_GAMEINPUT_THREAD", "0");
+    // A real controller that the system reports a few seconds into the run (Wine does, after a fresh prefix start)
+    // would restart SDL's gamepad subsystem under the virtual pads.
+    set_env("LEONIDA_GAMEINPUT_HOTPLUG", "0");
     set_env("LEONIDA_KEYBOARD_PAD", nullptr);
     set_env("LEONIDA_INPUT_SCRIPT", nullptr);
     set_env("LEONIDA_DS_TRIGGERS", nullptr);

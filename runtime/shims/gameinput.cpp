@@ -1848,7 +1848,7 @@ struct KeyboardPadBackend {
     }
     static void attached() {
         std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter A, Backspace B, X X, Y Y, "
-                             "Q/E shoulders, Esc Menu, Tab View, WASD left stick, mouse right stick, right/left "
+                             "Q/E shoulders, Esc Menu, Tab View, WASD left stick, mouse or IJKL right stick, right/left "
                              "button LT/RT)\n");
         start_raw_mouse();
     }
@@ -1902,6 +1902,14 @@ void update_keyboard_pad() {
         g_keyboard.right_y = step(g_keyboard.right_y, moved ? delta(y, g_keyboard.cursor_y) : 0);
         if (have) g_keyboard.cursor_x = x, g_keyboard.cursor_y = y;
         g_keyboard.have_cursor = have;
+        // IJKL push the right stick to its edge, over the mouse, for screens that ask for a right-stick flick (the
+        // retail title's Legal Notices page scrolls on right stick down) and for runs without a mouse.
+        const int rx = key_down('L') - key_down('J'), ry = key_down('K') - key_down('I');
+        if (rx || ry) {
+            const int r = rx && ry ? kStickDiagonal : kStickFull;
+            g_keyboard.right_x = rx * r;
+            g_keyboard.right_y = ry * r;
+        }
     } else {
         g_keyboard.right_x = g_keyboard.right_y = 0;
         g_keyboard.have_cursor = false;
@@ -2040,10 +2048,103 @@ bool init_sdl() {
     return true;
 }
 
+// Hotplug under Wine. SDL's Windows backends rescan for pads only when Windows reports a device change: the XInput
+// and DirectInput drivers through CM_Register_Notification, HIDAPI through WM_DEVICECHANGE. Wine delivers neither for a
+// pad plugged in after start (measured: a pad connected during a run never appeared, while one unplugged did go, as a
+// failed read). So the poll thread watches what SDL cannot: the XInput slots in use and the HID joysticks and gamepads
+// in the raw-input device list, which Wine refreshes itself every couple of seconds. When either changes, SDL's gamepad
+// subsystem is restarted, the one public way to make every backend scan again; open pads are closed first and come
+// back as reconnections, so this happens only when the hardware changed. LEONIDA_GAMEINPUT_HOTPLUG=0 turns it off.
+using XInputGetCapabilitiesFn = DWORD(WINAPI*)(DWORD, DWORD, void*);
+
+std::vector<uint64_t> controller_signature() {
+    static XInputGetCapabilitiesFn xinput_caps = [] {
+        for (const wchar_t* dll : {L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"})
+            if (HMODULE m = LoadLibraryW(dll))
+                if (auto f = reinterpret_cast<XInputGetCapabilitiesFn>(GetProcAddress(m, "XInputGetCapabilities")))
+                    return f;
+        return XInputGetCapabilitiesFn{};
+    }();
+    std::vector<uint64_t> sig;
+    if (xinput_caps) {
+        uint64_t slots = 0;
+        alignas(8) unsigned char caps[64];  // XINPUT_CAPABILITIES is 20 bytes
+        for (DWORD i = 0; i < 4; ++i)
+            if (xinput_caps(i, 0, caps) == ERROR_SUCCESS) slots |= uint64_t{1} << i;
+        sig.push_back(slots);
+    }
+    UINT count = 0;
+    if (GetRawInputDeviceList(nullptr, &count, sizeof(RAWINPUTDEVICELIST)) == 0 && count) {
+        std::vector<RAWINPUTDEVICELIST> list(count);
+        const UINT got = GetRawInputDeviceList(list.data(), &count, sizeof(RAWINPUTDEVICELIST));
+        for (UINT i = 0; i < got && got != static_cast<UINT>(-1); ++i) {
+            if (list[i].dwType != RIM_TYPEHID) continue;
+            RID_DEVICE_INFO info{};
+            info.cbSize = sizeof(info);
+            UINT size = sizeof(info);
+            if (GetRawInputDeviceInfoW(list[i].hDevice, RIDI_DEVICEINFO, &info, &size) == static_cast<UINT>(-1)) continue;
+            const USHORT page = info.hid.usUsagePage, usage = info.hid.usUsage;
+            if (page == 0x01 && (usage == 0x04 || usage == 0x05 || usage == 0x08))
+                sig.push_back(reinterpret_cast<uint64_t>(list[i].hDevice));
+        }
+    }
+    std::sort(sig.begin() + (sig.empty() ? 0 : 1), sig.end());
+    return sig;
+}
+
+void restart_sdl_gamepads() {
+    State& s = g();
+    const uint64_t now = now_us();
+    std::vector<Device*> connected;
+    {
+        std::lock_guard lock(s.mu);
+        connected = s.connected;
+    }
+    for (Device* d : connected) close_pad(d, now);
+    // The keyboard pad is a virtual joystick of the subsystem that goes: off now, and the next poll attaches it again.
+    KeyboardPadBackend backend;
+    g_keyboard.update(false, backend);
+    g_keyboard.right_x = g_keyboard.right_y = 0;
+    g_keyboard.have_cursor = false;
+    SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+    if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+        std::fprintf(stderr, "[rt] gameinput: SDL gamepad restart failed: %s; no controllers\n", SDL_GetError());
+        s.sdl_ready = false;
+        s.sdl_failed = true;
+        return;
+    }
+    SDL_SetGamepadEventsEnabled(false);
+}
+
+void watch_hotplug() {
+    static const bool on = [] {
+        char v[4] = {};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_GAMEINPUT_HOTPLUG", v, sizeof v);
+        return !(n == 1 && v[0] == '0');
+    }();
+    static uint64_t next_us = 0;
+    static std::vector<uint64_t> last;
+    static bool have_last = false;
+    if (!on) return;
+    const uint64_t now = now_us();
+    if (now < next_us) return;
+    next_us = now + 1'000'000;
+    std::vector<uint64_t> sig = controller_signature();
+    if (have_last && sig != last) {
+        std::fprintf(stderr, "[rt] gameinput: controllers changed (%zu -> %zu devices); rescanning\n",
+                     last.size(), sig.size());
+        restart_sdl_gamepads();
+    }
+    last = std::move(sig);
+    have_last = true;
+}
+
 void poll_once() {
     State& s = g();
     std::lock_guard pl(s.poll_mu);
     if (!init_sdl()) return;
+    watch_hotplug();
+    if (!s.sdl_ready) return;
     apply_prompt_config();
     update_keyboard_pad();
     SDL_UpdateGamepads();
