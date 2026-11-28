@@ -4394,6 +4394,9 @@ int compare_invalid_arguments(ID3D12Device* ours) {
 int compare_heap_neighbours(ID3D12Device* ours) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
+    // A GTX 1050 (driver 582.28, Windows 11 24H2) answers E_INVALIDARG for every CreateHeap, the canonical
+    // 64 KiB neighbour included, so there is nothing to compare the valid neighbours against.
+    if (FAILED(heap_create(host.p, heap_desc_of(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)))) return -1;
     struct Case {
         const char* name;
         InvalidCase call;
@@ -4509,6 +4512,9 @@ int compare_heap_descs(ID3D12Device* ours) {
 int compare_placed_reserved(ID3D12Device* ours) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
+    // A host that cannot CreateHeap at all (a GTX 1050's runtime answers E_INVALIDARG for every heap) turns
+    // every placed case into E_UNEXPECTED; there is nothing to compare (compare_heap_neighbours does the same).
+    if (FAILED(heap_create(host.p, heap_desc_of(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)))) return -1;
     struct Case {
         const char* name;
         InvalidCase call;
