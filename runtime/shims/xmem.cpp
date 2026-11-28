@@ -1294,30 +1294,6 @@ bool map_view(uintptr_t address, const View& view, uint64_t* done = nullptr) {
             return false;
         }
         leonida::title_memory_map::changed(target, size);
-        extern bool sections_committed();
-        if (sections_committed() && !view.zero) {
-            const DWORD guarded = leonida::geometry_writes::read_only(view.protect);
-            if (!(view.protect & PAGE_GUARD) && (guarded || (view.protect & 255u) == PAGE_NOACCESS)) {
-                auto& s = leonida::geometry_writes::state();
-                if (s.count.load(std::memory_order_acquire)) {
-                    const std::uintptr_t seed_lo = base;
-                    const std::uintptr_t seed_hi = base + static_cast<std::uintptr_t>(size);
-                    if (seed_lo < s.watched_hi.load(std::memory_order_acquire) &&
-                        seed_hi > s.watched_lo.load(std::memory_order_acquire)) {
-                        const std::uint64_t seed_gen = leonida::title_memory_map::generation();
-                        std::lock_guard lock(s.mutex);
-                        for (auto it = s.cells.lower_bound(seed_lo); it != s.cells.end() && it->first < seed_hi; ++it) {
-                            auto& c = it->second;
-                            c.known_state = MEM_COMMIT;
-                            c.known_protect = guarded ? view.protect : PAGE_NOACCESS;
-                            c.known_guarded = guarded;
-                            c.known_mapping = c.mapping.load(std::memory_order_acquire);
-                            c.known_map_gen = seed_gen;
-                        }
-                    }
-                }
-            }
-        }
         View part = view;
         part.count = count;
         part.offset = offset;

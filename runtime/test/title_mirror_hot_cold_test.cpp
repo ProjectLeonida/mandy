@@ -272,27 +272,45 @@ int main() {
             other.release(base);
         }
 
-        // 2. MEM_RESERVE and PAGE_READONLY VQ region caching (explicit cached_state).
+        // 2. MEM_RESERVE and PAGE_NOACCESS VQ region caching (explicit cached_state), while PAGE_READONLY is NEVER
+        //    cached across sub-runs in the intra-lock VQ cache (ShadowPages::reopen() bypasses map_gen).
         {
             auto* reserved = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 4 * kPage, MEM_RESERVE, PAGE_NOACCESS));
+            auto* noacc_mem = static_cast<std::uint8_t*>(
+                VirtualAlloc(nullptr, 4 * kPage, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS));
             auto* ro_mem = static_cast<std::uint8_t*>(
                 VirtualAlloc(nullptr, 4 * kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY));
-            EXPECT(reserved && ro_mem);
-            if (reserved && ro_mem) {
+            EXPECT(reserved && noacc_mem && ro_mem);
+            if (reserved && noacc_mem && ro_mem) {
                 const auto res_base = reinterpret_cast<std::uintptr_t>(reserved);
+                const auto noacc_base = reinterpret_cast<std::uintptr_t>(noacc_mem);
                 const auto ro_base = reinterpret_cast<std::uintptr_t>(ro_mem);
-                leonida::HotColdTracking tracking;
-                std::vector<std::uint64_t> mix = {res_base, res_base + 2 * kPage, res_base + 3 * kPage,
-                                                  ro_base,  ro_base + 2 * kPage,  ro_base + 3 * kPage};
-                tracking.watch_batch(mix.data(), mix.size());
-                tracking.collect(out);
-                const auto arm_s = tracking.last_arm_stats();
-                EXPECT(arm_s.vp_calls == 0);
-                EXPECT(arm_s.vq_calls <= 2);  // cached across non-contiguous sub-runs in each region!
-                EXPECT(tracking.take_refused() == 0);
-                tracking.unwatch_batch(mix.data(), mix.size());
+                {
+                    leonida::HotColdTracking tracking;
+                    std::vector<std::uint64_t> mix = {res_base,   res_base + 2 * kPage,   res_base + 3 * kPage,
+                                                      noacc_base, noacc_base + 2 * kPage, noacc_base + 3 * kPage};
+                    tracking.watch_batch(mix.data(), mix.size());
+                    tracking.collect(out);
+                    const auto arm_s = tracking.last_arm_stats();
+                    EXPECT(arm_s.vp_calls == 0);
+                    EXPECT(arm_s.vq_calls <= 2);  // cached across non-contiguous sub-runs in each region!
+                    EXPECT(tracking.take_refused() == 0);
+                    tracking.unwatch_batch(mix.data(), mix.size());
+                }
+                {
+                    leonida::HotColdTracking tracking;
+                    std::vector<std::uint64_t> ro_mix = {ro_base, ro_base + 2 * kPage, ro_base + 3 * kPage};
+                    tracking.watch_batch(ro_mix.data(), ro_mix.size());
+                    tracking.collect(out);
+                    const auto arm_s = tracking.last_arm_stats();
+                    EXPECT(arm_s.vp_calls == 0);
+                    EXPECT(arm_s.vq_calls == 2);  // PAGE_READONLY NOT cached across sub-runs!
+                    EXPECT(tracking.take_refused() == 0);
+                    tracking.unwatch_batch(ro_mix.data(), ro_mix.size());
+                }
             }
             if (reserved) VirtualFree(reserved, 0, MEM_RELEASE);
+            if (noacc_mem) VirtualFree(noacc_mem, 0, MEM_RELEASE);
             if (ro_mem) VirtualFree(ro_mem, 0, MEM_RELEASE);
         }
 
@@ -550,6 +568,124 @@ int main() {
             }
         }
         std::printf("WS2 fast paths (shared Cell::known_*, no-guard cache + RO guardrail, 64-gap bridge, C1): ok\n");
+    }
+
+    // Verify Round 10b WS-C fixes:
+    //  1. C2 bridged multi-tile rollback: when tile 0 has an unexpected prior protection (e.g., PAGE_NOACCESS changed
+    //     without title_memory_map::changed()), rollback restores ONLY eligible tiles individually (tile 0 -> old,
+    //     other eligible tiles -> verified kp), preserves already-armed gap tiles (both batch run_already_armed_ and
+    //     other-owner s.cells tiles) at kg (PAGE_READONLY), and clears Cell::known_* across the bridged span.
+    //  2. C2 non-bridged multi-tile fast-path rollback: tile 0 restored to old, remaining tiles restored to fkp and
+    //     re-armed cleanly via slow path (never clobbered to old).
+    {
+        std::vector<std::uint64_t> out;
+
+        // 1. Bridged rollback preserves already-armed gap tiles and clears Cell::known_*.
+        {
+            constexpr std::size_t kSpan = 6;
+            auto* smem = static_cast<std::uint8_t*>(
+                VirtualAlloc(nullptr, kSpan * kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            EXPECT(smem != nullptr);
+            if (smem) {
+                const auto sbase = reinterpret_cast<std::uintptr_t>(smem);
+                leonida::HotColdTracking tracking;
+                TextureCells other;
+                // Tile 2 is watched ONLY by `other` (s.cells gap tile); tiles 0,1,3,4,5 watched by `tracking`.
+                leonida::geometry_writes::Cell* c2 = other.acquire(sbase + 2 * kPage);
+                EXPECT(other.arm(sbase + 2 * kPage, *c2) == 1);
+                {
+                    leonida::HotColdTracking seed;
+                    seed.watch(sbase + 2 * kPage);
+                    seed.collect(out);  // seed Cell::known_* on tile 2
+                    seed.unwatch(sbase + 2 * kPage);
+                }
+                std::vector<std::uint64_t> spages = {sbase + 0 * kPage, sbase + 1 * kPage, sbase + 3 * kPage,
+                                                     sbase + 4 * kPage, sbase + 5 * kPage};
+                tracking.watch_batch(spages.data(), spages.size());
+                tracking.collect(out);  // arms all tiles and populates Cell::known_*
+
+                // Open tiles 0, 1, 4; re-arm tile 1 via `other` so tile 1 is run_already_armed_ in this batch,
+                // tile 2 is an other-owner gap tile, tile 3 is a tracking-owned armed gap tile, and tiles 0 & 4
+                // are eligible -> bridged span covers [tile 0 .. tile 4].
+                leonida::geometry_writes::notify(sbase + 0 * kPage, sbase + 0 * kPage + 1,
+                                                 leonida::geometry_writes::Event::open);
+                leonida::geometry_writes::notify(sbase + 1 * kPage, sbase + 1 * kPage + 1,
+                                                 leonida::geometry_writes::Event::open);
+                leonida::geometry_writes::notify(sbase + 4 * kPage, sbase + 4 * kPage + 1,
+                                                 leonida::geometry_writes::Event::open);
+                leonida::geometry_writes::Cell* c1 = other.acquire(sbase + 1 * kPage);
+                EXPECT(other.arm(sbase + 1 * kPage, *c1) == 1);
+
+                // Bypass title_memory_map::changed() on tile 0 -> PAGE_NOACCESS triggers unexpected `old` in
+                // bridged VirtualProtect!
+                DWORD prev_prot = 0;
+                EXPECT(VirtualProtect(smem + 0 * kPage, kPage, PAGE_NOACCESS, &prev_prot) != 0);
+
+                tracking.collect(out);
+
+                MEMORY_BASIC_INFORMATION mbi{};
+                // Tile 0 restored to PAGE_NOACCESS; gap tiles 1, 2, 3 preserved at PAGE_READONLY; tile 4 re-armed!
+                EXPECT(VirtualQuery(smem + 0 * kPage, &mbi, sizeof mbi) && mbi.Protect == PAGE_NOACCESS);
+                EXPECT(VirtualQuery(smem + 1 * kPage, &mbi, sizeof mbi) && mbi.Protect == PAGE_READONLY);
+                EXPECT(VirtualQuery(smem + 2 * kPage, &mbi, sizeof mbi) && mbi.Protect == PAGE_READONLY);
+                EXPECT(VirtualQuery(smem + 3 * kPage, &mbi, sizeof mbi) && mbi.Protect == PAGE_READONLY);
+                EXPECT(VirtualQuery(smem + 4 * kPage, &mbi, sizeof mbi) && mbi.Protect == PAGE_READONLY);
+                EXPECT(tracking.unwritten(sbase + 4 * kPage));
+
+                // Cell::known_* cleared across the bridged span's gap tiles (tile 4 was re-populated by slow path).
+                {
+                    auto& st = leonida::geometry_writes::state();
+                    std::lock_guard lock(st.mutex);
+                    for (std::size_t g : {std::size_t(1), std::size_t(2), std::size_t(3)}) {
+                        const auto it = st.cells.find(sbase + g * kPage);
+                        EXPECT(it != st.cells.end() && it->second.known_state == 0);
+                    }
+                }
+
+                // Restore tile 0 before cleanup.
+                EXPECT(VirtualProtect(smem + 0 * kPage, kPage, PAGE_READWRITE, &prev_prot) != 0);
+                leonida::title_memory_map::changed(sbase, sbase + kPage);
+                tracking.unwatch_batch(spages.data(), spages.size());
+                other.release(sbase + 1 * kPage);
+                other.release(sbase + 2 * kPage);
+                VirtualFree(smem, 0, MEM_RELEASE);
+            }
+        }
+
+        // 2. Non-bridged multi-tile fast-path rollback: tile 0 -> old (PAGE_NOACCESS), tiles 1 & 2 -> fkp then armed!
+        {
+            constexpr std::size_t kRun = 3;
+            auto* rmem = static_cast<std::uint8_t*>(
+                VirtualAlloc(nullptr, kRun * kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            EXPECT(rmem != nullptr);
+            if (rmem) {
+                const auto rbase = reinterpret_cast<std::uintptr_t>(rmem);
+                leonida::HotColdTracking tracking;
+                std::vector<std::uint64_t> rpages = {rbase + 0 * kPage, rbase + 1 * kPage, rbase + 2 * kPage};
+                tracking.watch_batch(rpages.data(), rpages.size());
+                tracking.collect(out);  // arms all 3 and populates Cell::known_*
+                for (std::size_t p = 0; p < kRun; ++p)
+                    leonida::geometry_writes::notify(rbase + p * kPage, rbase + p * kPage + 1,
+                                                     leonida::geometry_writes::Event::open);
+                // Bypass title_memory_map::changed() on tile 0 -> PAGE_NOACCESS.
+                DWORD prev_prot = 0;
+                EXPECT(VirtualProtect(rmem + 0 * kPage, kPage, PAGE_NOACCESS, &prev_prot) != 0);
+
+                tracking.collect(out);
+
+                MEMORY_BASIC_INFORMATION mbi{};
+                EXPECT(VirtualQuery(rmem + 0 * kPage, &mbi, sizeof mbi) && mbi.Protect == PAGE_NOACCESS);
+                EXPECT(VirtualQuery(rmem + 1 * kPage, &mbi, sizeof mbi) && mbi.Protect == PAGE_READONLY);
+                EXPECT(VirtualQuery(rmem + 2 * kPage, &mbi, sizeof mbi) && mbi.Protect == PAGE_READONLY);
+                EXPECT(tracking.unwritten(rbase + 1 * kPage) && tracking.unwritten(rbase + 2 * kPage));
+
+                EXPECT(VirtualProtect(rmem + 0 * kPage, kPage, PAGE_READWRITE, &prev_prot) != 0);
+                leonida::title_memory_map::changed(rbase, rbase + kPage);
+                tracking.unwatch_batch(rpages.data(), rpages.size());
+                VirtualFree(rmem, 0, MEM_RELEASE);
+            }
+        }
+        std::printf("Round 10b WS-C (bridged/non-bridged rollback preserving gap tiles, RO VQ exclusion): ok\n");
     }
 
     VirtualFree(memory, 0, MEM_RELEASE);
