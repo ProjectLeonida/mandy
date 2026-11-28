@@ -367,5 +367,45 @@ class DelayImportCallSitesTest(unittest.TestCase):
                                    thunks=[DELAY_THUNK], call=DELAY_CALLS, jmp=[DELAY_JMP])
 
 
+class OrdinaryIatAndSingleParseTest(unittest.TestCase):
+    def test_ordinary_descriptor_with_zero_or_unmapped_iat_is_skipped(self):
+        for bad_iat in (0, 0x3000):
+            with self.subTest(iat_rva=bad_iat):
+                data = bytearray(build_image([(NORMAL_CALL, 0xE8, THUNK_FOO)]))
+                struct.pack_into("<I", data, IDATA_RVA + 16, bad_iat)
+                self.assertEqual(import_call_sites.call_sites(bytes(data))["imports"], {})
+
+    def test_truncated_ordinary_iat_keeps_only_whole_mapped_slots(self):
+        data = bytearray(build_image([
+            (TEXT_RVA + 0x100, 0xE8, THUNK_FOO),
+            (TEXT_RVA + 0x110, 0xE8, THUNK_BAR),
+        ]))
+        table = len(data) - 12  # One whole 8-byte IAT slot and half of the next one.
+        struct.pack_into("<I", data, IDATA_RVA + 16, table)
+        for thunk, slot in ((THUNK_FOO, table), (THUNK_BAR, table + 8)):
+            data[thunk + 2:thunk + 6] = rel32(thunk + 6, slot)
+        out = import_call_sites.call_sites(bytes(data))["imports"]
+        self.assertEqual(list(out), ["xmem.dll!XMemFoo"])
+        self.assertEqual(out["xmem.dll!XMemFoo"]["call"], [TEXT_RVA + 0x100])
+
+    def test_cli_parses_pe_image_once(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "image.exe")
+            with open(path, "wb") as f:
+                f.write(build_image([(TEXT_RVA + 0x100, 0xE8, THUNK_FOO)]))
+            out = io.StringIO()
+            with (
+                mock.patch.object(pe_inspect, "PeImage", wraps=pe_inspect.PeImage) as spy_pe,
+                mock.patch.object(import_call_sites, "import_entries", wraps=import_call_sites.import_entries) as spy_imp,
+                contextlib.redirect_stdout(out),
+            ):
+                rc = import_call_sites.main([path, "--dll", "xmem.dll"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(spy_pe.call_count, 1)
+            self.assertEqual(spy_imp.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -48,12 +48,19 @@ def import_entries(img):
         oft, _stamp, _forwarder, dll_rva, iat_rva = struct.unpack_from("<IIIII", img.data, at)
         if not dll_rva:
             break
-        dll = img.string_at(dll_rva)
         lookup = oft or iat_rva
-        if dll is None or not lookup:
+        if not iat_rva or not lookup:
+            continue
+        if img.offset(iat_rva, 8) is None or img.offset(lookup, 8) is None:
+            continue
+        dll = img.string_at(dll_rva)
+        if dll is None:
             continue
         for j, name in enumerate(img.thunk_names(lookup)):
-            slots[iat_rva + j * 8] = (dll, name)
+            slot = iat_rva + j * 8
+            if img.offset(slot, 8) is None:
+                break
+            slots[slot] = (dll, name)
 
     for dll_rva, iat_rva, lookup, va_entries in img.import_descriptors(pe_inspect.DIR_DELAY_IMPORT, delay=True):
         # Delay IAT slots hold resolver addresses before binding, so require a positive mapped INT
@@ -73,15 +80,8 @@ def import_entries(img):
     return slots
 
 
-def call_sites(data, wanted=None, dlls=None):
-    """Per import: its thunk RVAs and the RVAs of the `call` and `jmp` instructions that target them.
-
-    `wanted` is a set of 'dll!name' (compared case-insensitively on the dll), `dlls` a set of dll names; with both
-    None every import is scanned.
-    """
-    img = pe_inspect.PeImage(data)
-    if not img.is64:
-        raise pe_inspect.PeFormatError("only PE32+ (x86-64) images are scanned")
+def _call_sites_from_image(img, entries, wanted=None, dlls=None):
+    """Per import: its thunk RVAs and the RVAs of the `call` and `jmp` instructions that target them."""
     lower_wanted = {w.lower() for w in wanted} if wanted else None
     lower_dlls = {d.lower() for d in dlls} if dlls else None
 
@@ -91,7 +91,7 @@ def call_sites(data, wanted=None, dlls=None):
         return (lower_wanted is not None and f"{dll.lower()}!{name}".lower() in lower_wanted) or \
                (lower_dlls is not None and dll.lower() in lower_dlls)
 
-    slots = {rva: f"{dll}!{name}" for rva, (dll, name) in import_entries(img).items() if selected(dll, name)}
+    slots = {rva: f"{dll}!{name}" for rva, (dll, name) in entries.items() if selected(dll, name)}
     code = [(s["rva"], img.section_data(s)) for s in img.sections if s["exec"]]
 
     thunks = {}
@@ -121,6 +121,18 @@ def call_sites(data, wanted=None, dlls=None):
     return {"image_base": img.image_base, "imports": out}
 
 
+def call_sites(data, wanted=None, dlls=None):
+    """Per import: its thunk RVAs and the RVAs of the `call` and `jmp` instructions that target them.
+
+    `wanted` is a set of 'dll!name' (compared case-insensitively on the dll), `dlls` a set of dll names; with both
+    None every import is scanned.
+    """
+    img = pe_inspect.PeImage(data)
+    if not img.is64:
+        raise pe_inspect.PeFormatError("only PE32+ (x86-64) images are scanned")
+    return _call_sites_from_image(img, import_entries(img), wanted=wanted, dlls=dlls)
+
+
 def import_selector(text: str) -> str:
     """--import: `DLL!NAME`, the form `selected()` matches. A bare DLL, a bare name or an empty half selects no import,
     so the run printed "0 import(s), 0 call site(s)" for a typo in either half: the answer read as "the image never
@@ -138,15 +150,18 @@ def dll_selector(text: str) -> str:
     return text
 
 
-def unmatched_selectors(data: bytes, wanted, dlls) -> list:
-    """The well-formed selectors that name nothing this image imports: a misspelled half of `DLL!NAME`, or a DLL the
-    image does not import. They answered "0 import(s), 0 call site(s)", which reads as "the image never calls it".
-    `call_sites()` keeps answering `{}` for a caller that selects nothing on purpose."""
-    entries = import_entries(pe_inspect.PeImage(data))
+def _unmatched_from_entries(entries, wanted, dlls) -> list:
     names = {f"{dll}!{name}".lower() for dll, name in entries.values()}
     libs = {dll.lower() for dll, _ in entries.values()}
     return [f"--import {w}" for w in wanted if w.lower() not in names] + \
            [f"--dll {d}" for d in dlls if d.lower() not in libs]
+
+
+def unmatched_selectors(data: bytes, wanted, dlls) -> list:
+    """The well-formed selectors that name nothing this image imports: a misspelled half of `DLL!NAME`, or a DLL the
+    image does not import. They answered "0 import(s), 0 call site(s)", which reads as "the image never calls it".
+    `call_sites()` keeps answering `{}` for a caller that selects nothing on purpose."""
+    return _unmatched_from_entries(import_entries(pe_inspect.PeImage(data)), wanted, dlls)
 
 
 def main(argv=None):
@@ -161,12 +176,16 @@ def main(argv=None):
     try:
         with open(args.image, "rb") as f:
             data = f.read()
-        result = call_sites(data, set(args.imports) or None, set(args.dlls) or None)
+        img = pe_inspect.PeImage(data)
+        if not img.is64:
+            raise pe_inspect.PeFormatError("only PE32+ (x86-64) images are scanned")
+        entries = import_entries(img)
+        result = _call_sites_from_image(img, entries, set(args.imports) or None, set(args.dlls) or None)
     except (OSError, pe_inspect.PeFormatError) as e:
         print(f"{os.path.basename(sys.argv[0])}: {e}", file=sys.stderr)
         return 2
     imports = result["imports"]
-    missing = unmatched_selectors(data, args.imports, args.dlls)
+    missing = _unmatched_from_entries(entries, args.imports, args.dlls)
     if missing:
         print(f"{os.path.basename(sys.argv[0])}: {os.path.basename(args.image)}: "
               f"no import matches {', '.join(missing)}", file=sys.stderr)
