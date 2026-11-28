@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <intrin.h>
+#include <share.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
@@ -10,7 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
@@ -77,9 +78,16 @@ std::string path_utf8(const std::filesystem::path& path) {
 }
 
 std::vector<uint8_t> read_file(const std::filesystem::path& p) {
-    std::ifstream f(p, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + path_utf8(p));
-    return {std::istreambuf_iterator<char>(f), {}};
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> file(
+        _wfsopen(p.c_str(), L"rb", _SH_DENYNO), std::fclose);
+    if (!file) throw std::runtime_error("cannot open " + path_utf8(p));
+
+    std::vector<uint8_t> bytes;
+    std::array<uint8_t, 64 * 1024> block;
+    while (const auto count = std::fread(block.data(), 1, block.size(), file.get()))
+        bytes.insert(bytes.end(), block.data(), block.data() + count);
+    if (std::ferror(file.get())) throw std::runtime_error("cannot read " + path_utf8(p));
+    return bytes;
 }
 
 template <class T>
