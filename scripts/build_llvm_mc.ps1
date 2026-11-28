@@ -40,17 +40,33 @@ foreach ($t in "git", "python") {
     if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { throw "$t wasn't found on PATH." }
 }
 $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
-$vs = & "$installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-if (-not $vs) { throw "Visual Studio with the C++ x64 tools wasn't found." }
+$vswhere = Join-Path $installer "vswhere.exe"
+if (-not (Test-Path -LiteralPath $vswhere)) {
+    throw "Visual Studio wasn't found (vswhere.exe missing at '$vswhere')."
+}
+$vsArgs = @("-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath")
+$vs = & $vswhere @vsArgs
+if (-not $vs) {
+    # vswhere hides Preview/Insiders instances unless -prerelease is passed.
+    $vs = & $vswhere @vsArgs -prerelease
+}
+# vswhere can print an empty line; take the first non-empty one.
+$vs = @($vs | Where-Object { $_ -and $_.Trim() })[0]
+if (-not $vs) { throw "Visual Studio with the C++ x64 tools wasn't found (stable or Preview)." }
 $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+if (-not (Test-Path -LiteralPath $vcvars)) {
+    throw "vcvars64.bat wasn't found at '$vcvars'; the VS install looks incomplete."
+}
 $jobs = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2))
 
 $cmakeDir = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake"
 $cmake = Join-Path $cmakeDir "CMake\bin\cmake.exe"
 $ninja = Join-Path $cmakeDir "Ninja\ninja.exe"
 if (-not ((Test-Path $cmake) -and (Test-Path $ninja))) {
-    $cmake = (Get-Command cmake -ErrorAction SilentlyContinue).Source
-    $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
+    $cmakeCmd = Get-Command cmake -ErrorAction SilentlyContinue
+    $ninjaCmd = Get-Command ninja -ErrorAction SilentlyContinue
+    $cmake = if ($cmakeCmd) { $cmakeCmd.Source } else { $null }
+    $ninja = if ($ninjaCmd) { $ninjaCmd.Source } else { $null }
     if (-not ($cmake -and $ninja)) { throw "CMake and Ninja weren't found (install VS's 'C++ CMake tools' or put them on PATH)." }
 }
 
@@ -85,23 +101,26 @@ if (-not (Test-Path (Join-Path $src "llvm\CMakeLists.txt"))) {
     & git clone --quiet --depth 1 --branch "llvmorg-$Version" --filter=blob:none --sparse --config core.longpaths=true https://github.com/llvm/llvm-project $src
     if ($LASTEXITCODE -ne 0) { throw "git clone of llvmorg-$Version failed." }
     # libc: LLVM 23 configures only with its shared headers (llvm/CMakeLists.txt, "LLVM libc is not found").
+    # Harmless on <23 (the dir is just never referenced).
     & git -C $src sparse-checkout set llvm cmake third-party libc
     if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout failed." }
-}
-# A source kept by a failed LLVM 23 build of an older version of this script has no libc yet.
-if ((Test-Path (Join-Path $src ".git\info\sparse-checkout")) -and -not (Test-Path (Join-Path $src "libc"))) {
-    & git -C $src sparse-checkout add libc
-    if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout add libc failed." }
 }
 
 # -Keep (or an interrupted build) can leave sources from another -Version.
 # Refuse that checkout rather than silently rebuilding the wrong release or resetting user files.
+# Checked BEFORE any sparse-checkout mutation so a rejected checkout is left untouched.
 $versionError = "Cannot reuse '$src' for LLVM $Version. Choose a fresh -Temp directory for this version; existing files were kept."
 if (-not (Test-Path -LiteralPath (Join-Path $src '.git'))) { throw $versionError }
 $wantedCommit = & git -C $src rev-parse --verify --quiet "refs/tags/llvmorg-$Version^{commit}"
 if ($LASTEXITCODE -ne 0 -or -not $wantedCommit) { throw $versionError }
 $sourceCommit = & git -C $src rev-parse --verify --quiet HEAD
 if ($LASTEXITCODE -ne 0 -or $sourceCommit -ne $wantedCommit) { throw $versionError }
+
+# A source kept by a failed LLVM 23 build of an older version of this script has no libc yet.
+if ((Test-Path (Join-Path $src ".git\info\sparse-checkout")) -and -not (Test-Path (Join-Path $src "libc"))) {
+    & git -C $src sparse-checkout add libc
+    if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout add libc failed." }
+}
 
 # DIA SDK off: its headers need ATL, which the C++ build tools don't always include, and llvm-mc doesn't use it.
 $body = @"
@@ -140,8 +159,12 @@ try { $p.PriorityClass = "BelowNormal" } catch {}
 $p.WaitForExit()
 if ($p.ExitCode -ne 0) { throw "build failed ($($p.ExitCode)); the build folder is kept in $out" }
 
-# Same check shader_disasm.py makes before a run: one s_endpgm on the console's GPU.
 $exe = Join-Path $out "bin\llvm-mc.exe"
+if (-not (Test-Path -LiteralPath $exe)) {
+    throw "the build reported success but '$exe' doesn't exist (output layout changed?). The build folder is kept in $out"
+}
+
+# Same check shader_disasm.py makes before a run: one s_endpgm on the console's GPU.
 # Through a file: a PowerShell pipe can prepend a BOM, which llvm-mc rejects as an invalid token.
 $probeFile = Join-Path $Temp "probe.txt"
 [IO.File]::WriteAllText($probeFile, "0x00 0x00 0x81 0xbf`n")
