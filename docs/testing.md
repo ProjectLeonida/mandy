@@ -754,8 +754,9 @@ fallback"), so the device needs geometry shaders instead.
 
 `ps_interp_f16_high` and `ms_f16_pack` read 16-bit interpolants as `PerVertexKHR` inputs, which need the extension
 too and which `--bary-fallback` can't express. With `LEONIDA_F16_INTERP_FALLBACK=1` they read halves the producer
-exports decoded instead (see Macs, below) and run with or without the bary fallback; `run_gpu_tests.py` turns that
-on by itself where the device lacks the extension. Under the bary fallback without it they skip.
+exports decoded instead (see Macs, below) and run with or without the bary fallback; `run_gpu_tests.py`, `build.py`
+and `check.py` turn that on by themselves where the device lacks the extension. Under the bary fallback without it
+they skip.
 
 Intel Arc with Mesa ANV currently advertises the native barycentric feature but has a driver bug where translated
 pixel shaders can read `BaryCoordKHR.i` as zero (SHADER-925). `make_game.py` detects ANV and automatically translates
@@ -786,8 +787,10 @@ driverVersion 2.0.283; newer drivers keep native barycentrics, and `LEONIDA_BARY
 MoltenVK can't convert to Metal ("PerVertexKHR decoration is not supported in MSL"). `run_gpu_tests.py` asks
 `tools/vk_subgroup_info.py` whether the device can take them and, on MoltenVK, translates with
 `--f16-interp-fallback` by itself: the vertex or mesh shader then also exports the decoded f16 halves
-(`docs/design.md`, "16-bit interpolation without `PerVertexKHR`"). `LEONIDA_F16_INTERP_FALLBACK=1` or `0` forces it
-on or off; `build.py` (for `check.py`) translates with the flag only when that variable is `1`. `ms_f16_pack` also runs
+(`docs/design.md`, "16-bit interpolation without `PerVertexKHR`"). `build.py` and `check.py` ask the same question,
+so the two-step form translates and judges the shaders the same way: `ps_interp_f16_high` passes and `ps_ij_computed`,
+whose computed I/J pair needs those inputs, is left out and reported as `SKIP`. `LEONIDA_F16_INTERP_FALLBACK=1` or `0`
+forces the fallback on or off in all three; set it for `build.py` and `check.py` alike. `ms_f16_pack` also runs
 on a Mac with `LEONIDA_MESH_COMPUTE=1 LEONIDA_W64_EMULATE=1`.
 
 ## GPUs without VK_KHR_maintenance8 (NVIDIA Pascal and older)

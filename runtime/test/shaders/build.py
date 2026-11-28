@@ -22,8 +22,11 @@ VK_KHR_shader_fma; the test programs enable it when the device has it, else they
 With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
 each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
 With the variable unset, build.py/check.py follow the Mesa ANV probe automatically.
-Under that or LEONIDA_F16_INTERP_FALLBACK=1, ps_ij_computed isn't built: its computed I/J pair needs PerVertexKHR
-inputs, and check.py reports it as SKIP.
+With LEONIDA_F16_INTERP_FALLBACK=1, 16-bit interpolants are translated with --f16-interp-fallback (decoded halves from
+the producer instead of PerVertexKHR inputs); 0 turns that off. With the variable unset, build.py/check.py turn it on
+where tools/vk_subgroup_info.py reports no PerVertexKHR inputs (MoltenVK), as scripts/run_gpu_tests.py does.
+Under either fallback, ps_ij_computed isn't built: its computed I/J pair needs PerVertexKHR inputs, and check.py
+reports it as SKIP.
 With LEONIDA_PC_TAIL_UBO=1, every shader is translated with --pc-tail-ubo (s0..s31 in 128 push-constant bytes, the
 heap base and code base in a uniform block at set 1), for devices whose maxPushConstantsSize is 128; set it for
 check.py too, whose test programs then bind that block (runtime/test/vk_pc_tail.h).
@@ -45,7 +48,7 @@ import mc_command  # noqa: E402
 
 MC = mc_command.mc_command()
 RSRC2, GROUP = 0x8088, (64, 1, 1)
-# Not built under LEONIDA_BARY_FALLBACK=1 or LEONIDA_F16_INTERP_FALLBACK=1 (see main).
+# Not built under the barycentric or the f16 interpolation fallback, set or picked from the device (see main).
 NEEDS_PER_VERTEX_INPUTS = ("ps_ij_computed",)
 sys.path.insert(0, HERE)  # this script is also run with python -I
 from compute_fixture import compute_header, shift_user_data, user_data_shift  # noqa: E402
@@ -69,6 +72,31 @@ def barycentric_fallback():
                            capture_output=True, text=True, timeout=60)
         answer = json.loads(r.stdout.strip().splitlines()[-1])
         return answer.get("barycentric_fallback") is True
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return False
+
+
+def f16_interp_fallback_override():
+    v = (os.environ.get("LEONIDA_F16_INTERP_FALLBACK") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def f16_interp_fallback():
+    """LEONIDA_F16_INTERP_FALLBACK=1 (or 0). Unset, it is on where the device can't take PerVertexKHR inputs:
+    tools/vk_subgroup_info.py reports per_vertex_inputs false (MoltenVK), the rule of scripts/run_gpu_tests.py.
+    A device that gives no answer leaves it off."""
+    override = f16_interp_fallback_override()
+    if override is not None:
+        return override
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        answer = json.loads(r.stdout.strip().splitlines()[-1])
+        return answer.get("per_vertex_inputs") is False
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return False
 
@@ -191,7 +219,7 @@ def translate_tests(work, names):
         cmd.append("--bary-fallback")
     if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma (default), OpFmaKHR, or emulated
         cmd += ["--fma", os.environ["LEONIDA_FMA"]]
-    if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":   # f16 interpolation without PerVertexKHR (MoltenVK)
+    if f16_interp_fallback():   # f16 interpolation without PerVertexKHR (MoltenVK)
         cmd.append("--f16-interp-fallback")
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
@@ -227,7 +255,7 @@ def main():
     names = [n for n in names if n not in skipped]
     # A computed I/J pair needs PerVertexKHR inputs, which both fallbacks take away: the translator refuses it there,
     # and check.py and run_gpu_tests.py report it as SKIP. Leave it out instead of losing the whole batch.
-    if barycentric_fallback() or os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":
+    if barycentric_fallback() or f16_interp_fallback():
         per_vertex = [n for n in names if n in NEEDS_PER_VERTEX_INPUTS]
         if per_vertex:
             print("not built (computed I/J pairs need PerVertexKHR inputs, off under the fallback):",
