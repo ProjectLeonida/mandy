@@ -468,12 +468,17 @@ int main() {
         const std::uint64_t own = fly.execute_begin();
         leonida::TitleVaAliases aliases;
         aliases.record_removals(true);
-        std::uint64_t cursor = 0;
-        {
-            leonida::DescriptorRanges skip;
-            aliases.changed_ranges(cursor, skip);
-        }
-        const std::uint64_t invalidations = aliases.invalidations();
+        // What the console heaps' slot records are told (TitleVaAliases::add_listener).
+        struct Heard {
+            bool removed;
+            std::uint64_t title_va, bytes, shader_va;
+        };
+        std::vector<Heard> heard;
+        aliases.add_listener(&heard, [](void* to, leonida::TitleVaAliases::Change change, std::uint64_t va,
+                                        std::uint64_t bytes, std::uint64_t shader_va) {
+            static_cast<std::vector<Heard>*>(to)->push_back(
+                {change == leonida::TitleVaAliases::Change::removed, va, bytes, shader_va});
+        });
         leonida::geometry_writes::note_released(flybase, flybase + kView);
         fly.drain_released(device, rt::d3d12::GeometryViews::kAfterExecutes, submitted,
                            [&](std::uintptr_t source, std::size_t size, VkDeviceSize va) {
@@ -483,13 +488,12 @@ int main() {
                   fly.bytes() == kView && g_gone_blocks == gone,
               "a view retired in before_execute_ is not reaped there, though the GPU is idle");
 
-        leonida::DescriptorRanges changed;
-        const bool read = aliases.changed_ranges(cursor, changed);
-        changed.merge();
         std::vector<std::pair<std::uint64_t, std::uint64_t>> removed;
         aliases.take_removed(removed);
-        check(read && aliases.invalidations() != invalidations && changed.overlaps(flybase, kView) &&
-                  removed.size() == 1 && removed[0].first == va_f && removed[0].second == kView,
+        aliases.remove_listener(&heard);
+        check(heard.size() == 1 && heard[0].removed && heard[0].title_va == flybase && heard[0].bytes == kView &&
+                  heard[0].shader_va == va_f && removed.size() == 1 && removed[0].first == va_f &&
+                  removed[0].second == kView,
               "the retirement invalidates the heap slots and key answers made through the view without an alias");
 
         submitted = 8;  // this replay's submission
