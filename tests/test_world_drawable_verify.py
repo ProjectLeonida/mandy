@@ -120,8 +120,19 @@ class VerifyTest(unittest.TestCase):
         first = self.write("First.json", export)
         real_first = os.path.realpath(first)
         upper_first = real_first.replace("First.json", "FIRST.JSON")
+        original_realpath = os.path.realpath
+        seen = {"manifest": 0}
+
+        def realpath(path):
+            resolved = original_realpath(path)
+            if os.path.basename(resolved) == "First.json":
+                seen["manifest"] += 1
+                if seen["manifest"] > 1:
+                    return upper_first
+            return resolved
+
         with mock.patch.object(verifier.os, "fstat", return_value=SimpleNamespace(st_dev=0, st_ino=0)), \
-                mock.patch.object(verifier.os.path, "realpath", side_effect=[real_first, upper_first]), \
+                mock.patch.object(verifier.os.path, "realpath", side_effect=realpath), \
                 mock.patch.object(verifier.os.path, "normcase", side_effect=str.lower):
             if os.path.exists(upper_first):
                 self.assert_observations(predictions, [first, upper_first], 1)

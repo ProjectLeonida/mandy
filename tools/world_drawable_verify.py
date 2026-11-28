@@ -10,6 +10,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import path_key  # noqa: E402
 from world_drawable_lookup import report_rows
 import world_build
 import world_names
@@ -27,7 +28,9 @@ def _same_archive(first, second):
 def archive_path(value):
     if not isinstance(value, str) or not value.strip():
         raise ValueError("expected a source archive path")
-    return os.path.normcase(os.path.abspath(value))
+    # path_key folds case on a volume that ignores it. normcase(abspath()) keeps the typed case on macOS,
+    # so Game/missing.rpf and game/missing.rpf looked like two archives when neither file existed yet.
+    return path_key(value)
 
 
 def _manifest_identity(handle, path):

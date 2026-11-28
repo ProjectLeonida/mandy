@@ -71,6 +71,17 @@ class ArchiveAliasTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assert_confirmed(json.loads(result.stdout))
 
+    def test_another_case_of_one_missing_archive_is_the_same_source(self):
+        folder = self.root / "Game"
+        folder.mkdir()
+        probe = folder / "Probe.tmp"
+        probe.write_bytes(b"")
+        if not (folder / "probe.tmp").exists():
+            self.skipTest("volume keeps case")
+        probe.unlink()
+        predictions, manifest = self.reports(folder / "missing.rpf", self.root / "game" / "missing.rpf")
+        self.assert_confirmed(verifier.verify(predictions, [manifest]))
+
     def test_distinct_archive_with_identical_bytes_is_rejected(self):
         other = self.root / "different.bin"
         other.write_bytes(self.archive.read_bytes())
