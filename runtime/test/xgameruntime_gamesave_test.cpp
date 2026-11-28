@@ -73,6 +73,51 @@ template <class F> F at(void* obj, int index) { return reinterpret_cast<F>(slot(
 
 bool finished(XAsyncBlock* async) { return XAsyncGetStatus(async, true) != E_PENDING; }
 
+// Makes this process's CopyFile2 fail and count its calls, as Wine 9 has none (its stub aborts the process): a commit
+// that backs up or restores a blob must not reach it (kevincommits' finding in #1608, batch 18 item 1). The entry is
+// overwritten with a jump to the counter and put back afterwards.
+LONG g_copy_file2_calls = 0;
+HRESULT WINAPI counting_copy_file2(PCWSTR, PCWSTR, void*) {
+    InterlockedIncrement(&g_copy_file2_calls);
+    return HRESULT_FROM_WIN32(ERROR_CALL_NOT_IMPLEMENTED);
+}
+
+class CopyFile2Trap {
+public:
+    CopyFile2Trap() {
+        if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll"))
+            target_ = reinterpret_cast<uint8_t*>(GetProcAddress(k32, "CopyFile2"));
+        if (!target_) return;
+        DWORD old = 0;
+        if (!VirtualProtect(target_, sizeof(saved_), PAGE_EXECUTE_READWRITE, &old)) {
+            target_ = nullptr;
+            return;
+        }
+        std::memcpy(saved_, target_, sizeof(saved_));
+        uint8_t jump[sizeof(saved_)] = {0xFF, 0x25, 0, 0, 0, 0};  // jmp [rip+0], then the address
+        const auto to = reinterpret_cast<uint64_t>(&counting_copy_file2);
+        std::memcpy(jump + 6, &to, sizeof(to));
+        std::memcpy(target_, jump, sizeof(jump));
+        VirtualProtect(target_, sizeof(saved_), old, &old);
+        FlushInstructionCache(GetCurrentProcess(), target_, sizeof(saved_));
+    }
+    ~CopyFile2Trap() {
+        if (!target_) return;
+        DWORD old = 0;
+        VirtualProtect(target_, sizeof(saved_), PAGE_EXECUTE_READWRITE, &old);
+        std::memcpy(target_, saved_, sizeof(saved_));
+        VirtualProtect(target_, sizeof(saved_), old, &old);
+        FlushInstructionCache(GetCurrentProcess(), target_, sizeof(saved_));
+    }
+    bool armed() const { return target_ != nullptr; }
+    CopyFile2Trap(const CopyFile2Trap&) = delete;
+    CopyFile2Trap& operator=(const CopyFile2Trap&) = delete;
+
+private:
+    uint8_t* target_ = nullptr;
+    uint8_t saved_[14] = {};
+};
+
 using Init = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char*, bool, Handle*);
 using InitAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char*, bool, XAsyncBlock*);
 using ResultHandle = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, Handle*);
@@ -483,6 +528,24 @@ int main() {
         check(submit(rc, {{"a", "X"}, {"b", "Y"}}) == out_of_local, "an update that fails at a, before b is reached");
         CloseHandle(hold);
         check(read_blob(rollback_dir, L"b~b~") == "KEPT_B", "the failed update keeps the backup it did not write");
+
+        // Case E: with CopyFile2 failing as on Wine 9, an overwrite (a backup copy) and a rolled-back update (a copy
+        // back from the backup) still work, and neither calls it.
+        std::filesystem::remove(rollback_dir / L"b~b~", ec);
+        check(submit(rc, {{"a", "WINE_OLD_A"}, {"b", "WINE_OLD_B"}}) == S_OK, "seed a and b for the CopyFile2 checks");
+        {
+            CopyFile2Trap trap;
+            check(trap.armed(), "CopyFile2 is trapped");
+            check(submit(rc, {{"a", "WINE_NEW_A"}}) == S_OK && read_blob(rollback_dir, L"a") == "WINE_NEW_A",
+                  "an update that overwrites a blob succeeds without CopyFile2");
+            hold = CreateFileW((rollback_dir / L"b").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+            check(submit(rc, {{"a", "WINE_X"}, {"b", "WINE_Y"}}) == out_of_local &&
+                      read_blob(rollback_dir, L"a") == "WINE_NEW_A",
+                  "a failed update copies a back from its backup without CopyFile2");
+            CloseHandle(hold);
+            check(g_copy_file2_calls == 0, "no commit or rollback calls CopyFile2 (Wine 9 has none)");
+        }
 
         at<Close>(save, 17)(save, rc);
     }

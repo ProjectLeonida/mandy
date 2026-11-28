@@ -485,10 +485,11 @@ struct CommitStep {
     bool keep_backup = false;  // its undo failed: the backup holds the only copy of the old contents
 };
 
+// CopyFileW, not std::filesystem::copy_file: MSVC's copy_file calls CopyFile2, which Wine 9 and the Protons built on
+// it do not implement (the call aborts the process), as file_system.cpp notes. CopyFileW copies the same way on
+// Windows: contents, attributes and the last-write time, replacing an existing file.
 bool copy_blob(const fs::path& from, const fs::path& to) {
-    std::error_code ec;
-    fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
-    return !ec;
+    return CopyFileW(from.c_str(), to.c_str(), FALSE) != FALSE;
 }
 
 // Undoes the applied steps among steps[0, upto), newest first. A step whose restore fails keeps its backup.
