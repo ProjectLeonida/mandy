@@ -7726,8 +7726,13 @@ struct DeviceState {
     using ZeroShape = std::tuple<DXGI_FORMAT, UINT64, UINT, UINT16, UINT16>;
     std::mutex zero_image_mutex;
     std::map<ZeroShape, Resource*> zero_images;  // null: past the 256 MiB the shared images may take
-    // Shapes whose image could not be made, with when to try again (zero_sampled_image). Under zero_image_mutex.
-    std::map<ZeroShape, std::chrono::steady_clock::time_point> zero_image_retry;
+    // Shapes whose image could not be made, with when to try again and how long they waited last
+    // (zero_sampled_image). Under zero_image_mutex.
+    struct ZeroImageRetry {
+        std::chrono::steady_clock::time_point at;
+        std::chrono::steady_clock::duration delay;
+    };
+    std::map<ZeroShape, ZeroImageRetry> zero_image_retry;
     std::atomic<VkDeviceSize> zero_image_bytes{0};
     VkImage zero_sampled_image(const D3D12_RESOURCE_DESC&, const Format&, VkDeviceSize);
     std::multimap<std::uint64_t, leonida::DescriptorKey> image_keys;  // by the texture's address
@@ -10759,15 +10764,15 @@ VkImage DeviceState::zero_sampled_image(const D3D12_RESOURCE_DESC& d, const Form
     const ZeroShape key{d.Format, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels};
     std::lock_guard lock(zero_image_mutex);
     if (auto it = zero_images.find(key); it != zero_images.end()) return it->second ? it->second->image() : VK_NULL_HANDLE;
-    // A shape whose image could not be made is tried again a second later. Under VRAM pressure create_texture fails,
-    // or its image loses host-transfer usage: a shape left without an image for good would have every later placement
-    // of it take memory of its own for the rest of the session, and one tried at every placement would make an image
-    // and ask for its memory each time.
+    // A shape whose image could not be made is tried again later. Under VRAM pressure create_texture fails, or its
+    // image loses host-transfer usage: a shape left without an image for good would have every later placement of it
+    // take memory of its own for the rest of the session, and one tried at every placement would make an image and ask
+    // for its memory each time. The wait is a second and doubles at each failure, up to 64 s, so a shape that fails
+    // every time (where the driver allows no memory type for host-transfer images, that usage is dropped at every try)
+    // is tried about once a minute, not once a second.
     const auto now = std::chrono::steady_clock::now();
-    if (auto it = zero_image_retry.find(key); it != zero_image_retry.end()) {
-        if (now < it->second) return VK_NULL_HANDLE;
-        zero_image_retry.erase(it);
-    }
+    const auto retry = zero_image_retry.find(key);
+    if (retry != zero_image_retry.end() && now < retry->second.at) return VK_NULL_HANDLE;
     constexpr VkDeviceSize limit = 256ull << 20;
     const auto used = zero_image_bytes.load(std::memory_order_relaxed);
     if (used >= limit || bytes > limit - used) return VK_NULL_HANDLE;
@@ -10775,9 +10780,13 @@ VkImage DeviceState::zero_sampled_image(const D3D12_RESOURCE_DESC& d, const Form
     auto* zero = new Resource(*this, d, heap, D3D12_HEAP_FLAG_NONE);
     if (FAILED(zero->create_texture(format)) || (copy_memory_to_image && !zero->host_initialized_image())) {
         zero->Release();
-        zero_image_retry[key] = now + std::chrono::seconds(1);
+        constexpr std::chrono::steady_clock::duration first = std::chrono::seconds(1),
+                                                      longest = std::chrono::seconds(64);
+        const auto delay = retry != zero_image_retry.end() ? std::min(retry->second.delay * 2, longest) : first;
+        zero_image_retry[key] = {now + delay, delay};
         return VK_NULL_HANDLE;
     }
+    if (retry != zero_image_retry.end()) zero_image_retry.erase(retry);
     // The shared images are never released, so a shape past the limit stays past it.
     if (zero->image_backing_bytes() > limit - used) {
         zero->Release();

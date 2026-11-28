@@ -7,8 +7,10 @@
 //   - The test wraps vkCreateImage behind the instance-proc pointer it hands the layer and refuses the next image of
 //     the shape under test: that is the shared image, made before the placement's own. That placement, and one right
 //     after it, have memory of their own: the shape is not tried again at every placement.
-//   - After the retry delay, a third placement of the shape gets its shared image (no memory of its own): two images
-//     of the shape are made for it, the shared one and the placement's.
+//   - After the retry delay (a second), a third placement of the shape tries again, and that image is refused too.
+//   - The delay doubles at each refusal: 1.5 s later a fourth placement does not try (memory of its own, one image of
+//     the shape made for it), and 1.5 s after that (past the 2 s) a fifth gets its shared image (no memory of its
+//     own): two images of the shape are made for it, the shared one and the placement's.
 // The device has no host image copies, so a placement takes the shared image whatever its driver allows for host-copy
 // images (d3d12_existing_heap's shared slot-133 BC images do the same). Needs the bindless set (skipped otherwise).
 // Synthetic data only. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
@@ -28,6 +30,9 @@ namespace {
 template<class T>
 struct Ref {
     T* p = nullptr;
+    Ref() = default;
+    Ref(const Ref&) = delete;  // a copy would release the same interface twice
+    Ref& operator=(const Ref&) = delete;
     ~Ref() { reset(); }
     void reset() {
         if (p) p->Release();
@@ -92,7 +97,7 @@ int main() {
     vktest::Device vk;
     if (!vk.create()) return 77;
     real_instance_proc = vk.instance_proc;
-    void* pages = VirtualAlloc(nullptr, 4 * 65536, MEM_RESERVE, PAGE_NOACCESS);
+    void* pages = VirtualAlloc(nullptr, 6 * 65536, MEM_RESERVE, PAGE_NOACCESS);
     EXPECT(pages);
     const auto at = [&](unsigned i) { return static_cast<char*>(pages) + i * 65536; };
     int result = 0;
@@ -108,7 +113,7 @@ int main() {
         info.bindless_partially_bound = vk.partially_bound;
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
-        Ref<ID3D12Resource> control, first, second, third;
+        Ref<ID3D12Resource> control, first, second, third, fourth, fifth;
         const D3D12_RESOURCE_DESC control_desc = bc1(32, 32), desc = bc1(width, height);
         if (!rt::d3d12::bindless_set_layout(device.p)) {
             std::fprintf(stderr, "SKIP: the device has no bindless set\n");
@@ -135,16 +140,39 @@ int main() {
             EXPECT(!shared(second.p));
             EXPECT(by_second == 1);
 
-            // After the retry delay the shape is tried again, and the placement gets the shared image.
+            // After the retry delay the shape is tried again, and its image is refused again.
             Sleep(1500);
+            refuse_next = true;
             const unsigned before_third = shape_images.load();
             EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(device.p, at(3), desc, 0,
                                                                       IID_PPV_ARGS(&third.p))));
             const unsigned by_third = shape_images.load() - before_third;
-            std::printf("after the retry delay: placement %s; %u images of the shape made for it\n",
+            std::printf("after the retry delay, refused again: placement %s; %u images of the shape made for it\n",
                         shared(third.p) ? "shared" : "with memory of their own", by_third);
-            EXPECT(shared(third.p));
+            EXPECT(refused == 2);
+            EXPECT(!shared(third.p));
             EXPECT(by_third == 2);
+
+            // Refused twice, the shape waits 2 s: 1.5 s later it is not tried, and after the 2 s it gets its image.
+            Sleep(1500);
+            const unsigned before_fourth = shape_images.load();
+            EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(device.p, at(4), desc, 0,
+                                                                      IID_PPV_ARGS(&fourth.p))));
+            const unsigned by_fourth = shape_images.load() - before_fourth;
+            std::printf("1.5 s later: placement %s; %u images of the shape made for it\n",
+                        shared(fourth.p) ? "shared" : "with memory of their own", by_fourth);
+            EXPECT(!shared(fourth.p));
+            EXPECT(by_fourth == 1);
+            Sleep(1500);
+            const unsigned before_fifth = shape_images.load();
+            EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(device.p, at(5), desc, 0,
+                                                                      IID_PPV_ARGS(&fifth.p))));
+            const unsigned by_fifth = shape_images.load() - before_fifth;
+            std::printf("1.5 s later: placement %s; %u images of the shape made for it\n",
+                        shared(fifth.p) ? "shared" : "with memory of their own", by_fifth);
+            EXPECT(refused == 2);
+            EXPECT(shared(fifth.p));
+            EXPECT(by_fifth == 2);
         }
     }
     VirtualFree(pages, 0, MEM_RELEASE);

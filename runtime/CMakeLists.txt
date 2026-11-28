@@ -2967,7 +2967,8 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_existing_heap_write_watch COMMAND d3d12_existing_heap_test)
     set_tests_properties(d3d12_existing_heap_write_watch PROPERTIES SKIP_RETURN_CODE 77
                          ENVIRONMENT "LEONIDA_WRITE_WATCH=1")
-    # A placed BC texture's shape whose shared zero image could not be made gets one at a later placement.
+    # A placed BC texture's shape whose shared zero image could not be made gets one at a later placement, after a wait
+    # that doubles at each failure.
     add_executable(d3d12_zero_image_retry_test test/d3d12_zero_image_retry_test.cpp)
     target_link_libraries(d3d12_zero_image_retry_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_zero_image_retry_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
