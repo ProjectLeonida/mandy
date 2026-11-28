@@ -16,6 +16,8 @@
 //     WSAConnectByNameA/W pass "localhost" to the host as the literal 127.0.0.1, so the hosts file is never read.
 //   - bind (#2) rewrites wildcard binds (0.0.0.0 or ::) to 127.0.0.1 or ::1 so no external peer can connect in,
 //     allows explicit loopback binds, and refuses any other address with WSAEADDRNOTAVAIL.
+//   - connect and WSAConnect also pass the two forms that dissolve a datagram socket's association instead of
+//     reaching a peer: an AF_UNSPEC address, and the unspecified address (0.0.0.0 or ::) with port 0.
 //   - getaddrinfo, GetAddrInfoW, GetAddrInfoExA/W, gethostbyname (#52), gethostbyaddr (#51), and
 //     WSAAsyncGetHostByName/Addr (#103/#102) permit only null/empty nodes, "localhost", and loopback IP literals;
 //     everything else fails with WSAHOST_NOT_FOUND without sending DNS packets. A dotted octet with a leading zero
@@ -130,6 +132,28 @@ bool is_loopback_sockaddr(const sockaddr* sa, int namelen) {
         std::memcpy(&v6, sa, sizeof(v6));
         const auto* b = reinterpret_cast<const uint8_t*>(&v6.sin6_addr);
         return is_ipv6_loopback_bytes(b);
+    }
+    return false;
+}
+
+// connect's remarks: on a connectionless socket, an all-zero address dissolves the association, after which send and
+// recv fail with WSAENOTCONN. Windows 11 does this for 0.0.0.0:0, [::]:0 and an AF_UNSPEC address (connect and
+// WSAConnect return 0) and refuses 0.0.0.0 with a port; a TCP socket refuses all three with an error. None of them
+// reaches a peer, so they go to the host.
+bool is_disconnect_sockaddr(const sockaddr* sa, int namelen) {
+    if (!sa || namelen < static_cast<int>(sizeof(ADDRESS_FAMILY))) return false;
+    if (sa->sa_family == AF_UNSPEC) return true;
+    if (sa->sa_family == AF_INET) {
+        if (namelen < static_cast<int>(sizeof(sockaddr_in))) return false;
+        sockaddr_in v4{};
+        std::memcpy(&v4, sa, sizeof(v4));
+        return v4.sin_port == 0 && is_ipv4_unspecified_bytes(reinterpret_cast<const uint8_t*>(&v4.sin_addr));
+    }
+    if (sa->sa_family == AF_INET6) {
+        if (namelen < static_cast<int>(sizeof(sockaddr_in6))) return false;
+        sockaddr_in6 v6{};
+        std::memcpy(&v6, sa, sizeof(v6));
+        return v6.sin6_port == 0 && is_ipv6_unspecified_bytes(reinterpret_cast<const uint8_t*>(&v6.sin6_addr));
     }
     return false;
 }
@@ -255,7 +279,7 @@ bool is_localhost_name_a(const char* node) {
 // ---- Socket connect / send / bind shims ----
 
 int WSAAPI connect_offline(SOCKET s, const sockaddr* name, int namelen) {
-    if (!is_loopback_sockaddr(name, namelen)) {
+    if (!is_loopback_sockaddr(name, namelen) && !is_disconnect_sockaddr(name, namelen)) {
         log_refused("connect", format_sockaddr(name, namelen));
         set_wsa_error(WSAENETUNREACH);
         return SOCKET_ERROR;
@@ -271,7 +295,7 @@ int WSAAPI connect_offline(SOCKET s, const sockaddr* name, int namelen) {
 
 int WSAAPI wsa_connect_offline(SOCKET s, const sockaddr* name, int namelen, LPWSABUF caller_data,
                                LPWSABUF callee_data, LPQOS sqos, LPQOS gqos) {
-    if (!is_loopback_sockaddr(name, namelen)) {
+    if (!is_loopback_sockaddr(name, namelen) && !is_disconnect_sockaddr(name, namelen)) {
         log_refused("WSAConnect", format_sockaddr(name, namelen));
         set_wsa_error(WSAENETUNREACH);
         return SOCKET_ERROR;
