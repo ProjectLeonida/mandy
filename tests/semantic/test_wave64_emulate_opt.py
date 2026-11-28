@@ -311,6 +311,8 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                 else:
                     box = [zero_of(pointee)]
                 ptrs[res] = (box, 0)
+            elif cls == "Private":   # one per invocation (the loop guard's total), from its initializer
+                ptrs[res] = ([consts[init_id] if init_id is not None else zero_of(pointee)], 0)
             else:
                 raise NotImplementedError(f"global storage class {cls}")
         return {

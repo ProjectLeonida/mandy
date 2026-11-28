@@ -136,7 +136,10 @@ def _parse_spv(asm):
             elif op == "OpVariable":
                 sc = args[1]
                 _, elem = ptr_elem[args[0]]
-                gvars[res] = (sc, elem)
+                if sc == "Private":      # one per invocation, as a function variable (the loop guard's total)
+                    fvars.append((res, elem, args[2] if len(args) > 2 else None))
+                else:
+                    gvars[res] = (sc, elem)
             continue
 
         if op == "OpLabel":

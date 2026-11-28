@@ -2,14 +2,24 @@
 
 Five-star-recomp b12a952 identified nonterminating translated loops during story loading.
 Instrument the back edge so a normally terminating iteration takes its original exit.
+
+Each loop counts its own visits from every entry, so nested loops multiply their limits: an inner loop may make
+65,536 visits in each of 65,536 visits of the outer one, which bounds nothing a GPU survives. `total` adds a second
+count, of every guarded back edge of an invocation, in a Private variable, which no back edge passes once it reaches
+the total. Each loop keeps its own limit; a loop that ends by itself is cut only after the whole invocation has made
+`total` visits. The case it is for: a loop bound computed by a float divide whose divisor is 0 is +inf, converts to
+0xFFFFFFFF, and an inclusive exit test against it never fails once the counter wraps; nested loops of that kind ran
+for seconds a dispatch at the per-loop limit, and the device was lost.
 """
 import argparse
 from collections import defaultdict
 import re
 
 DEFAULT_LIMIT = 65536
+DEFAULT_TOTAL = 1 << 20     # visits of all the guarded loops of an invocation together
 _LINE = re.compile(r"(?m)^[ \t]*(?:(%[\w.]+)\s*=\s*)?(Op(?:Label|BranchConditional|Branch|Switch|"
-                   r"LoopMerge|SelectionMerge|Phi|Function|TypeInt|TypeBool|Constant))\b([^;\n]*)")
+                   r"LoopMerge|SelectionMerge|Phi|Function|TypeInt|TypeBool|TypePointer|Constant|"
+                   r"EntryPoint))\b([^;\n]*)")
 
 
 def parse_limit(text):
@@ -19,9 +29,11 @@ def parse_limit(text):
     return value
 
 
-def add_guards(text, limit=DEFAULT_LIMIT):
+def add_guards(text, limit=DEFAULT_LIMIT, total=DEFAULT_TOTAL):
     if not 0 <= limit <= 0xffffffff:
         raise ValueError("loop limit must fit an unsigned 32-bit word")
+    if not 0 <= total <= 0xffffffff:
+        raise ValueError("loop total must fit an unsigned 32-bit word")
     if not limit or "OpLoopMerge" not in text:
         return text
     prefix = "%loop_guard_"
@@ -29,14 +41,18 @@ def add_guards(text, limit=DEFAULT_LIMIT):
         prefix += "_"
     heads, labels, terminators, merges, phis = {}, {}, {}, {}, defaultdict(list)
     pred = defaultdict(list)
-    constants = {}
-    uint = boolean = first_function = block = None
+    constants, pointers = {}, {}
+    uint = boolean = first_function = block = entry_point = None
     for match in _LINE.finditer(text):
         result, op, operands = match.groups()
         args = operands.split()
         if op == "OpFunction":
             if first_function is None:
                 first_function = match.start()
+        elif op == "OpEntryPoint":
+            entry_point = match.end()
+        elif op == "OpTypePointer":
+            pointers[tuple(args)] = result
         elif op == "OpTypeInt" and args == ["32", "0"]:
             uint = result
         elif op == "OpTypeBool":
@@ -67,12 +83,22 @@ def add_guards(text, limit=DEFAULT_LIMIT):
     if boolean is None:
         boolean = prefix + "bool"
         decls.append(f"{boolean} = OpTypeBool")
-    for value in (1, limit):
+    # The invocation's total is a global, which the entry point lists (SPIR-V 1.4 lists every global it uses); a
+    # fragment without an entry point keeps the per-loop counts alone.
+    totalled = total > 0 and entry_point is not None
+    for value in (1, limit) + ((0, total) if totalled else ()):
         if value not in constants:
             constants[value] = prefix + f"c{value}"
             decls.append(f"{constants[value]} = OpConstant {uint} {value}")
 
     edits, undef = [], {}
+    if totalled:
+        private = pointers.get(("Private", uint))
+        if private is None:
+            private = prefix + "private"
+            decls.append(f"{private} = OpTypePointer Private {uint}")
+        decls.append(f"{prefix}total = OpVariable {private} Private {constants[0]}")
+        edits.append((entry_point, entry_point, f" {prefix}total"))
     for i, (header, exit_label) in enumerate(heads.items()):
         # The translator emits dominators first. A structured loop has exactly one back edge.
         backward = [p for p in pred[header] if labels[p] >= labels[header]]
@@ -89,8 +115,17 @@ def add_guards(text, limit=DEFAULT_LIMIT):
         latch = q + "latch" if split else back
         incoming = " ".join((q + "next " + latch) if p == back else (constants[1] + " " + p) for p in pred[header])
         edits.append((labels[header], labels[header], f"\n{q}count = OpPhi {uint} {incoming}"))
-        operations = [f"{q}next = OpIAdd {uint} {q}count {constants[1]}",
-                      f"{q}room = OpULessThan {boolean} {q}count {constants[limit]}"]
+        operations = [f"{q}next = OpIAdd {uint} {q}count {constants[1]}"]
+        if totalled:
+            # Room in this loop's own count and in the invocation's total: the back edge needs both.
+            operations += [f"{q}spent = OpLoad {uint} {prefix}total",
+                           f"{q}spent_next = OpIAdd {uint} {q}spent {constants[1]}",
+                           f"OpStore {prefix}total {q}spent_next",
+                           f"{q}own = OpULessThan {boolean} {q}count {constants[limit]}",
+                           f"{q}left = OpULessThan {boolean} {q}spent {constants[total]}",
+                           f"{q}room = OpLogicalAnd {boolean} {q}own {q}left"]
+        else:
+            operations.append(f"{q}room = OpULessThan {boolean} {q}count {constants[limit]}")
         if op == "OpBranch" or split:
             branch = f"OpBranchConditional {q}room {header} {exit_label}"
         else:

@@ -54,6 +54,7 @@ STRUCTURED = True     # False (--dispatch-loop): every shader with branches as o
 # differs. docs/design.md "Control flow" has the numbers.
 MAX_STRUCTURED_DEPTH = 64
 LOOP_LIMIT = spirv_loop_guard.DEFAULT_LIMIT
+LOOP_TOTAL = spirv_loop_guard.DEFAULT_TOTAL  # --loop-total: the visits of all the loops of an invocation (0: none)
 DESCRIPTOR_HASHES = ("fnv1a", "fnv1a_fmix32")
 DESCRIPTOR_HASH = "fnv1a"
 # --descriptor-table: how the table's entries are read. "plain" is what every module read until the T# dimension
@@ -19358,7 +19359,7 @@ def finish_module(g):
     if OPT_SPIRV:
         import spirv_opt
         text = spirv_opt.optimize(text)
-    return spirv_loop_guard.add_guards(text, LOOP_LIMIT)
+    return spirv_loop_guard.add_guards(text, LOOP_LIMIT, total=LOOP_TOTAL)
 
 
 def _block_out_pcs(blocks, raw_edges, succ):
@@ -20273,7 +20274,7 @@ def _out_inside_input(src, out):
 
 
 def main():
-    global MAX_SHARED_BYTES, MAX_STRUCTURED_DEPTH, LOOP_LIMIT, DESCRIPTOR_HASH, DESCRIPTOR_TABLE
+    global MAX_SHARED_BYTES, MAX_STRUCTURED_DEPTH, LOOP_LIMIT, LOOP_TOTAL, DESCRIPTOR_HASH, DESCRIPTOR_TABLE
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("--out", required=True)
@@ -20353,6 +20354,10 @@ def main():
                     help="descriptor table entry layout: 'tagged' also carries each image's array kind, recorded as "
                          "descriptor_table in the module meta (default: tagged; 'plain' is the old layout, for a "
                          "library that keeps the runtime's old behaviour)")
+    ap.add_argument("--loop-total", type=spirv_loop_guard.parse_limit, default=spirv_loop_guard.DEFAULT_TOTAL,
+                    metavar="N",
+                    help="the most visits all the loops of an invocation make together, on top of each loop's own "
+                         "limit, so nested loops cannot multiply it (default %(default)s; 0 = none)")
     ap.add_argument("--loop-limit", type=spirv_loop_guard.parse_limit, default=spirv_loop_guard.DEFAULT_LIMIT,
                     help="maximum visits to each loop header, including dispatch loops (default %(default)s, 0 disables)")
     ap.add_argument("--max-structured-depth", type=_depth_arg, default=MAX_STRUCTURED_DEPTH, metavar="N",
@@ -20384,6 +20389,7 @@ def main():
     DESCRIPTOR_HASH = a.descriptor_hash
     DESCRIPTOR_TABLE = a.descriptor_table
     LOOP_LIMIT = a.loop_limit
+    LOOP_TOTAL = a.loop_total
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
     global MESH_SERIAL_WAVES

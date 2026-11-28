@@ -1857,7 +1857,10 @@ def fallback_flags(a) -> tuple[str, ...]:
     if descriptor_hash != "fnv1a":
         flags += (f"--descriptor-hash={descriptor_hash}",)
     limit = getattr(a, "loop_limit", None)
-    return flags if limit is None else (*flags, f"--loop-limit={limit}")
+    if limit is not None:
+        flags = (*flags, f"--loop-limit={limit}")
+    total = getattr(a, "loop_total", None)
+    return flags if total is None else (*flags, f"--loop-total={total}")
 
 
 def recorded_fallback_flags(work: str) -> tuple[str, ...]:
@@ -3142,6 +3145,9 @@ def main() -> int:
     ap.add_argument("--descriptor-hash", choices=("fnv1a", "fnv1a_fmix32"), default="fnv1a",
                     help="translate all stages for the selected runtime descriptor table hash")
     ap.add_argument("--loop-limit", type=int, help="translator loop visit limit (default 65536, 0 disables)")
+    ap.add_argument("--loop-total", type=int,
+                    help="translator total of loop visits an invocation may make across all its loops, on top of each "
+                         "loop's own limit (default 1048576, 0 = none)")
     ap.add_argument("--compact-spirv", action="store_true",
                     help="run the translator's compact binary pass on all shader libraries (requires spirv-opt)")
     ap.add_argument("--no-float-controls", action="store_true",
@@ -3175,6 +3181,8 @@ def main() -> int:
     a = ap.parse_args()
     if a.loop_limit is not None and not 0 <= a.loop_limit <= 0xffffffff:
         ap.error("--loop-limit must be in 0..4294967295")
+    if a.loop_total is not None and not 0 <= a.loop_total <= 0xffffffff:
+        ap.error("--loop-total must be in 0..4294967295")
     stages = STAGES
     if a.stages is not None:
         stages = [s.strip() for s in a.stages.split(",") if s.strip()]

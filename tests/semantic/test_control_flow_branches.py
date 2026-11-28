@@ -314,6 +314,7 @@ class StructuredBranchInterp:
         self.constants: dict[str, int | float | bool | tuple | list] = {}
         self.ptr_types: dict[str, tuple[str, str]] = {}
         self.var_class: dict[str, str] = {}
+        self.private_init: dict[str, tuple] = {}   # Private globals: (initializer id or None, pointee type)
         self.var_box: dict[str, list] = {}
         self.pointers: dict[str, tuple] = {}
         self.outputs: list[str] = []
@@ -392,11 +393,16 @@ class StructuredBranchInterp:
                 elif cls == "PushConstant":
                     self.var_box[res] = [None]
                     self.pointers[res] = ("pc", None)
+                elif cls == "Private":   # the loop guard's total: one per run, from its initializer
+                    self.private_init[res] = (a[2] if len(a) > 2 else None, pointee)
 
     def run(self, max_steps: int = 20000) -> dict[str, tuple]:
         values = dict(self.constants)
         var_box = dict(self.var_box)
         pointers = dict(self.pointers)
+        for res, (init, pointee) in self.private_init.items():
+            var_box[res] = [values[init] if init is not None else self.zero(pointee)]
+            pointers[res] = (var_box[res], 0)
 
         def val(x: str):
             if x in values:

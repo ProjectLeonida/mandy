@@ -72,3 +72,41 @@ class LoopGuardTests(unittest.TestCase):
         with patch.object(rdna2spirv, "LOOP_LIMIT", 3):
             text, _ = _translate_cs("cs_guard_nested", lines, threads=32)
         self.assertEqual(execute(text, 32, 0), [9] * 32)
+
+    # Two nested loops that never end (as an inclusive exit against a bound of 0xFFFFFFFF makes them, once the counter
+    # wraps). With a count per loop the limits multiply: LIMIT visits of the inner loop in each of LIMIT outer visits.
+    # --loop-total bounds them all together. s9 counts the inner loop's visits.
+    NEVER = ["s_mov_b32 s8, 0", "s_mov_b32 s9, 0", "outer:", "s_mov_b32 s10, 0",
+             "inner:", "s_add_u32 s9, s9, 1", "s_add_u32 s10, s10, 1", "s_cmp_eq_u32 s10, 0",
+             "s_cbranch_scc0 inner", "s_add_u32 s8, s8, 1", "s_cmp_eq_u32 s8, 0", "s_cbranch_scc0 outer",
+             "v_mov_b32_e32 v1, s9", "v_lshlrev_b32_e32 v2, 2, v0",
+             "buffer_store_dword v1, v2, s[0:3], 0 offen", "s_endpgm"]
+
+    def nested(self, lines, limit, total, lanes=32):
+        with patch.object(rdna2spirv, "LOOP_LIMIT", limit), patch.object(rdna2spirv, "LOOP_TOTAL", total):
+            text, _ = _translate_cs("cs_guard_total", lines, threads=lanes, emulate=lanes == 64)
+        return text, execute(text, lanes, 0)
+
+    def test_total_bounds_nested_loops(self):
+        # Without a total: 50 visits of the inner loop in each of 50 outer visits.
+        text, words = self.nested(self.NEVER, 50, 0)
+        self.assertNotIn("%loop_guard_total", text)
+        self.assertEqual(words, [2500] * 32)
+        # A total of 40: the first inner run takes 41 visits (the 41st finds the total spent), and the outer loop
+        # leaves at once after it.
+        text, words = self.nested(self.NEVER, 50, 40)
+        self.assertIn("%loop_guard_total", text)
+        self.assertEqual(words, [41] * 32)
+        # Emulated wave64: the round scheduler's own loop is guarded too and spends from the same total, so fewer
+        # visits are left for the program's loops, never more.
+        text, words = self.nested(self.NEVER, 50, 40, lanes=64)
+        self.assertIn("%loop_guard_total", text)
+        self.assertEqual(len(set(words)), 1)
+        self.assertTrue(0 < words[0] <= 41, words[0])
+
+    def test_total_leaves_loops_that_end_alone(self):
+        # Loops that end by themselves within the total compute what they did: 3 x 3 visits.
+        lines = [s.replace("s10, 0", "s10, 3").replace("s8, 0", "s8, 3") if s.startswith("s_cmp") else s
+                 for s in self.NEVER]
+        _, words = self.nested(lines, 50, 16)
+        self.assertEqual(words, [9] * 32)
