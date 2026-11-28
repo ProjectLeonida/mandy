@@ -16,6 +16,9 @@ namespace leonida {
 
 // Adds [start, end) to `ranges`. False when the caps refuse it: a range that adds a new entry past `max_ranges`, or
 // adds bytes once `bytes` has reached `max_bytes`. A range already covered always fits.
+// The byte cap is soft, as it was before the merge moved here: it is checked before a range goes in, so the range
+// that crosses it is kept whole (cutting it would drop GPU writes inside it), and the next one that adds bytes is
+// refused. A refused range leaves `ranges` and `bytes` as they were.
 inline bool add_reached_range(std::map<std::uint64_t, std::uint64_t>& ranges, std::uint64_t& bytes, std::uint64_t start,
                               std::uint64_t end, std::size_t max_ranges, std::uint64_t max_bytes) {
     if (start >= end) return true;

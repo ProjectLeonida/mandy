@@ -79,6 +79,16 @@ int main() {
         ok &= check(r.is({{0, 100}}) && r.bytes == 100, "and leaves the ranges as they were");
         ok &= check(r.add(10, 90, 8192, 100), "a range already covered still fits");
     }
+    {  // the byte cap is soft: the range that crosses it goes in whole, the next byte past it does not (akimfomin, #2517)
+        Recorder r;
+        ok &= check(r.add(0, 63, 8192, 64) && r.bytes == 63, "[0,63) fits a 64-byte cap");
+        ok &= check(r.add(128, 132, 8192, 64), "a disjoint [128,132) still goes in: 63 bytes is under the cap");
+        ok &= check(r.is({{0, 63}, {128, 132}}) && r.bytes == 67, "and is kept whole: 63 -> 67 bytes");
+        ok &= check(!r.add(200, 201, 8192, 64), "the next range that adds a byte is refused");
+        ok &= check(!r.add(60, 70, 8192, 64), "so is a merge that adds bytes");
+        ok &= check(r.is({{0, 63}, {128, 132}}) && r.bytes == 67, "and refusals leave the map and count unchanged");
+        ok &= check(r.add(129, 131, 8192, 64) && r.bytes == 67, "a covered range still fits");
+    }
     {  // the range cap refuses only new entries
         Recorder r;
         r.add(0, 10, 2);
