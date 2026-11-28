@@ -531,6 +531,69 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.assertEqual(self.run_stage(), [])                  # hours of translation are not redone
 
 
+class SubsetListIdentityTest(unittest.TestCase):
+    """The shard plan's identity must include the shader list content, so changing the list
+    (even overwriting the same file) re-translates instead of reusing stale shards."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.spirv = os.path.join(self.tmp.name, "spirv")
+        os.makedirs(self.spirv)
+        self.list_path = os.path.join(self.tmp.name, "shaders.txt")
+        self.write_list("s0\ns1\n")
+        self.popen_calls = []
+        self.popen_patch = mock.patch.object(make_game.subprocess, "Popen", self.fake_popen)
+        self.popen_patch.start()
+        self.addCleanup(self.popen_patch.stop)
+        self.py_patch = mock.patch.object(make_game, "py", lambda *a, **k: None)
+        self.py_patch.start()
+        self.addCleanup(self.py_patch.stop)
+
+    def write_list(self, content):
+        with open(self.list_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+
+    def fake_popen(self, cmd, **kw):
+        self.popen_calls.append(list(cmd))
+        proc = mock.Mock()
+        proc.wait.return_value = 0
+        proc.poll.return_value = 0
+        return proc
+
+    def finish_shards(self, jobs=2):
+        """Simulate finished shards from a previous translation."""
+        for i in range(jobs):
+            with open(os.path.join(self.spirv, f"index.part{i}.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({}, f)
+            with open(os.path.join(self.spirv, f"shard{i}.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({}, f)
+
+    def test_same_list_reuses_finished_shards(self):
+        make_game.translate("disasm", self.spirv, 2, shader_list=self.list_path)
+        self.popen_calls.clear()
+        self.finish_shards()
+        make_game.translate("disasm", self.spirv, 2, shader_list=self.list_path)
+        self.assertEqual(self.popen_calls, [], "same list and finished shards: nothing to translate")
+
+    def test_changed_list_retranslates(self):
+        make_game.translate("disasm", self.spirv, 2, shader_list=self.list_path)
+        self.popen_calls.clear()
+        self.finish_shards()
+        self.write_list("s2\ns3\n")
+        make_game.translate("disasm", self.spirv, 2, shader_list=self.list_path)
+        self.assertNotEqual(self.popen_calls, [], "changed list: plan mismatch, re-translate")
+
+    def test_overwriting_same_file_retranslates(self):
+        make_game.translate("disasm", self.spirv, 2, shader_list=self.list_path)
+        self.popen_calls.clear()
+        self.finish_shards()
+        # Overwrite the same file with different content
+        self.write_list("s2\ns3\n")
+        make_game.translate("disasm", self.spirv, 2, shader_list=self.list_path)
+        self.assertNotEqual(self.popen_calls, [], "same path, new content: plan mismatch, re-translate")
+
+
 class TranslationSourcesTest(unittest.TestCase):
     def test_the_list_covers_the_translator_and_native_catalog_imports(self):
         seen, todo = set(), ["rdna2spirv", "native_pso_hashes"]

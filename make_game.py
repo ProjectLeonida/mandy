@@ -1305,7 +1305,7 @@ def translated_index_is_empty(index: str) -> bool:
 
 
 def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulated: bool = False,
-            fallbacks: tuple[str, ...] = ()) -> None:
+            fallbacks: tuple[str, ...] = (), shader_list: str | None = None) -> None:
     src = os.path.join(game, "shaders.rpf")
     sh = os.path.join(work, "shaders")
     dxbc = os.path.join(sh, "dxbc")
@@ -1321,11 +1321,14 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     signature = llvm_mc_signature()
     if not os.path.isfile(carved):
         log("shaders: carving shaders.rpf")
-        drop(translated, shard_plan, disassembled, disassembly_started, unpacked)
+        # A subset translation writes to its own directory and never touches the full index, so don't drop it.
+        if shader_list is None:
+            drop(translated, shard_plan, disassembled, disassembly_started, unpacked)
         py("shader_carve.py", src, dxbc)
     if unpacked_shader_stems(dxbc) is None:
         log("shaders: unpacking native code")
-        drop(translated, shard_plan, disassembled, disassembly_started)
+        if shader_list is None:
+            drop(translated, shard_plan, disassembled, disassembly_started)
         py("fssm_unpack.py", dxbc, "--carve-index", carved)
     # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
     # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
@@ -1335,7 +1338,8 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         if os.path.isfile(disassembled) or os.path.isfile(translated):
             log("shaders: llvm-mc changed or the saved disassembly could not be verified")
         log("shaders: resuming disassembly (gfx1013)" if resume else "shaders: disassembling (gfx1013)")
-        drop(translated, shard_plan)
+        if shader_list is None:
+            drop(translated, shard_plan)
         if not resume:
             drop(disassembly_started, disassembled)
         prepare_shader_disassembly(work, disasm, resume)
@@ -1358,63 +1362,75 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
             f.write("\n")
         os.replace(marker, disassembled)
         drop(disassembly_started)
-    # The translation also depends on the translator's own files, so their digest is kept beside it. A folder without
-    # it (from before the file existed), with an unreadable one or with another one is translated again; carving, unpacking and
-    # disassembly stay current.
-    sources_file = os.path.join(spirv, "translation_sources.sha256")
-    sources = translation_sources_digest()
-    if os.path.isfile(translated) and read_shader_setting(sources_file) != sources:
-        log("shaders: no matching translator fingerprint for the existing shaders: translating again")
-        drop(translated)
-    # The translation depends on --wave64-emulate, so the mode it was made with is kept beside it. A folder from
-    # before the file existed was translated without emulation.
-    mode_file = os.path.join(spirv, "wave64_emulate.txt")
-    had = read_shader_setting(mode_file, default="off")
-    want = requested_shader_mode(had, emulate, keep_emulated)
-    if want == "on" and not emulate:
-        # auto answers differently from run to run (a GPU asleep or hidden, vulkaninfo missing); emulated shaders are
-        # exact on every GPU, so they are kept rather than translating the whole corpus again. When they are
-        # translated again for another reason, or a stopped translation is retried, they stay emulated.
-        log("shaders: the shaders were translated with wave64 emulation and it stays on (exact on every GPU); "
-            "--wave64-emulate off translates them natively")
-        emulate = True
-    elif had != want and os.path.isfile(translated):
-        log(f"shaders: wave64 emulation is now {want} (the shaders were translated with it {had}): "
-            "translating again")
-        drop(translated)
-    # The translation also depends on the fallback flags (--no-float-controls, --bary-fallback,
-    # --texel-offset-fallback, --mesh-compute), so they are kept beside it like the wave64 mode. A folder from
-    # before the file existed was translated without them.
-    flags_file = os.path.join(spirv, "translator_flags.txt")
-    want_flags = translator_flags_setting(fallbacks)
-    had_flags = read_shader_setting(flags_file)
-    if had_flags != want_flags and os.path.isfile(translated):
-        log(f"shaders: the fallback flags are now {want_flags or 'none'} (the shaders were translated with "
-            f"{had_flags or 'none'}): translating again")
-        drop(translated)
-    if os.path.isfile(translated) and translated_index_is_empty(translated):
-        # An empty merge, or an index that cannot be read, is not a finished translation. The shard plan goes with it:
-        # its parts are what the empty merge read, so a retry has to translate them again rather than reuse them.
-        log("shaders: the saved translated index names no shaders: translating again")
-        drop(translated, shard_plan)
-    if not os.path.isfile(translated):
-        need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
-        need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
-        if "--compact-spirv" in fallbacks:
-            need("spirv-opt", "Install SPIRV-Tools with spirv-opt to use --compact-spirv.")
-        log(f"shaders: translating RDNA2 to SPIR-V on {jobs} processes (the longest step)")
-        # The mode and the translator's digest go down before the translation starts, while there is no index.json:
-        # a stop at any point then leaves either no index (translated again) or an index with the right mode and
-        # digest, never a guessed one. rdna2spirv.py --merge writes index.json last, after the stubs.
-        os.makedirs(spirv, exist_ok=True)
-        with open(mode_file, "w", encoding="utf-8", newline="\n") as f:
-            f.write(want + "\n")
-        with open(flags_file, "w", encoding="utf-8", newline="\n") as f:
-            f.write(want_flags + "\n")
-        with open(sources_file, "w", encoding="utf-8", newline="\n") as f:
-            f.write(sources + "\n")
-        translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
-    verify_translation_completeness(dxbc, spirv)
+    if shader_list is not None:
+        # Subset translation: write to a separate directory, never touch the full index. None of the full-index
+        # fingerprint checks (translator digest, wave64 mode, fallback flags) apply: we never read or overwrite
+        # spirv/index.json, and we never call verify_translation_completeness().
+        subset_spirv = os.path.join(spirv, "subset")
+        os.makedirs(subset_spirv, exist_ok=True)
+        log(f"shaders: translating listed shaders to {subset_spirv}")
+        translate(disasm, subset_spirv, jobs, emulate=emulate, fallbacks=fallbacks,
+                  shader_list=shader_list)
+    else:
+        # Full translation with fingerprint checks: the translator's own files, wave64 mode and fallback flags
+        # all gate reuse of the saved index.
+        sources_file = os.path.join(spirv, "translation_sources.sha256")
+        sources = translation_sources_digest()
+        if os.path.isfile(translated) and read_shader_setting(sources_file) != sources:
+            log("shaders: no matching translator fingerprint for the existing shaders: translating again")
+            drop(translated)
+        # The translation depends on --wave64-emulate, so the mode it was made with is kept beside it. A folder from
+        # before the file existed was translated without emulation.
+        mode_file = os.path.join(spirv, "wave64_emulate.txt")
+        had = read_shader_setting(mode_file, default="off")
+        want = requested_shader_mode(had, emulate, keep_emulated)
+        if want == "on" and not emulate:
+            # auto answers differently from run to run (a GPU asleep or hidden, vulkaninfo missing); emulated
+            # shaders are exact on every GPU, so they are kept rather than translating the whole corpus again.
+            # When they are translated again for another reason, or a stopped translation is retried, they stay
+            # emulated.
+            log("shaders: the shaders were translated with wave64 emulation and it stays on (exact on every GPU); "
+                "--wave64-emulate off translates them natively")
+            emulate = True
+        elif had != want and os.path.isfile(translated):
+            log(f"shaders: wave64 emulation is now {want} (the shaders were translated with it {had}): "
+                "translating again")
+            drop(translated)
+        # The translation also depends on the fallback flags (--no-float-controls, --bary-fallback,
+        # --texel-offset-fallback, --mesh-compute), so they are kept beside it like the wave64 mode. A folder from
+        # before the file existed was translated without them.
+        flags_file = os.path.join(spirv, "translator_flags.txt")
+        want_flags = translator_flags_setting(fallbacks)
+        had_flags = read_shader_setting(flags_file)
+        if had_flags != want_flags and os.path.isfile(translated):
+            log(f"shaders: the fallback flags are now {want_flags or 'none'} (the shaders were translated with "
+                f"{had_flags or 'none'}): translating again")
+            drop(translated)
+        if os.path.isfile(translated) and translated_index_is_empty(translated):
+            # An empty merge, or an index that cannot be read, is not a finished translation. The shard plan goes
+            # with it: its parts are what the empty merge read, so a retry has to translate them again rather than
+            # reuse them.
+            log("shaders: the saved translated index names no shaders: translating again")
+            drop(translated, shard_plan)
+        if not os.path.isfile(translated):
+            need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
+            need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
+            if "--compact-spirv" in fallbacks:
+                need("spirv-opt", "Install SPIRV-Tools with spirv-opt to use --compact-spirv.")
+            log(f"shaders: translating RDNA2 to SPIR-V on {jobs} processes (the longest step)")
+            # The mode and the translator's digest go down before the translation starts, while there is no
+            # index.json: a stop at any point then leaves either no index (translated again) or an index with the
+            # right mode and digest, never a guessed one. rdna2spirv.py --merge writes index.json last, after the
+            # stubs.
+            os.makedirs(spirv, exist_ok=True)
+            with open(mode_file, "w", encoding="utf-8", newline="\n") as f:
+                f.write(want + "\n")
+            with open(flags_file, "w", encoding="utf-8", newline="\n") as f:
+                f.write(want_flags + "\n")
+            with open(sources_file, "w", encoding="utf-8", newline="\n") as f:
+                f.write(sources + "\n")
+            translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
+            verify_translation_completeness(dxbc, spirv)
     native_pso_hashes(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
@@ -2140,17 +2156,22 @@ def _stop_procs(procs: list) -> None:
 
 
 def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
-              fallbacks: tuple[str, ...] = ()) -> None:
+              fallbacks: tuple[str, ...] = (), shader_list: str | None = None) -> None:
     """rdna2spirv.py runs on one core: start one --shard per job side by side, then merge their index parts.
 
     A shard publishes shard<i>.json and then index.part<i>.json. Both are needed to reuse it. A run stopped
     part-way, or during the merge, keeps those parts when it resumes with the same --jobs, wave64 mode, fallback
-    flags and translator source, and starts only the shards that have none. shaders() drops the plan whenever an
-    earlier step reruns."""
+    flags, translator source and shader list, and starts only the shards that have none. shaders() drops the plan
+    whenever an earlier step reruns."""
     os.makedirs(spirv, exist_ok=True)
     plan_path = os.path.join(spirv, SHARD_PLAN)
     plan = {"jobs": jobs, "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks),
             "translator": translator_digest()}
+    if shader_list is not None:
+        # The list content is part of the plan identity: overwriting the same list file with a different
+        # selection must not reuse shards translated for the old list.
+        with open(shader_list, "rb") as f:
+            plan["shader_list"] = hashlib.sha256(f.read()).hexdigest()
     try:
         with open(plan_path, encoding="utf-8") as f:
             same = json.load(f) == plan
@@ -2174,6 +2195,8 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
     tool = os.path.join(TOOLS, "rdna2spirv.py")
     extra = ["--wave64-emulate"] if emulate else []
     extra.extend(fallbacks)
+    if shader_list is not None:
+        extra.extend(["--shader-list", shader_list])
     if todo:
         which = f"0..{jobs - 1}" if len(todo) == jobs else ",".join(str(i) for i in todo)
         log(f"  rdna2spirv.py {disasm} --out {spirv} --shard {which}/{jobs}" + "".join(" " + e for e in extra))
@@ -2996,7 +3019,7 @@ def _invoke_stage(name: str, fn) -> None:
 
 def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, wav: bool, jobs: int,
                      runtime_build: str | None, emulate: bool, keep_emulated: bool,
-                     fallbacks: tuple[str, ...], overlap: bool = True) -> None:
+                     fallbacks: tuple[str, ...] = (), shader_list: str | None = None, overlap: bool = True) -> None:
     """Run build stages after check. With overlap=True (default), shaders/assets/runtime share the machine and
     pipelines starts once shaders (and a selected runtime rebuild) are ready. With overlap=False, stages run in order."""
     cpu_heavy = [s for s in ("shaders", "assets") if s in stages]
@@ -3006,7 +3029,8 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
     progress = StageBoard([s for s in ("shaders", "assets", "runtime", "pipelines") if s in stages])
 
     def fn_shaders():
-        shaders(game, work, shader_jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks)
+        shaders(game, work, shader_jobs, emulate=emulate, keep_emulated=keep_emulated,
+                fallbacks=fallbacks, shader_list=shader_list)
 
     def fn_assets():
         assets(game, work, wav, jobs, dump_jobs=dump_jobs)
@@ -3169,6 +3193,9 @@ def main() -> int:
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
                          "the shaders need (144, or 152 with --mesh-compute)")
+    ap.add_argument("--shader-list", metavar="FILE", type=nonempty_path,
+                    help="translate only shaders whose stem is listed in FILE (one stem per line); "
+                         "skips the completeness check, for testing on a subset instead of all 26,503")
     ap.add_argument("--no-tui", action="store_true",
                     help="plain console logs (default when stdout is not a TTY); skip the LEONIDA setup screen "
                          "and per-stage log view")
@@ -3303,12 +3330,12 @@ def main() -> int:
             tui_board.set_summary(f"build 0% · {', '.join(build_stages)}")
             run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                              runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                             fallbacks=fallbacks, overlap=overlap)
+                             fallbacks=fallbacks, shader_list=a.shader_list, overlap=overlap)
             tui_board.set_summary(f"finished in {(time.time() - t0) / 60:.0f} min")
     else:
         run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                          runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                         fallbacks=fallbacks, overlap=overlap)
+                         fallbacks=fallbacks, shader_list=a.shader_list, overlap=overlap)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 
