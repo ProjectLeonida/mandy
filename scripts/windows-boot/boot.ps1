@@ -444,6 +444,67 @@ if (-not $DigestOnly) {
 
 # -------------------------------------------------------------------------------------------- the digest
 
+function Get-FaultContext {
+    param([string]$Path)
+    $apis = @("vkAcquireNextImageKHR", "vkBeginCommandBuffer", "vkCreateSwapchainKHR", "vkDeviceWaitIdle",
+              "vkEndCommandBuffer", "vkGetFenceStatus", "vkGetQueryPoolResults", "vkGetSemaphoreCounterValue",
+              "vkQueueBindSparse", "vkQueuePresentKHR", "vkQueueSubmit", "vkQueueWaitIdle", "vkResetFences",
+              "vkSignalSemaphore", "vkWaitForFences", "vkWaitSemaphores")
+    $api = "not observed"
+    $query = "not observed"
+    $lost = $false
+    [long]$queues = 0
+    [long]$reported = 0
+    [long]$decoded = 0
+    [long]$unrecognized = 0
+
+    # Select-String streams matches, including a report that arrives after a long trace.
+    $prefix = '^\s*\[rt\] (device-fault: |vulkan: the device was lost \()'
+    Select-String -LiteralPath $Path -CaseSensitive -Pattern $prefix | ForEach-Object {
+        $tag = $_.Matches[0]
+        $record = $_.Line.Substring($tag.Length).TrimEnd()
+        if ($tag.Groups[1].Value -eq "vulkan: the device was lost (") {
+            $lost = $true
+            if ($api -in @("not observed", "other")) {
+                if ($record -cmatch '^(vkWaitSemaphores|vkGetSemaphoreCounterValue) in the fence dispatcher returned VK_ERROR_DEVICE_LOST\)') {
+                    $api = $Matches[1]
+                } elseif ($record.StartsWith("a fence's counter read UINT64_MAX and vkDeviceWaitIdle then returned VK_ERROR_DEVICE_LOST)")) {
+                    $api = "vkDeviceWaitIdle"
+                }
+            }
+        } elseif ($record.StartsWith("VK_ERROR_DEVICE_LOST from ")) {
+            $lost = $true
+            if ($api -in @("not observed", "other")) {
+                $api = "other"
+                if ($record -cmatch '^VK_ERROR_DEVICE_LOST from ([^\s(]+)' -and $apis -ccontains $Matches[1]) {
+                    $api = $Matches[1]
+                }
+            }
+        } elseif ($record -cmatch '^queue \S+ checkpoints=([0-9]+)$') {
+            [uint32]$count = 0
+            if ([uint32]::TryParse($Matches[1], [ref]$count)) {
+                $queues++
+                $reported += $count
+            }
+        } elseif ($record -cmatch '^stage=0x[0-9a-fA-F]+ submission=[0-9]+ list=[0-9]+ command=[0-9]+ kind=\S+$') {
+            $decoded++
+        } elseif ($record -cmatch '^stage=0x[0-9a-fA-F]+ marker=\S+ \(unrecognized\)$') {
+            $unrecognized++
+        } elseif ($query -eq "not observed") {
+            if ($record.StartsWith("description:")) {
+                $query = if ($record.EndsWith(" (partial report)")) { "partial" } else { "complete" }
+            } elseif ($record -cmatch '^vkGetDeviceFaultInfoEXT (counts|data) failed \(-?[0-9]+\)$') {
+                $query = "$($Matches[1]) failed"
+            } elseif ($record -ceq "fault info collection failed") {
+                $query = "collection failed"
+            }
+        }
+    }
+    if ($lost -or $query -ne "not observed" -or $queues -or $decoded -or $unrecognized) {
+        "fault context: api=$api, query=$query, queues=$queues, reported=$reported, decoded=$decoded, unrecognized=$unrecognized"
+    }
+}
+
 $py = @(Resolve-Python $Python)
 if ($py.Count) {
     $pyArgs = @()
@@ -529,6 +590,10 @@ $digest.Add("input:    $presses presses logged")
 $digest.Add("faults:   $(if ($faults.Count) { $faults.Count.ToString() + ' device-fault lines' } else { 'none' })")
 foreach ($f in $faults) { $digest.Add("          $f") }
 if ($wrapped) { $digest.Add("wrapped:  $wrapped lines mention wrapped V#s") }
+if (Test-Path -LiteralPath $LogFile) {
+    $faultContext = Get-FaultContext $LogFile
+    if ($faultContext) { $digest.Add($faultContext) }
+}
 $digest.Add("frames:   $capText")
 $digest.Add("files:    $LogFile, $TraceFile, $SummaryFile")
 $digest | Out-File -FilePath $DigestFile -Encoding utf8

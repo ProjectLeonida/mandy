@@ -84,6 +84,12 @@ session=?`. A `LEONIDA_PEEK` of your own still works for the log, but the digest
 variables name. `docs/linux_proton.md` (the same stages apply natively)
 section 2 has the healthy sequence with times and section 3 "which blank do you have".
 
+When the log contains a device loss, a fault query outcome or checkpoint records, `fault context` shows the first
+recognized Vulkan API that reported loss and the first observed fault query outcome. An unrecognized operation is
+shown as `other`. A missing outcome is `not observed`. The queue count includes queries that returned zero
+checkpoints. `reported` sums the driver counts from the queue headers. `decoded` and `unrecognized` count the
+two kinds of printed stage records, so a truncated log can have fewer printed records than reported checkpoints.
+
 ## One game at a time
 
 The script holds the named mutex `Local\LeonidaGameBoot` for the whole boot and also waits while any `gta6rt.exe`
