@@ -195,7 +195,7 @@ def fit_distant_mips(pools, docs):
                     prefix = calib.decode_lanes_prefix(
                         pool.data[offset:offset + packed], mode, size, pblocks * 2)
                     if _chunk_needs_missing_slot(mode, prefix, pblocks, docs, static_bc7):
-                        wanted.add((offset, packed))
+                        wanted.add((offset, packed, mode))
                         lanes_cache[(offset, packed, pblocks)] = prefix
             if not wanted:
                 continue
@@ -243,7 +243,7 @@ def fit_distant_mips(pools, docs):
                         needy_chunks = [
                             (size, offset, packed, virt - start, min(4096, size // 16))
                             for virt, size, offset, packed, mode, _ in pool.chunks_for(start, mip["region"])
-                            if mode == codec and (offset, packed) in wanted and start - virt < 4096 * 16
+                            if mode == codec and (offset, packed, mode) in wanted and start - virt < 4096 * 16
                         ]
                         if not needy_chunks:
                             continue
