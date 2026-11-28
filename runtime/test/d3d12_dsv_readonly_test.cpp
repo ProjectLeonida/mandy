@@ -501,7 +501,10 @@ int main() {
         const std::uint64_t q_ro = mapped_q[0], q_rw = mapped_q[1];
         rb_query->Unmap(0, nullptr);
         const std::uint64_t want_q = std::uint64_t(kSide) * kSide;
-        if (q_ro != q_rw || (vk.occlusion_query_precise ? (q_ro != want_q) : (q_ro == 0))) {
+        const bool queries_match = vk.occlusion_query_precise
+            ? q_ro == want_q && q_rw == want_q
+            : q_ro != 0 && q_rw != 0;
+        if (!queries_match) {
             std::fprintf(stderr, "FAIL D32_FLOAT occlusion control: ro=%llu rw=%llu (want %llu)\n",
                          static_cast<unsigned long long>(q_ro), static_cast<unsigned long long>(q_rw),
                          static_cast<unsigned long long>(want_q));
