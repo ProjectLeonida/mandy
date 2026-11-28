@@ -113,6 +113,7 @@ struct VulkanDeviceInfo {
     bool device_diagnostics_config = false;
     bool device_markers = false;  // VK_AMD_buffer_marker enabled for LEONIDA_DEVICE_MARKERS=1
     bool separate_depth_stencil_layouts = true;
+    bool separate_depth_stencil_attachment_access = false;  // VK_KHR_maintenance7 separateDepthStencilAttachmentAccess
     bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled on this device.
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
@@ -592,7 +593,8 @@ std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
 // submitted, without waiting (PipelineState::queue_build). `id` is what compute_pipeline_id or graphics_pipeline_id gave (0:
 // nothing). Compute: at SetPipelineState; graphics: at each draw, with the render-target slots it binds (bit per slot)
 // and whether it binds a depth buffer.
-void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool depth_bound);
+void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool depth_bound,
+                            std::uint32_t dsv_flags = 0);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
 // The linked SPIR-V stage modules for a lazy pipeline (in recipe stages order); false when not a lazy pipeline.

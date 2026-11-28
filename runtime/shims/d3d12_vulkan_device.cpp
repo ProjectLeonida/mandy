@@ -12919,7 +12919,7 @@ public:
     // Record time (SetPipelineState for compute, a draw for graphics, with the render-target slots it binds and
     // whether it binds a depth buffer): asynchronous builds start on the compile worker before the list is submitted.
     // Never waits; nothing to do when the variant is the last one asked for here.
-    void request_early(std::uint32_t bound_targets, bool depth_bound) {
+    void request_early(std::uint32_t bound_targets, bool depth_bound, std::uint32_t dsv_flags = 0) {
         if (!async_replay_compile() || !registered_) return;
         // A pipeline under LEONIDA_ASYNC_MIN_BYTES is built where it is needed, as without asynchronous builds.
         if (!(is_graphics_ ? graphics_.async_build : pipeline_.async_build)) return;
@@ -12930,6 +12930,12 @@ public:
                     unbound |= 1u << slot;
             if (graphics_.depth_format != VK_FORMAT_UNDEFINED && !depth_bound)
                 unbound |= leonida::GraphicsPipeline::unbound_depth;
+            if (depth_bound) {
+                if ((dsv_flags & leonida::dsv_read_only_depth) && graphics_.depth_writes)
+                    unbound |= leonida::GraphicsPipeline::read_only_depth;
+                if ((dsv_flags & leonida::dsv_read_only_stencil) && graphics_.stencil_writes)
+                    unbound |= leonida::GraphicsPipeline::read_only_stencil;
+            }
             if (!unbound && graphics_.pipeline) return;
         } else if (!pipeline_.build || pipeline_.skipped) {
             return;  // an eager pipeline has no build
@@ -14733,6 +14739,29 @@ public:
                 if (!state_.info.max_buffer_size) state_.info.max_buffer_size = limits.max_buffer_size;
                 if (!state_.info.max_memory_allocation_size)
                     state_.info.max_memory_allocation_size = limits.max_allocation_size;
+#ifdef VK_KHR_MAINTENANCE_7_EXTENSION_NAME
+                if (!state_.info.separate_depth_stencil_attachment_access) {
+                    if (const auto enum_exts = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+                            info.get_instance_proc(info.instance, "vkEnumerateDeviceExtensionProperties"))) {
+                        std::uint32_t ext_count = 0;
+                        if (enum_exts(info.physical, nullptr, &ext_count, nullptr) == VK_SUCCESS && ext_count) {
+                            std::vector<VkExtensionProperties> exts(ext_count);
+                            if (enum_exts(info.physical, nullptr, &ext_count, exts.data()) == VK_SUCCESS &&
+                                std::any_of(exts.begin(), exts.end(), [](const auto& e) {
+                                    return std::strcmp(e.extensionName, VK_KHR_MAINTENANCE_7_EXTENSION_NAME) == 0;
+                                })) {
+                                VkPhysicalDeviceMaintenance7PropertiesKHR m7{
+                                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_PROPERTIES_KHR};
+                                VkPhysicalDeviceProperties2 m7_props{
+                                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &m7};
+                                get_props2(info.physical, &m7_props);
+                                state_.info.separate_depth_stencil_attachment_access =
+                                    m7.separateDepthStencilAttachmentAccess == VK_TRUE;
+                            }
+                        }
+                    }
+                }
+#endif
             }
         }
 
@@ -14742,12 +14771,10 @@ public:
             .robust_index_view = info.robust_index_view, .require_clamp = leonida::indirect_clamp_enabled()};
         // Before the context: its SubmitMutex takes the gate's mode and limits when it is made.
         decide_auto_compile_gate(info, get_device, state_.pso_identity);
-        state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
-                                                                  info.separate_depth_stencil_layouts,
-                                                                  info.conditional_rendering, info.ray_tracing,
-                                                                  info.xdxr_acceleration_structures &&
-                                                                      info.buffer_device_address,
-                                                                  indirect);
+        state_.context = std::make_unique<leonida::VulkanContext>(
+            get_device, info.device, info.separate_depth_stencil_layouts, info.conditional_rendering, info.ray_tracing,
+            info.xdxr_acceleration_structures && info.buffer_device_address, indirect,
+            state_.info.separate_depth_stencil_attachment_access);
         if (info.device_fault_diagnostics) {
             state_.context->configure_device_fault(get_device,
                 {info.device_fault_info, info.device_checkpoints, info.device_diagnostics_config, info.device_markers},
@@ -21278,11 +21305,12 @@ std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
     return p && p->resolve_type(true) ? p->id() : 0;
 }
 
-void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool depth_bound) {
+void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool depth_bound,
+                            std::uint32_t dsv_flags) {
     if (!id || !async_replay_compile()) return;
     // The id is the PSO's own ID3D12PipelineState pointer (PipelineState::id), which the list keeps a reference to.
     auto* pso = static_cast<PipelineState*>(reinterpret_cast<ID3D12PipelineState*>(id));
-    pso->request_early(bound_targets, depth_bound);
+    pso->request_early(bound_targets, depth_bound, dsv_flags);
 }
 
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {
@@ -22441,6 +22469,15 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     }
 #endif
 
+#ifdef VK_KHR_MAINTENANCE_7_EXTENSION_NAME
+    if (has_device_extension(VK_KHR_MAINTENANCE_7_EXTENSION_NAME)) {
+        VkPhysicalDeviceMaintenance7PropertiesKHR m7{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &m7};
+        vkGetPhysicalDeviceProperties2(info.physical, &query);
+        info.separate_depth_stencil_attachment_access = m7.separateDepthStencilAttachmentAccess == VK_TRUE;
+    }
+#endif
 #ifdef VK_KHR_MAINTENANCE_10_EXTENSION_NAME
     VkPhysicalDeviceMaintenance10FeaturesKHR maintenance10{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_10_FEATURES_KHR};
     // Vulkan 1.3 makes the 64-bit optimal tiling format features used by this path core.

@@ -1366,6 +1366,9 @@ struct ReplayFunctions {
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
+    // VK_KHR_maintenance7 separateDepthStencilAttachmentAccess: storing a writable depth/stencil aspect does not
+    // touch the read-only sibling aspect, so a shader may safely sample the read-only aspect in GENERAL concurrently.
+    bool separate_depth_stencil_attachment_access = false;
 };
 
 namespace detail {
@@ -3673,9 +3676,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!detail::view_range(p.binding, depth_clear->target, aspects, p.range))
                 return ReplayResult::invalid_subresource;
             if (!aspects) p.skip = true;
-            if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
-                r != ReplayResult::success)
-                return r;
+            if (!p.skip) {
+                if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
+                    r != ReplayResult::success)
+                    return r;
+            }
             if (!p.skip && p.rects.empty() && !vk.clear_depth_stencil_image) return unsupported_at(__LINE__);
         } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
             const UavView& view = uav->view;
@@ -5545,8 +5550,13 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             constexpr VkAccessFlags depth_access =
                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            constexpr VkAccessFlags depth_ro_access =
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
             constexpr VkPipelineStageFlags depth_stages =
                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+            constexpr VkPipelineStageFlags depth_ro_stages =
+                depth_stages | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+            const GraphicsPipeline& graphics = *d.graphics;
             std::array<VkRenderingAttachmentInfo, detail::max_render_targets> colors;
             colors.fill({VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO});
             for (std::size_t slot = 0; slot < d.colors.size(); ++slot) {
@@ -5569,52 +5579,74 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 const bool ro_stencil = has_stencil && (d.depth.dsv_flags & dsv_read_only_stencil) != 0;
                 const bool split = has_depth && has_stencil && ro_depth != ro_stencil;
                 const bool all_ro = (!has_depth || ro_depth) && (!has_stencil || ro_stencil);
+                const bool any_ro = ro_depth || ro_stencil;
+                const bool depth_can_write = has_depth && !ro_depth && graphics.depth_writes &&
+                                             (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
+                const bool stencil_can_write = has_stencil && !ro_stencil && graphics.stencil_writes &&
+                                               (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+                // On packed depth/stencil formats without VK_KHR_maintenance7 separateDepthStencilAttachmentAccess,
+                // storing a writable sibling aspect can access the read-only aspect, racing concurrent shader sampling
+                // in GENERAL. Keep the read-only aspect out of GENERAL unless sibling stores are inactive or isolated.
+                const bool allow_general_ro =
+                    !split || (!depth_can_write && !stencil_can_write) || vk.separate_depth_stencil_attachment_access;
+                if (!allow_general_ro && d.depth.binding.sampled && d.depth.binding.sampled_in_general) {
+                    static std::atomic<bool> logged{false};
+                    if (!logged.exchange(true, std::memory_order_relaxed))
+                        std::fprintf(stderr,
+                                     "[rt] replay: mixed read-only depth/stencil with writable sibling cannot safely "
+                                     "sample in GENERAL without VK_KHR_maintenance7 "
+                                     "separateDepthStencilAttachmentAccess; keeping optimal read-only layout\n");
+                }
+                const auto dsv_layout = [&](VkImageLayout wanted) {
+                    if (d.depth.binding.simultaneous_access && wanted != VK_IMAGE_LAYOUT_UNDEFINED &&
+                        wanted != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+                        return VK_IMAGE_LAYOUT_GENERAL;
+                    return allow_general_ro ? image_layout(d.depth.binding, wanted) : wanted;
+                };
                 VkImageLayout depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                 VkImageLayout stencil_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                 if (split && separate) {
                     auto depth_part = d.depth;
                     depth_part.range.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-                    depth_layout = image_layout(
-                        d.depth.binding, ro_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                                                  : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                    depth_layout = dsv_layout(ro_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                       : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
                     detail::to_attachment(vk, command_buffer, depth_part, depth_layout,
-                                          ro_depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT : depth_access,
-                                          depth_stages, tracker, true);
+                                          ro_depth ? depth_ro_access : depth_access,
+                                          ro_depth ? depth_ro_stages : depth_stages, tracker, true);
                     auto stencil_part = d.depth;
                     stencil_part.range.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
-                    stencil_layout = image_layout(
-                        d.depth.binding, ro_stencil ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                                                    : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                    stencil_layout = dsv_layout(ro_stencil ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                           : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
                     detail::to_attachment(vk, command_buffer, stencil_part, stencil_layout,
-                                          ro_stencil ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT : depth_access,
-                                          depth_stages, tracker, true);
+                                          ro_stencil ? depth_ro_access : depth_access,
+                                          ro_stencil ? depth_ro_stages : depth_stages, tracker, true);
                 } else {
                     const VkImageLayout wanted =
                         all_ro     ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
                         : !split   ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
                         : ro_depth ? VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL
                                    : VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL;
-                    depth_layout = stencil_layout = image_layout(d.depth.binding, wanted);
+                    depth_layout = stencil_layout = dsv_layout(wanted);
                     const VkAccessFlags access =
-                        all_ro ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT : depth_access;
-                    detail::to_attachment(vk, command_buffer, d.depth, depth_layout, access, depth_stages, tracker,
-                                          separate);
+                        all_ro ? depth_ro_access
+                               : (any_ro ? (depth_access | VK_ACCESS_SHADER_READ_BIT) : depth_access);
+                    const VkPipelineStageFlags stages = any_ro ? depth_ro_stages : depth_stages;
+                    detail::to_attachment(vk, command_buffer, d.depth, depth_layout, access, stages, tracker, separate);
                 }
                 depth.imageView = d.depth.view;
                 depth.imageLayout = depth_layout;
                 depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                depth.storeOp = ro_depth ? VK_ATTACHMENT_STORE_OP_NONE : VK_ATTACHMENT_STORE_OP_STORE;
+                depth.storeOp = depth_can_write ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_NONE;
                 stencil.imageView = d.depth.view;
                 stencil.imageLayout = stencil_layout;
                 stencil.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                stencil.storeOp = ro_stencil ? VK_ATTACHMENT_STORE_OP_NONE : VK_ATTACHMENT_STORE_OP_STORE;
+                stencil.storeOp = stencil_can_write ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_NONE;
             }
             VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
             rendering.renderArea = {{0, 0}, d.area};
             rendering.layerCount = d.layers;  // array views: SV_RenderTargetArrayIndex picks the layer
             rendering.colorAttachmentCount = std::uint32_t(d.colors.size());
             rendering.pColorAttachments = colors.data();
-            const GraphicsPipeline& graphics = *d.graphics;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &stencil;
             vk.begin_rendering(command_buffer, &rendering);

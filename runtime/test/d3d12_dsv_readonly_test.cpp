@@ -178,7 +178,8 @@ int main() {
 
     const auto vs_program = fssm_program({0x56532464, 0xbf810000});
     const auto ps_program = fssm_program({0x50532464, 0xbf810000});
-    const auto library = std::filesystem::temp_directory_path() / "leonida_dsv_readonly_test";
+    const auto library = std::filesystem::temp_directory_path() /
+                         ("leonida_dsv_readonly_test_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(library);
     const auto copy = std::filesystem::copy_options::overwrite_existing;
     std::filesystem::copy_file(LEONIDA_TEST_VS_DEPTH_SPV, library / "vs_depth.spv", copy);
@@ -203,6 +204,7 @@ int main() {
         info.bindless = vk.bindless;
         info.bindless_partially_bound = vk.partially_bound;
         info.buffer_device_address = vk.buffer_device_address;
+        info.occlusion_query_precise = vk.occlusion_query_precise;
         info.subgroup = vk.subgroup;
         info.shader_dir = library.string();
         info.features = vk.enabled;
@@ -230,7 +232,7 @@ int main() {
         EXPECT(make_pso(device.p, root.p, vs_blob, ps_blob, DXGI_FORMAT_D24_UNORM_S8_UINT,
                         D3D12_COMPARISON_FUNC_ALWAYS, true, D3D12_COMPARISON_FUNC_ALWAYS, &pso_always_always.p));
         EXPECT(make_pso(device.p, root.p, vs_blob, ps_blob, DXGI_FORMAT_D32_FLOAT,
-                        D3D12_COMPARISON_FUNC_ALWAYS, false, D3D12_COMPARISON_FUNC_ALWAYS, &pso_d32.p));
+                        D3D12_COMPARISON_FUNC_LESS, false, D3D12_COMPARISON_FUNC_ALWAYS, &pso_d32.p));
 
         const D3D12_HEAP_PROPERTIES def_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES rb_heap{D3D12_HEAP_TYPE_READBACK};
@@ -412,14 +414,36 @@ int main() {
             ++failures;
         }
 
-        // 5. D32_FLOAT with READ_ONLY_DEPTH: cleared 0.75f stays 0.75f across a DepthWriteMask = ALL draw at 0.25f.
+        // 5. D32_FLOAT (no stencil attachment) paired control: identical draws at 0.25f against cleared 0.75f with
+        // read-only DSV vs writable DSV produce matching occlusion query counts while depth changes only in the
+        // writable arm.
+        Ref<ID3D12QueryHeap> qheap;
+        const D3D12_QUERY_HEAP_DESC qhd{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 2, 0};
+        EXPECT(SUCCEEDED(device->CreateQueryHeap(&qhd, IID_PPV_ARGS(&qheap.p))));
+        Ref<ID3D12Resource> rb_query;
+        const auto rb_query_desc = buf_desc(2 * sizeof(std::uint64_t));
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&rb_heap, D3D12_HEAP_FLAG_NONE, &rb_query_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&rb_query.p))));
+
+        const auto read_d32 = [&](float& out_f) -> bool {
+            std::uint8_t* mapped32 = nullptr;
+            if (FAILED(rb32->Map(0, nullptr, reinterpret_cast<void**>(&mapped32))) || !mapped32) return false;
+            std::memcpy(&out_f, mapped32 + foot32.Offset + (kSide / 2) * foot32.Footprint.RowPitch + (kSide / 2) * 4, 4);
+            rb32->Unmap(0, nullptr);
+            return true;
+        };
+
+        // 5a. Read-only arm: depth stays 0.75f, occlusion query 0 records all passing fragments.
         EXPECT(SUCCEEDED(alloc->Reset()) && SUCCEEDED(list->Reset(alloc.p, nullptr)));
         list->ClearDepthStencilView(d32_rw, D3D12_CLEAR_FLAG_DEPTH, 0.75f, 0, 0, nullptr);
         const auto d32_to_ro = subresource_transition(
             d32.p, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE,
             D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         list->ResourceBarrier(1, &d32_to_ro);
+        list->BeginQuery(qheap.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
         draw_at_z(list.p, root.p, pso_d32.p, d32_ro_d, 0.25f);
+        list->EndQuery(qheap.p, D3D12_QUERY_TYPE_OCCLUSION, 0);
         const auto d32_to_copy = subresource_transition(
             d32.p, 0, D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -437,13 +461,50 @@ int main() {
             EXPECT(SUCCEEDED(queue->Signal(fence.p, ++fence_value)) &&
                    SUCCEEDED(fence->SetEventOnCompletion(fence_value, nullptr)));
         }
-        std::uint8_t* mapped32 = nullptr;
-        EXPECT(SUCCEEDED(rb32->Map(0, nullptr, reinterpret_cast<void**>(&mapped32))) && mapped32);
-        float got_f = 0.0f;
-        std::memcpy(&got_f, mapped32 + foot32.Offset + (kSide / 2) * foot32.Footprint.RowPitch + (kSide / 2) * 4, 4);
-        rb32->Unmap(0, nullptr);
-        if (got_f != 0.75f) {
-            std::fprintf(stderr, "FAIL D32_FLOAT READ_ONLY_DEPTH: got %g, want 0.75\n", double(got_f));
+        float got_f_ro = 0.0f;
+        EXPECT(read_d32(got_f_ro));
+        if (got_f_ro != 0.75f) {
+            std::fprintf(stderr, "FAIL D32_FLOAT READ_ONLY_DEPTH: got %g, want 0.75\n", double(got_f_ro));
+            ++failures;
+        }
+
+        // 5b. Writable control arm: same clear + draw with d32_rw updates depth to 0.25f and matches query 0.
+        EXPECT(SUCCEEDED(alloc->Reset()) && SUCCEEDED(list->Reset(alloc.p, nullptr)));
+        const auto d32_to_rw = subresource_transition(d32.p, 0, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                      D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        list->ResourceBarrier(1, &d32_to_rw);
+        list->ClearDepthStencilView(d32_rw, D3D12_CLEAR_FLAG_DEPTH, 0.75f, 0, 0, nullptr);
+        list->BeginQuery(qheap.p, D3D12_QUERY_TYPE_OCCLUSION, 1);
+        draw_at_z(list.p, root.p, pso_d32.p, d32_rw, 0.25f);
+        list->EndQuery(qheap.p, D3D12_QUERY_TYPE_OCCLUSION, 1);
+        const auto d32_rw_to_copy = subresource_transition(d32.p, 0, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->ResourceBarrier(1, &d32_rw_to_copy);
+        list->CopyTextureRegion(&dst32, 0, 0, 0, &src32, nullptr);
+        list->ResolveQueryData(qheap.p, D3D12_QUERY_TYPE_OCCLUSION, 0, 2, rb_query.p, 0);
+        EXPECT(SUCCEEDED(list->Close()));
+        {
+            ID3D12CommandList* lists[] = {list.p};
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, ++fence_value)) &&
+                   SUCCEEDED(fence->SetEventOnCompletion(fence_value, nullptr)));
+        }
+        float got_f_rw = 0.0f;
+        EXPECT(read_d32(got_f_rw));
+        if (got_f_rw != 0.25f) {
+            std::fprintf(stderr, "FAIL D32_FLOAT writable control: got %g, want 0.25\n", double(got_f_rw));
+            ++failures;
+        }
+        std::uint64_t* mapped_q = nullptr;
+        EXPECT(SUCCEEDED(rb_query->Map(0, nullptr, reinterpret_cast<void**>(&mapped_q))) && mapped_q);
+        const std::uint64_t q_ro = mapped_q[0], q_rw = mapped_q[1];
+        rb_query->Unmap(0, nullptr);
+        const std::uint64_t want_q = std::uint64_t(kSide) * kSide;
+        if (q_ro != q_rw || (vk.occlusion_query_precise ? (q_ro != want_q) : (q_ro == 0))) {
+            std::fprintf(stderr, "FAIL D32_FLOAT occlusion control: ro=%llu rw=%llu (want %llu)\n",
+                         static_cast<unsigned long long>(q_ro), static_cast<unsigned long long>(q_rw),
+                         static_cast<unsigned long long>(want_q));
             ++failures;
         }
     }

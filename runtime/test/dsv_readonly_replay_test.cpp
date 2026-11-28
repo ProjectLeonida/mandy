@@ -15,7 +15,9 @@ namespace {
 
 struct Recorded {
     std::vector<VkImageMemoryBarrier> image_barriers;
+    std::vector<VkPipelineStageFlags> image_barrier_dst_stages;
     unsigned memory_barriers = 0;
+    unsigned image_view_calls = 0;
     bool saw_rendering = false;
     bool has_depth = false;
     bool has_stencil = false;
@@ -28,7 +30,9 @@ struct Recorded {
 
     void reset() {
         image_barriers.clear();
+        image_barrier_dst_stages.clear();
         memory_barriers = 0;
+        image_view_calls = 0;
         saw_rendering = has_depth = has_stencil = false;
         depth = {};
         stencil = {};
@@ -41,12 +45,15 @@ struct Recorded {
 
 Recorded g;
 
-VKAPI_ATTR void VKAPI_CALL rec_barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
-                                       std::uint32_t mem_count, const VkMemoryBarrier*, std::uint32_t,
-                                       const VkBufferMemoryBarrier*, std::uint32_t img_count,
+VKAPI_ATTR void VKAPI_CALL rec_barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags dst_stage,
+                                       VkDependencyFlags, std::uint32_t mem_count, const VkMemoryBarrier*,
+                                       std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t img_count,
                                        const VkImageMemoryBarrier* imgs) {
     g.memory_barriers += mem_count;
-    for (std::uint32_t i = 0; i < img_count; ++i) g.image_barriers.push_back(imgs[i]);
+    for (std::uint32_t i = 0; i < img_count; ++i) {
+        g.image_barriers.push_back(imgs[i]);
+        g.image_barrier_dst_stages.push_back(dst_stage);
+    }
 }
 
 VKAPI_ATTR void VKAPI_CALL rec_begin(VkCommandBuffer, const VkRenderingInfo* info) {
@@ -99,7 +106,10 @@ leonida::ReplayFunctions make_vk(bool separate, leonida::GraphicsPipeline* pso) 
     vk.draw_indexed = rec_draw_indexed;
     vk.clear_depth_stencil_image = rec_clear_ds;
     vk.buffer_at = [](std::uint64_t, std::uint64_t&, VkBuffer&, VkDeviceSize&) { return false; };
-    vk.image_view = [](const auto&, const auto&) { return reinterpret_cast<VkImageView>(std::uintptr_t{0x10}); };
+    vk.image_view = [](const auto&, const auto&) {
+        ++g.image_view_calls;
+        return reinterpret_cast<VkImageView>(std::uintptr_t{0x10});
+    };
     vk.graphics_pipeline = [pso](auto) { return pso; };
     return vk;
 }
@@ -274,6 +284,93 @@ int main() {
         g.reset();
         EXPECT(replay(list, VK_NULL_HANDLE, [&](auto) { return &b; }, vk) == ReplayResult::success);
         EXPECT(g.clear_depth_calls == 1 && g.cleared_aspects == VK_IMAGE_ASPECT_STENCIL_BIT);
+        ++checks;
+    }
+
+    // 7. Draw-time transition of a read-only DSV to GENERAL (both separate and coupled fallback) must include
+    // VK_ACCESS_SHADER_READ_BIT and VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT so shaders sampling it are synchronized.
+    for (bool separate : {true, false}) {
+        auto b = depth_binding(true, true);
+        auto pso = make_pso(true, true, true);
+        auto vk = make_vk(separate, &pso);
+        vk.separate_depth_stencil_attachment_access = true;
+        LayoutTracker tracker(separate);
+        tracker.track(1, b, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        auto list = draw_list(dsv_read_only_depth);
+        g.reset();
+        EXPECT(replay(list, VK_NULL_HANDLE, [&](auto) { return &b; }, vk, &tracker) == ReplayResult::success);
+        EXPECT(g.image_barriers.size() == 1);
+        EXPECT(g.image_barriers[0].newLayout == VK_IMAGE_LAYOUT_GENERAL);
+        EXPECT((g.image_barriers[0].dstAccessMask & VK_ACCESS_SHADER_READ_BIT) != 0);
+        EXPECT((g.image_barriers[0].dstAccessMask & VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT) != 0);
+        EXPECT((g.image_barrier_dst_stages[0] & VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT) != 0);
+        ++checks;
+    }
+
+    // 8. Packed depth/stencil sibling STORE vs GENERAL sampling: without separateDepthStencilAttachmentAccess, a mixed
+    // read-only draw whose writable sibling writes keeps the read-only aspect out of GENERAL; when the sibling does
+    // not write (STORE_OP_NONE) or separateDepthStencilAttachmentAccess is true, GENERAL is allowed.
+    {
+        auto b = depth_binding(true, true);
+        auto pso_writes_s = make_pso(true, true, true);
+        auto pso_no_s = make_pso(true, true, false);
+        auto list = draw_list(dsv_read_only_depth);
+
+        // No maintenance7, stencil writes -> depth stays out of GENERAL.
+        {
+            auto vk = make_vk(true, &pso_writes_s);
+            vk.separate_depth_stencil_attachment_access = false;
+            LayoutTracker tracker(true);
+            tracker.track(1, b, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            g.reset();
+            EXPECT(replay(list, VK_NULL_HANDLE, [&](auto) { return &b; }, vk, &tracker) == ReplayResult::success);
+            EXPECT(g.depth.imageLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+            EXPECT(g.depth.storeOp == VK_ATTACHMENT_STORE_OP_NONE);
+            EXPECT(g.stencil.storeOp == VK_ATTACHMENT_STORE_OP_STORE);
+        }
+        // With maintenance7, stencil writes -> depth stays in GENERAL for concurrent SRV sampling.
+        {
+            auto vk = make_vk(true, &pso_writes_s);
+            vk.separate_depth_stencil_attachment_access = true;
+            LayoutTracker tracker(true);
+            tracker.track(1, b, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            g.reset();
+            EXPECT(replay(list, VK_NULL_HANDLE, [&](auto) { return &b; }, vk, &tracker) == ReplayResult::success);
+            EXPECT(g.depth.imageLayout == VK_IMAGE_LAYOUT_GENERAL);
+            EXPECT(g.depth.storeOp == VK_ATTACHMENT_STORE_OP_NONE);
+            EXPECT(g.stencil.storeOp == VK_ATTACHMENT_STORE_OP_STORE);
+        }
+        // No maintenance7, stencil does NOT write -> stencil gets STORE_OP_NONE, so depth may use GENERAL safely.
+        {
+            auto vk = make_vk(true, &pso_no_s);
+            vk.separate_depth_stencil_attachment_access = false;
+            LayoutTracker tracker(true);
+            tracker.track(1, b, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            g.reset();
+            EXPECT(replay(list, VK_NULL_HANDLE, [&](auto) { return &b; }, vk, &tracker) == ReplayResult::success);
+            EXPECT(g.depth.imageLayout == VK_IMAGE_LAYOUT_GENERAL);
+            EXPECT(g.depth.storeOp == VK_ATTACHMENT_STORE_OP_NONE);
+            EXPECT(g.stencil.storeOp == VK_ATTACHMENT_STORE_OP_NONE);
+        }
+        ++checks;
+    }
+
+    // 9. Fully suppressed rectangular ClearDepthStencil skips rect_view (no image view allocated, no rendering hooks).
+    {
+        auto b = depth_binding(true, false);
+        auto pso = make_pso(true, false, false);
+        auto vk = make_vk(true, &pso);
+        vk.begin_rendering = nullptr;
+        vk.end_rendering = nullptr;
+        vk.clear_attachments = nullptr;
+        CommandList list;
+        const Rect rect{0, 0, 8, 8};
+        EXPECT(list.clear_depth_stencil({1, 0, 0, 1, ColorViewFormat::resource, dsv_read_only_depth | dsv_read_only_stencil},
+                                        clear_depth | clear_stencil, 0.5f, 0x11, {&rect, 1}));
+        EXPECT(list.close());
+        g.reset();
+        EXPECT(replay(list, VK_NULL_HANDLE, [&](auto) { return &b; }, vk) == ReplayResult::success);
+        EXPECT(g.image_view_calls == 0 && g.clear_depth_calls == 0);
         ++checks;
     }
 
