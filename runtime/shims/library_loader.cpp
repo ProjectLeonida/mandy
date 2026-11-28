@@ -94,26 +94,16 @@ std::string module_name(std::string path) {
     return path;
 }
 
-// host_module_name's cache, HMODULE -> module name. loader_mutex() held.
-std::map<HMODULE, std::string>& host_module_names() {
-    static auto* names = new std::map<HMODULE, std::string>;
-    return *names;
-}
-
+// The module name of a host module, asked of Windows on every call. Not cached by HMODULE: a handle names a module
+// only while it is loaded, and once FreeLibrary unloads it another DLL can be mapped at the same base, possibly by
+// another thread before any cache entry could be dropped. Windows' own answer always belongs to the module mapped
+// there now.
 std::string host_module_name(HMODULE module) {
-    std::lock_guard lock(loader_mutex());
-    auto* names = &host_module_names();
-    if (auto it = names->find(module); it != names->end()) return it->second;
-
     std::vector<wchar_t> path(MAX_PATH);
     for (;;) {
         const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
         if (!length) return {};
-        if (length < path.size()) {
-            const std::string name = module_name(narrow(path.data()));
-            names->emplace(module, name);
-            return name;
-        }
+        if (length < path.size()) return module_name(narrow(path.data()));
         if (path.size() == 32768) return {};
         path.resize(path.size() > 16384 ? 32768 : path.size() * 2);
     }
@@ -288,14 +278,7 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
 BOOL WINAPI free_library(HMODULE module) {
     if (pseudo(module)) return TRUE;   // owned modules are never unloaded
     if (owns_bundled_module_handle(module)) return TRUE;  // mapped modules stay live until ~Loader detaches them
-    const BOOL freed = FreeLibrary(module);
-    // The module may be gone, and another DLL can be mapped at its base later: drop the name cached for the handle, so
-    // GetProcAddress on the new one does not serve the old one's shims. A module still loaded is looked up again.
-    if (freed) {
-        std::lock_guard lock(loader_mutex());
-        host_module_names().erase(module);
-    }
-    return freed;
+    return FreeLibrary(module);
 }
 
 // DisableThreadLibraryCalls(hinstance) from a mapped image's DllMain. The real function only accepts a module the

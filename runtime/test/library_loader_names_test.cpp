@@ -2,8 +2,9 @@
 //
 // - An empty name, or a path that ends in a slash, names no module but came out as ".dll", which then went to the
 //   bundled loader's lookups as if it were a module's name.
-// - GetProcAddress on a host module looks its name up once and caches it by HMODULE. FreeLibrary kept the entry, so a
-//   different DLL loaded later at the same base was served the first one's shims.
+// - GetProcAddress on a host module looked its name up once and cached it by HMODULE. FreeLibrary kept the entry, so a
+//   different DLL loaded later at the same base was served the first one's shims. The name is now asked of Windows on
+//   every call, which also covers another thread loading a DLL at that base between FreeLibrary and any cache update.
 //
 // The bundled loader here is a fake that records the names it is asked for. The second case uses fixed_base_probe.dll
 // (no relocations, one fixed base) copied under two names: wsock32.dll, for which this test registers a shim (the
@@ -138,6 +139,21 @@ int main(int argc, char** argv) {
             check(get_proc(second, "leonida_loader_probe") == nullptr,
                   "GetProcAddress on the new module does not serve the freed module's shim");
         if (second) free_lib(second);
+
+        // The race timbot103 found in #2525: the module is unloaded and another DLL is mapped at its base (by another
+        // thread) before the unloading FreeLibrary could drop any cached name. The host's FreeLibrary is called
+        // directly here, so the shim never sees the unload: the name must still be the new module's.
+        HMODULE third = load_w(shimmed.c_str());
+        check(third == first && reinterpret_cast<void*>(get_proc(third, "leonida_loader_probe")) ==
+                                    reinterpret_cast<void*>(&probe_export),
+              "the fixture loads as wsock32.dll again and is served its shim");
+        check(::FreeLibrary(third) == TRUE, "the host's FreeLibrary unloads it, past the shim");
+        HMODULE fourth = load_w(plain.c_str());
+        check(fourth == first, "the plain copy loads at the same base again");
+        if (fourth == first)
+            check(get_proc(fourth, "leonida_loader_probe") == nullptr,
+                  "a module mapped where an unloaded one was is not served its shims, without the shim seeing the unload");
+        if (fourth) free_lib(fourth);
     }
     std::filesystem::remove_all(dir, ec);
 
