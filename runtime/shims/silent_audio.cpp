@@ -375,6 +375,11 @@ public:
         Lock l(lock_);
         if (!initialized_) return AUDCLNT_E_NOT_INITIALIZED;
         if (pending_) return AUDCLNT_E_OUT_OF_ORDER;
+        // A 0-frame packet need not be released (IAudioRenderClient::GetBuffer remarks), so it leaves nothing pending,
+        // as Windows' audio engine does. Marking it pending made every later GetBuffer AUDCLNT_E_OUT_OF_ORDER and
+        // Reset AUDCLNT_E_BUFFER_OPERATION_PENDING for a title that asks for its free space whatever it is and
+        // releases only what it filled: the stream stopped taking audio for good.
+        if (frames == 0) return S_OK;
         advance(qpc_now());
         const uint64_t padding = written_ - played_;
         if (frames > buffer_frames_ - padding) return AUDCLNT_E_BUFFER_TOO_LARGE;

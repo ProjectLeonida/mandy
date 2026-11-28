@@ -434,6 +434,12 @@ void test_render_stream() {
 
     // Fill the whole buffer before Start, as a title primes its stream.
     BYTE* data = nullptr;
+    // A 0-frame packet needs no ReleaseBuffer (IAudioRenderClient::GetBuffer remarks). Windows 11's audio engine leaves
+    // nothing pending after one: Reset and the next GetBuffer succeed, and ReleaseBuffer(5) is out of order.
+    check(render->GetBuffer(0, &data) == S_OK && !data, "GetBuffer(0) gets an empty packet");
+    check(render->ReleaseBuffer(5, 0) == AUDCLNT_E_OUT_OF_ORDER, "an empty packet has nothing to release");
+    check(SUCCEEDED(c->Reset()), "an empty packet leaves Reset no buffer operation pending");
+    check(render->GetBuffer(0, &data) == S_OK, "a second empty packet, never released");
     check(render->ReleaseBuffer(1, 0) == AUDCLNT_E_OUT_OF_ORDER, "ReleaseBuffer without GetBuffer");
     check(render->GetBuffer(frames + 1, &data) == AUDCLNT_E_BUFFER_TOO_LARGE, "GetBuffer larger than the buffer");
     check(render->GetBuffer(frames, &data) == S_OK && data, "GetBuffer(whole buffer)");
