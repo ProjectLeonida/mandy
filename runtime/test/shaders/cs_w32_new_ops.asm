@@ -36,10 +36,12 @@ v_mov_b32_e32 v14, 0x66
 ds_write_b32 v11, v13
 ds_write_b32 v12, v14
 s_waitcnt lgkmcnt(0)
+s_barrier
 v_mov_b32_e32 v15, 0x88
 v_mov_b32_e32 v16, 0x99
 ds_wrxchg2_rtn_b32 v[5:6], v10, v15, v16 offset0:2 offset1:5
 s_waitcnt lgkmcnt(0)
+s_barrier
 ds_read_b32 v6, v12
 s_waitcnt lgkmcnt(0)
 v_mov_b32_e32 v7, 0x1234

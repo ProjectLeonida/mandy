@@ -4,25 +4,31 @@
 	v_mov_b32_e32 v11, 0
 	ds_write_b32 v10, v11
 	s_waitcnt lgkmcnt(0)
+	s_barrier
 	v_mov_b32_e32 v12, 0x80000000
 	v_mov_b32_e32 v13, 1.0
 	ds_cmpst_rtn_f32 v14, v10, v12, v13
 	s_waitcnt lgkmcnt(0)
+	s_barrier
 	ds_read_b32 v15, v10
 	v_mov_b32_e32 v16, 0x80
 	v_mov_b32_e32 v17, 0x7fc00000
 	ds_write_b32 v16, v17
 	s_waitcnt lgkmcnt(0)
+	s_barrier
 	ds_cmpst_rtn_f32 v18, v16, v17, v13
 	s_waitcnt lgkmcnt(0)
+	s_barrier
 	ds_read_b32 v18, v16
 	v_mov_b32_e32 v19, 0xc0
 	ds_write_b32 v19, v13
 	s_waitcnt lgkmcnt(0)
+	s_barrier
 	v_mov_b32_e32 v12, 2.0
 	v_mov_b32_e32 v11, 0x40400000
 	ds_cmpst_f32 v19, v12, v11
 	s_waitcnt lgkmcnt(0)
+	s_barrier
 	ds_read_b32 v21, v19
 	s_waitcnt lgkmcnt(0)
 	v_mov_b32_e32 v20, 0x40
