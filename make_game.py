@@ -15,8 +15,9 @@ and the usual mount points elsewhere (/mnt, /media, /run/media, /Volumes, and th
 /run/media/<user> where Linux desktops mount drives), two folder levels down. A share path
 (\\server\share\...) can't be listed, so give it to --game. This script never decrypts or works around anything:
 it reads plain files and writes
-everything it makes under --out. The only thing it downloads is the third_party/rpf9-explorer submodule, when
-it is missing. Never share what it makes.
+everything it makes under --out. The only things it downloads are the third_party/rpf9-explorer submodule, when
+it is missing, and, for the Windows runtime stage, the pinned SDL3 release CMake checks by SHA-256 (controller,
+keyboard and mouse input; --no-sdl3 skips it). Never share what it makes.
 
 Stages (each skips work that is already done, so a stopped build continues where it left off):
     check     always first: file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
@@ -2663,7 +2664,7 @@ def build_pipeline_check(jobs: int) -> None:
 
 
 def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1,
-            *, work: str | None = None) -> None:
+            *, work: str | None = None, sdl3: bool = True) -> None:
     destinations = [*RUNTIME_FILES, "game_path.txt"]
     if work is not None:
         destinations.append("shader_path.txt")
@@ -2683,8 +2684,11 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         build = cross_build_runtime(jobs)
     else:
         log("runtime: building")
+        # -FetchSdl3 builds the GameInput shim (docs/gameinput.md): without it and without an installed SDL3, no
+        # controller, keyboard or mouse reaches the title. CMake downloads the pinned, hash-checked SDL3 release
+        # once; --no-sdl3 leaves it out.
         run([windows_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-             os.path.join(ROOT, "scripts", "build_runtime.ps1"), "-Jobs", str(jobs)])
+             os.path.join(ROOT, "scripts", "build_runtime.ps1"), "-Jobs", str(jobs), *(["-FetchSdl3"] if sdl3 else [])])
         build = os.path.join(ROOT, "runtime", "build")
     artifacts = [os.path.join(build, name) for name in RUNTIME_FILES]
     for built in artifacts:
@@ -3044,7 +3048,7 @@ def _invoke_stage(name: str, fn) -> None:
 
 def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, wav: bool, jobs: int,
                      runtime_build: str | None, emulate: bool, keep_emulated: bool,
-                     fallbacks: tuple[str, ...], overlap: bool = True) -> None:
+                     fallbacks: tuple[str, ...], overlap: bool = True, sdl3: bool = True) -> None:
     """Run build stages after check. With overlap=True (default), shaders/assets/runtime share the machine and
     pipelines starts once shaders (and a selected runtime rebuild) are ready. With overlap=False, stages run in order."""
     split = shader_asset_jobs(stages, jobs, overlap)
@@ -3058,7 +3062,7 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
         assets(game, work, wav, jobs, dump_jobs=dump_jobs)
 
     def fn_runtime():
-        runtime(game, out, v, runtime_build, jobs, work=work)
+        runtime(game, out, v, runtime_build, jobs, work=work, sdl3=sdl3)
 
     def fn_pipelines():
         pipelines(work, out, jobs, runtime_build=runtime_build)
@@ -3177,6 +3181,9 @@ def main() -> int:
                     help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
+    ap.add_argument("--no-sdl3", action="store_true",
+                    help="on Windows, build the runtime without downloading SDL3: no GameInput shim, so no controller, "
+                         "keyboard or mouse input unless SDL3 is installed (docs/gameinput.md)")
     ap.add_argument("--runtime-build", metavar="DIR", type=nonempty_path,
                     help="a Windows build of runtime/ (gta6rt.exe and gta6rt_tls_host.dll) for the runtime stage "
                          "instead of building it (off Windows: instead of the clang-cl + xwin cross-build); "
@@ -3349,12 +3356,12 @@ def main() -> int:
             tui_board.set_summary(f"build 0% · {', '.join(build_stages)}")
             run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                              runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                             fallbacks=fallbacks, overlap=overlap)
+                             fallbacks=fallbacks, overlap=overlap, sdl3=not a.no_sdl3)
             tui_board.set_summary(f"finished in {(time.time() - t0) / 60:.0f} min")
     else:
         run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                          runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                         fallbacks=fallbacks, overlap=overlap)
+                         fallbacks=fallbacks, overlap=overlap, sdl3=not a.no_sdl3)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 

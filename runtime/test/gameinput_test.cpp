@@ -834,10 +834,15 @@ void test_keyboard_pad(IGameInput* input) {
     rt::gameinput::set_keyboard_source(fake_key_down, fake_focus);
     rt::gameinput::set_cursor_source(fake_cursor);
 
+    // On by default (focused): a player without a pad still has the keyboard and mouse.
     set_env("LEONIDA_KEYBOARD_PAD", nullptr);
     rt::gameinput::reload_config();
+    check(rt::gameinput::config().keyboard_pad == rt::gameinput::KeyboardPadMode::Focused,
+          "keyboard pad: the focused mode by default");
+    set_env("LEONIDA_KEYBOARD_PAD", "off");
+    rt::gameinput::reload_config();
     rt::gameinput::poll();
-    check(rt::gameinput::connected_count() == 0, "keyboard pad: off by default");
+    check(rt::gameinput::connected_count() == 0, "keyboard pad: off with LEONIDA_KEYBOARD_PAD=off");
 
     set_env("LEONIDA_KEYBOARD_PAD", "1");
     rt::gameinput::reload_config();
@@ -938,7 +943,7 @@ void test_keyboard_pad(IGameInput* input) {
               (kb->GetDeviceStatus() & GameInputDeviceConnected),
           "keyboard pad: on again is the same device object");
 
-    set_env("LEONIDA_KEYBOARD_PAD", nullptr);
+    set_env("LEONIDA_KEYBOARD_PAD", "off");
     rt::gameinput::reload_config();
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "keyboard pad: removed at the end");
@@ -1085,7 +1090,7 @@ void test_active_input() {
     // Clean up: everything off and unplugged.
     set_env("LEONIDA_PROMPTS", nullptr);
     set_env("LEONIDA_PROMPTS_SWITCH_MS", nullptr);
-    set_env("LEONIDA_KEYBOARD_PAD", nullptr);
+    set_env("LEONIDA_KEYBOARD_PAD", "off");
     rt::gameinput::reload_config();
     detach(ds);
     detach(ds4);
@@ -1721,7 +1726,8 @@ int main(int argc, char** argv) {
                              SDL_HINT_JOYSTICK_GAMEINPUT, SDL_HINT_XINPUT_ENABLED, SDL_HINT_JOYSTICK_DIRECTINPUT})
         SDL_SetHintWithPriority(hint, "0", SDL_HINT_OVERRIDE);
     set_env("LEONIDA_GAMEINPUT_THREAD", "0");
-    set_env("LEONIDA_KEYBOARD_PAD", nullptr);
+    // The keyboard pad is on by default; the other tests count only their own virtual pads.
+    set_env("LEONIDA_KEYBOARD_PAD", "off");
     set_env("LEONIDA_INPUT_SCRIPT", nullptr);
     set_env("LEONIDA_DS_TRIGGERS", nullptr);
     set_env("LEONIDA_DS_LIGHTBAR", nullptr);
