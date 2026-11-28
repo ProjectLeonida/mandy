@@ -81,6 +81,59 @@ class FallbackTest(unittest.TestCase):
             self.assertEqual(run(self.inputs, True), self.expected)
             load.return_value.assert_called_once()
 
+    def test_malformed_inputs_fall_back_before_loading_native(self):
+        cells = np.zeros((4, 3, 3), dtype=np.int32)
+        tiles = np.zeros((1, 3, 3), dtype=np.int32)
+        good_order = [0, 1, 2, 3]
+        bad_calls = [
+            ("nan_margin", tiles, cells, good_order, float("nan")),
+            ("inf_margin", tiles, cells, good_order, float("inf")),
+            ("bool_margin", tiles, cells, good_order, True),
+            ("short_order", tiles, cells, [0, 1], 0.1),
+            ("oob_order", tiles, cells, [0, 1, 2, 99], 0.1),
+            ("neg_order", tiles, cells, [-1, 0, 1, 2], 0.1),
+            ("bool_order", tiles, cells, [True, 0, 1, 2], 0.1),
+        ]
+        with mock.patch.dict(os.environ, {"LEONIDA_WORLD_ATLAS_NATIVE": "1"}), \
+                mock.patch.object(accel, "_load", side_effect=AssertionError("must not load")):
+            for label, t, c, order, margin in bad_calls:
+                with self.subTest(case=label):
+                    self.assertIsNone(accel.match(np, t, c, order, margin))
+
+    def test_corrupt_native_outputs_fall_back_safely(self):
+        cells = np.zeros((4, 3, 3), dtype=np.int32)
+        tiles = np.zeros((1, 3, 3), dtype=np.int32)
+        order = [0, 1, 2, 3]
+        corrupt_rows = [
+            ("oob_clear", 4, 0, 0.5),
+            ("oob_placed", -1, 4, 0.5),
+            ("neg_clear", -2, 0, 0.5),
+            ("neg_placed", -1, -2, 0.5),
+            ("nan_overlap", -1, 0, float("nan")),
+            ("inf_overlap", -1, 0, float("inf")),
+        ]
+        for label, clear_idx, placed_idx, overlap in corrupt_rows:
+            with self.subTest(case=label):
+                def bad_kernel(_t, _tl, _c, _cl, _w, _m, out, _ol, cl=clear_idx, pl=placed_idx, ov=overlap):
+                    out[0].clear = cl
+                    out[0].placed = pl
+                    out[0].overlap = ov
+                    return 0
+
+                with mock.patch.dict(os.environ, {"LEONIDA_WORLD_ATLAS_NATIVE": "1"}), \
+                        mock.patch.object(accel, "_load", return_value=bad_kernel):
+                    self.assertIsNone(accel.match(np, tiles, cells, order, 0.1))
+
+        # End-to-end match_mask falls back to Python reference when native emits an OOB index.
+        def oob_kernel(_t, _tl, _c, _cl, _w, _m, out, _ol):
+            out[0].clear = 999
+            out[0].placed = 0
+            out[0].overlap = 0.5
+            return 0
+
+        with mock.patch.object(accel, "_load", return_value=oob_kernel):
+            self.assertEqual(run(self.inputs, True), self.expected)
+
 
 @unittest.skipIf(np is None, "NumPy is required")
 class NativeTest(unittest.TestCase):

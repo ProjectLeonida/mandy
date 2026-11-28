@@ -2,6 +2,7 @@
 
 import ctypes
 from functools import lru_cache
+import math
 import os
 from pathlib import Path
 import sys
@@ -42,18 +43,25 @@ def match(np, tiles, cells, order, margin):
     The native kernel sees cells in text order. A tied best overlap cannot
     be a clear anchor, so the reordering does not affect anchor selection.
     """
-    if (os.environ.get("LEONIDA_WORLD_ATLAS_NATIVE") == "0" or tiles.ndim != 3 or not tiles.size
-            or not len(cells) or tiles.shape[1:] != cells.shape[1:]):
+    if (os.environ.get("LEONIDA_WORLD_ATLAS_NATIVE") == "0" or tiles.ndim != 3 or cells.ndim != 3
+            or not tiles.size or not len(cells) or tiles.shape[1:] != cells.shape[1:]):
+        return None
+    if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not math.isfinite(margin):
+        return None
+    n_cells = len(cells)
+    if len(order) != n_cells or any(
+            isinstance(idx, bool) or not isinstance(idx, (int, np.integer)) or idx < 0 or idx >= n_cells
+            for idx in order):
         return None
     kernel = _load()
     if kernel is None:
         return None
     words = (tiles.shape[1] * tiles.shape[2] + 63) // 64
-    if (words > 4096 or max(len(tiles), len(cells)) * words > 8 * 1024**2
-            or len(tiles) * len(cells) > 8 * 1024**2):
+    if (words > 4096 or max(len(tiles), n_cells) * words > 8 * 1024**2
+            or len(tiles) * n_cells > 8 * 1024**2):
         return None
     packed_tiles = _pack(np, tiles)
-    packed_cells = _pack(np, cells)[order]
+    packed_cells = np.require(_pack(np, cells)[order], requirements=("C", "A"))
     out = (_Match * len(tiles))()
     try:
         status = kernel(packed_tiles.ctypes.data, packed_tiles.size, packed_cells.ctypes.data,
@@ -62,6 +70,11 @@ def match(np, tiles, cells, order, margin):
         return None
     if status != 0:
         return None
+    for row in out:
+        if row.clear < -1 or row.clear >= n_cells or row.placed < -1 or row.placed >= n_cells:
+            return None
+        if row.placed >= 0 and not math.isfinite(row.overlap):
+            return None
     clear = {i: order[row.clear] for i, row in enumerate(out) if row.clear >= 0}
     placed = {i: order[row.placed] for i, row in enumerate(out) if row.placed >= 0}
     scores = sorted(row.overlap for row in out if row.placed >= 0)
