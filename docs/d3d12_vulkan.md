@@ -3568,9 +3568,18 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   with its pages; two textures over the same bytes that views keep naming both stay. Its T# keys go at once and the
   image 3 s later, as for an address given another description. A later view of the address makes it again: a T#
   names the title address, so descriptors the title kept find the new image once it is filled; until then, and for
-  an address no view names again, they sample the fallback. The title textures census line counts the retirements
-  under a newer texture and with their pages gone. `LEONIDA_TITLE_IMAGE_RETIRE=0` keeps the images as before.
-  `d3d12_title_image_retire` covers it without game files.
+  an address no view names again, they sample the fallback. A slot-133 texture covers an image with the layout of
+  the title's XG computer of its shape, or with the one its first slot-70 view gives it; the guess from its
+  description (Layout 0) can be larger than what the title placed, and covers nothing. A view that names an image
+  whose pages went keeps it, until a later change over its pages finds them still gone. Pages are looked at only
+  after a change with a range: xmem records a change anywhere for each run of pages it commits for a DirectStorage
+  transfer on Windows, and it names no image's pages. A whole release (`VirtualFree` with `MEM_RELEASE` and no size)
+  records the range of the reservation. A look walks the pages with VirtualQuery on the title's submitting thread,
+  so a pass visits at most `LEONIDA_TITLE_IMAGE_CHECKS` (128) of the images that may go, from where the last one
+  stopped. The title textures census line counts the retirements under a newer texture and with their pages gone,
+  and the images a view named again after a newer texture covered them (overlapping textures both in use).
+  `LEONIDA_TITLE_IMAGE_RETIRE=0` keeps the images as before. `d3d12_title_image_retire` and `d3d12_title_image_idle`
+  cover it without game files.
 - With `LEONIDA_TITLE_PARTIAL_MIPS=1`, such a texture can be filled before all its pages are readable. The XG
   layout of a 2D texture of one slice stores its mips from the smallest to the largest, so the mips from `m` on are
   the first `mip_chain_bytes(layout, m)` bytes from its base (`xg_xs_layout.h`; checked in `xg_xs_test` for tiled,
