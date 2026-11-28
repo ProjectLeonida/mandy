@@ -198,6 +198,28 @@ class PageIndexTest(unittest.TestCase):
             self.assertEqual((rec["target"], rec["size"], rec["target_stream"]), (0x100, 0x80, 1))
             self.assertEqual(page_doc["span"], 0x180)
 
+    def test_a_continuation_under_64_bytes_is_taken_only_as_one(self):
+        # docs/navmesh.md recovers 16-48 byte 0DRP continuations. The carver's 64-byte cutoff must not skip such a
+        # stream and continue the page with the one after it; on its own, a short stream is neither a page nor a
+        # counted stream.
+        page = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
+        put_q38(page, 0xC0, [(0x5678, 0x20, 0x100)])
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "tiny.rpf")
+            out = os.path.join(tmp, "pages.json")
+            offsets = make_rpf(arc, [b"\xdd" * 0x20, page, b"\xbb" * 0x28, b"\xcc" * 0x100])
+            run_tool(arc, out)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+        self.assertEqual(doc["summary"]["pages"], 1)
+        self.assertEqual(doc["summary"]["streams"], 2)
+        page_doc = doc["pages"][0]
+        self.assertEqual(page_doc["offset"], offsets[1])
+        self.assertTrue(page_doc["complete"])
+        self.assertEqual([(c["offset"], c["inflated"]) for c in page_doc["continuations"]], [(offsets[2], 0x28)])
+        self.assertEqual(page_doc["q38_records"][0]["target_stream"], 1)
+        self.assertEqual(page_doc["span"], 0x120)
+
     def test_resource_grouping_reports_streams_and_declared_pages(self):
         # The resource group is the directory plus the streams needed to reach the q38 table and its
         # last record. The +0x20 count is reported next to the 64 KiB units, never used as a boundary.
