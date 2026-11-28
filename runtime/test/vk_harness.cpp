@@ -309,16 +309,24 @@ int main(int argc, char** argv) {
     // (llvmpipe and other software devices), so the suite reports it as unsupported instead. 77 is the existing
     // "this device cannot run the test" code (runtime/test/shaders/check.py, scripts/run_gpu_tests.py).
     const std::vector<uint32_t> fs_code = read_spv(argv[2]);
-    bool needs_barycentric = false, needs_float64 = false;
-    for (std::size_t i = 5; i + 1 < fs_code.size();) {   // instructions follow the 5-word SPIR-V header
-        const uint32_t words = fs_code[i] >> 16, op = fs_code[i] & 0xffffu;
-        if (!words) break;
-        if (op == 17 && fs_code[i + 1] == 5284)          // OpCapability FragmentBarycentricKHR
-            needs_barycentric = true;
-        if (op == 17 && fs_code[i + 1] == 10)            // OpCapability Float64 (v_add_f64 and friends)
-            needs_float64 = true;
-        i += words;
-    }
+    // Both stages are scanned: a hand-written f16-varying fixture (docs/design.md, "16-bit interpolation") declares
+    // Float16 / StorageInputOutput16 on the vertex stage and StorageInputOutput16 on the fragment stage, and a
+    // translated stage can declare Float64. Anything the module asks for that the device lacks is 77, not a crash.
+    auto has_cap = [](const std::vector<uint32_t>& code, uint32_t cap) {
+        for (std::size_t i = 5; i + 1 < code.size();) {   // instructions follow the 5-word SPIR-V header
+            const uint32_t words = code[i] >> 16, op = code[i] & 0xffffu;
+            if (!words) break;
+            if (op == 17 && code[i + 1] == cap) return true;   // OpCapability
+            i += words;
+        }
+        return false;
+    };
+    const std::vector<uint32_t> vs_cap_code = read_spv(argv[1]);
+    auto either_stage_has_cap = [&](uint32_t cap) { return has_cap(fs_code, cap) || has_cap(vs_cap_code, cap); };
+    const bool needs_barycentric = has_cap(fs_code, 5284);          // FragmentBarycentricKHR
+    const bool needs_float64 = has_cap(fs_code, 10);                // v_add_f64 and friends
+    const bool needs_float16 = either_stage_has_cap(9);             // Float16
+    const bool needs_io16 = either_stage_has_cap(4436);             // StorageInputOutput16
     if (needs_barycentric && !has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
         std::fprintf(stderr, "unsupported: %s reads BaryCoordKHR and the device has no %s\n",
                      argv[2], VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
@@ -383,7 +391,20 @@ int main(int argc, char** argv) {
                              "constants, not from the --pc-tail-ubo block\n");
         return 77;
     }
-    const uint32_t pc_bytes = pc_tail ? 128u : mesh_compute ? 152u : 144u;
+    uint32_t pc_bytes = pc_tail ? 128u : mesh_compute ? 152u : 144u;
+    // VKH_PC_BYTES=<n> declares a smaller range than the translated block for a module that reads fewer words (a
+    // hand-written fixture, or one with no push constants at all), so a 128-byte device can run it too.
+    if (const char* pc_env = std::getenv("VKH_PC_BYTES")) {
+        char* end = nullptr;
+        const unsigned long n = std::strtoul(pc_env, &end, 0);
+        // VkPushConstantRange size must be a multiple of 4.
+        if (!*pc_env || *end || n < 4 || n > pc_bytes || (n & 3)) {
+            std::fprintf(stderr, "VKH_PC_BYTES: expected a multiple of 4 in 4..%u bytes, got \"%s\"\n",
+                         pc_bytes, pc_env);
+            return 2;
+        }
+        pc_bytes = uint32_t(n);
+    }
     if (props.limits.maxPushConstantsSize < pc_bytes) {
         std::fprintf(stderr, "unsupported: need %u push constant bytes, device has %u\n", pc_bytes,
                      props.limits.maxPushConstantsSize);
@@ -413,11 +434,15 @@ int main(int argc, char** argv) {
         m8.maintenance8 = VK_TRUE; m8.pNext = chain; chain = &m8;
     }
 #endif
+#ifdef VK_AMD_SHADER_INFO_EXTENSION_NAME
+    if (std::getenv("VKH_SHADER_INFO") && has(VK_AMD_SHADER_INFO_EXTENSION_NAME))
+        enable.push_back(VK_AMD_SHADER_INFO_EXTENSION_NAME);
+#endif
     VkPhysicalDeviceVulkan11Features f11q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkPhysicalDeviceVulkan12Features f12q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    f12q.pNext = &f11q;
     VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13q.pNext = &f12q;
+    f12q.pNext = &f11q;
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2q.pNext = &f13q;
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
@@ -429,6 +454,18 @@ int main(int argc, char** argv) {
         f11.pNext = chain;
         chain = &f11;
     }
+    // 16-bit varyings (Float16 / StorageInputOutput16 in a module: the hand-written f16 interpolation fixture): a
+    // Vulkan-1.1 feature, so it goes in the version struct already queried rather than in a feature struct those
+    // structs alias (VUID-VkDeviceCreateInfo-pNext-04748). A module that does not declare it enables nothing.
+    if (needs_io16) {
+        if (!f11q.storageInputOutput16) {
+            std::fprintf(stderr, "unsupported: %s uses 16-bit shader input/output and the device has no "
+                                 "storageInputOutput16\n", argv[2]);
+            return 77;
+        }
+        f11.storageInputOutput16 = VK_TRUE;
+        if (!f11.pNext) { f11.pNext = chain; chain = &f11; }
+    }
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     if (f13q.subgroupSizeControl) {
         f13.subgroupSizeControl = VK_TRUE;
@@ -436,14 +473,19 @@ int main(int argc, char** argv) {
         chain = &f13;
     }
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    if (need_heap || mesh_compute) {
+    if (need_heap || mesh_compute || needs_float16) {
         // 77 is the "this device cannot run the test" code that check.py and run_gpu_tests.py report as SKIP.
-        if (!f12q.bufferDeviceAddress) {
+        if ((need_heap || mesh_compute) && !f12q.bufferDeviceAddress) {
             std::fprintf(stderr, "unsupported: %s needs bufferDeviceAddress\n",
                          tex_rgba_path ? "VKH_TEX_RGBA" : heap_env ? "VKH_HEAP" : "VKH_MESH_COMPUTE");
             return 77;
         }
-        f12.bufferDeviceAddress = VK_TRUE;
+        if (needs_float16 && !f12q.shaderFloat16) {
+            std::fprintf(stderr, "unsupported: %s declares Float16 and the device has no shaderFloat16\n", argv[2]);
+            return 77;
+        }
+        f12.bufferDeviceAddress = (need_heap || mesh_compute) ? VK_TRUE : VK_FALSE;
+        f12.shaderFloat16 = needs_float16 ? VK_TRUE : VK_FALSE;
         if (tex_rgba_path) {
             if (!f12q.runtimeDescriptorArray || !f12q.descriptorIndexing) {
                 std::fprintf(stderr, "unsupported: VKH_TEX_RGBA needs runtimeDescriptorArray and descriptorIndexing\n");
@@ -841,6 +883,25 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::fprintf(stderr, "wrote %u pipeline binaries to %s\n", count, bin_out);
+    }
+#endif
+#ifdef VK_AMD_SHADER_INFO_EXTENSION_NAME
+    // VKH_SHADER_INFO=1: print the driver's disassembly of the fragment stage (VK_AMD_shader_info), for pinning a
+    // measurement to the code the driver actually ran. A device without the extension says so and carries on.
+    if (std::getenv("VKH_SHADER_INFO")) {
+        auto info = reinterpret_cast<PFN_vkGetShaderInfoAMD>(vkGetDeviceProcAddr(dev, "vkGetShaderInfoAMD"));
+        if (!info) {
+            std::fprintf(stderr, "no vkGetShaderInfoAMD on this device\n");
+        } else {
+            std::size_t n = 0;
+            if (info(dev, pipe, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &n, nullptr) != VK_SUCCESS || !n) {
+                std::fprintf(stderr, "vkGetShaderInfoAMD: no disassembly\n");
+            } else {
+                std::vector<char> text(n + 1, 0);
+                if (info(dev, pipe, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &n, text.data()) == VK_SUCCESS)
+                    std::printf("%s\n", text.data());
+            }
+        }
     }
 #endif
     VkPipeline cpipe = VK_NULL_HANDLE;

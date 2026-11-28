@@ -1117,6 +1117,17 @@ class Gen:
         self.emit(f"{r} = OpSelect %uint {is_z} {self.cu(0)} {v}")
         return r
 
+    def f16_round(self, f):
+        """f32 ``f`` -> the f32 nearest f16 value (round to nearest even), i.e. the value an f16 word holds.
+
+        Used for the interpolation's P10/P20 deltas, which the SPI rounds to f16 (SHADER-468). The bits come from
+        f16_bits, so no driver can fold the round trip away (#512, #513), and UnpackHalf2x16 of integer-built bits
+        is exact for every f16 including the denormals and inf."""
+        v2, r = self.tmp(), self.tmp()
+        self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {self.f16_bits(f)}")
+        self.emit(f"{r} = OpCompositeExtract %float {v2} 0")
+        return r
+
     def f16_omod(self, h, mods):
         """VOP3 mul:2 / mul:4 / div:2 on the rounded f16 bits ``h`` (low 16) of v_cvt_f16_f32, as measured on RDNA2
         (RX 6800 on #718; gfx1036 across wave32/wave64 and MODE RNE/RTZ): after rounding and before clamp, so 65520
@@ -11848,8 +11859,13 @@ class Gen:
                 # VOP3 clamp applies to the f16 result (ACO: dst(F16); llvm-mc takes clamp but no omod on this op).
                 # Until 2026-11-22 it was dropped. A partial write like the other f16 results: the high half of vdst is
                 # kept (SHADER-430, measured on gfx1036 with tools/hw_oracle: a preset 0xdead high half survived every
-                # case). It used to be zeroed.
-                self.write_lo16(a[0], self.f16_res(self.clamp_f16(f, mods)))
+                # case). It used to be zeroed. The narrow is always toward zero: MODE.FP_ROUND decides the rounding
+                # of an f16 VALU result, and every AMD compiler sets that field to toward zero around this pair
+                # (LLVM's SIModeRegister: "f16 interpolation instructions need double precision round to zero"; the
+                # Windows driver's ISA shows s_round_mode 0x000c around v_interp_p1ll_f16 / v_interp_p2_f16 on
+                # gfx1036), so f16_res's MODE read is bypassed. Measured: toward zero explains 65,536 of 65,536
+                # samples, nearest even 39,607 (SHADER-468).
+                self.write_lo16(a[0], self.f16_bits(self.clamp_f16(f, mods), rtz=True))
             else:   # p1ll/p1lv produce the f32 intermediate consumed by p2_f16
                 self.dst(a[0], self.tou(f))
         elif op in SOPC_CMP32_OPS:
@@ -15205,6 +15221,12 @@ class Gen:
         d1, d2, m1, m2, s, r = (self.tmp() for _ in range(6))
         self.emit(f"{d1} = OpFSub %float {pv[1]} {pv[0]}")
         self.emit(f"{d2} = OpFSub %float {pv[2]} {pv[0]}")
+        if half is not None:
+            # The SPI writes P10/P20 for a 16-bit channel as per-half f16 differences (SHADER-468: measured on
+            # gfx1036, an f16 delta overflows to inf where the f32 difference does not), so each delta is rounded
+            # to f16 before it is weighted. The weights and the sum stay f32 (measured: an exact f32 sum explains
+            # 65,536 of 65,536 samples, an f16 sum 57,583).
+            d1, d2 = self.f16_round(d1), self.f16_round(d2)
         self.emit(f"{m1} = OpFMul %float {d1} {i}")
         self.emit(f"{s} = OpFAdd %float {pv[0]} {m1}")
         self.emit(f"{m2} = OpFMul %float {d2} {j}")
