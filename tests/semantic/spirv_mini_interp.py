@@ -521,11 +521,30 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
                                               f"{subgroup_size}-wide subgroup")
                     ident %= subgroup_size
                 results.append(group[ident][2] if ident in group else UNDEF)
+            elif kind in ("OpDPdxFine", "OpDPdyFine"):
+                # SPIR-V 3.32.16: fine screen-quad derivatives over 2x2 quads (lanes 0:(0,0), 1:(1,0), 2:(0,1),
+                # 3:(1,1) within each group of 4 contiguous invocations; helper invocations participate).
+                if invocations % 4 or slots != list(range(invocations)):
+                    raise UnsupportedConstruct(f"{kind} requires complete 2x2 pixel quads (4*n contiguous invocations)")
+                qbase = i & ~3
+                lo_idx, hi_idx = ((qbase + (i & 2), qbase + (i & 2) + 1) if kind == "OpDPdxFine"
+                                  else (qbase + (i & 1), qbase + 2 + (i & 1)))
+                lo_v, hi_v = pending[lo_idx][2], pending[hi_idx][2]
+                diff = lambda h, l: f32(ieee_nan(h - l, h, l))                    # noqa: E731
+                results.append(tuple(diff(h, l) for h, l in zip(hi_v, lo_v)) if isinstance(lo_v, tuple)
+                               else diff(hi_v, lo_v))
             else:
                 raise UnsupportedConstruct(kind)
         for i in range(invocations):
             advance(i, results[i])
     return (memory, invocation_outputs) if return_outputs else memory
+
+
+def run_quad(text, inputs_for, push_constants=None, memory=None, resources=None):
+    """Execute one 2x2 pixel quad (lanes 0:(x,y), 1:(x+1,y), 2:(x,y+1), 3:(x+1,y+1)) and return its four Output dicts."""
+    _, outs = run_workgroup(text, 4, 4, inputs_for=inputs_for, push_constants=push_constants, memory=memory,
+                            return_outputs=True, resources=resources)
+    return outs
 
 
 _TICK = ("tick", None, None, None)
@@ -1237,6 +1256,11 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
         elif op == "OpConvertUToPtr":
             values[res] = ("psb", val(a[1]))
             pointers[res] = values[res]
+        elif op in ("OpDPdxFine", "OpDPdyFine"):
+            v = val(a[1])
+            if not (isinstance(v, float) or (isinstance(v, tuple) and all(isinstance(c, float) for c in v))):
+                raise UnsupportedConstruct(f"{op} on non-float")
+            values[res] = yield (op, pc - 1, v, None)
         elif op == "OpExtInst":
             if len(a) < 3 or a[1] != "%glsl":
                 raise UnsupportedConstruct("extended instruction set")
