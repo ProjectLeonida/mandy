@@ -118,12 +118,14 @@ struct MarkerTarget {
     explicit operator bool() const { return buffer != VK_NULL_HANDLE; }
 
     void started(VkCommandBuffer command_buffer, std::uint64_t seq) const {
+        if (!*this || (!write2 && !write)) return;
         if (write2)
             write2(command_buffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, buffer, offset, std::uint32_t(seq));
         else
             write(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, buffer, offset, std::uint32_t(seq));
     }
     void finished(VkCommandBuffer command_buffer, std::uint64_t seq) const {
+        if (!*this || (!write2 && !write)) return;
         if (write2)
             write2(command_buffer, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, buffer, offset + 4, std::uint32_t(seq));
         else
@@ -140,7 +142,7 @@ public:
     DeviceMarkers(const DeviceMarkers&) = delete;
     DeviceMarkers& operator=(const DeviceMarkers&) = delete;
     ~DeviceMarkers() {
-        if (memory_ && unmap_) unmap_(device_, memory_);
+        if (words_ && memory_ && unmap_) unmap_(device_, memory_);
         if (buffer_ && destroy_buffer_) destroy_buffer_(device_, buffer_, nullptr);
         if (memory_ && free_memory_) free_memory_(device_, memory_, nullptr);
     }
@@ -148,6 +150,7 @@ public:
     // Returns the VkResult of the step that failed, or VK_SUCCESS.
     VkResult create(PFN_vkGetDeviceProcAddr get, VkDevice device, const VkPhysicalDeviceMemoryProperties& memory,
                     bool synchronization2) {
+        if (!get) return VK_ERROR_EXTENSION_NOT_PRESENT;
         device_ = device;
 #define LEONIDA_MARKER_LOAD(type, name) const auto name = reinterpret_cast<type>(get(device, #name))
         LEONIDA_MARKER_LOAD(PFN_vkCreateBuffer, vkCreateBuffer);
@@ -219,7 +222,9 @@ public:
     static std::uint32_t memory_type(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t allowed) {
         constexpr VkMemoryPropertyFlags need = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         std::uint32_t fallback = UINT32_MAX;
-        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+        const std::uint32_t count =
+            memory.memoryTypeCount < VK_MAX_MEMORY_TYPES ? memory.memoryTypeCount : VK_MAX_MEMORY_TYPES;
+        for (std::uint32_t i = 0; i < count; ++i) {
             const VkMemoryPropertyFlags flags = memory.memoryTypes[i].propertyFlags;
             if (!(allowed & (1u << i)) || (flags & need) != need) continue;
             if (!(flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return i;
