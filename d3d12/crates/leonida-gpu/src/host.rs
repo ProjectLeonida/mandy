@@ -1038,6 +1038,18 @@ fn create() -> windows::core::Result<Host> {
         let forced = std::env::var_os("LEONIDA_MESH_COMPUTE").is_some_and(|v| v == "1");
         leonida_shader::emit::set_host_mesh_shaders(mesh && !forced);
         tracing::info!(mesh, forced, "mesh programs run as compute: {}", !mesh || forced);
+        // `D3D12-BARYCENTRICS-FALLBACK`: without D3D12 barycentrics (Pascal and older refuse every pixel
+        // shader that reads them: "Shader uses Barycentrics, but the device does not support this") the
+        // translator reads the weights and the other vertices' values from inputs a geometry stage of ours
+        // writes (`leonida_shader::emit::bary_gs`). `LEONIDA_BARY_FALLBACK=1` takes that path on any card.
+        let mut o3 = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        let barycentrics = device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, (&raw mut o3).cast(), size_of_val(&o3) as u32)
+            .is_ok()
+            && o3.BarycentricsSupported.as_bool();
+        let forced = crate::switch::on("LEONIDA_BARY_FALLBACK");
+        leonida_shader::emit::set_host_barycentrics(barycentrics && !forced);
+        tracing::info!(barycentrics, forced, "pixel shaders read barycentrics through a geometry stage: {}", !barycentrics || forced);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

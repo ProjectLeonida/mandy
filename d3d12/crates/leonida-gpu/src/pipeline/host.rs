@@ -942,12 +942,31 @@ impl HostPipeline {
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
         }
+        // `D3D12-BARYCENTRICS-FALLBACK`: a pixel shader translated for a host
+        // without barycentrics (`leonida_shader::emit::set_host_barycentrics`)
+        // reads inputs that only the barycentrics geometry stage writes.
+        // shortcut: a rectangle list then goes without its own stage (the
+        // two do not combine yet): `draw` completes its rectangles as it does
+        // when the host refuses that stage.
+        let mut bary_gs = None;
+        if let Some(ps) = stages.get(1).and_then(|(s, _)| s.translated())
+            && leonida_shader::emit::needs_bary_gs(&ps.host.dxil)
+        {
+            let vs = &stages[0].0.translated()?.host.dxil;
+            if rect_gs.take().is_some() {
+                tracing::warn!(?shaders, "a rectangle list without its geometry stage: its pixel shader needs the barycentrics stage");
+            }
+            match leonida_shader::emit::bary_gs(vs, &ps.host.dxil) {
+                Ok(gs) => bary_gs = Some(gs),
+                Err(e) => tracing::warn!(error = %e, ?shaders, "no barycentrics geometry stage"),
+            }
+        }
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
-            GS: rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+            GS: rect_gs.as_ref().or(bary_gs.as_ref()).map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
                 D3D12_SHADER_BYTECODE {
                     pShaderBytecode: gs.as_ptr().cast(),
                     BytecodeLength: gs.len(),
@@ -977,6 +996,12 @@ impl HostPipeline {
         // A pipeline with the geometry stage has a name of its own in the
         // library; the others keep theirs.
         let name = |gs: Option<&Vec<u8>>| match gs {
+            Some(gs) if bary_gs.is_some() => super::library::name(
+                "graphics barycentrics",
+                &root_blob,
+                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
+                &state,
+            ),
             Some(gs) => super::library::name(
                 "graphics rectangles",
                 &root_blob,
@@ -1004,7 +1029,7 @@ impl HostPipeline {
                 || unsafe { host.device.CreateGraphicsPipelineState(desc) },
             )
         };
-        let mut made = make(&desc, &name(rect_gs.as_ref()));
+        let mut made = make(&desc, &name(rect_gs.as_ref().or(bary_gs.as_ref())));
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
