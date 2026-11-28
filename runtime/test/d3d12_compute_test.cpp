@@ -27,12 +27,15 @@
 #include <fstream>
 #include <vector>
 
-#ifndef LEONIDA_TEST_CS_SPV
-#error "LEONIDA_TEST_CS_SPV must name the compiled test shader"
+#if !defined(LEONIDA_TEST_CS_SPV) || !defined(LEONIDA_TEST_CS_TAIL_SPV)
+#error "LEONIDA_TEST_CS_SPV and LEONIDA_TEST_CS_TAIL_SPV must name the compiled test shaders"
 #endif
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
+} while (0)
+#define REQUIRE(condition) do { \
+    if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return {}; } \
 } while (0)
 
 namespace {
@@ -244,6 +247,81 @@ std::vector<std::vector<HRESULT>> host_cached_pso_cases(const std::vector<std::u
     return out;
 }
 
+// One dispatch of `container`'s program on `device` (a PC-side device, not the Xbox proxy) with the test's root
+// signature: s0 = base, s1 = step, the root UAV an arena buffer, and the table's first slot the console VA of an
+// upload buffer holding `table`. The 64 results, or none when a step fails (its line is printed).
+std::vector<std::uint32_t> dispatch_once(ID3D12Device* device, const std::vector<std::uint8_t>& root_blob,
+                                         const std::vector<std::uint8_t>& container, std::uint32_t base,
+                                         std::uint32_t step, const std::uint32_t (&table)[4]) {
+    constexpr UINT elements = 64, bytes = elements * 4;
+    Ref<ID3D12RootSignature> root;
+    REQUIRE(SUCCEEDED(device->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&root.p))));
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = root.p;
+    pso_desc.CS = {container.data(), container.size()};
+    Ref<ID3D12PipelineState> pso;
+    REQUIRE(SUCCEEDED(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
+
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+    const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    Ref<ID3D12Resource> out, constants, readback;
+    const auto uav = buffer_desc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    REQUIRE(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                      IID_PPV_ARGS(&out.p))));
+    const auto constants_desc = buffer_desc(256, D3D12_RESOURCE_FLAG_NONE);
+    REQUIRE(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &constants_desc,
+                                                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                      IID_PPV_ARGS(&constants.p))));
+    const auto readback_desc = buffer_desc(bytes, D3D12_RESOURCE_FLAG_NONE);
+    REQUIRE(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                      IID_PPV_ARGS(&readback.p))));
+    void* mapped = nullptr;
+    REQUIRE(SUCCEEDED(constants->Map(0, nullptr, &mapped)));
+    std::memcpy(mapped, table, sizeof(table));
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    REQUIRE(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    const std::uint64_t target = constants->GetGPUVirtualAddress();
+    std::memcpy(reinterpret_cast<void*>(heap->GetCPUDescriptorHandleForHeapStart().ptr), &target, sizeof(target));
+
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    REQUIRE(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    REQUIRE(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    REQUIRE(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, pso.p,
+                                                IID_PPV_ARGS(&list.p))));
+    REQUIRE(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    ID3D12DescriptorHeap* heaps[] = {heap.p};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(root.p);
+    const std::uint32_t base_and_step[2] = {base, step};
+    list->SetComputeRoot32BitConstants(0, 2, base_and_step, 0);
+    list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
+    list->SetComputeRootDescriptorTable(2, heap->GetGPUDescriptorHandleForHeapStart());
+    list->Dispatch(1, 1, 1);
+    const auto to_copy = transition(out.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &to_copy);
+    list->CopyBufferRegion(readback.p, 0, out.p, 0, bytes);
+    REQUIRE(list->Close() == S_OK);
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    REQUIRE(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+    REQUIRE(SUCCEEDED(queue->Signal(fence.p, 1)));
+    REQUIRE(SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
+    void* results = nullptr;
+    REQUIRE(SUCCEEDED(readback->Map(0, nullptr, &results)));
+    std::vector<std::uint32_t> values(elements);
+    std::memcpy(values.data(), results, bytes);
+    return values;
+}
+
 }  // namespace
 
 int main() {
@@ -290,171 +368,181 @@ int main() {
                  "\"uses_code_base\": true, \"wave64\": false}}";
     }
 
+    // The --pc-tail-ubo twin of the module, in a library of its own (one index entry per program there).
+    const testfiles::ScratchDir tail_scratch("leonida_compute_test_tail");
+    const auto& tail_library = tail_scratch.path();
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_TAIL_SPV),
+                                tail_library / "cs_user_data_tail.spv"));
+
     constexpr UINT elements = 64, bytes = elements * 4;
     const std::uint32_t table_values[4] = {1000, 2000, 3000, 4000};
+    constexpr std::uint32_t tail_base = 11, tail_step = 5;
+    std::vector<std::uint32_t> tail_limited, tail_full;  // the tail dispatch on a 128-byte device and on this GPU
     std::vector<std::uint32_t> first(elements), second(elements), third(elements);
     std::vector<std::uint32_t> cbv_a_out(elements), cbv_oob_out(elements), cbv_b_out(elements), cbv_null_out(elements);
     std::vector<std::uint32_t> srv_raw_a(elements), srv_raw_b(elements), srv_struct_a(elements),
         srv_struct_b(elements), srv_typed(elements), srv_null(elements);
+    bool real_needs_fallback = false;
+    std::uint32_t real_max_push = 0;
+    rt::d3d12::VulkanDeviceInfo info{};
+    info.prepare_on_bind=d.prepare_on_bind;
+    info.get_instance_proc = d.instance_proc;
+    info.instance = d.instance;
+    info.physical = d.physical;
+    info.device = d.device;
+    info.queue = d.queue;
+    info.queue_family = d.family;
+    info.buffer_device_address = true;
+    info.subgroup = d.subgroup;
+    info.shader_dir = library.string();
+
+    // Root signature: [0] two constants (s4, s5), [1] a root UAV (s6:s7), [2] a one-CBV table (s8, its 32-bit VA):
+    // the console compute layout (rt::rootsig::pack_stage, D3D-448).
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};
+    D3D12_ROOT_PARAMETER params[3] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants = {0, 0, 2};
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[1].Descriptor = {0, 0};
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[2].DescriptorTable = {1, &range};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+    root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    root_desc.Desc_1_0 = {3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    const auto root_blob = serialize(root_desc);
+    EXPECT(!root_blob.empty());
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC base_pso_desc{};
+    base_pso_desc.CS = {container.data(), container.size()};
+
     {
-        rt::d3d12::VulkanDeviceInfo info{};
-        info.prepare_on_bind=d.prepare_on_bind;
-        info.get_instance_proc = d.instance_proc;
-        info.instance = d.instance;
-        info.physical = d.physical;
-        info.device = d.device;
-        info.queue = d.queue;
-        info.queue_family = d.family;
-        info.buffer_device_address = true;
-        info.subgroup = d.subgroup;
-        info.shader_dir = library.string();
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
+        real_needs_fallback = rt::d3d12::device_push_constants_need_fallback(device.p);
+        real_max_push = rt::d3d12::device_max_push_constants_size(device.p);
 
-        // Root signature: [0] two constants (s4, s5), [1] a root UAV (s6:s7), [2] a one-CBV table (s8, its 32-bit VA):
-        // the console compute layout (rt::rootsig::pack_stage, D3D-448).
-        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};
-        D3D12_ROOT_PARAMETER params[3] = {};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants = {0, 0, 2};
-        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        params[1].Descriptor = {0, 0};
-        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[2].DescriptorTable = {1, &range};
-        D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
-        root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
-        root_desc.Desc_1_0 = {3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-        const auto root_blob = serialize(root_desc);
-        EXPECT(!root_blob.empty());
         Ref<ID3D12RootSignature> root;
         EXPECT(SUCCEEDED(device->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&root.p))));
         Ref<ID3D12RootSignature> junk;
         EXPECT(device->CreateRootSignature(0, "junk", 4, IID_PPV_ARGS(&junk.p)) == E_INVALIDARG && !junk.p);
 
-        // The PSO through slot 62, the Xbox call shape; an unknown program is refused.
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+        // The PSO through slot 62, the Xbox call shape; an unknown program is refused. On a real 128-byte device
+        // (maxPushConstantsSize < 144), the 144-byte PSO is refused with E_NOTIMPL and only the --pc-tail-ubo path runs.
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc = base_pso_desc;
         pso_desc.pRootSignature = root.p;
-        pso_desc.CS = {container.data(), container.size()};
         const IID pso_iid = __uuidof(ID3D12PipelineState);
-        Ref<ID3D12PipelineState> pso, unknown;
-        EXPECT(SUCCEEDED(reinterpret_cast<XboxComputePipelineFn>(slot(device.p, 62))(
-            device.p, &pso_desc, 0, 0, &pso_iid, reinterpret_cast<void**>(&pso.p))));
-        auto other = fssm;
-        other[8] ^= 1;
-        const auto other_container = shader_container(other);
-        pso_desc.CS = {other_container.data(), other_container.size()};
-        EXPECT(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&unknown.p)) == E_INVALIDARG && !unknown.p);
-        {
-            // XboxBvhBuilder.dll's call: slot 62 with a container whose program is translated in <library>/bvh.
-            Ref<ID3D12PipelineState> builder_pso;
-            pso_desc.CS = {builder_container.data(), builder_container.size()};
+        Ref<ID3D12PipelineState> pso, unknown, pso67, unknown67;
+        if (real_needs_fallback) {
+            EXPECT(reinterpret_cast<XboxComputePipelineFn>(slot(device.p, 62))(
+                       device.p, &pso_desc, 0, 0, &pso_iid, reinterpret_cast<void**>(&pso.p)) == E_NOTIMPL &&
+                   !pso.p);
+        } else {
             EXPECT(SUCCEEDED(reinterpret_cast<XboxComputePipelineFn>(slot(device.p, 62))(
-                device.p, &pso_desc, 0, 0, &pso_iid, reinterpret_cast<void**>(&builder_pso.p))));
-            EXPECT(builder_pso.p && builder_pso.p != pso.p);
-        }
-        pso_desc.CS = {container.data(), container.size()};
-
-        // The PSO through slot 67, compute pipeline from native code; maps to CreateComputePipelineState.
-        struct XboxNativeComputeDesc {
-            ID3D12RootSignature* root_signature;
-            const void* kind0;
-            std::uint64_t kind0_size;
-            const void* kind1;
-            std::uint64_t kind1_size;
-            const void* kind6;
-            std::uint64_t kind6_size;
-            const void* kind7;
-            std::uint64_t kind7_size;
-        } native_desc{};
-        native_desc.root_signature = root.p;
-        native_desc.kind6 = fssm.data();
-        native_desc.kind6_size = fssm.size();
-        Ref<ID3D12PipelineState> pso67, unknown67;
-        EXPECT(SUCCEEDED(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
-            device.p, &native_desc, &pso_iid, reinterpret_cast<void**>(&pso67.p))));
-        EXPECT(pso67.p != nullptr);
-        native_desc.kind6 = other.data();
-        native_desc.kind6_size = other.size();
-        EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
-            device.p, &native_desc, &pso_iid, reinterpret_cast<void**>(&unknown67.p)) == E_INVALIDARG && !unknown67.p);
-        void* out_null = reinterpret_cast<void*>(0x1111);
-        EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
-            device.p, nullptr, &pso_iid, &out_null) == E_INVALIDARG && !out_null);
-        out_null = reinterpret_cast<void*>(0x1111);
-        native_desc.kind6 = fssm.data();
-        native_desc.kind6_size = fssm.size();
-        EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
-            device.p, &native_desc, nullptr, &out_null) == E_POINTER && !out_null);
-        EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
-            device.p, &native_desc, &pso_iid, nullptr) == E_POINTER);
-        // GetCachedBlob and CachedPSO answer as the PC runtime does (src/cached_pso.h).
-        {
-            D3D12_VERSIONED_ROOT_SIGNATURE_DESC other_desc = root_desc;
-            other_desc.Desc_1_0.NumParameters = 2;
-            const auto other_root_blob = serialize(other_desc);
-            EXPECT(!other_root_blob.empty());
-            const std::vector<HRESULT> layer = cached_pso_cases(device.p, pso_desc, root_blob, other_root_blob);
-            EXPECT(int(layer.size()) == cached_case_count);
-            const std::vector<HRESULT> expected = {S_OK,         S_OK,         S_OK,         E_INVALIDARG,
-                                                   E_INVALIDARG, E_INVALIDARG, E_INVALIDARG, E_INVALIDARG,
-                                                   E_INVALIDARG, E_INVALIDARG, S_OK};
-            EXPECT(layer == expected);
-            const auto hosts = host_cached_pso_cases(root_blob, other_root_blob);
-            if (hosts.empty())
-                std::printf("SKIP: no host D3D12 reference (Wine, or no device or compiler) for the CachedPSO "
-                            "comparison\n");
-            for (const auto& host : hosts) EXPECT(host == layer);
-            if (!hosts.empty()) std::printf("cached PSO: %zu host adapter(s) gave the same %d answers\n", hosts.size(), cached_case_count);
-
-            // Every byte of the blob counts, and the adapter and driver fields give the runtime's own errors.
-            Ref<ID3DBlob> blob;
-            EXPECT(pso->GetCachedBlob(&blob.p) == S_OK && blob.p);
-            const auto* p = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
-            std::vector<std::uint8_t> blob_bytes(p, p + blob->GetBufferSize());
-            auto attempt = [&](const std::vector<std::uint8_t>& b) {
-                D3D12_COMPUTE_PIPELINE_STATE_DESC d = pso_desc;
-                d.CachedPSO = {b.data(), b.size()};
-                Ref<ID3D12PipelineState> made;
-                return device->CreateComputePipelineState(&d, IID_PPV_ARGS(&made.p));
-            };
-            for (std::size_t at = 0; at < blob_bytes.size(); ++at) {
-                auto changed = blob_bytes;
-                changed[at] ^= 0x01;
-                EXPECT(attempt(changed) == E_INVALIDARG);
+                device.p, &pso_desc, 0, 0, &pso_iid, reinterpret_cast<void**>(&pso.p))));
+            auto other = fssm;
+            other[8] ^= 1;
+            const auto other_container = shader_container(other);
+            pso_desc.CS = {other_container.data(), other_container.size()};
+            EXPECT(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&unknown.p)) == E_INVALIDARG &&
+                   !unknown.p);
+            {
+                // XboxBvhBuilder.dll's call: slot 62 with a container whose program is translated in <library>/bvh.
+                Ref<ID3D12PipelineState> builder_pso;
+                pso_desc.CS = {builder_container.data(), builder_container.size()};
+                EXPECT(SUCCEEDED(reinterpret_cast<XboxComputePipelineFn>(slot(device.p, 62))(
+                    device.p, &pso_desc, 0, 0, &pso_iid, reinterpret_cast<void**>(&builder_pso.p))));
+                EXPECT(builder_pso.p && builder_pso.p != pso.p);
             }
-            auto resealed = [](std::vector<std::uint8_t> b, std::size_t at) {
-                b[at] ^= 0x01;
-                const std::uint32_t sum = leonida::cached_pso::fnv1a(b.data(), b.size() - 4);
-                for (int i = 0; i < 4; ++i) b[b.size() - 4 + i] = std::uint8_t(sum >> (8 * i));
-                return b;
-            };
-            EXPECT(attempt(resealed(blob_bytes, 8)) == D3D12_ERROR_ADAPTER_NOT_FOUND);   // vendor
-            EXPECT(attempt(resealed(blob_bytes, 12)) == D3D12_ERROR_ADAPTER_NOT_FOUND);  // device
-            EXPECT(attempt(resealed(blob_bytes, 16)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);
-            EXPECT(attempt(resealed(blob_bytes, 20)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);  // pipelineCacheUUID
-            EXPECT(attempt(resealed(blob_bytes, 4)) == E_INVALIDARG);  // version
-        }
+            pso_desc.CS = {container.data(), container.size()};
 
-        // A device whose maxPushConstantsSize is the Vulkan minimum (128 bytes) cannot hold the 144-byte block, so
-        // its PSOs are refused instead of creating a pipeline layout the spec forbids (#224's fallback flag).
-        {
-            rt::d3d12::VulkanDeviceInfo limited_info = info;
-            limited_info.max_push_constants_size = 128;
-            limited_info.push_constants_need_fallback = true;
-            Ref<ID3D12Device> limited;
-            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(limited_info, IID_PPV_ARGS(&limited.p))));
-            EXPECT(rt::d3d12::device_push_constants_need_fallback(limited.p));
-            Ref<ID3D12RootSignature> limited_root;
-            EXPECT(SUCCEEDED(limited->CreateRootSignature(0, root_blob.data(), root_blob.size(),
-                                                        IID_PPV_ARGS(&limited_root.p))));
-            D3D12_COMPUTE_PIPELINE_STATE_DESC limited_desc = pso_desc;
-            limited_desc.pRootSignature = limited_root.p;
-            Ref<ID3D12PipelineState> refused;
-            EXPECT(limited->CreateComputePipelineState(&limited_desc, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
+            // The PSO through slot 67, compute pipeline from native code; maps to CreateComputePipelineState.
+            struct XboxNativeComputeDesc {
+                ID3D12RootSignature* root_signature;
+                const void* kind0;
+                std::uint64_t kind0_size;
+                const void* kind1;
+                std::uint64_t kind1_size;
+                const void* kind6;
+                std::uint64_t kind6_size;
+                const void* kind7;
+                std::uint64_t kind7_size;
+            } native_desc{};
+            native_desc.root_signature = root.p;
+            native_desc.kind6 = fssm.data();
+            native_desc.kind6_size = fssm.size();
+            EXPECT(SUCCEEDED(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+                device.p, &native_desc, &pso_iid, reinterpret_cast<void**>(&pso67.p))));
+            EXPECT(pso67.p != nullptr);
+            native_desc.kind6 = other.data();
+            native_desc.kind6_size = other.size();
+            EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+                       device.p, &native_desc, &pso_iid, reinterpret_cast<void**>(&unknown67.p)) == E_INVALIDARG &&
+                   !unknown67.p);
+            void* out_null = reinterpret_cast<void*>(0x1111);
+            EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+                       device.p, nullptr, &pso_iid, &out_null) == E_INVALIDARG &&
+                   !out_null);
+            out_null = reinterpret_cast<void*>(0x1111);
+            native_desc.kind6 = fssm.data();
+            native_desc.kind6_size = fssm.size();
+            EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+                       device.p, &native_desc, nullptr, &out_null) == E_POINTER &&
+                   !out_null);
+            EXPECT(reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67))(
+                       device.p, &native_desc, &pso_iid, nullptr) == E_POINTER);
+            // GetCachedBlob and CachedPSO answer as the PC runtime does (src/cached_pso.h).
+            {
+                D3D12_VERSIONED_ROOT_SIGNATURE_DESC other_desc = root_desc;
+                other_desc.Desc_1_0.NumParameters = 2;
+                const auto other_root_blob = serialize(other_desc);
+                EXPECT(!other_root_blob.empty());
+                const std::vector<HRESULT> layer = cached_pso_cases(device.p, pso_desc, root_blob, other_root_blob);
+                EXPECT(int(layer.size()) == cached_case_count);
+                const std::vector<HRESULT> expected = {S_OK,         S_OK,         S_OK,         E_INVALIDARG,
+                                                       E_INVALIDARG, E_INVALIDARG, E_INVALIDARG, E_INVALIDARG,
+                                                       E_INVALIDARG, E_INVALIDARG, S_OK};
+                EXPECT(layer == expected);
+                const auto hosts = host_cached_pso_cases(root_blob, other_root_blob);
+                if (hosts.empty())
+                    std::printf("SKIP: no host D3D12 reference (Wine, or no device or compiler) for the CachedPSO "
+                                "comparison\n");
+                for (const auto& host : hosts) EXPECT(host == layer);
+                if (!hosts.empty())
+                    std::printf("cached PSO: %zu host adapter(s) gave the same %d answers\n", hosts.size(),
+                                cached_case_count);
+
+                // Every byte of the blob counts, and the adapter and driver fields give the runtime's own errors.
+                Ref<ID3DBlob> blob;
+                EXPECT(pso->GetCachedBlob(&blob.p) == S_OK && blob.p);
+                const auto* p = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
+                std::vector<std::uint8_t> blob_bytes(p, p + blob->GetBufferSize());
+                auto attempt = [&](const std::vector<std::uint8_t>& b) {
+                    D3D12_COMPUTE_PIPELINE_STATE_DESC d = pso_desc;
+                    d.CachedPSO = {b.data(), b.size()};
+                    Ref<ID3D12PipelineState> made;
+                    return device->CreateComputePipelineState(&d, IID_PPV_ARGS(&made.p));
+                };
+                for (std::size_t at = 0; at < blob_bytes.size(); ++at) {
+                    auto changed = blob_bytes;
+                    changed[at] ^= 0x01;
+                    EXPECT(attempt(changed) == E_INVALIDARG);
+                }
+                auto resealed = [](std::vector<std::uint8_t> b, std::size_t at) {
+                    b[at] ^= 0x01;
+                    const std::uint32_t sum = leonida::cached_pso::fnv1a(b.data(), b.size() - 4);
+                    for (int i = 0; i < 4; ++i) b[b.size() - 4 + i] = std::uint8_t(sum >> (8 * i));
+                    return b;
+                };
+                EXPECT(attempt(resealed(blob_bytes, 8)) == D3D12_ERROR_ADAPTER_NOT_FOUND);   // vendor
+                EXPECT(attempt(resealed(blob_bytes, 12)) == D3D12_ERROR_ADAPTER_NOT_FOUND);  // device
+                EXPECT(attempt(resealed(blob_bytes, 16)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);
+                EXPECT(attempt(resealed(blob_bytes, 20)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);  // pipelineCacheUUID
+                EXPECT(attempt(resealed(blob_bytes, 4)) == E_INVALIDARG);  // version
+            }
         }
 
         // The GPU address arena is no larger than the device's maxBufferSize and maxMemoryAllocationSize
@@ -503,6 +591,7 @@ int main() {
                         static_cast<unsigned long long>(capped_arena >> 20));
         }
 
+        if (!real_needs_fallback) {
         // Buffers in the arena, an upload buffer outside it, a readback buffer for the results.
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
@@ -1075,87 +1164,148 @@ int main() {
         }
 
         for (auto* r : {&out_a, &out_b, &out_c, &constants, &readback}) r->reset();
-        pso67.reset();
-        unknown67.reset();
-        pso.reset();
-        pso67.reset();  // the slot-67 PSO holds the device like any other; released before the count is checked
-        unknown.reset();
-        unknown67.reset();
-        junk.reset();
-        root.reset();
         heap.reset();
         list.reset();
         allocator.reset();
         queue.reset();
         fence.reset();
+        }
+        pso67.reset();  // the slot-67 PSO holds the device like any other; released before the count is checked
+        unknown.reset();
+        unknown67.reset();
+        pso.reset();
+        junk.reset();
+        root.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
+    }
+
+    // A device whose maxPushConstantsSize is the Vulkan minimum (128 bytes) cannot hold the 144-byte block, so
+    // a PSO whose shader needs it is refused instead of creating a pipeline layout the spec forbids (#224's
+    // fallback flag). Run after `device` is released so each tail device owns the process-wide title_va_aliases()
+    // hooks for its upload-buffer descriptor table scan.
+    {
+        rt::d3d12::VulkanDeviceInfo limited_info = info;
+        limited_info.max_push_constants_size = 128;
+        limited_info.push_constants_need_fallback = true;
+        {
+            Ref<ID3D12Device> limited;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(limited_info, IID_PPV_ARGS(&limited.p))));
+            EXPECT(rt::d3d12::device_push_constants_need_fallback(limited.p));
+            Ref<ID3D12RootSignature> limited_root;
+            EXPECT(SUCCEEDED(limited->CreateRootSignature(0, root_blob.data(), root_blob.size(),
+                                                        IID_PPV_ARGS(&limited_root.p))));
+            D3D12_COMPUTE_PIPELINE_STATE_DESC limited_desc = base_pso_desc;
+            limited_desc.pRootSignature = limited_root.p;
+            Ref<ID3D12PipelineState> refused;
+            EXPECT(limited->CreateComputePipelineState(&limited_desc, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
+        }
+        // The same program translated with --pc-tail-ubo (index: 128 push-constant bytes and a 16-byte pc_tail) is
+        // built there: s0..s5 arrive as push constants, the heap base and code base through set 1, and a dispatch
+        // gives what the 144-byte path gives. On a device with room for 144 bytes the same entry is built too.
+        {
+            {
+                std::ofstream index(tail_library / "index.json", std::ios::binary);
+                index << "{\"cs_user_data_tail\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(fssm)
+                      << "\", \"bindings\": [], \"push_constant_bytes\": 128, "
+                         "\"pc_tail\": {\"set\": 1, \"binding\": 0, \"bytes\": 16}, \"local_size\": [64, 1, 1], "
+                         "\"uses_code_base\": true, \"wave64\": false}}";
+            }
+            for (const bool limit : {true, false}) {
+                rt::d3d12::VulkanDeviceInfo tail_info = limit ? limited_info : info;
+                tail_info.shader_dir = tail_library.string();
+                Ref<ID3D12Device> tail_device;
+                EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(tail_info, IID_PPV_ARGS(&tail_device.p))));
+                EXPECT(rt::d3d12::device_push_constants_need_fallback(tail_device.p) == (limit || real_needs_fallback));
+                const auto values = dispatch_once(tail_device.p, root_blob, container, tail_base, tail_step,
+                                                  table_values);
+                EXPECT(values.size() == elements);
+                (limit ? tail_limited : tail_full) = values;
+            }
+        }
     }
 
     unsigned mismatches = 0;
     for (std::uint32_t i = 0; i < elements; ++i) {
-        const std::uint32_t a = 7 + 3 * i + table_values[i % 4] + code_word;
-        const std::uint32_t b = 100 + 3 * i + table_values[i % 4] + code_word;
-        const std::uint32_t c = 5 * i + table_values[i % 4] + code_word;
-        if ((first[i] != a || second[i] != b || third[i] != c) && mismatches++ < 4)
-            std::fprintf(stderr, "element %u: got %u, %u and %u, want %u, %u and %u\n", i, first[i], second[i],
-                         third[i], a, b, c);
+        // The tail path: a wrong heap base would fault or read the wrong table, a wrong code base the wrong word.
+        const std::uint32_t t = tail_base + tail_step * i + table_values[i % 4] + code_word;
+        if ((tail_limited[i] != t || tail_full[i] != t) && mismatches++ < 4)
+            std::fprintf(stderr, "tail element %u: got %u (128-byte device) and %u, want %u\n", i, tail_limited[i],
+                         tail_full[i], t);
     }
     EXPECT(!mismatches);
-    UINT cbv_b_diff = 0, cbv_null_diff = 0;
-    for (std::uint32_t i = 0; i < elements; ++i) {
-        const std::uint32_t want_a = 0x10000u + i;
-        const std::uint32_t want_oob = i < 32 ? (0x10000u + 32u + i) : 0u;
-        const std::uint32_t want_b = 0x20000u + i;
-        if (cbv_a_out[i] != want_a && mismatches++ < 4)
-            std::fprintf(stderr, "CBV A[%u]: got 0x%x want 0x%x\n", i, cbv_a_out[i], want_a);
-        if (cbv_oob_out[i] != want_oob && mismatches++ < 4)
-            std::fprintf(stderr, "CBV OOB[%u]: got 0x%x want 0x%x\n", i, cbv_oob_out[i], want_oob);
-        if (cbv_b_out[i] != want_b && mismatches++ < 4)
-            std::fprintf(stderr, "CBV B[%u]: got 0x%x want 0x%x\n", i, cbv_b_out[i], want_b);
-        if (cbv_null_out[i] != 0u && mismatches++ < 4)
-            std::fprintf(stderr, "CBV null[%u]: got 0x%x want 0\n", i, cbv_null_out[i]);
-        if (cbv_b_out[i] != cbv_a_out[i]) ++cbv_b_diff;
-        if (cbv_null_out[i] != cbv_a_out[i]) ++cbv_null_diff;
+    std::printf("--pc-tail-ubo: a 128-byte device built the tail PSO and %u/%u elements matched there and on this GPU\n",
+                elements, elements);
+    if (!real_needs_fallback) {
+        for (std::uint32_t i = 0; i < elements; ++i) {
+            const std::uint32_t a = 7 + 3 * i + table_values[i % 4] + code_word;
+            const std::uint32_t b = 100 + 3 * i + table_values[i % 4] + code_word;
+            const std::uint32_t c = 5 * i + table_values[i % 4] + code_word;
+            if ((first[i] != a || second[i] != b || third[i] != c) && mismatches++ < 4)
+                std::fprintf(stderr, "element %u: got %u, %u and %u, want %u, %u and %u\n", i, first[i], second[i],
+                             third[i], a, b, c);
+        }
+        EXPECT(!mismatches);
+        UINT cbv_b_diff = 0, cbv_null_diff = 0;
+        for (std::uint32_t i = 0; i < elements; ++i) {
+            const std::uint32_t want_a = 0x10000u + i;
+            const std::uint32_t want_oob = i < 32 ? (0x10000u + 32u + i) : 0u;
+            const std::uint32_t want_b = 0x20000u + i;
+            if (cbv_a_out[i] != want_a && mismatches++ < 4)
+                std::fprintf(stderr, "CBV A[%u]: got 0x%x want 0x%x\n", i, cbv_a_out[i], want_a);
+            if (cbv_oob_out[i] != want_oob && mismatches++ < 4)
+                std::fprintf(stderr, "CBV OOB[%u]: got 0x%x want 0x%x\n", i, cbv_oob_out[i], want_oob);
+            if (cbv_b_out[i] != want_b && mismatches++ < 4)
+                std::fprintf(stderr, "CBV B[%u]: got 0x%x want 0x%x\n", i, cbv_b_out[i], want_b);
+            if (cbv_null_out[i] != 0u && mismatches++ < 4)
+                std::fprintf(stderr, "CBV null[%u]: got 0x%x want 0\n", i, cbv_null_out[i]);
+            if (cbv_b_out[i] != cbv_a_out[i]) ++cbv_b_diff;
+            if (cbv_null_out[i] != cbv_a_out[i]) ++cbv_null_diff;
+        }
+        EXPECT(!mismatches);
+        EXPECT(cbv_b_diff == elements && cbv_null_diff == elements);
+        std::printf("CreateConstantBufferView: 64/64 dwords matched for CBV A, 32 in-bounds + 32 OOB-zero matched at "
+                    "+128, negative controls flipped %u/%u (CBV B) and %u/%u (null CBV)\n",
+                    cbv_b_diff, elements, cbv_null_diff, elements);
+        UINT raw_diff = 0, struct_diff = 0, null_diff = 0;
+        for (std::uint32_t i = 0; i < elements; ++i) {
+            const std::uint32_t want_raw_a = i < 32 ? (0x50000u + i) : 0u;
+            const std::uint32_t want_raw_b = i < 32 ? (0x50000u + 64u + i) : 0u;
+            const std::uint32_t want_struct_a = i < 32 ? (0x50000u + i * 4u) : 0u;
+            const std::uint32_t want_struct_b = i < 32 ? (0x50000u + (16u + i) * 4u) : 0u;
+            const std::uint32_t want_typed = i < 24 ? (0x50000u + (8u + i) * 4u) : 0u;
+            if (srv_raw_a[i] != want_raw_a && mismatches++ < 4)
+                std::fprintf(stderr, "SRV raw A[%u]: got 0x%x want 0x%x\n", i, srv_raw_a[i], want_raw_a);
+            if (srv_raw_b[i] != want_raw_b && mismatches++ < 4)
+                std::fprintf(stderr, "SRV raw B[%u]: got 0x%x want 0x%x\n", i, srv_raw_b[i], want_raw_b);
+            if (srv_struct_a[i] != want_struct_a && mismatches++ < 4)
+                std::fprintf(stderr, "SRV struct A[%u]: got 0x%x want 0x%x\n", i, srv_struct_a[i], want_struct_a);
+            if (srv_struct_b[i] != want_struct_b && mismatches++ < 4)
+                std::fprintf(stderr, "SRV struct B[%u]: got 0x%x want 0x%x\n", i, srv_struct_b[i], want_struct_b);
+            if (srv_typed[i] != want_typed && mismatches++ < 4)
+                std::fprintf(stderr, "SRV typed[%u]: got 0x%x want 0x%x\n", i, srv_typed[i], want_typed);
+            if (srv_null[i] != 0u && mismatches++ < 4)
+                std::fprintf(stderr, "SRV null[%u]: got 0x%x want 0\n", i, srv_null[i]);
+            if (srv_raw_b[i] != srv_raw_a[i]) ++raw_diff;
+            if (srv_struct_b[i] != srv_struct_a[i]) ++struct_diff;
+            if (srv_null[i] != srv_raw_a[i]) ++null_diff;
+        }
+        EXPECT(!mismatches);
+        EXPECT(raw_diff == 32 && struct_diff == 32 && null_diff == 32);
+        std::printf("CreateShaderResourceView(buffer): raw (32 in-bounds + 32 OOB-zero), structured (32 + 32 OOB-zero), "
+                    "typed (24 + 40 OOB-zero) matched; negative controls flipped %u/32 (raw B), %u/32 (struct B), %u/32 "
+                    "(null)\n",
+                    raw_diff, struct_diff, null_diff);
+    } else {
+        std::printf("compute: skipped the 144-byte PSO, dispatch, CBV and SRV checks because this GPU reports %u "
+                    "push-constant bytes (< 144)\n",
+                    real_max_push);
     }
-    EXPECT(!mismatches);
-    EXPECT(cbv_b_diff == elements && cbv_null_diff == elements);
-    std::printf("CreateConstantBufferView: 64/64 dwords matched for CBV A, 32 in-bounds + 32 OOB-zero matched at "
-                "+128, negative controls flipped %u/%u (CBV B) and %u/%u (null CBV)\n",
-                cbv_b_diff, elements, cbv_null_diff, elements);
-    UINT raw_diff = 0, struct_diff = 0, null_diff = 0;
-    for (std::uint32_t i = 0; i < elements; ++i) {
-        const std::uint32_t want_raw_a = i < 32 ? (0x50000u + i) : 0u;
-        const std::uint32_t want_raw_b = i < 32 ? (0x50000u + 64u + i) : 0u;
-        const std::uint32_t want_struct_a = i < 32 ? (0x50000u + i * 4u) : 0u;
-        const std::uint32_t want_struct_b = i < 32 ? (0x50000u + (16u + i) * 4u) : 0u;
-        const std::uint32_t want_typed = i < 24 ? (0x50000u + (8u + i) * 4u) : 0u;
-        if (srv_raw_a[i] != want_raw_a && mismatches++ < 4)
-            std::fprintf(stderr, "SRV raw A[%u]: got 0x%x want 0x%x\n", i, srv_raw_a[i], want_raw_a);
-        if (srv_raw_b[i] != want_raw_b && mismatches++ < 4)
-            std::fprintf(stderr, "SRV raw B[%u]: got 0x%x want 0x%x\n", i, srv_raw_b[i], want_raw_b);
-        if (srv_struct_a[i] != want_struct_a && mismatches++ < 4)
-            std::fprintf(stderr, "SRV struct A[%u]: got 0x%x want 0x%x\n", i, srv_struct_a[i], want_struct_a);
-        if (srv_struct_b[i] != want_struct_b && mismatches++ < 4)
-            std::fprintf(stderr, "SRV struct B[%u]: got 0x%x want 0x%x\n", i, srv_struct_b[i], want_struct_b);
-        if (srv_typed[i] != want_typed && mismatches++ < 4)
-            std::fprintf(stderr, "SRV typed[%u]: got 0x%x want 0x%x\n", i, srv_typed[i], want_typed);
-        if (srv_null[i] != 0u && mismatches++ < 4)
-            std::fprintf(stderr, "SRV null[%u]: got 0x%x want 0\n", i, srv_null[i]);
-        if (srv_raw_b[i] != srv_raw_a[i]) ++raw_diff;
-        if (srv_struct_b[i] != srv_struct_a[i]) ++struct_diff;
-        if (srv_null[i] != srv_raw_a[i]) ++null_diff;
-    }
-    EXPECT(!mismatches);
-    EXPECT(raw_diff == 32 && struct_diff == 32 && null_diff == 32);
-    std::printf("CreateShaderResourceView(buffer): raw (32 in-bounds + 32 OOB-zero), structured (32 + 32 OOB-zero), "
-                "typed (24 + 40 OOB-zero) matched; negative controls flipped %u/32 (raw B), %u/32 (struct B), %u/32 "
-                "(null)\n",
-                raw_diff, struct_diff, null_diff);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("compute: root constants, a root UAV and a descriptor table reached the shader through the GPU "
-                "address arena; %u elements matched in each of three dispatches\n", elements);
+    if (!real_needs_fallback)
+        std::printf("compute: root constants, a root UAV and a descriptor table reached the shader through the GPU "
+                    "address arena; %u elements matched in each of three dispatches\n", elements);
     return 0;
 }

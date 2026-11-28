@@ -1066,9 +1066,14 @@ The compute path, end to end:
   - **Refused with a log:** hull and domain stages, stream output, MSAA, set-0 bindings, and two stages
     that both read their code base (question 14, section 5.2). More than eight render targets is `E_INVALIDARG`.
   - **Push constants:** both PSO paths declare the 144-byte block as one range. Its stage flags are the whole
-    stage table the graphics path accepts, and the replay pushes with the same flags. A device whose
-    `maxPushConstantsSize` is below 144 (#224's `push_constants_need_fallback`) has every PSO refused, with the
-    limit in the log, until the uniform-buffer tail exists.
+    stage table the graphics path accepts, and the replay pushes with the same flags. When every stage fits in 128
+    push-constant bytes (`--pc-tail-ubo`: index `push_constant_bytes` 128, with a `pc_tail` entry on stages that read
+    heap base or code base), the range is the first 128 bytes (s0..s31). Whenever any stage has `pc_tail`, the layout
+    adds set 1: one `UNIFORM_BUFFER_DYNAMIC` descriptor over the arena, made once per device, with an empty set-0
+    layout standing in when the pipeline has no bindless set; each such PSO writes its 16-byte tail (heap base, code
+    base) into the arena when it is created, and replay binds set 1 with that offset at every dispatch and draw. A
+    device whose `maxPushConstantsSize` is below 144 (#224's `push_constants_need_fallback`) builds only 128-byte
+    PSOs; a PSO whose shaders need the 144-byte range is refused there, with the limit in the log.
 
   The command list keeps the input-assembler, viewport, scissor, render-target (read at `OMSetRenderTargets`, as
   D3D12 does), blend-factor and stencil-reference state, including CommandList8's front/back references. Each
@@ -1501,7 +1506,9 @@ and any validation error fails them.
     crashes);
   - the index has an entry with set-0 bindings for the same program ahead of the binding-free one, and the PSO
     must take the binding-free one;
-  - a device that reports 128 bytes of push constants refuses the PSO.
+  - a device that reports 128 bytes of push constants refuses the PSO, and builds the same program translated with
+    `--pc-tail-ubo` (the same GLSL compiled with `-DPC_TAIL`); its dispatch gives the expected values there and on
+    the test GPU.
 - `d3d12_fspx_compute_test`: the FidelityFX DLL's two ways of passing an FSPX program, with synthetic programs
   ([fspx.md](fspx.md), "Build and run-time lookup"). A PSO through slot 62 from a `DXBC` container whose `ACCC` part
   is an FSPX payload, and one through `CreateComputePipelineState` from a bare kind-6 program, as the slot-67
@@ -1573,7 +1580,10 @@ and any validation error fails them.
     - nine render targets is refused, at PSO creation and at `OMSetRenderTargets`;
     - 0-byte and wrapping buffer sizes are refused, and a buffer or shader-visible heap larger than the arena runs
       out of memory;
-    - a draw with no viewport executes cleanly and draws nothing.
+    - a draw with no viewport executes cleanly and draws nothing;
+    - a device reporting 128 bytes of push constants refuses the 144-byte VS+PS PSO, and builds and draws the
+      `--pc-tail-ubo` pair (`vs_draw.vert` and `ps_draw.frag` compiled with `-DPC_TAIL`: VS with 128 push-constant
+      bytes and no `pc_tail`, PS with 128 push-constant bytes and a set-1 tail) there and on the test GPU.
   - **Check:** all 4096 pixels of the read-back target are compared. Where the red and green quadrants land also
     checks the viewport flip and the winding. The test fails with any of these fixes undone: the rebind, step
     rate and logic op show wrong pixels, the variant breaks `dynamicRenderingUnusedAttachments-08912`, and the
@@ -2835,7 +2845,8 @@ Pipeline creation:
   says how many entries the list names and builds them; `--skip-listed` leaves them out on purpose. The last line
   counts what was built (compiled, or found in a cache), what was journaled already or being built by another
   process, what failed, and what was left out and why: by `--skip-listed`, not buildable on this device (no SPIR-V,
-  set-0 bindings without a bindless set, workgroup memory over the limit), or filtered out (`--filter`, the size
+  set-0 bindings without a bindless set, workgroup memory over the limit, or 144 push-constant bytes on a 128-byte
+  device when not `--pc-tail-ubo`), or filtered out (`--filter`, the size
   bounds, `--limit`). The 89-167 s per program behind the skip list of the large `library/` programs came from
   wave64-emulated packs. Measured with a native wave64 pack on an RX 7900 XTX (RADV, Mesa 26.3.1, Wine): all 721
   programs of 2 MiB or more built, 360 of them in 170 s on 32 threads, 2.5-32 s each, the largest (13 MiB) in 28.5 s
@@ -5137,16 +5148,11 @@ stage whose program is not in the carve output, so its code base is unknown rath
 program counts there (38 VS, 46 PS, 260 MS, 263 CS) are lower than the corpus counts above: the library holds a
 second compiled form of 6,522 carved shaders, and a program can serve two stage slots.
 
-**Measured:** across the GPU test fleet (Issue #166), desktop NVIDIA (Turing, Ampere, Ada, Blackwell: 256 bytes), desktop AMD (RDNA2: 256 bytes) and Apple Silicon (MoltenVK: 4096 bytes) all satisfy the 144-byte contract natively (`maxPushConstantsSize >= 144`). Intel Arc is not uniform: the earlier fleet entries report the 128-byte specification minimum (`maxPushConstantsSize == 128`) for Arc, but an Arc B580 (Battlemage) on Windows 11, driver 32.0.101.9175, reports 256 bytes (#166, @rtrexmass), so there D3D-14's fallback never engages. The 128 figure may be specific to another OS or driver (Mesa ANV on Linux is the guess; no Arc run on Linux that records the OS is cited here, and an ANV result would settle it). So does an integrated AMD RDNA2 GPU, a Radeon 680M on the Windows driver 22.40.84.06, so the minimum is not Intel-only. That figure follows the driver as well: a Radeon 610M reports 128 on 24.10.16.14 and 256 on 26.11.2 (#166). 128 bytes cannot fit the 16-byte tail (dwords 32–35: heap base and code base) inside push constants. The runtime detects `maxPushConstantsSize < 144` at device creation (`d3d12_vulkan_device.cpp`) and flags `push_constants_need_fallback` for the uniform-buffer fallback.
-**Open:** the minimum `maxPushConstantsSize` across target GPUs. The pair count above is measured, and zero, so the
-168-byte block is not needed for this package. If a GPU only
-supports 128 bytes, the current 144-byte contract already fails; the layer needs a fallback (uniform buffer for the
-tail) regardless.
+**Measured:** across the GPU test fleet (Issue #166), desktop NVIDIA (Turing, Ampere, Ada, Blackwell: 256 bytes), desktop AMD (RDNA2: 256 bytes) and Apple Silicon (MoltenVK: 4096 bytes) all satisfy the 144-byte contract natively (`maxPushConstantsSize >= 144`). Intel Arc is not uniform: the earlier fleet entries report the 128-byte specification minimum (`maxPushConstantsSize == 128`) for Arc, but an Arc B580 (Battlemage) on Windows 11, driver 32.0.101.9175, reports 256 bytes (#166, @rtrexmass), so there D3D-14's fallback never engages. The 128 figure may be specific to another OS or driver (Mesa ANV on Linux is the guess; no Arc run on Linux that records the OS is cited here, and an ANV result would settle it). So does an integrated AMD RDNA2 GPU, a Radeon 680M on the Windows driver 22.40.84.06, so the minimum is not Intel-only. That figure follows the driver as well: a Radeon 610M reports 128 on 24.10.16.14 and 256 on 26.11.2 (#166), and the iGPU of a Ryzen 5 7600 (RDNA2) reports 128 bytes on AMD Windows driver 24.10.24. 128 bytes cannot fit the 16-byte tail (dwords 32–35: heap base and code base) inside push constants. The runtime detects `maxPushConstantsSize < 144` at device creation (`d3d12_vulkan_device.cpp`) and flags `push_constants_need_fallback`. On such a device the shaders are translated with `--pc-tail-ubo`, which moves the tail to a uniform block at set 1 ("Push constants", section 3.2). The pair count above is measured, and zero, so the 168-byte block is not needed for this package.
 
 At run time, `CreateGraphicsPipelineState` refuses a pair where both stages read their code base, with a log, so a
 pair the measurement missed still shows up on the first boot. A device whose `maxPushConstantsSize` is below 144
-has every PSO refused,
-with the limit in the log, until the uniform-buffer tail exists.
+builds only PSOs whose shaders were translated with `--pc-tail-ubo`; the others are refused, with the limit in the log.
 
 ### 5.3 Descriptor T#/S# parsing
 
@@ -5363,7 +5369,7 @@ nothing is copied from their trees.
 | 10 | Does the game use binning, DCC, VRS, wave MMA, stream output, tessellation, or amplification shaders? | **Shaders: answered** by `tools/feature_scan.py` over all 26,503 (1.0.2.1): no hull, domain or amplification shader (DXIL program kinds: 2,236 VS, 12,101 PS, 195 GS, 2,689 CS, 9,282 MS); no `WAVE_MMA` or `SHADING_RATE` in any SFI0, and no `v_mfma`/`v_wmma`/`v_smfmac` in the disassembly; no output-signature element on a stream other than 0 (all 195 GS write stream 0 only) and no GDS / `ds_ordered_count` / GWS instruction, so no stream-output path. Also from SFI0: 10 PS need ROVs (pixel interlock), 30 shaders `TILED_RESOURCES` (see #18), 685 `ATOMIC_INT64_ON_TYPED_RESOURCE`. Binning and DCC are not shader-visible; they stay open for the PSO/stream subobjects. |
 | 11 | What should `CheckFeatureSupport` answer for UMA, resource binding tier, mesh tier, RT tier? | **Implemented** (D3D-11). Reports truthful host architecture (discrete desktop GPU: non-UMA), ResourceBindingTier 3 (descriptor indexing / bindless support), 48-bit GPU virtual address support matching the arena, and maps `D3D12_FEATURE_FORMAT_SUPPORT` to Vulkan format properties plus multisample render-target/resolve support and one quality level per supported sample count. |
 | 12 | Does the game rely on async compute or copy queues for correctness? | Trace queue creation and cross-queue fences. If only performance, serialize on one queue for boot. |
-| 13 | Is 144 bytes of push constants available on all target GPUs? | **Resolved / Measured** (D3D-14). Checked at device creation in `runtime/shims/d3d12_vulkan_device.cpp`. Measured across the test fleet (#166): NVIDIA (256 B), desktop AMD (256 B), and Apple M1/MoltenVK (4096 B) satisfy 144 B natively. A Radeon 680M on the Windows driver 22.40.84.06 and the earlier Intel Arc entries expose only the core minimum 128 B (`maxPushConstantsSize == 128`), but an Arc B580 on Windows 11 (driver 32.0.101.9175) reports 256 B (#166), so the 128 B figure for Arc depends on the OS or driver; an Arc result on Linux (Mesa ANV) would settle which side it is. `d3d12_vulkan_device_test` accepts either answer and checks that the fallback flag matches it. Below 144 B, the device logs a warning and marks `push_constants_need_fallback`, routing the 16-byte tail (dwords 32..35: heap base and code base) to a uniform-buffer fallback. |
+| 13 | Is 144 bytes of push constants available on all target GPUs? | **Resolved / Measured** (D3D-14). Checked at device creation in `runtime/shims/d3d12_vulkan_device.cpp`. Measured across the test fleet (#166): NVIDIA (256 B), desktop AMD (256 B), and Apple M1/MoltenVK (4096 B) satisfy 144 B natively. A Radeon 680M on the Windows driver 22.40.84.06 and the earlier Intel Arc entries expose only the core minimum 128 B (`maxPushConstantsSize == 128`), but an Arc B580 on Windows 11 (driver 32.0.101.9175) reports 256 B (#166), so the 128 B figure for Arc depends on the OS or driver; an Arc result on Linux (Mesa ANV) would settle which side it is. `d3d12_vulkan_device_test` accepts either answer and checks that the fallback flag matches it. Below 144 B, the device logs a warning and marks `push_constants_need_fallback`; the shaders are then translated with `--pc-tail-ubo`, which reads the 16-byte tail (dwords 32..35: heap base and code base) from a uniform block at set 1, and the D3D12 layer builds those PSOs ("Push constants", section 3.2). |
 | 14 | Are there PSOs with two code-base stages? | **No: 0 of 25,471**, measured per PSO (`tools/pso_code_base_pairs.py`, section 5.2). Per stage (`tools/feature_scan.py`, `s_getpc_b64` kept for data rather than a far branch): 54 VS, 93 PS, 266 MS, 263 CS, 0 GS; the translator's `uses_code_base` gives the same counts (with LLVM 23 that needs #223, without which these 1,471 shaders are rejected). The pairing is in `shaders.rpf` after all, in the pipeline library ([shader_library.md](shader_library.md) §3): each graphics record names a program per stage slot and a stage's resource-layout blob carries the digest of the container its code came from, which joins to the translation index. So one 144-byte block with one code base at dwords 34–35 is enough for this package; the per-stage slot stays a fallback, and the runtime's refusal of a PSO whose two stages both read the code base (section 3.2) can stand. |
 | 15 | Is `ExecuteIndirect` used with signatures Vulkan cannot express directly? | Trace `CreateCommandSignature` and `ExecuteIndirect`; implement simple signatures first, expand the complex ones with compute. The simple signatures are D3D-17 (#313). |
 | 16 | Does the game use append/consume UAV counters or typed buffer formats the translator does not model? | **Shaders: answered** by `tools/feature_scan.py` over all 26,503 (1.0.2.1, disassembled with LLVM 21.1.8 for gfx1013; SHADER-65). **No append/consume counters:** none of the 445,394 PSV0 binding records is a structured UAV with a counter, and there is no `ds_append`/`ds_consume`/GDS instruction. Typed buffers are declared in 5,359 shaders as SRVs (17,328 records) and in 2,177 as UAVs (4,005). **MTBUF** (format in the instruction): 52,890 loads in 10,278 shaders, all in five formats the translator decodes (`16_16_SNORM` 24,881, `8_8_8_8_UNORM` 19,835, `8_8_8_8_UINT` 5,099, `2_10_10_10_UNORM` 2,648, `16_16_16_16_UINT` 427), and no MTBUF store. **MUBUF** `buffer_*_format_*` (format from V# word 3): 90,316 accesses (84,908 loads, 5,408 stores) in 11,591 shaders; word 3 comes from a scalar load in 88,924 of them, is computed in 1,390, and is a literal in 2 (FORMAT 0, INVALID, which reads 0 on the hardware and in the translator). So the shaders fix no MUBUF format: the descriptors the executable writes decide it. Still open: which formats those descriptors carry; the runtime can log a V# format outside `Gen.FORMATS` (those read 0 today) when the descriptor is created or copied. Trace UAV descs and shader `buffer_*` ops; extend the translator/runtime together. **Runtime side done, console side open:** the layer writes typed buffer V#s and a counter V# (a hypothesis for where the shader finds it, section 3.4 "Buffer UAVs"); whether the game uses either is for the trace. |

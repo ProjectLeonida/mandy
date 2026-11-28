@@ -863,11 +863,20 @@ struct QueryPool {
 
 // A compute pipeline as replay needs it. code_base is the console VA of the shader's FSSM blob (push-constant
 // dwords 34-35), 0 when the shader does not read it.
+//
+// push_bytes is the size of the layout's push-constant range: all of ShaderUserData, or its first 128 bytes (s0..s31)
+// when the shaders were translated with --pc-tail-ubo for a device whose maxPushConstantsSize is below 144. Those
+// read the heap base and code base from tail_set instead: set 1 of the layout, a dynamic uniform buffer bound at
+// every dispatch with tail_offset, where the pipeline wrote both values once when it was created (they are fixed
+// for its lifetime). Null: none.
 struct ComputePipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     std::uint64_t code_base = 0;
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every dispatch; null: none
+    std::uint32_t push_bytes = 144;
+    VkDescriptorSet tail_set = VK_NULL_HANDLE;
+    std::uint32_t tail_offset = 0;
     // A pipeline built on first use: with `pipeline` null, `build(build_context)` returns the handle, or null when it
     // cannot be built or (async_build) is still being built - it never waits for a build another thread runs, since
     // prepare calls it with the resource lock held. Null `build`: `pipeline` is final.
@@ -894,6 +903,9 @@ struct GraphicsPipeline {
     VkShaderStageFlags push_stages = 0;   // the layout's push-constant range; vkCmdPushConstants must name the same
     std::uint64_t code_base = 0;
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every draw; null: none
+    std::uint32_t push_bytes = 144;                 // push_bytes, tail_set and tail_offset: as for compute
+    VkDescriptorSet tail_set = VK_NULL_HANDLE;
+    std::uint32_t tail_offset = 0;
     std::vector<VkFormat> color_formats;  // by render-target slot
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags depth_aspects = 0;
@@ -924,13 +936,16 @@ struct GraphicsPipeline {
     std::uint64_t estimate = 0;  // as ComputePipeline::estimate
 };
 
-// The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
+// The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base. A shader
+// translated with --pc-tail-ubo declares only s0..s31 (the first 128 bytes) and reads the other two from its
+// pipeline's tail_set.
 struct ShaderUserData {
     std::uint32_t s[32];
     std::uint64_t heap_base;
     std::uint64_t code_base;
 };
 static_assert(sizeof(ShaderUserData) == 144);
+static_assert(offsetof(ShaderUserData, heap_base) == 128);
 
 // A host read of a small CPU-written input either succeeds, names no VA, or names GPU-written memory. The last is a
 // capability limit, not bad contents: DEFAULT and READBACK bytes may still be stale while replay prepares a command.
@@ -1821,6 +1836,22 @@ inline void memory_barrier(const ReplayFunctions& vk, VkCommandBuffer command_bu
     barrier.srcAccessMask = src_access;
     barrier.dstAccessMask = dst_access;
     vk.pipeline_barrier(command_buffer, src_stages, dst_stages, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
+// What every dispatch and draw does after binding its pipeline: set 0 (the bindless heap) and set 1 (the
+// --pc-tail-ubo tail) when the pipeline has them, then the root arguments as push constants: push_bytes of them, so
+// a tail pipeline's 128-byte range gets s0..s31 only.
+template<typename Pipeline>
+inline void bind_user_data(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkPipelineBindPoint point,
+                           const Pipeline& pipeline, VkShaderStageFlags stages, const ShaderUserData& data) {
+    if (pipeline.bindless_set) {
+        const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : pipeline.bindless_set;
+        vk.bind_descriptor_sets(command_buffer, point, pipeline.layout, 0, 1, &set0, 0, nullptr);
+    }
+    if (pipeline.tail_set)
+        vk.bind_descriptor_sets(command_buffer, point, pipeline.layout, 1, 1, &pipeline.tail_set, 1,
+                                &pipeline.tail_offset);
+    vk.push_constants(command_buffer, pipeline.layout, stages, 0, pipeline.push_bytes, &data);
 }
 
 // The current layouts of a range: from the tracker, or `assumed` for an untracked image.
@@ -2789,7 +2820,7 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
     if (pipeline->viewport_with_count && (!vk.set_viewport_with_count || !vk.set_scissor_with_count))
         return unsupported_at(__LINE__);
     if (pipeline->depth_bounds && !vk.set_depth_bounds) return unsupported_at(__LINE__);
-    if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
+    if ((pipeline->bindless_set || pipeline->tail_set) && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
     if (pipeline->color_formats.size() > max_render_targets) return unsupported_at(__LINE__);
     p.graphics = pipeline;
     p.pipeline = pipeline->pipeline;
@@ -2965,7 +2996,7 @@ inline bool first_use(const ComputePipeline& pipeline, PipelineCompiles::User us
     if (pipeline.requested) pipeline.requested(pipeline.request_context, 0);  // also for a handle that exists already
     if (p.pipeline.pipeline || !pipeline.build) return p.pipeline.pipeline != VK_NULL_HANDLE;
     if (vk.compiles && pipeline.built && !pipeline.async_build && !pipeline.skipped &&
-        (!pipeline.bindless_set || vk.bind_descriptor_sets)) {
+        (!(pipeline.bindless_set || pipeline.tail_set) || vk.bind_descriptor_sets)) {
         p.pipeline.pipeline = pipeline.built(pipeline.build_context);
         if (!p.pipeline.pipeline) p.compile = vk.compiles->add(pipeline, user);
         return true;
@@ -4169,7 +4200,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!found && p.pipeline.skipped) continue;  // dropped on request, strict or not
                 if (!found && p.pipeline.async_build && !strict_replay()) continue;
                 if (!found) return unresolved_at(__LINE__);
-                if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
+                if ((pipeline->bindless_set || pipeline->tail_set) && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
@@ -4294,7 +4325,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!p.pipeline.async_build) unresolved_at(__LINE__);
                 continue;
             }
-            if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
+            if ((pipeline->bindless_set || pipeline->tail_set) && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
         } else if (const auto draw = draw_command(command); draw.state) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
@@ -5375,13 +5406,8 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 data.heap_base = vk.heap_base;
                 data.code_base = p.pipeline.code_base;
                 vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
-                if (p.pipeline.bindless_set) {
-                    const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : p.pipeline.bindless_set;
-                    vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0,
-                                            1, &set0, 0, nullptr);
-                }
-                vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
-                                  &data);
+                detail::bind_user_data(vk, command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline,
+                                       VK_SHADER_STAGE_COMPUTE_BIT, data);
             }
             for (std::uint32_t k = 0; k < records; ++k) {
                 vk.dispatch_indirect(command_buffer, indirect_buffer, arguments + VkDeviceSize(k) * stride);
@@ -5496,12 +5522,8 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             data.heap_base = vk.heap_base;
             data.code_base = p.pipeline.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
-            if (p.pipeline.bindless_set) {
-                const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : p.pipeline.bindless_set;
-                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0, 1,
-                                        &set0, 0, nullptr);
-            }
-            vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
+            detail::bind_user_data(vk, command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline,
+                                   VK_SHADER_STAGE_COMPUTE_BIT, data);
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
             if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
         } else if (raster.state) {
@@ -5565,12 +5587,8 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             data.heap_base = vk.heap_base;
             data.code_base = graphics.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
-            if (graphics.bindless_set) {
-                const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : graphics.bindless_set;
-                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1,
-                                        &set0, 0, nullptr);
-            }
-            vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
+            detail::bind_user_data(vk, command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics,
+                                   graphics.push_stages, data);
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
             if (graphics.viewport_with_count) {

@@ -127,9 +127,10 @@ int main() {
     const auto ms_container = shader_container(fssm_program({0x4D530001, 0xbf810000}));
     std::vector<std::uint8_t> empty_pixels(2 * size * pitch), colour_pixels(2 * size * pitch),
         cull_pixels(2 * size * pitch), reverse_z_pixels(2 * size * pitch), wireframe_pixels(2 * size * pitch),
-        no_samples_pixels(2 * size * pitch);
+        no_samples_pixels(2 * size * pitch), limited_pixels(2 * size * pitch);
     HRESULT foreign_close = S_OK;
     HRESULT mesh_create = E_FAIL, mesh_own_close = E_FAIL, mesh_other_close = S_OK, wireframe_create = E_FAIL;
+    bool real_needs_fallback = false;
     {
         ForeignPipelineState foreign;  // declared before the list, so it outlives the list's reference
         rt::d3d12::VulkanDeviceInfo info{};
@@ -147,11 +148,7 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
-        if (rt::d3d12::device_push_constants_need_fallback(inner)) {
-            std::printf("d3d12_stub_draw_test: skipped, the PSOs need 144 push-constant bytes and this GPU has %u\n",
-                        rt::d3d12::device_max_push_constants_size(inner));
-            return 77;
-        }
+        real_needs_fallback = rt::d3d12::device_push_constants_need_fallback(inner);
 
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
         root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
@@ -429,6 +426,159 @@ int main() {
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
 
+    // On a GPU with >= 144 push-constant bytes, also verify stub graphics PSOs under a simulated 128-byte limit.
+    if (!real_needs_fallback) {
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = d.instance_proc;
+        info.instance = d.instance;
+        info.physical = d.physical;
+        info.device = d.device;
+        info.queue = d.queue;
+        info.queue_family = d.family;
+        info.buffer_device_address = true;
+        info.mesh_shader = d.mesh_shader;
+        info.max_push_constants_size = 128;
+        info.push_constants_need_fallback = true;
+        ID3D12Device* inner = nullptr;
+        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
+        Ref<ID3D12Device> device;
+        EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
+        rt::d3d12::set_device_outer(inner, device.p);
+        EXPECT(rt::d3d12::device_push_constants_need_fallback(inner));
+
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+        root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+        root_desc.Desc_1_0 = {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+        const auto root_blob = serialize_root_signature(root_desc);
+        Ref<ID3D12RootSignature> root;
+        EXPECT(SUCCEEDED(device->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&root.p))));
+
+        const D3D12_INPUT_ELEMENT_DESC elements[1] = {
+            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
+        pso_desc.pRootSignature = root.p;
+        pso_desc.VS = {vs_container.data(), vs_container.size()};
+        pso_desc.PS = {ps_container.data(), ps_container.size()};
+        pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pso_desc.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pso_desc.SampleMask = 0xffffffff;
+        pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pso_desc.RasterizerState.DepthClipEnable = TRUE;
+        pso_desc.InputLayout = {elements, 1};
+        pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso_desc.NumRenderTargets = 2;
+        pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pso_desc.RTVFormats[1] = DXGI_FORMAT_R32_UINT;
+        pso_desc.SampleDesc = {1, 0};
+
+        Ref<ID3D12PipelineState> colour;
+        _putenv_s("LEONIDA_STUB_PIPELINES", "color");
+        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&colour.p))));
+        _putenv_s("LEONIDA_STUB_PIPELINES", "");
+
+        const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+        const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+        const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+        Ref<ID3D12Resource> vertices, readback, rgba, uints;
+        const auto vb_desc = buffer_desc(256);
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &vb_desc,
+                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                         IID_PPV_ARGS(&vertices.p))));
+        const auto readback_desc = buffer_desc(2 * size * pitch);
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&readback.p))));
+        D3D12_RESOURCE_DESC rt_desc{};
+        rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rt_desc.Width = rt_desc.Height = size;
+        rt_desc.DepthOrArraySize = 1;
+        rt_desc.MipLevels = 1;
+        rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rt_desc.SampleDesc = {1, 0};
+        rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                                                         D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                         IID_PPV_ARGS(&rgba.p))));
+        rt_desc.Format = DXGI_FORMAT_R32_UINT;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                                                         D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                         IID_PPV_ARGS(&uints.p))));
+        void* mapped_vertices = nullptr;
+        EXPECT(SUCCEEDED(vertices->Map(0, nullptr, &mapped_vertices)));
+        std::memset(mapped_vertices, 0, 256);
+
+        const D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2,
+                                                       D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        Ref<ID3D12DescriptorHeap> rtv_heap;
+        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&rtv_heap_desc, IID_PPV_ARGS(&rtv_heap.p))));
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {heap_start(rtv_heap.p),
+                                                     {heap_start(rtv_heap.p).ptr + rt::d3d12::descriptor_size}};
+        device->CreateRenderTargetView(rgba.p, nullptr, rtvs[0]);
+        device->CreateRenderTargetView(uints.p, nullptr, rtvs[1]);
+
+        D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        Ref<ID3D12CommandQueue> queue;
+        Ref<ID3D12CommandAllocator> allocator;
+        Ref<ID3D12GraphicsCommandList> list;
+        Ref<ID3D12Fence> fence;
+        EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+        EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+        EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                   IID_PPV_ARGS(&list.p))));
+        EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+
+        const FLOAT blue[4] = {0, 0, 1, 1}, seven[4] = {7, 0, 0, 0};
+        list->ClearRenderTargetView(rtvs[0], blue, 0, nullptr);
+        list->ClearRenderTargetView(rtvs[1], seven, 0, nullptr);
+        list->SetGraphicsRootSignature(root.p);
+        const D3D12_VERTEX_BUFFER_VIEW vbv{vertices->GetGPUVirtualAddress(), 256, 8};
+        list->IASetVertexBuffers(0, 1, &vbv);
+        const D3D12_VIEWPORT viewport{0, 0, float(size), float(size), 0, 1};
+        const D3D12_RECT scissor{0, 0, LONG(size), LONG(size)};
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
+        list->SetPipelineState(colour.p);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->DrawInstanced(3, 1, 0, 0);
+        ID3D12Resource* targets[2] = {rgba.p, uints.p};
+        const DXGI_FORMAT formats[2] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT};
+        for (UINT i = 0; i < 2; ++i) {
+            D3D12_RESOURCE_BARRIER to_copy =
+                transition(targets[i], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &to_copy);
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            dst.pResource = readback.p;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint = {i * size * pitch, {formats[i], size, size, 1, pitch}};
+            D3D12_TEXTURE_COPY_LOCATION src{};
+            src.pResource = targets[i];
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        EXPECT(list->Close() == S_OK);
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
+        void* mapped = nullptr;
+        EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        std::memcpy(limited_pixels.data(), mapped, limited_pixels.size());
+        readback->Unmap(0, nullptr);
+
+        for (auto* r : {&vertices, &readback, &rgba, &uints}) r->reset();
+        colour.reset();
+        root.reset();
+        rtv_heap.reset();
+        list.reset();
+        allocator.reset();
+        queue.reset();
+        fence.reset();
+        EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
+    }
+
     const std::uint8_t blue[4] = {0, 0, 255, 255};
     std::uint8_t magenta[4];
     for (int i = 0; i < 4; ++i) magenta[i] = std::uint8_t(leonida::stub_colour[i] * 255.0f);
@@ -451,6 +601,9 @@ int main() {
     }
     ok &= targets_hold(no_samples_pixels.data(), no_samples_pixels.data() + size * pitch, magenta, 1,
                        "LEONIDA_STUB_PIPELINES=color, SampleMask 0");
+    if (!real_needs_fallback)
+        ok &= targets_hold(limited_pixels.data(), limited_pixels.data() + size * pitch, magenta, 1,
+                           "LEONIDA_STUB_PIPELINES=color, 128-byte push-constant limit");
     if (foreign_close != E_INVALIDARG) {
         std::fprintf(stderr, "a draw with another implementation's PSO: Close returned 0x%08lx, want E_INVALIDARG\n",
                      static_cast<unsigned long>(foreign_close));

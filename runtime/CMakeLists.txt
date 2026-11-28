@@ -3995,10 +3995,22 @@ if(TARGET Vulkan::Headers)
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_user_data.comp
         COMMENT "Compiling the compute test shader"
         VERBATIM)
-      add_executable(d3d12_compute_test test/d3d12_compute_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_CS})
+      # The same shader as one translated with --pc-tail-ubo: heap base and code base in the set-1 uniform block.
+      set(LEONIDA_TEST_CS_TAIL ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_user_data_tail.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_TAIL}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -DPC_TAIL -o ${LEONIDA_TEST_CS_TAIL}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_user_data.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_user_data.comp
+        COMMENT "Compiling the compute test shader (set-1 tail)"
+        VERBATIM)
+      add_custom_target(gta6rt_pc_tail_shaders DEPENDS ${LEONIDA_TEST_CS} ${LEONIDA_TEST_CS_TAIL})
+      add_executable(d3d12_compute_test test/d3d12_compute_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
+                     ${LEONIDA_TEST_CS} ${LEONIDA_TEST_CS_TAIL})
       target_link_libraries(d3d12_compute_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
-                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}"
+                                 LEONIDA_TEST_CS_TAIL_SPV="${LEONIDA_TEST_CS_TAIL}")
       target_compile_options(d3d12_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_compute COMMAND d3d12_compute_test)
       set_tests_properties(d3d12_compute PROPERTIES SKIP_RETURN_CODE 77)
@@ -4082,6 +4094,8 @@ if(TARGET Vulkan::Headers)
       set(LEONIDA_TEST_VS ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_draw.spv)
       set(LEONIDA_TEST_PS ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_draw.spv)
       set(LEONIDA_TEST_PS_UINT ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_draw_uint.spv)
+      set(LEONIDA_TEST_VS_TAIL ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_draw_tail.spv)
+      set(LEONIDA_TEST_PS_TAIL ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_draw_tail.spv)
       set(LEONIDA_TEST_VS_FULLSCREEN ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_fullscreen.spv)
       set(LEONIDA_TEST_VS_INT ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_draw_int.spv)
       set(LEONIDA_TEST_GS_DOUBLE ${CMAKE_CURRENT_BINARY_DIR}/generated/gs_double.spv)
@@ -4098,13 +4112,27 @@ if(TARGET Vulkan::Headers)
           COMMENT "Compiling the draw test shader ${source}"
           VERBATIM)
       endforeach()
+      foreach(pair "vs_draw.vert;${LEONIDA_TEST_VS_TAIL}" "ps_draw.frag;${LEONIDA_TEST_PS_TAIL}")
+        list(GET pair 0 source)
+        list(GET pair 1 output)
+        add_custom_command(
+          OUTPUT ${output}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -DPC_TAIL -o ${output}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMENT "Compiling the draw test shader ${source} (set-1 tail)"
+          VERBATIM)
+      endforeach()
       add_executable(d3d12_draw_test test/d3d12_draw_test.cpp test/d3d12_stateful_indirect_pixels.cpp
                      shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_VS}
-                     ${LEONIDA_TEST_PS} ${LEONIDA_TEST_PS_UINT} ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_VS_INT})
+                     ${LEONIDA_TEST_PS} ${LEONIDA_TEST_PS_UINT} ${LEONIDA_TEST_VS_TAIL}
+                     ${LEONIDA_TEST_PS_TAIL} ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_VS_INT})
       target_link_libraries(d3d12_draw_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
                                  LEONIDA_TEST_PS_UINT_SPV="${LEONIDA_TEST_PS_UINT}"
+                                 LEONIDA_TEST_VS_TAIL_SPV="${LEONIDA_TEST_VS_TAIL}"
+                                 LEONIDA_TEST_PS_TAIL_SPV="${LEONIDA_TEST_PS_TAIL}"
                                  LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}"
                                  LEONIDA_TEST_VS_INT_SPV="${LEONIDA_TEST_VS_INT}")
       target_compile_options(d3d12_draw_test PRIVATE /W4 /permissive- /utf-8)
@@ -4533,6 +4561,15 @@ if(TARGET Vulkan::Headers)
           "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/precompile_skip_list"
           -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_precompile_skip_list.cmake")
         set_tests_properties(precompile_skip_list PROPERTIES TIMEOUT 240 SKIP_REGULAR_EXPRESSION "SKIP: ")
+      endif()
+      if(TARGET gta6rt_pc_tail_shaders)
+        add_dependencies(gta6rt gta6rt_pc_tail_shaders)
+        add_test(NAME precompile_pc_tail COMMAND ${CMAKE_COMMAND}
+          "-DGTA6RT=$<TARGET_FILE:gta6rt>" "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+          "-DSPV_TAIL=${LEONIDA_TEST_CS_TAIL}" "-DSPV_FULL=${LEONIDA_TEST_CS}"
+          "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/precompile_pc_tail"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_precompile_pc_tail.cmake")
+        set_tests_properties(precompile_pc_tail PROPERTIES TIMEOUT 240 SKIP_REGULAR_EXPRESSION "SKIP: ")
       endif()
 
       # A stand-in title that imports d3d12_xs.dll!D3D12XboxCreateDevice and runs a clear and a readback on the

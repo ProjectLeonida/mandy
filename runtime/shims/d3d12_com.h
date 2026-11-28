@@ -380,8 +380,8 @@ bool depth_stencil_resolve_supported(DXGI_FORMAT format, ID3D12Resource* dst, UI
 // The maxPushConstantsSize in bytes of the Vulkan physical device behind `device`, or 0 if not a Vulkan device.
 std::uint32_t device_max_push_constants_size(ID3D12Device* device);
 
-// True when `device`'s Vulkan physical device has maxPushConstantsSize < 144 bytes, requiring
-// the uniform-buffer fallback for the 16-byte tail (heap/code base).
+// True when `device`'s Vulkan physical device has maxPushConstantsSize < 144 bytes: its pipelines need shaders
+// translated with --pc-tail-ubo, which read the 16-byte tail (heap base, code base) from a set-1 uniform block.
 bool device_push_constants_need_fallback(ID3D12Device* device);
 
 // True when `device` puts upload-heap buffers in DEVICE_LOCAL | HOST_VISIBLE memory: its GPU has Resizable BAR and
