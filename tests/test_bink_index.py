@@ -417,6 +417,27 @@ class TestCommandLine(unittest.TestCase):
         self.assertIn("would overwrite the carve manifest", err.getvalue())
         self.assertFalse(os.path.exists(manifest))
 
+    def test_output_cannot_create_the_manifest_under_another_case(self):
+        # normcase keeps case on macOS, so Movies/index.json and movies/index.json used to pass as two paths
+        # and the second write replaced the carve manifest. APFS treats them as one name.
+        carve = os.path.join(self.tmp.name, "Movies")
+        os.makedirs(carve, exist_ok=True)
+        probe = os.path.join(carve, "Probe.tmp")
+        with open(probe, "wb"):
+            pass
+        insensitive = os.path.exists(os.path.join(carve, "probe.tmp"))
+        os.remove(probe)
+        if not insensitive:
+            self.skipTest("volume keeps case")
+        other = os.path.join(self.tmp.name, "movies", "index.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bink.main([carve, "--out", other])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("would overwrite the carve manifest", err.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(carve, "index.json")))
+
     def test_output_cannot_overwrite_carve_manifest(self):
         carve = os.path.join(self.tmp.name, "carve")
         os.makedirs(carve, exist_ok=True)

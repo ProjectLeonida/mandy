@@ -43,6 +43,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
+from report_paths import same_report_path as same_output_path  # noqa: E402
 
 SIG = re.compile(rb"KB2[a-z]")
 HDR = 0x2C
@@ -391,16 +392,6 @@ def is_rpf_archive(path):
     except OSError:
         return False
     return len(header) >= 16 and header[1:4] == b"FPR"
-
-
-def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def target_problem(path):
