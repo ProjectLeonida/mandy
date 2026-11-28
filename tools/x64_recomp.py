@@ -62,7 +62,7 @@ FLAG_WRITERS = {
     "shl": "NZCP", "shr": "NZCP", "sar": "NZCP", "sal": "NZCP",
     "rol": "C", "ror": "C", "rcl": "C", "rcr": "C",
     "imul": "CV", "mul": "CV",
-    "bsf": "Z", "bsr": "Z",
+    "bsf": "Z", "bsr": "Z", "tzcnt": "CZ", "lzcnt": "CZ",
     "bt": "C", "bts": "C", "btr": "C", "btc": "C",
     "popcnt": "Z",
     "cmps": "NZCVPA", "scas": "NZCVPA",
@@ -466,13 +466,22 @@ def _classify(ins, mnem, cc_index, state):
         ins.kind = "conv"
     elif mnem == "bswap":
         ins.kind = "misc"
-    elif mnem in ("bsf", "bsr", "popcnt"):
+    elif mnem in ("bsf", "bsr", "popcnt", "popcnt_jmpe"):
+        if mnem == "popcnt_jmpe":
+            if ins.rep == "f3":
+                ins.mnem = mnem = "popcnt"
+            else:
+                ins.kind = "sys"
+                return
+        elif mnem == "bsf" and ins.rep == "f3":
+            ins.mnem = mnem = "tzcnt"
+        elif mnem == "bsr" and ins.rep == "f3":
+            ins.mnem = mnem = "lzcnt"
         ins.kind = "alu"
         ins.flags_w = FLAG_WRITERS.get(mnem, "")
     elif mnem in ("bt", "bts", "btr", "btc"):
         ins.kind = "bt"
         ins.flags_w = "C"
-        ins.flags_r = "C" if mnem != "bt" else ""
     elif mnem in ("nop", "endbr", "fwait", "emms"):
         ins.kind = "nop"
         if mnem == "nop" and ins.rep == "f3":
@@ -884,6 +893,8 @@ class Asm:
         start = len(self.words)
         if not nz:
             self.movz(rd, 0)
+        elif not nzc:
+            self.movn(rd, 0)
         elif len(nzc) < len(nz):
             self.movn(rd, chunks[nzc[0]] ^ 0xFFFF, nzc[0])
             for i in nzc[1:]:
@@ -1141,6 +1152,13 @@ class Asm:
 
     def csetm(self, rd, cond, sf=1):
         self.csinv(rd, 31, 31, INV[cond], sf)
+
+    # bit manipulation
+    def rbit(self, rd, rn, sf=1):
+        self.emit((0xDAC00000 if sf else 0x5AC00000) | rn << 5 | rd)
+
+    def clz(self, rd, rn, sf=1):
+        self.emit((0xDAC01000 if sf else 0x5AC01000) | rn << 5 | rd)
 
     # system
     def nop(self):
@@ -1559,6 +1577,9 @@ class FunctionTranslator:
         m = ins.mnem
         if m in ("cmp", "test"):
             self._emit_cmp(ins)
+            return
+        if m in ("bsf", "bsr", "tzcnt", "lzcnt", "popcnt"):
+            self._emit_bitscan(ins)
             return
         if m in ("inc", "dec"):
             self._emit_incdec(ins)
@@ -2093,6 +2114,150 @@ class FunctionTranslator:
             return
         raise UnhandledInsn(ins, f"{m} form")
 
+    # -- bit test / scan / popcnt ------------------------------------------------
+    def _emit_bt(self, ins):
+        a = self.asm
+        m = ins.mnem
+        dst, idx = ins.ops
+        sz = self._op_size(dst)
+        width = sz * 8
+        if dst[0] == "r":
+            self._load(ins, dst, T0)
+            if idx[0] == "i":
+                a.movz(T1, (idx[1] & 0xFF) & (width - 1), 0)
+            else:
+                self._load(ins, idx, T1)
+                a.and_i(T1, T1, width - 1)
+            a.lsrv(T3, T0, T1, sf=1)
+            a.and_i(T3, T3, 1, sf=0)
+            self._set_cf(T3)
+            if m != "bt":
+                a.movz(T2, 1, 0)
+                a.lslv(T2, T2, T1, sf=1)
+                if m == "bts":
+                    a.orr_r(T0, T0, T2, sf=1)
+                elif m == "btr":
+                    a.bic_r(T0, T0, T2, sf=1)
+                else:
+                    a.eor_r(T0, T0, T2, sf=1)
+                self._store(ins, dst, T0)
+            self._maybe_mkflags(ins)
+            return
+        if dst[0] != "m":
+            raise UnhandledInsn(ins, f"{m} dst")
+        if idx[0] == "i":
+            bit = (idx[1] & 0xFF) & (width - 1)
+            byte_off, bit_in_byte = bit >> 3, bit & 7
+            self._mem_addr(dst[1], ADDR_T)
+            if byte_off:
+                a.add(ADDR_T, ADDR_T, byte_off)
+            a.ldr(T0, ADDR_T, 0, size=1)
+            a.ubfx(T3, T0, bit_in_byte, 1, sf=0)
+            self._set_cf(T3)
+            if m != "bt":
+                mask = 1 << bit_in_byte
+                if m == "bts":
+                    a.orr_i(T0, T0, mask, sf=0)
+                elif m == "btr":
+                    a.and_i(T0, T0, (~mask) & 0xFFFFFFFF, sf=0)
+                else:
+                    a.eor_i(T0, T0, mask, sf=0)
+                a.str(T0, ADDR_T, 0, size=1)
+            self._maybe_mkflags(ins)
+            return
+        # Register bit index into memory is signed of operand width `sz`.
+        self._load(ins, idx, T1)
+        if sz == 2:
+            a.sxth(T1, T1, sf=1)
+        elif sz == 4:
+            a.sxtw(T1, T1)
+        self._mem_addr(dst[1], ADDR_T)
+        a.asr(T2, T1, 3, sf=1)
+        a.add_r(ADDR_T, ADDR_T, T2, sf=1)
+        a.and_i(T1, T1, 7, sf=0)
+        a.ldr(T0, ADDR_T, 0, size=1)
+        a.lsrv(T3, T0, T1, sf=0)
+        a.and_i(T3, T3, 1, sf=0)
+        self._set_cf(T3)
+        if m != "bt":
+            a.movz(T2, 1, 0, sf=0)
+            a.lslv(T2, T2, T1, sf=0)
+            if m == "bts":
+                a.orr_r(T0, T0, T2, sf=0)
+            elif m == "btr":
+                a.bic_r(T0, T0, T2, sf=0)
+            else:
+                a.eor_r(T0, T0, T2, sf=0)
+            a.str(T0, ADDR_T, 0, size=1)
+        self._maybe_mkflags(ins)
+
+    def _emit_bitscan(self, ins):
+        a = self.asm
+        m = ins.mnem
+        dst, src = ins.ops
+        sz = self._op_size(dst)
+        self._load(ins, src, T0)
+        if m in ("bsf", "bsr"):
+            a.cmp(T0, 0)                      # Z = (src == 0)
+            done = self._skip_lbl()
+            a.cbz(T0, done)                   # preserve dst when src == 0
+            if m == "bsf":
+                a.rbit(T1, T0, sf=1)
+                a.clz(T1, T1, sf=1)
+            else:
+                a.clz(T1, T0, sf=1)
+                a.movz(T2, 63, 0)
+                a.sub_r(T1, T2, T1)
+            self._store(ins, dst, T1)
+            a.label(done)
+            self._maybe_mkflags(ins)
+            return
+        if m in ("tzcnt", "lzcnt"):
+            if m == "tzcnt":
+                if sz == 8:
+                    a.rbit(T1, T0, sf=1)
+                    a.clz(T1, T1, sf=1)
+                elif sz == 4:
+                    a.rbit(T1, T0, sf=0)
+                    a.clz(T1, T1, sf=0)
+                else:
+                    a.orr_i(T1, T0, 0x10000)
+                    a.rbit(T1, T1, sf=1)
+                    a.clz(T1, T1, sf=1)
+            else:
+                if sz == 8:
+                    a.clz(T1, T0, sf=1)
+                elif sz == 4:
+                    a.clz(T1, T0, sf=0)
+                else:
+                    a.lsl(T1, T0, 16, sf=0)
+                    a.orr_i(T1, T1, 0xFFFF, sf=0)
+                    a.clz(T1, T1, sf=0)
+            self._store(ins, dst, T1)
+            a.cmp(T0, 0)
+            a.cset(T2, "eq", sf=0)            # CF = (src == 0)
+            a.cmp(T1, 0)                      # ZF = (result == 0)
+            self._set_cf(T2)
+            self._maybe_mkflags(ins)
+            return
+        # popcnt: pure-GPR 64-bit SWAR Hamming weight (T0 is zero-extended from sz)
+        a.lsr(T1, T0, 1)
+        a.and_i(T1, T1, 0x5555555555555555)
+        a.sub_r(T0, T0, T1)
+        a.and_i(T1, T0, 0x3333333333333333)
+        a.lsr(T2, T0, 2)
+        a.and_i(T2, T2, 0x3333333333333333)
+        a.add_r(T0, T1, T2)
+        a.lsr(T1, T0, 4)
+        a.add_r(T0, T0, T1)
+        a.and_i(T0, T0, 0x0F0F0F0F0F0F0F0F)
+        a.li(T2, 0x0101010101010101)
+        a.mul(T0, T0, T2)
+        a.lsr(T0, T0, 56)
+        self._store(ins, dst, T0)
+        a.tst_r(T0, T0)                       # ZF = (src == 0), N=C=V=0
+        self._maybe_mkflags(ins)
+
     # -- string ops --------------------------------------------------------------
     def _emit_str(self, ins):
         a = self.asm
@@ -2235,6 +2400,8 @@ class FunctionTranslator:
             self._emit_shift(ins)
         elif k == "mul":
             self._emit_mul(ins)
+        elif k == "bt":
+            self._emit_bt(ins)
         elif k == "str":
             self._emit_str(ins)
         elif k == "cc":
