@@ -347,6 +347,17 @@ struct TitleShadowWatch {
     std::uint64_t asks = 0, written = 0, faults = 0, watched_bytes = 0, hot_bytes = 0;
 };
 TitleShadowWatch title_shadow_watch(ID3D12Device* device);
+// The device's registry of textures in the title's own memory now (write_placed_texture_view): the images it made for
+// slot-70 texture views and their image memory, the slot-133 textures in it, the made images retired since the device
+// was created (of them, those a newer texture over their bytes retired and those whose pages went), and how many
+// retired images still wait for the GPU before their memory is freed. For tests.
+struct TitleImages {
+    std::uint64_t owned = 0, owned_bytes = 0, slot133 = 0, retired = 0, superseded = 0, gone = 0, waiting = 0;
+};
+TitleImages title_images(ID3D12Device* device);
+// The image made for slot-70 texture views at `address`, with a reference added for the caller; null when the
+// registry holds none there. For tests.
+ID3D12Resource* title_image(ID3D12Device* device, std::uint64_t address);
 // True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.
 bool device_supports_ray_tracing(ID3D12Device* device);
 

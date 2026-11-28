@@ -14327,6 +14327,12 @@ struct TitleTexture {
         device_local = (r->memory_flags() & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
     }
     bool owned = false;                     // made here for slot-70 views (a reference is held); else slot 133's
+    // Owned, for its retirement (Device::retire_idle_owned_images): when a slot-70 view last named it, whether a
+    // texture made or registered since then covers some of its bytes, and since when no page of it has been committed
+    // (time_point{}: some were at the last look after a map change, or a view has named it since).
+    std::chrono::steady_clock::time_point named{};
+    bool superseded = false;
+    std::chrono::steady_clock::time_point gone_since{};
     bool attachment_4k = false;             // slot 133: 3840x2160 color or depth attachment
     bool gpu_written = false;               // render target, depth or unordered access: never filled
     bool mapped = false;                    // a slot-133 texture the title mapped: checked before submissions
@@ -16370,6 +16376,12 @@ public:
             state_.index_texture(*entry);
             slot = std::move(entry);
             ++title_stats_.registered;
+            if (retire_owned_images()) {
+                forget_owned_range(address);
+                // A texture the GPU writes has no layout here: what it covers is not known.
+                if (slot->layout_known && !slot->gpu_written)
+                    supersede_owned_images(address, slot->cpu, slot->layout.layout.size);
+            }
         }
     }
 
@@ -16533,6 +16545,11 @@ public:
         leonida::merge_title_writes(title_map_changes_);
         stats.map_ranges += title_map_changes_.size();
         stats.map_all += map_all;
+        // The owned images over these changes may have lost their pages (retire_idle_owned_images looks). Changes the
+        // journal lost are not looked for: such an image goes with the next change over it or a texture over it.
+        if (retire_owned_images())
+            for (const auto& [from, to] : title_map_changes_)
+                owned_ranges_.overlapping(from, to, [&](std::uint64_t key) { retire_candidates_[key] = true; });
         if (!written.empty() || overflow || map_all || !title_map_changes_.empty()) {
             stats.written_ranges += written.size();
             leonida::merge_title_writes(written);
@@ -16639,6 +16656,7 @@ public:
         stats.hashed += checked;
         stats.filled_bytes += filled;
         stats.max_pass_bytes = std::max(stats.max_pass_bytes, filled);
+        if (!retire_candidates_.empty()) retire_idle_owned_images(now);
         std::vector<Resource*> release;
         std::erase_if(retired_title_textures_, [&](const auto& r) {
             if (now - r.first < std::chrono::seconds(3)) return false;  // descriptors may still be in flight
@@ -16667,6 +16685,33 @@ public:
         for (Resource* r : release) r->Release();
     }
 
+    // For tests (rt::d3d12::title_images, title_image).
+    TitleImages title_images() {
+        std::lock_guard lock(state_.title_texture_mutex);
+        TitleImages out;
+        for (const auto& [address, t] : state_.title_textures) {
+            if (!t->resource) continue;
+            if (!t->owned) {
+                ++out.slot133;
+                continue;
+            }
+            ++out.owned;
+            out.owned_bytes += t->resource->image_backing_bytes();
+        }
+        out.retired = title_stats_.retired;
+        out.superseded = title_stats_.retired_superseded;
+        out.gone = title_stats_.retired_gone;
+        out.waiting = retired_title_textures_.size();
+        return out;
+    }
+    ID3D12Resource* title_image(std::uint64_t address) {
+        std::lock_guard lock(state_.title_texture_mutex);
+        const auto it = state_.title_textures.find(address);
+        if (it == state_.title_textures.end() || !it->second->owned || !it->second->resource) return nullptr;
+        it->second->resource->AddRef();
+        return it->second->resource;
+    }
+
 private:
     struct TitleTextureStats {
         std::uint64_t mapped_checks = 0, mapped_changed = 0, mapped_fills = 0;
@@ -16675,6 +16720,8 @@ private:
         std::map<std::string, std::uint64_t> refused;  // why a view is a null view -> views
         std::uint64_t views = 0, null_views = 0, of_slot133 = 0, of_cache = 0, made = 0, retired = 0, registered = 0,
                       refusals = 0, written_ranges = 0, unmaps = 0, unreadable = 0, pending_views = 0;
+        // Of the retired: under a newer texture, with their pages gone (retire_idle_owned_images).
+        std::uint64_t retired_superseded = 0, retired_gone = 0;
         std::uint64_t fills = 0, fill_bytes = 0, fill_failures = 0;
         // Fills of some mips only; textures whose first fill was one; those that got larger mips later; first fills
         // refused by LEONIDA_TITLE_PARTIAL_MIPS_MB.
@@ -16953,6 +17000,10 @@ private:
     VkDeviceSize retired_backing_ = 0;
     VkDeviceSize title_partial_bytes_ = 0;  // likewise: image memory of the textures filled in part, as of this pass
     std::vector<std::pair<std::chrono::steady_clock::time_point, Resource*>> retired_title_textures_;  // likewise
+    // LEONIDA_TITLE_IMAGE_RETIRE, likewise: the owned images by the CPU bytes they are filled from, and those that may
+    // be retired (a newer texture covers them, or their pages may have gone: true until a pass has looked at them).
+    leonida::TitleTextureRangeIndex owned_ranges_;
+    std::map<std::uint64_t, bool> retire_candidates_;
     std::vector<std::uint8_t> title_tiled_, title_linear_;         // scratch, under title_texture_mutex
     std::vector<std::uint64_t> title_columns_;
 
@@ -17064,10 +17115,15 @@ private:
             }();
             retire_title_texture(*t);
             state_.texture_ranges.erase(address);
+            forget_owned_range(address);
             textures.erase(address);
             t = make_title_texture(d, words, srv, address, view_mip, same_shape ? formats : std::vector<DXGI_FORMAT>{});
         } else if (t) {
             ++title_stats_.of_cache;
+            // Named again: in use, whatever covers its bytes now, and a view of a texture whose pages may come back.
+            t->named = std::chrono::steady_clock::now();
+            t->superseded = false;
+            t->gone_since = {};
             if (t->view_mip != view_mip) {
                 t->view_mip = view_mip;
                 if (!t->fills) t->memory.retry();  // what is readable may do for this view
@@ -17170,8 +17226,13 @@ private:
         }
         ++title_stats_.made;
         TitleTexture* t = entry.get();
+        t->named = std::chrono::steady_clock::now();
         state_.index_texture(*entry);
         state_.title_textures[address] = std::move(entry);
+        if (retire_owned_images()) {
+            owned_ranges_.set(address, t->cpu, t->layout.layout.size);
+            supersede_owned_images(address, t->cpu, t->layout.layout.size);
+        }
         if (title_fill_async() && readable) queue_title_fill(address);
         return t;
     }
@@ -17185,6 +17246,91 @@ private:
         retired_title_textures_.emplace_back(std::chrono::steady_clock::now(), t.resource);
         t.resource = nullptr;
         ++title_stats_.retired;
+    }
+
+    // LEONIDA_TITLE_IMAGE_RETIRE (on by default; 0: as before). An image made for slot-70 views was retired only when
+    // its own address got another description or a slot-133 texture, and a title that streams places its textures at
+    // ever new addresses: each kept its image (in VRAM, then in system memory), its bindless index and its turn in the
+    // refresh passes for the device's life. Now one is also retired once a texture made or registered after the last
+    // view of it covers some of its bytes, or once no page of it has been committed for a while, when no slot-70 view
+    // has named it for LEONIDA_TITLE_IMAGE_IDLE_MS (2000 by default): the bytes now hold another texture, or nothing,
+    // as they would for its T# on the console. Two textures over the same bytes that views keep naming both stay.
+    // A view of a retired image's address makes it again (place_title_view): its T# names the title address
+    // (Resource::place_at_title_address), so the copies of its descriptors the title kept find the new image once it
+    // is filled. Until then, and for a T# whose address no view names again, a shader samples the fallback.
+    static bool retire_owned_images() {
+        static const bool on = [] {
+            const char* v = std::getenv("LEONIDA_TITLE_IMAGE_RETIRE");
+            return !v || std::strcmp(v, "0");
+        }();
+        return on;
+    }
+    static std::chrono::milliseconds owned_image_idle() {
+        static const std::chrono::milliseconds idle([] {
+            const char* v = std::getenv("LEONIDA_TITLE_IMAGE_IDLE_MS");
+            return v && *v ? std::strtoll(v, nullptr, 10) : 2000ll;
+        }());
+        return idle;
+    }
+
+    // A texture at `key` now holds the title's bytes [cpu, cpu + size): the owned images at other keys over some of
+    // them are superseded. One over exactly these bytes is the same texture named through the other view of a
+    // stream pool (title_gpu_views::other_view), or the same bytes in another shape, and is left alone.
+    void supersede_owned_images(std::uint64_t key, std::uint64_t cpu, std::uint64_t size) {
+        if (!size) return;
+        owned_ranges_.overlapping(cpu, cpu + size, [&](std::uint64_t other) {
+            const auto it = state_.title_textures.find(other);
+            if (other == key || it == state_.title_textures.end() || !it->second->owned || !it->second->resource)
+                return;
+            TitleTexture& t = *it->second;
+            if (t.cpu == cpu && t.layout.layout.size == size) return;
+            t.superseded = true;
+            retire_candidates_.try_emplace(other, false);
+        });
+    }
+
+    // The registry no longer holds an owned image at `key` (retired, or replaced by another texture).
+    void forget_owned_range(std::uint64_t key) {
+        owned_ranges_.erase(key);
+        retire_candidates_.erase(key);
+    }
+
+    // Once a pass, after its visits: the candidates of LEONIDA_TITLE_IMAGE_RETIRE. One over a map change since the
+    // last pass is looked at first (a filled image none of whose pages is committed has gone; an image never filled
+    // is the view of a texture whose pages have not come yet, and stays). A superseded image goes once no view has
+    // named it for the idle time, one whose pages went once they have been gone that long; the others stay
+    // candidates. Its Release waits as every retired image's does (retired_title_textures_).
+    void retire_idle_owned_images(std::chrono::steady_clock::time_point now) {
+        const auto idle = owned_image_idle();
+        for (auto it = retire_candidates_.begin(); it != retire_candidates_.end();) {
+            const std::uint64_t key = it->first;
+            const auto entry = state_.title_textures.find(key);
+            TitleTexture* t = entry == state_.title_textures.end() || !entry->second->owned || !entry->second->resource
+                                  ? nullptr
+                                  : entry->second.get();
+            if (t && std::exchange(it->second, false)) {
+                if (!t->fills || leonida::texture_memory_committed(std::uintptr_t(t->cpu), t->layout.layout.size))
+                    t->gone_since = {};
+                else if (t->gone_since == std::chrono::steady_clock::time_point{})
+                    t->gone_since = now;
+            }
+            const bool gone = t && t->gone_since != std::chrono::steady_clock::time_point{};
+            if (!t || (!t->superseded && !gone)) {
+                it = retire_candidates_.erase(it);
+                continue;
+            }
+            const bool covered = t->superseded && now - t->named >= idle;
+            if (!covered && !(gone && now - t->gone_since >= idle)) {
+                ++it;
+                continue;
+            }
+            ++(covered ? title_stats_.retired_superseded : title_stats_.retired_gone);
+            retire_title_texture(*t);
+            it = retire_candidates_.erase(it);
+            owned_ranges_.erase(key);
+            state_.texture_ranges.erase(key);
+            state_.title_textures.erase(entry);
+        }
     }
 
     // LEONIDA_TITLE_PARTIAL_MIPS=1 (off by default). A slot-70 2D texture whose larger mips are not readable is filled from the
@@ -17486,14 +17632,15 @@ private:
                          double(s.staged_ns) / 1e9, double(state_.title_upload.capacity()) / 1048576.0);
         std::fprintf(stderr,
                      "[rt] d3d12: title textures (%s): %llu slot-70 texture views (%zu kinds), %llu of slot-133 textures, "
-                     "%llu of images made for them (%llu made, %llu over memory not readable yet, %llu retired), %llu "
-                     "null views; registry %zu images "
+                     "%llu of images made for them (%llu made, %llu over memory not readable yet, %llu retired: %llu "
+                     "under a newer texture, %llu with their pages gone), %llu null views; registry %zu images "
                      "(%zu made, %zu slot 133 of %llu registered, %zu mapped, %zu filled); %llu fills %.1f MiB, %llu "
                      "failed\n",
                      when, static_cast<unsigned long long>(s.views), s.asked.size(),
                      static_cast<unsigned long long>(s.of_slot133), static_cast<unsigned long long>(s.of_cache),
                      static_cast<unsigned long long>(s.made), static_cast<unsigned long long>(s.unreadable),
-                     static_cast<unsigned long long>(s.retired),
+                     static_cast<unsigned long long>(s.retired), static_cast<unsigned long long>(s.retired_superseded),
+                     static_cast<unsigned long long>(s.retired_gone),
                      static_cast<unsigned long long>(s.null_views), state_.title_textures.size(), owned, slot133,
                      static_cast<unsigned long long>(s.registered), mapped, filled,
                      static_cast<unsigned long long>(s.fills), double(s.fill_bytes) / 1048576.0,
@@ -21983,6 +22130,14 @@ TitleWindows title_windows(ID3D12Device* device) {
     std::lock_guard retired(state.retired_window_mutex);
     windows.waiting = state.retired_windows.size();
     return windows;
+}
+TitleImages title_images(ID3D12Device* device) {
+    auto* d = Device::from<Device>(device);
+    return d ? d->title_images() : TitleImages{};
+}
+ID3D12Resource* title_image(ID3D12Device* device, std::uint64_t address) {
+    auto* d = Device::from<Device>(device);
+    return d ? d->title_image(address) : nullptr;
 }
 std::uint64_t title_shadow_trackers(ID3D12Device* device) {
     auto* d = Device::from<Device>(device);
