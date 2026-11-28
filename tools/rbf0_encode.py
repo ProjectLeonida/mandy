@@ -162,7 +162,14 @@ class _Writer:
         self.out += b"\xfd\xff" + struct.pack("<I", len(raw)) + raw
 
     def element(self, node):
-        if node.get("attribute_order_violation"):
+        # rbf0_tree also sets the flag when text or a child element comes while the attribute count is not reached
+        # yet; such an element writes back exactly (a value in the content is refused below). Refuse when an
+        # attribute record came after the content, or when the records carry no offsets to tell.
+        content_at = [c.get("offset") for c in node.get("content", [])]
+        attr_at = [a.get("offset") for a in node.get("attributes", [])]
+        if node.get("attribute_order_violation") and (
+                not all(isinstance(o, int) and not isinstance(o, bool) for o in content_at + attr_at)
+                or (attr_at and content_at and max(attr_at) > min(content_at))):
             raise EncodeError("order", f"element {node.get('name')!r} has a value attribute after its content")
         attrs = node.get("attrs_declared", len(node.get("attributes", [])))
         if not isinstance(attrs, int) or isinstance(attrs, bool) or not 0 <= attrs <= 0xFFFF:
