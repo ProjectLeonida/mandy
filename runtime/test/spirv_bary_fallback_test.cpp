@@ -539,6 +539,11 @@ int main(int argc, char** argv) {
         CHECK(ins.builtin_dist_in == (std::set<std::uint32_t>{3, 4}));
         CHECK(ins.builtin_dist_out == (std::set<std::uint32_t>{3, 4}));
         maybe_dump(dump_dir, "gs_mixed_clip_cull", gs);
+
+        const auto vs_eight = build_vs({.raw_locs = {0}, .clip_count = 5, .cull_count = 3});
+        CHECK(build_bary_fallback_gs(vs_eight, ps_ok, 1, gs, &info, &err));
+        CHECK(info.clip_count == 5 && info.cull_count == 3);
+        maybe_dump(dump_dir, "gs_mixed_eight_distances", gs);
     }
 
     // 7. Refusals leave caller's gs_words untouched.
@@ -548,6 +553,10 @@ int main(int argc, char** argv) {
         std::string err;
 
         const auto ps_ok = build_ps({0}, {}, 1);
+
+        const auto vs_nine = build_vs({.raw_locs = {0}, .clip_count = 5, .cull_count = 4});
+        CHECK(!build_bary_fallback_gs(vs_nine, ps_ok, 1, gs, nullptr, &err));
+        CHECK(err.find("combined") != std::string::npos && gs == sentinel);
 
         // ShaderLayer (69) and ShaderViewportIndex (70).
         const auto vs_layer = build_vs({.raw_locs = {0}, .extra_caps = {69}});

@@ -148,6 +148,7 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     }
     if (!has_vs_ep) return fail("bary_fallback: VS has no Vertex entry point");
 
+    constexpr std::uint32_t kMaxDistances = 8;  // D3D12_CLIP_OR_CULL_DISTANCE_COUNT
     std::uint32_t clip_count = 0;
     std::uint32_t cull_count = 0;
     const auto record_vs_builtin = [&](std::uint32_t bi, std::uint32_t ty_id) -> bool {
@@ -160,7 +161,7 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
         if (arr_it == vs_arr_tys.end() || !vs_float32_tys.count(arr_it->second.first))
             return fail("bary_fallback: VS ClipDistance/CullDistance output is not float[N]");
         const auto len_it = vs_pos_int_consts.find(arr_it->second.second);
-        if (len_it == vs_pos_int_consts.end() || len_it->second < 1 || len_it->second > 8)
+        if (len_it == vs_pos_int_consts.end() || len_it->second < 1 || len_it->second > kMaxDistances)
             return fail("bary_fallback: VS ClipDistance/CullDistance length must be in 1..8");
         std::uint32_t& dst = (bi == kBuiltInClipDistance) ? clip_count : cull_count;
         if (dst != 0 && dst != len_it->second)
@@ -184,6 +185,10 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
             }
         }
     }
+    const std::uint32_t dist_count = clip_count + cull_count;
+    if (dist_count > kMaxDistances)
+        return fail("bary_fallback: combined ClipDistance and CullDistance exceed the D3D12 limit of 8");
+
     std::map<std::uint32_t, std::uint32_t> vs_out_loc_pointee;  // loc -> pointee_ty
     for (const auto& [target, loc] : vs_loc_decs) {
         const auto it = vs_out_var_pointee.find(target);
