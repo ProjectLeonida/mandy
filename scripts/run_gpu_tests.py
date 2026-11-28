@@ -102,7 +102,7 @@ def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2, group_
 TEXT_ONLY_MARK = "; run_gpu_tests: text only, llvm-mc has no gfx1013 encoding for an instruction here"
 
 
-def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
+def assemble_to_s(llvm_mc: str | None, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
     with open(asm_path, encoding="utf-8") as source:
         raw = source.read()
@@ -334,7 +334,9 @@ def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, *,
     # gpu=False (the translator over the whole suite) runs without a limit.
     limit = gpu_test_timeout() if gpu else None
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit, cwd=cwd)
+        # Keep the exit status and the rest of the log if a tool emits bytes outside the host encoding.
+        p = subprocess.run(cmd, capture_output=True, text=True, errors="backslashreplace",
+                           env=env, timeout=limit, cwd=cwd)
     except subprocess.TimeoutExpired:
         return 1, timed_out(cmd[0], limit)
     except OSError as e:   # e.g. Smart App Control blocked a fresh build: fail this test, keep running the others
@@ -377,7 +379,9 @@ def _device_per_vertex():
         try:
             r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
                                capture_output=True, text=True, timeout=60)
-            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
+            report = json.loads(r.stdout.strip().splitlines()[-1])
+            if isinstance(report, dict):
+                answer = report.get("per_vertex_inputs")
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             pass
         _PER_VERTEX.append(answer)
@@ -392,7 +396,9 @@ def _device_barycentric_fallback():
         try:
             r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
                                capture_output=True, text=True, timeout=60)
-            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("barycentric_fallback")
+            report = json.loads(r.stdout.strip().splitlines()[-1])
+            if isinstance(report, dict):
+                answer = report.get("barycentric_fallback")
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             pass
         _BARYCENTRIC_FALLBACK.append(answer)
@@ -774,8 +780,11 @@ def native_folder(path: str, ansi: str = "mbcs") -> str | None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"),
-                    help="llvm-mc path, or a whole command such as 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'")
+    # No literal default: unset, mc_command() reads LLVM_MC and then finds llvm-mc on PATH or a versioned
+    # Debian/Ubuntu install (llvm-mc-21, /usr/lib/llvm-21/bin/llvm-mc), as the not-found message promises.
+    ap.add_argument("--llvm-mc", default=None,
+                    help="llvm-mc path, or a whole command such as 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc' "
+                         "(default: LLVM_MC, then llvm-mc on PATH, then the newest llvm-mc-<N>)")
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"),
                     help="CMake build folder; with the Visual Studio generator the RelWithDebInfo/Release/... "
                          "subfolder that has the test programs is found by itself")
@@ -907,6 +916,8 @@ def run_suite(a, work: str) -> int:
             ])
         elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3", "ms_f16_pack"):
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 64, 64, 2))])
+        elif name in ("ms_w64x_wave_votes", "ms_w64x_wave_loops"):      # vertex 64 comes from the second wave: 128 output vertices
+            dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 128, 64, 2))])
         elif name == "ms_v5_workgroup":
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(32, 3, 1, group_shared=128))])
         elif name == "ms_clip":
@@ -957,6 +968,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--texel-offset-fallback")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
+        if os.environ.get("LEONIDA_MESH_SERIAL_WAVES") == "1":   # with --wave64-emulate: one pass per wave
+            cmd.append("--mesh-serial-waves")
         if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
             cmd.append("--pc-tail-ubo")
         if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma, OpFmaKHR or emulated (docs/design.md)
@@ -1636,13 +1649,13 @@ def run_suite(a, work: str) -> int:
             problem = mesh_v5_test(a.build, spirv_dir, Path(raw_dir) / f"{name}.raw")
             results.append((name, None if isinstance(problem, Skip) else not problem,
                             problem or "24/24 workgroup coordinates exact (2 x 3 x 4)"))
-        elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3"):
+        elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3", "ms_w64x_wave_votes", "ms_w64x_wave_loops"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = mesh_env(spirv_dir, name, gfx_env)
             rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, fs_passthru, raw], env=env)
             # ms_w64x_ballot needs exact wave64 (a 64-wide subgroup, or --wave64-emulate): skip it elsewhere, as
             # the wave64 compute dumps are.
-            no64 = (name == "ms_w64x_ballot" and not w64_emulated() and
+            no64 = (name in ("ms_w64x_ballot", "ms_w64x_wave_votes", "ms_w64x_wave_loops") and not w64_emulated() and
                     not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg)))
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
@@ -1694,14 +1707,15 @@ def run_suite(a, work: str) -> int:
                 ok, detail = check_flat(raw)
                 results.append((name, ok, detail))
 
-    if a.filter and not results:   # the filter matched only inputs/partners: say so rather than "0/0 passed"
+    if (a.filter or disasm_src is not None) and not results:
         names = [os.path.splitext(f)[0] for f in asm_files]
         partners = {os.path.splitext(f)[0] for f in DRAWN_WITH.values()} | set(TEXTURE_MIP_DEPENDENCIES)
         shown = ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")
         role = "partners built for other tests" if partners.issuperset(names) else "inputs without a GPU test row"
         hint = ("; cs_bench_* shaders are benchmark inputs, run them with the benchmark tool"
                 if all(n.startswith("cs_bench_") for n in names) else "")
-        print(f"error: --filter {a.filter!r} selected {shown} but no runnable GPU test cases ({role}){hint}",
+        selected_by = f"--filter {a.filter!r}" if a.filter else f"--disasm-dir {disasm_src!r}"
+        print(f"error: {selected_by} selected {shown} but no runnable GPU test cases ({role}){hint}",
               file=sys.stderr)
         return 2
 
