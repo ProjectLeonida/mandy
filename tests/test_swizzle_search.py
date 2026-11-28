@@ -692,5 +692,35 @@ def test_preview_with_no_fitting_layout_reports_the_problem(tmp_path=None):
             td.cleanup()
 
 
+# `import numpy` raises ImportError in the child, as on a Python without numpy (CI's standard-library job)
+WITHOUT_NUMPY = ("import runpy, sys; sys.modules['numpy'] = None; sys.argv = sys.argv[1:]; "
+                 "runpy.run_path(sys.argv[0], run_name='__main__')")
+
+
+class SwizzleSearchWithoutNumpyTest(unittest.TestCase):
+    """The argument checks need no numpy, and the missing numpy itself is one line, not a traceback."""
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", "-c", WITHOUT_NUMPY, str(TOOL), *args],
+                              capture_output=True, text=True, timeout=120)
+
+    def test_missing_file_is_a_usage_error_without_numpy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self.run_tool(os.path.join(tmp, "missing.bin"))
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("missing.bin", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_missing_numpy_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = os.path.join(tmp, "blob.bin")
+            with open(blob, "wb") as f:
+                f.write(bytes(range(256)) * 64)
+            p = self.run_tool(blob)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertEqual(p.stderr.strip().splitlines(),
+                         ["ERROR: swizzle_search.py needs numpy (python -m pip install numpy)"])
+
+
 if __name__ == "__main__":
     unittest.main()

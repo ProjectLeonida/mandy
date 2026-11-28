@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -971,6 +972,37 @@ if pytest is not None:
                 "winners: [(('4K_S', 'first'), 1)]\n"
                 "probed 1 of 1 textures; 0 skipped\n"
             )
+
+
+# `import numpy` raises ImportError in the child, as on a Python without numpy (CI's standard-library job)
+WITHOUT_NUMPY = ("import runpy, sys; sys.modules['numpy'] = None; sys.argv = sys.argv[1:]; "
+                 "runpy.run_path(sys.argv[0], run_name='__main__')")
+
+
+class TexModeProbeWithoutNumpyTest(unittest.TestCase):
+    """The argument checks need no numpy, and the missing numpy itself is one line, not a traceback."""
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", "-c", WITHOUT_NUMPY,
+                               os.path.join(TOOLS_DIR, "tex_mode_probe.py"), *args],
+                              capture_output=True, text=True, timeout=120)
+
+    def test_unreadable_index_is_a_usage_error_without_numpy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self.run_tool(os.path.join(tmp, "missing.json"), tmp)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("missing.json", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_missing_numpy_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = os.path.join(tmp, "textures_index.json")
+            with open(index, "w", encoding="utf-8", newline="\n") as f:
+                f.write("[]")
+            p = self.run_tool(index, tmp)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertEqual(p.stderr.strip().splitlines(),
+                         ["ERROR: tex_mode_probe.py needs numpy (python -m pip install numpy)"])
 
 
 if __name__ == "__main__":

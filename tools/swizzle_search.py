@@ -12,7 +12,10 @@ import itertools
 import os
 import sys
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # main() checks the arguments first, then says numpy is missing in one line
+    np = None
 
 sys.path.insert(0, os.path.dirname(__file__))
 from tile_probe import block_feature, score, same_report_path  # noqa: E402
@@ -150,6 +153,9 @@ def main(argv=None):
             data = f.read()
     except OSError as e:  # a missing or unreadable input: one ERROR line, as the other tools do
         print(f"ERROR: cannot read {a.blob}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    if np is None:
+        print("ERROR: swizzle_search.py needs numpy (python -m pip install numpy)", file=sys.stderr)
         return 2
     res = search(data, a.bpe, a.tile, widths, a.tiles)
     if not res:
