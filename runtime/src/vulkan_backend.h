@@ -529,45 +529,83 @@ public:
             }
         }
 
-        for (const Item& item : to_destroy) {
-            switch (item.kind) {
-            case Kind::bindless_slot:
-                if (release_fn) {
-                    release_fn(release_user, static_cast<std::uint32_t>(item.handle >> 32),
-                               static_cast<std::uint32_t>(item.handle & 0xFFFFFFFFu));
+        for (const Item& item : to_destroy) destroy(item, device, vk, release_fn, release_user);
+    }
+
+    // What still waits for a drain after a device loss, in its order, instead of being destroyed at once. Releasing a
+    // bindless slot takes the device's descriptor lock, which the caller that defers it holds (DeviceState::release in
+    // d3d12_vulkan_device.cpp). An image view is deferred right after its slot, and until the slot is released the
+    // set's pending writes and shadow copy may still name the view; a flush hands those to vkUpdateDescriptorSets,
+    // which must not see a destroyed view. So views go at teardown too, after their slot. Both stay bounded: the set
+    // never hands out more slots than it has (a slot comes back only through its release), a slot has at most four
+    // views, and the context's own view cache grows only while batches replay, which stops at the loss.
+    static bool kept_after_loss(Kind kind) { return kind == Kind::bindless_slot || kind == Kind::image_view; }
+
+    // After a device loss: destroys every item now, whatever its ticket, except those kept_after_loss(), which stay
+    // queued in their order.
+    void drain_lost(VkDevice device, const VulkanDeviceFunctions& vk) {
+        std::vector<Item> to_destroy;
+        {
+            std::lock_guard lock(mutex_);
+            const std::size_t mask = pending_.size() - 1;
+            std::size_t kept = 0;
+            for (std::size_t i = 0; i < count_; ++i) {
+                const Item& item = pending_[(head_ + i) & mask];
+                if (kept_after_loss(item.kind)) {
+                    // Kept items move towards the front only, so this never overwrites one not yet read.
+                    pending_[(head_ + kept) & mask] = item;
+                    ++kept;
+                } else {
+                    to_destroy.push_back(item);
                 }
-                break;
-            case Kind::image_view:
-                vk.vkDestroyImageView(device, reinterpret_cast<VkImageView>(item.handle), nullptr);
-                break;
-            case Kind::image:
-                vk.vkDestroyImage(device, reinterpret_cast<VkImage>(item.handle), nullptr);
-                break;
-            case Kind::pooled_title_image:
-                delete reinterpret_cast<PooledTitleImage*>(item.handle);
-                break;
-            case Kind::sparse_resource:
-                // Releases the resource and its page backing together after outstanding submissions.
-                delete reinterpret_cast<std::shared_ptr<SparseResource>*>(item.handle);
-                break;
-            case Kind::buffer:
-                vk.vkDestroyBuffer(device, reinterpret_cast<VkBuffer>(item.handle), nullptr);
-                break;
-            case Kind::device_memory:
-                vk.vkFreeMemory(device, reinterpret_cast<VkDeviceMemory>(item.handle), nullptr);
-                break;
-            case Kind::image_memory:
-                delete reinterpret_cast<ImageMemory::Range*>(item.handle);
-                break;
-            case Kind::acceleration_structure:
-                if (vk.vkDestroyAccelerationStructureKHR)
-                    vk.vkDestroyAccelerationStructureKHR(
-                        device, reinterpret_cast<VkAccelerationStructureKHR>(item.handle), nullptr);
-                break;
-            case Kind::framebuffer:
-                vk.vkDestroyFramebuffer(device, reinterpret_cast<VkFramebuffer>(item.handle), nullptr);
-                break;
             }
+            count_ = kept;
+            tail_ = (head_ + kept) & mask;
+        }
+        for (const Item& item : to_destroy) destroy(item, device, vk, nullptr, nullptr);
+    }
+
+    // Destroys one item now. A bindless slot is handed to release_fn.
+    static void destroy(const Item& item, VkDevice device, const VulkanDeviceFunctions& vk,
+                        BindlessReleaseFn release_fn, void* release_user) {
+        switch (item.kind) {
+        case Kind::bindless_slot:
+            if (release_fn) {
+                release_fn(release_user, static_cast<std::uint32_t>(item.handle >> 32),
+                           static_cast<std::uint32_t>(item.handle & 0xFFFFFFFFu));
+            }
+            break;
+        case Kind::image_view:
+            vk.vkDestroyImageView(device, reinterpret_cast<VkImageView>(item.handle), nullptr);
+            break;
+        case Kind::image:
+            vk.vkDestroyImage(device, reinterpret_cast<VkImage>(item.handle), nullptr);
+            break;
+        case Kind::pooled_title_image:
+            delete reinterpret_cast<PooledTitleImage*>(item.handle);
+            break;
+        case Kind::sparse_resource:
+            // Releases the resource and its page backing together: after outstanding submissions, or at once after a
+            // device loss.
+            delete reinterpret_cast<std::shared_ptr<SparseResource>*>(item.handle);
+            break;
+        case Kind::buffer:
+            vk.vkDestroyBuffer(device, reinterpret_cast<VkBuffer>(item.handle), nullptr);
+            break;
+        case Kind::device_memory:
+            vk.vkFreeMemory(device, reinterpret_cast<VkDeviceMemory>(item.handle), nullptr);
+            break;
+        case Kind::image_memory:
+            delete reinterpret_cast<ImageMemory::Range*>(item.handle);
+            break;
+        case Kind::acceleration_structure:
+            if (vk.vkDestroyAccelerationStructureKHR)
+                vk.vkDestroyAccelerationStructureKHR(device, reinterpret_cast<VkAccelerationStructureKHR>(item.handle),
+                                                     nullptr);
+            break;
+        case Kind::framebuffer:
+            vk.vkDestroyFramebuffer(device, reinterpret_cast<VkFramebuffer>(item.handle), nullptr);
+            break;
         }
     }
 
@@ -1971,13 +2009,21 @@ public:
     void defer_destroy(DeferredDeletionQueue::Kind kind, VkHandle handle) {
         const auto raw = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(handle));
         if (!raw) return;
-        std::lock_guard lock(submit_mutex_);
-        const std::uint64_t safe_ticket = submitted_ticket_.load(std::memory_order_acquire) + 1;
-        deletion_queue_.push(safe_ticket, kind, raw);
+        defer_destroy(kind, raw);
     }
 
     void defer_destroy(DeferredDeletionQueue::Kind kind, std::uint64_t raw_handle) {
         if (!raw_handle && kind != DeferredDeletionQueue::Kind::bindless_slot) return;
+        // Once the device is lost no retire ticket completes again (completed_retire_ticket() answers 0 and acquire()
+        // returns before its drain), so a queued object would stay until the context goes and the queue would grow
+        // with everything the title releases. The lost device runs nothing more, and vkDestroy* and vkFreeMemory are
+        // valid on it: the object goes now, and the first time also everything queued before the loss. Bindless slots
+        // and image views still wait, in their order (DeferredDeletionQueue::kept_after_loss says why).
+        if (is_device_lost() && !DeferredDeletionQueue::kept_after_loss(kind)) {
+            if (!lost_queue_drained_.exchange(true, std::memory_order_acq_rel)) deletion_queue_.drain_lost(device_, vk);
+            DeferredDeletionQueue::destroy({0, raw_handle, kind}, device_, vk, nullptr, nullptr);
+            return;
+        }
         std::lock_guard lock(submit_mutex_);
         const std::uint64_t safe_ticket = submitted_ticket_.load(std::memory_order_acquire) + 1;
         deletion_queue_.push(safe_ticket, kind, raw_handle);
@@ -2372,6 +2418,7 @@ private:
     RetireTickets<VkSemaphore> retire_tickets_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
+    std::atomic<bool> lost_queue_drained_{false};  // defer_destroy emptied the queue once after the loss
     std::unique_ptr<DeviceFaultDiagnostics> device_fault_;
     std::jthread progress_watch_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
@@ -3644,6 +3691,16 @@ private:
                                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &full, 0, nullptr, 0, nullptr);
         }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
+        // Another queue holds tracker_mutex_ through its vkQueueSubmit, so it can find the device lost while this batch
+        // waits here, past its own checks above. Once the device is lost, defer_destroy destroys released objects at
+        // once rather than after the next submission, and also what was queued before the loss. An image may then be
+        // gone whose view the bindless set's pending writes or shadow copy still name until its slot is released, and
+        // the flush below would hand that view to vkUpdateDescriptorSets. Nothing this batch records would reach the
+        // queue anyway: submit() refuses a lost device.
+        if (context_.is_device_lost()) {
+            discard();
+            return queue_unsupported(__LINE__);
+        }
         if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             const bool ended = context_.observe_result(context_.vk.vkEndCommandBuffer(command_buffer),
                                                       "vkEndCommandBuffer") == VK_SUCCESS;
