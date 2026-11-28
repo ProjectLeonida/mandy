@@ -93,6 +93,9 @@ struct MockCounts {
     std::size_t index_robust = 0;
     std::size_t draws = 0;
     std::size_t dispatches = 0;
+    std::size_t begin_rendering = 0;
+    std::size_t end_rendering = 0;
+    std::size_t barriers = 0;
     std::vector<PushCall> pushes;
 
     void reset() { *this = MockCounts{}; }
@@ -247,11 +250,11 @@ struct MockEnv {
         vk.heap_base = 0x10000000ull;
         vk.pipeline_barrier = +[](VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
                                   std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*,
-                                  std::uint32_t, const VkImageMemoryBarrier*) {};
+                                  std::uint32_t, const VkImageMemoryBarrier*) { ++g_mc.barriers; };
         vk.clear_color_image = +[](VkCommandBuffer, VkImage, VkImageLayout, const VkClearColorValue*, std::uint32_t,
                                    const VkImageSubresourceRange*) {};
-        vk.begin_rendering = +[](VkCommandBuffer, const VkRenderingInfo*) {};
-        vk.end_rendering = +[](VkCommandBuffer) {};
+        vk.begin_rendering = +[](VkCommandBuffer, const VkRenderingInfo*) { ++g_mc.begin_rendering; };
+        vk.end_rendering = +[](VkCommandBuffer) { ++g_mc.end_rendering; };
         vk.copy_buffer = +[](VkCommandBuffer, VkBuffer, VkBuffer, std::uint32_t, const VkBufferCopy*) {};
         vk.copy_buffer_to_image = +[](VkCommandBuffer, VkBuffer, VkImage, VkImageLayout, std::uint32_t,
                                       const VkBufferImageCopy*) {};
@@ -397,6 +400,8 @@ void test_cpu_elision_and_invalidation() {
         g_mc.reset();
         emit(prep, cb, env.vk);
         CHECK(g_mc.draws == 5);
+        CHECK(g_mc.begin_rendering == 1 && g_mc.end_rendering == 1);
+        CHECK(g_mc.barriers == 1);
         CHECK(g_mc.bind_gfx == 1);
         CHECK(g_mc.desc_gfx == 1);
         CHECK(g_mc.push == 1 && g_mc.pushes[0].offset == 0 && g_mc.pushes[0].size == sizeof(ShaderUserData));
@@ -595,6 +600,11 @@ void test_cpu_elision_and_invalidation() {
 void test_throughput_5000_draws() {
     MockEnv env;
     // Swap to zero-overhead no-op callbacks (without vector push_back on pushes) for clean timing.
+    env.vk.pipeline_barrier = +[](VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
+                                  std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*,
+                                  std::uint32_t, const VkImageMemoryBarrier*) {};
+    env.vk.begin_rendering = +[](VkCommandBuffer, const VkRenderingInfo*) {};
+    env.vk.end_rendering = +[](VkCommandBuffer) {};
     env.vk.bind_pipeline = +[](VkCommandBuffer, VkPipelineBindPoint, VkPipeline) {};
     env.vk.bind_descriptor_sets = +[](VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, std::uint32_t,
                                       std::uint32_t, const VkDescriptorSet*, std::uint32_t, const std::uint32_t*) {};
@@ -1044,11 +1054,34 @@ void test_gpu_live_validation() {
     VkPipeline comp_pipe = VK_NULL_HANDLE;
     CHECK(vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &comp_pipe) == VK_SUCCESS);
 
-    if (gfx_pipe && comp_pipe) {
+    // Second graphics pipeline with depth-only, and third with depth+stencil (tests depth_aspects scope split on GPU).
+    const VkImage depth_img =
+        dev.image(VK_FORMAT_D32_SFLOAT_S8_UINT, kW, kH, 1,
+                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    VkPipeline gfx_depth_pipe = VK_NULL_HANDLE;
+    VkPipeline gfx_depth_stencil_pipe = VK_NULL_HANDLE;
+    {
+        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        VkPipelineRenderingCreateInfo rend_d = rend;
+        rend_d.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        VkGraphicsPipelineCreateInfo gp_d = gp_ci;
+        gp_d.pNext = &rend_d;
+        gp_d.pDepthStencilState = &ds;
+        CHECK(vkCreateGraphicsPipelines(dev.device, VK_NULL_HANDLE, 1, &gp_d, nullptr, &gfx_depth_pipe) == VK_SUCCESS);
+
+        VkPipelineRenderingCreateInfo rend_ds = rend_d;
+        rend_ds.stencilAttachmentFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        VkGraphicsPipelineCreateInfo gp_ds = gp_d;
+        gp_ds.pNext = &rend_ds;
+        CHECK(vkCreateGraphicsPipelines(dev.device, VK_NULL_HANDLE, 1, &gp_ds, nullptr, &gfx_depth_stencil_pipe) ==
+              VK_SUCCESS);
+    }
+
+    if (gfx_pipe && comp_pipe && depth_img && gfx_depth_pipe && gfx_depth_stencil_pipe) {
         VulkanContext ctx(dev.device_proc, dev.device, true, dev.conditional_rendering, dev.buffer_device_address);
         CHECK(ctx.loaded());
 
-        constexpr ResourceId kRtId = 1, kVbId = 2, kIbId = 3, kRbId = 4;
+        constexpr ResourceId kRtId = 1, kVbId = 2, kIbId = 3, kRbId = 4, kDsId = 5;
         constexpr std::uint64_t kVbVa = 0x10000ull, kIbVa = 0x20000ull;
         ResourceBinding rt_b{};
         rt_b.image = color_img;
@@ -1058,6 +1091,14 @@ void test_gpu_live_validation() {
         rt_b.height = kH;
         rt_b.color_attachment = true;
         ctx.add_resource(kRtId, rt_b, VK_IMAGE_LAYOUT_UNDEFINED);
+
+        ResourceBinding ds_b{};
+        ds_b.image = depth_img;
+        ds_b.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        ds_b.aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        ds_b.width = kW;
+        ds_b.height = kH;
+        ctx.add_resource(kDsId, ds_b, VK_IMAGE_LAYOUT_UNDEFINED);
 
         ResourceBinding vb_b{};
         vb_b.buffer = vb;
@@ -1084,6 +1125,21 @@ void test_gpu_live_validation() {
         gp.color_formats = {VK_FORMAT_R8G8B8A8_UNORM};
         gp.vertex_slots = 0b1;
         ctx.add_graphics_pipeline(100, gp);
+
+        GraphicsPipeline gp_glc = gp;
+        gp_glc.reads_glc_buffer = true;
+        ctx.add_graphics_pipeline(101, gp_glc);
+
+        GraphicsPipeline gp_d = gp;
+        gp_d.pipeline = gfx_depth_pipe;
+        gp_d.depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        gp_d.depth_aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+        ctx.add_graphics_pipeline(102, gp_d);
+
+        GraphicsPipeline gp_ds = gp_d;
+        gp_ds.pipeline = gfx_depth_stencil_pipe;
+        gp_ds.depth_aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        ctx.add_graphics_pipeline(103, gp_ds);
 
         ComputePipeline cp{};
         cp.pipeline = comp_pipe;
@@ -1161,6 +1217,23 @@ void test_gpu_live_validation() {
         const Draw d_black_bl = make_quad(1.0f, 1.0f, 0.0f, 0.0f, 0, 4, 4, 8);
         CHECK(list1.draw(d_black_bl));
 
+        // Consecutive reads_glc_buffer draw on the same RT (must close open scope for ALL_GRAPHICS_BIT barrier),
+        // followed by depth-only -> depth+stencil draws on the same D32S8 target (must split on depth_aspects!).
+        Draw d_glc_br = make_quad(1.0f, 1.0f, 0.0f, 1.0f, 4, 4, 8, 8);
+        d_glc_br.pipeline = 101;  // reads_glc_buffer = true
+        CHECK(list1.draw(d_glc_br));
+
+        CHECK(list1.transition({kDsId, all_subresources, d3d12_state::common, d3d12_state::depth_write}));
+        Draw d_depth_only = make_quad(1.0f, 0.0f, 0.0f, 1.0f, 0, 0, 4, 4);
+        d_depth_only.pipeline = 102;  // depth_aspects = DEPTH_BIT
+        d_depth_only.depth = {kDsId, 0, 0, 1};
+        CHECK(list1.draw(d_depth_only));
+        Draw d_depth_stencil = make_quad(1.0f, 0.0f, 0.0f, 1.0f, 0, 0, 4, 4);
+        d_depth_stencil.pipeline = 103;  // depth_aspects = DEPTH_BIT | STENCIL_BIT
+        d_depth_stencil.depth = {kDsId, 0, 0, 1};
+        CHECK(list1.draw(d_depth_stencil));
+        CHECK(list1.draw(d_depth_stencil));  // merged into same depth+stencil scope
+
         // Read back color target into rb_buf.
         CHECK(list1.transition({kRtId, all_subresources, d3d12_state::render_target, d3d12_state::copy_source}));
         CopyTexture readback{};
@@ -1202,6 +1275,8 @@ void test_gpu_live_validation() {
         std::puts("replay_state_cache live GPU validation (graphics + partial push + compute interleave): ok");
     }
 
+    if (gfx_depth_stencil_pipe) vkDestroyPipeline(dev.device, gfx_depth_stencil_pipe, nullptr);
+    if (gfx_depth_pipe) vkDestroyPipeline(dev.device, gfx_depth_pipe, nullptr);
     if (gfx_pipe) vkDestroyPipeline(dev.device, gfx_pipe, nullptr);
     if (comp_pipe) vkDestroyPipeline(dev.device, comp_pipe, nullptr);
     if (vs_mod) vkDestroyShaderModule(dev.device, vs_mod, nullptr);
@@ -1771,6 +1846,333 @@ void test_batch_parallel_sync_pipeline_compile() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Part 5: Dynamic rendering scope batching, LayoutTracker no-op elision, PrepareViewCache & PreparedList reuse
+
+void test_rendering_scope_batching_and_fast_paths() {
+    MockEnv env;
+    constexpr ResourceId kColor2 = 100;
+    constexpr ResourceId kColorArray = 101;
+    constexpr ResourceId kColorGeneral = 102;
+    constexpr ResourceId kDepth = 103;
+    constexpr ResourceId kDepth2 = 104;
+
+    ResourceBinding color2 = env.res[MockEnv::kColor];
+    color2.image = fake_handle<VkImage>(0x110);
+    color2.mip_levels = 2;
+    env.res[kColor2] = color2;
+
+    ResourceBinding color_arr = env.res[MockEnv::kColor];
+    color_arr.image = fake_handle<VkImage>(0x111);
+    color_arr.array_layers = 4;
+    env.res[kColorArray] = color_arr;
+
+    ResourceBinding color_gen = env.res[MockEnv::kColor];
+    color_gen.image = fake_handle<VkImage>(0x112);
+    color_gen.simultaneous_access = true;
+    env.res[kColorGeneral] = color_gen;
+
+    ResourceBinding depth{};
+    depth.image = fake_handle<VkImage>(0x113);
+    depth.format = VK_FORMAT_D24_UNORM_S8_UINT;
+    depth.aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    depth.width = depth.height = 64;
+    env.res[kDepth] = depth;
+
+    ResourceBinding depth2 = depth;
+    depth2.image = fake_handle<VkImage>(0x114);
+    env.res[kDepth2] = depth2;
+
+    // Distinct image views per (image, mip, layer, layerCount, format) so view changes are observable.
+    std::size_t view_calls = 0;
+    env.vk.image_view = [&view_calls](const ResourceBinding& r, const VkImageSubresourceRange& range) {
+        ++view_calls;
+        std::uintptr_t h = reinterpret_cast<std::uintptr_t>(r.image) * 1315423911ull;
+        h ^= std::uintptr_t(range.baseMipLevel) << 8;
+        h ^= std::uintptr_t(range.baseArrayLayer) << 12;
+        h ^= std::uintptr_t(range.layerCount) << 16;
+        h ^= std::uintptr_t(r.format) << 20;
+        return fake_handle<VkImageView>(h ? h : 1);
+    };
+
+    // Additional pipelines for depth_aspects, reads_glc_buffer, multi-RT, and attachment-less draws.
+    GraphicsPipeline g_depth_only = env.gfx[1];
+    g_depth_only.pipeline = fake_handle<VkPipeline>(0x710);
+    g_depth_only.depth_format = VK_FORMAT_D24_UNORM_S8_UINT;
+    g_depth_only.depth_aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+    env.gfx[10] = g_depth_only;
+
+    GraphicsPipeline g_depth_stencil = g_depth_only;
+    g_depth_stencil.pipeline = fake_handle<VkPipeline>(0x711);
+    g_depth_stencil.depth_aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    env.gfx[11] = g_depth_stencil;
+
+    GraphicsPipeline g_glc = env.gfx[1];
+    g_glc.pipeline = fake_handle<VkPipeline>(0x712);
+    g_glc.reads_glc_buffer = true;
+    env.gfx[12] = g_glc;
+
+    GraphicsPipeline g_mrt2 = env.gfx[1];
+    g_mrt2.pipeline = fake_handle<VkPipeline>(0x713);
+    g_mrt2.color_formats = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
+    g_mrt2.depth_format = VK_FORMAT_D24_UNORM_S8_UINT;
+    g_mrt2.depth_aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+    env.gfx[13] = g_mrt2;
+
+    GraphicsPipeline g_no_att = env.gfx[1];
+    g_no_att.pipeline = fake_handle<VkPipeline>(0x714);
+    g_no_att.color_formats.clear();
+    env.gfx[14] = g_no_att;
+
+    const auto resolve = [&env](ResourceId id) { return env.resolve(id); };
+    const VkCommandBuffer cb = fake_handle<VkCommandBuffer>(0x1);
+
+    // 5a: Consecutive MRT + DSV draws sharing targets (even across different pipelines) merge into 1 scope + 1 barrier;
+    //     PrepareViewCache calls vk.image_view only once per unique attachment view across all draws.
+    {
+        CommandList list;
+        Draw d = env.base_draw(13, true);
+        auto v = std::make_shared<DrawViews>(*d.views);
+        v->render_targets[0] = {MockEnv::kColor, 0, 0, 1};
+        v->render_targets[1] = {kColor2, 0, 0, 1};
+        v->render_target_count = 2;
+        d.views = v;
+        d.depth = {kDepth, 0, 0, 1};
+        for (int k = 0; k < 6; ++k) {
+            d.user_data[0] = std::uint32_t(k);
+            CHECK(list.draw(d));
+        }
+        CHECK(list.close());
+
+        view_calls = 0;
+        PreparedList prep;
+        CHECK(prepare(list, resolve, env.vk, prep) == ReplayResult::success);
+        CHECK(view_calls == 3);  // 2 color views + 1 depth view cached across all 6 draws (instead of 18)
+
+        g_mc.reset();
+        emit(prep, cb, env.vk);
+        CHECK(g_mc.draws == 6);
+        CHECK(g_mc.begin_rendering == 1 && g_mc.end_rendering == 1);
+        CHECK(g_mc.barriers == 1);  // coalesced single attachment barrier for 2 RTs + 1 DSV
+    }
+
+    // 5b: Changing color target, mip/view, depth_aspects, layers, or area closes and reopens rendering scope.
+    {
+        // Color target change (kColor -> kColor2)
+        CommandList list;
+        Draw d1 = env.base_draw(1, false);
+        Draw d2 = env.base_draw(1, false);
+        auto v2 = std::make_shared<DrawViews>(*d2.views);
+        v2->render_targets[0] = {kColor2, 0, 0, 1};
+        d2.views = v2;
+        // Same kColor2, different mip (mip 1 -> different view, range, and area 32x32)
+        Draw d3 = env.base_draw(1, false);
+        auto v3 = std::make_shared<DrawViews>(*d3.views);
+        v3->render_targets[0] = {kColor2, 1, 0, 1};
+        d3.views = v3;
+        // Different layerCount (1 layer -> 2 layers on kColorArray)
+        Draw d4 = env.base_draw(1, false);
+        auto v4 = std::make_shared<DrawViews>(*d4.views);
+        v4->render_targets[0] = {kColorArray, 0, 0, 1};
+        d4.views = v4;
+        Draw d5 = env.base_draw(1, false);
+        auto v5 = std::make_shared<DrawViews>(*d5.views);
+        v5->render_targets[0] = {kColorArray, 0, 0, 2};
+        d5.views = v5;
+        // Different depth_aspects on the SAME depth target (DEPTH -> DEPTH|STENCIL)
+        Draw d6 = env.base_draw(10, false);
+        d6.depth = {kDepth, 0, 0, 1};
+        Draw d7 = env.base_draw(11, false);
+        d7.depth = {kDepth, 0, 0, 1};
+        // Attachment-less draws with different viewport areas (64x64 -> 32x32)
+        Draw d8 = env.base_draw(14, false);
+        auto v8 = std::make_shared<DrawViews>(*d8.views);
+        v8->render_target_count = 0;
+        d8.views = v8;
+        d8.viewport = {0, 0, 64, 64, 0, 1};
+        Draw d9 = env.base_draw(14, false);
+        auto v9 = std::make_shared<DrawViews>(*d9.views);
+        v9->render_target_count = 0;
+        d9.views = v9;
+        d9.viewport = {0, 0, 32, 32, 0, 1};
+        // Different layout (OPTIMAL vs simultaneous_access GENERAL)
+        Draw d10 = env.base_draw(1, false);
+        auto v10 = std::make_shared<DrawViews>(*d10.views);
+        v10->render_targets[0] = {kColorGeneral, 0, 0, 1};
+        d10.views = v10;
+
+        CHECK(list.draw(d1) && list.draw(d2) && list.draw(d3) && list.draw(d4) && list.draw(d5));
+        CHECK(list.draw(d6) && list.draw(d7) && list.draw(d8) && list.draw(d9) && list.draw(d10));
+        CHECK(list.close());
+
+        PreparedList prep;
+        CHECK(prepare(list, resolve, env.vk, prep) == ReplayResult::success);
+        g_mc.reset();
+        emit(prep, cb, env.vk);
+        CHECK(g_mc.draws == 10);
+        CHECK(g_mc.begin_rendering == 10 && g_mc.end_rendering == 10);
+    }
+
+    // 5c: Exact event ordering at mandatory scope-closing boundaries:
+    //     reads_glc_buffer, indirect_clamp, quad_indices, non-draw (dispatch/barrier/clear), query, and predication.
+    {
+        static std::vector<std::string> ev;
+        ev.clear();
+        ReplayFunctions trace_vk = env.vk;
+        trace_vk.begin_rendering = +[](VkCommandBuffer, const VkRenderingInfo*) { ev.push_back("begin_rp"); };
+        trace_vk.end_rendering = +[](VkCommandBuffer) { ev.push_back("end_rp"); };
+        trace_vk.draw = +[](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {
+            ev.push_back("draw");
+        };
+        trace_vk.draw_indexed = +[](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t, std::int32_t,
+                                    std::uint32_t) { ev.push_back("draw_idx"); };
+        trace_vk.draw_indirect = +[](VkCommandBuffer, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t) {
+            ev.push_back("draw_ind");
+        };
+        trace_vk.pipeline_barrier = +[](VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags dst,
+                                        VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t,
+                                        const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {
+            if (dst == VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT) ev.push_back("glc_barrier");
+        };
+        trace_vk.emit_indirect_clamp = [](VkCommandBuffer, const ClampedIndirect&) { ev.push_back("clamp"); };
+        trace_vk.emit_quad_indices = [](VkCommandBuffer, const QuadIndexExpansion&) { ev.push_back("quad_expand"); };
+        trace_vk.dispatch = +[](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t) {
+            ev.push_back("dispatch");
+        };
+        trace_vk.begin_query = +[](VkCommandBuffer, VkQueryPool, std::uint32_t, VkQueryControlFlags) {
+            ev.push_back("begin_q");
+        };
+        trace_vk.end_query = +[](VkCommandBuffer, VkQueryPool, std::uint32_t) { ev.push_back("end_q"); };
+        trace_vk.begin_conditional_rendering = +[](VkCommandBuffer, const VkConditionalRenderingBeginInfoEXT*) {
+            ev.push_back("begin_pred");
+        };
+        trace_vk.end_conditional_rendering = +[](VkCommandBuffer) { ev.push_back("end_pred"); };
+
+        CommandList list;
+        const Draw d = env.base_draw(1, false);
+        const Draw d_glc = env.base_draw(12, false);
+        Draw d_quad = env.base_draw(1, true);
+        d_quad.topology = topology_quad_list;
+        d_quad.count = 8;
+        IndirectDrawArgs ind{};
+        ind.argument_buffer = MockEnv::kBuf;
+        ind.stride = 16;
+        ind.max_count = 1;
+        Dispatch c{};
+        c.pipeline = 1;
+        c.x = c.y = c.z = 1;
+
+        // 2 merged draws -> reads_glc_buffer -> quad_expand -> indirect_clamp -> dispatch -> query -> predication
+        CHECK(list.draw(d));
+        CHECK(list.draw(d));
+        CHECK(list.draw(d_glc));
+        CHECK(list.draw(d_quad));
+        CHECK(list.draw_indirect(Draw{d}, ind));
+        CHECK(list.dispatch(c));
+        CHECK(list.begin_query({MockEnv::kOccHeap, d3d12_query::occlusion, 0}));
+        CHECK(list.draw(d));
+        CHECK(list.draw(d));
+        CHECK(list.end_query({MockEnv::kOccHeap, d3d12_query::occlusion, 0}));
+        CHECK(list.set_predication({MockEnv::kPred, 0, d3d12_predication::equal_zero}));
+        CHECK(list.draw(d));
+        CHECK(list.draw(d));
+        CHECK(list.close());
+
+        PreparedList prep;
+        CHECK(prepare(list, resolve, trace_vk, prep) == ReplayResult::success);
+        QueryReplay qr;
+        CHECK(qr.plan(prep) == ReplayResult::success);
+        emit(prep, cb, trace_vk);
+
+        const std::vector<std::string> expected = {
+            "begin_rp", "draw", "draw", "end_rp",
+            "glc_barrier", "begin_rp", "draw", "end_rp",
+            "quad_expand", "begin_rp", "draw_idx", "end_rp",
+            "clamp", "begin_rp", "draw_ind", "end_rp",
+            "dispatch",
+            "begin_q", "begin_rp", "draw", "draw", "end_rp", "end_q",
+            "begin_pred", "begin_rp", "draw", "draw", "end_rp", "end_pred",
+        };
+        if (ev != expected) {
+            std::fprintf(stderr, "FAIL scope boundary event order (got %zu vs expected %zu):\n  got: ", ev.size(),
+                         expected.size());
+            for (const auto& s : ev) std::fprintf(stderr, "%s ", s.c_str());
+            std::fprintf(stderr, "\n  want: ");
+            for (const auto& s : expected) std::fprintf(stderr, "%s ", s.c_str());
+            std::fprintf(stderr, "\n");
+            ++g_failures;
+        }
+    }
+
+    // 5d: No-op LayoutTracker::set() elision (0 journal entries when unchanged; exact rollback when changed).
+    {
+        LayoutTracker tracker(true);
+        ResourceBinding img{};
+        img.image = fake_handle<VkImage>(0x120);
+        img.format = VK_FORMAT_R8G8B8A8_UNORM;
+        img.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        img.mip_levels = 3;
+        img.array_layers = 2;
+        tracker.track(42, img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+        tracker.begin();
+        CHECK(tracker.journal_size() == 0);
+        // No-op set on whole image and on single subresource must NOT journal anything.
+        tracker.set(42, {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS},
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        tracker.set(42, {VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, 1}, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        CHECK(tracker.journal_size() == 0);
+
+        // Actual change on mip 1 layer 0 journals once.
+        tracker.set(42, {VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, 1}, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        CHECK(tracker.journal_size() == 1);
+        CHECK(tracker.layout(42, 1) == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        CHECK(tracker.layout(42, 0) == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+        // Rollback restores mip 1 layer 0 to COLOR_ATTACHMENT_OPTIMAL.
+        tracker.rollback();
+        CHECK(tracker.journal_size() == 0);
+        CHECK(tracker.layout(42, 1) == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+        // Commit persists the change.
+        tracker.begin();
+        tracker.set(42, {VK_IMAGE_ASPECT_COLOR_BIT, 2, 1, 1, 1}, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        CHECK(tracker.journal_size() == 1);
+        tracker.commit();
+        CHECK(tracker.journal_size() == 0);
+        CHECK(tracker.layout(42, 5) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    }
+
+    // 5e: PreparedList reuse across mixed lists (draws -> copies/clears -> draws -> shorter list) has no stale state.
+    {
+        PreparedList reused;
+        CommandList l1, l2, l3;
+        const Draw d = env.base_draw(1, true);
+        CHECK(l1.draw(d) && l1.draw(d) && l1.draw(d) && l1.close());
+        CHECK(l2.transition({MockEnv::kColor, all_subresources, d3d12_state::common, d3d12_state::render_target}));
+        CHECK(l2.clear_render_target({MockEnv::kColor, 0, 0, 1}, {0, 0, 0, 1}));
+        CHECK(l2.copy_buffer({MockEnv::kBuf, 0, MockEnv::kResults, 0, 64}));
+        CHECK(l2.draw(d));
+        CHECK(l2.close());
+        CHECK(l3.draw(d) && l3.close());
+
+        CHECK(prepare(l1, resolve, env.vk, reused) == ReplayResult::success);
+        CHECK(reused.commands.size() == 3 && reused.draw_count == 3);
+        CHECK(prepare(l2, resolve, env.vk, reused) == ReplayResult::success);
+        CHECK(reused.commands.size() == 4 && reused.draw_count == 1);
+        CHECK(!reused.commands[2].buffer_copies.empty());
+        CHECK(reused.commands[3].buffer_copies.empty());
+        CHECK(prepare(l3, resolve, env.vk, reused) == ReplayResult::success);
+        CHECK(reused.commands.size() == 1 && reused.draw_count == 1);
+        CHECK(reused.commands[0].buffer_copies.empty());
+        g_mc.reset();
+        emit(reused, cb, env.vk);
+        CHECK(g_mc.draws == 1 && g_mc.begin_rendering == 1 && g_mc.end_rendering == 1);
+    }
+
+    std::puts("rendering scope batching, LayoutTracker no-op elision & prepare fast path: ok");
+}
+
 }  // namespace
 
 int main() {
@@ -1778,6 +2180,7 @@ int main() {
     test_throughput_5000_draws();
     test_gpu_live_validation();
     test_batch_parallel_sync_pipeline_compile();
+    test_rendering_scope_batching_and_fast_paths();
     if (g_failures) {
         std::fprintf(stderr, "replay_state_cache_test: %d failure(s)\n", g_failures);
         return 1;
