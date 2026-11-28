@@ -2389,17 +2389,67 @@ void print_cases(const std::vector<Case>& cases, const char* who) {
 }
 }  // namespace
 
+// Synthetic slot-70 reuse across same-footprint BC codecs must create legal native views.
+int check_bc_stream_views(ID3D12Device* device, void* pages) {
+    const char* who = "BC stream view compatibility";
+    EXPECT(pages);
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = desc.Height = 8;
+    desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_BC7_UNORM_SRGB;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    for (const DXGI_FORMAT format : {DXGI_FORMAT_BC7_UNORM_SRGB, DXGI_FORMAT_BC6H_UF16,
+                                    DXGI_FORMAT_BC6H_SF16, DXGI_FORMAT_BC7_UNORM}) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        std::array<UINT, 14> resource{};
+        std::array<UINT, 16> view{};
+        std::memcpy(resource.data(), &desc, sizeof(desc));
+        std::memcpy(view.data(), &srv, sizeof(srv));
+        leonida::gfx10::ImageWords slot{};
+        EXPECT(rt::d3d12::write_placed_texture_view(device, false, resource.data(), view.data(),
+               reinterpret_cast<UINT64>(pages), {reinterpret_cast<SIZE_T>(slot.data())}));
+        std::uint32_t key[8];
+        std::memcpy(key, slot.data(), sizeof(key));
+        EXPECT(rt::d3d12::bindless_hash_lookup(device, key));
+    }
+    // Replace the stream-owned image, then let the normal submission path retire its views.
+    Ref<ID3D12Resource> placement;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&placement.p)), S_OK);
+    GpuReader gpu;
+    EXPECT(!gpu.init(device, 65536));
+    Sleep(3100);  // the production descriptor retirement grace period is three seconds
+    ID3D12CommandList* lists[]{gpu.list.p};
+    gpu.queue->ExecuteCommandLists(1, lists);
+    EXPECT_HR(gpu.queue->Signal(gpu.fence.p, 1), S_OK);
+    EXPECT_HR(gpu.fence->SetEventOnCompletion(1, gpu.done), S_OK);
+    EXPECT(WaitForSingleObject(gpu.done, 30000) == WAIT_OBJECT_0);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const bool prefix_only = argc == 2 && std::strcmp(argv[1], "--host-prefix-only") == 0;
+    const bool bc_only = argc == 2 && std::strcmp(argv[1], "--bc-views-only") == 0;
     const bool async_plane = argc == 2 && std::strcmp(argv[1], "--mapped-plane-async") == 0;
-    if (argc != 1 && !prefix_only && !async_plane) return 2;
+    if (argc != 1 && !prefix_only && !bc_only && !async_plane) return 2;
+    if (bc_only) _putenv_s("LEONIDA_TITLE_IMAGE_DEFER", "0");
     if (async_plane) _putenv_s("LEONIDA_TEXTURE_REFRESH_ASYNC", "1");  // read once, at the device's first refresh
     _putenv_s("LEONIDA_TITLE_TEXTURE_PERIOD_MS", "0");
     _putenv_s("LEONIDA_TITLE_TEXTURE_CHECK_KB", "0");
+    const auto free_pages = [](void* p) { if (p) VirtualFree(p, 0, MEM_RELEASE); };
+    // Declared before the device: backing outlives its stream trackers and native images.
+    std::unique_ptr<void, decltype(free_pages)> bc_pages(
+        bc_only ? VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) : nullptr, free_pages);
     vktest::Device vk;
     const auto status = vk.initialize();
     if (status == vktest::DeviceStatus::unavailable) return 77;
     if (status != vktest::DeviceStatus::ready) return 1;
+    if (bc_only && !vk.bindless) return 77;
     int failures = 0;
     {
         Ref<ID3D12Device> ours;
@@ -2416,6 +2466,10 @@ int main(int argc, char** argv) {
         info.bindless_partially_bound = vk.partially_bound;
         info.robust_image_access = vk.robust_image_access;  // a Texture3D UAV is bound only with it
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
+        if (bc_only) {
+            const int result = check_bc_stream_views(ours.p, bc_pages.get());
+            return result || vk.validation_errors() ? 1 : 0;
+        }
         if (prefix_only) {
             if (!vk.host_pointer_alignment) return 77;
             const int result = check_host_prefix_buffers(ours.p);

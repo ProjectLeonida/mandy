@@ -2591,7 +2591,10 @@ struct TextureCreateInfo {
     TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable) {
         const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
-        info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+        // Console descriptors can select the numeric twin of a BC image (e.g. sRGB).
+        // Cross-codec views are rejected separately, even when block sizes match.
+        info.flags = (format.typeless || leonida::gfx10::bc_format_class(format.format))
+            ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
         if (volume && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
             info.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
         info.imageType = volume ? VK_IMAGE_TYPE_3D : one_d ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
@@ -8423,6 +8426,10 @@ HRESULT castable_view_formats(const Format& format, DXGI_FORMAT resource_format,
             return E_INVALIDARG;
         }
         const leonida::BlockFormat block = leonida::block_format(cast.format, cast.aspects);
+        if (!leonida::gfx10::compatible_bc_formats(format.format, cast.format)) {
+            log_once("castable format belongs to another BC compatibility class:", castable[i]);
+            return E_INVALIDARG;
+        }
         if (own.bytes && block.bytes && (block.bytes != own.bytes || block.block != own.block)) {
             log_once("castable format is a different texel size than the resource:", castable[i]);
             return E_INVALIDARG;
@@ -17214,7 +17221,26 @@ private:
             if (f != DXGI_FORMAT_UNKNOWN && std::find(formats.begin(), formats.end(), f) == formats.end())
                 formats.push_back(f);
         };
-        add(DXGI_FORMAT(d.format));
+        const DXGI_FORMAT requested = srv.Format == DXGI_FORMAT_UNKNOWN ? DXGI_FORMAT(d.format) : srv.Format;
+        const VkFormat requested_host = vulkan_format(requested, false).format;
+        const VkFormat original_host = vulkan_format(DXGI_FORMAT(d.format), false).format;
+        const bool bc_reinterpret = !leonida::gfx10::compatible_bc_formats(original_host, requested_host);
+        // A streamed allocation can be reused for a different BC codec. Untiling still follows
+        // its original block footprint, but Vulkan needs a new image in the requested codec.
+        // Never put the retired codec into this image's mutable-format list.
+        if (bc_reinterpret) {
+            const xg::Format a = xg::format_info(d.format), b = xg::format_info(requested);
+            if (!a.bytes || a.bytes != b.bytes || a.side != b.side ||
+                !leonida::gfx10::bc_format_class(original_host) ||
+                !leonida::gfx10::bc_format_class(requested_host))
+                return refuse_title_view("incompatible compressed view footprint", d, address), nullptr;
+        }
+        if (leonida::gfx10::bc_format_class(requested_host)) {
+            formats.erase(std::remove_if(formats.begin(), formats.end(), [&](DXGI_FORMAT f) {
+                return !leonida::gfx10::compatible_bc_formats(requested_host, vulkan_format(f, false).format);
+            }), formats.end());
+        }
+        add(bc_reinterpret ? requested : DXGI_FORMAT(d.format));
         if (srv.Format != DXGI_FORMAT_UNKNOWN && srv.Format != DXGI_FORMAT(d.format)) {
             const xg::Format a = xg::format_info(d.format), b = xg::format_info(srv.Format);
             if (a.bytes != b.bytes || a.side != b.side)

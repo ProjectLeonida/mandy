@@ -247,6 +247,25 @@ int main() {
     CHECK(vulkan_view_format(VK_FORMAT_R8G8B8A8_UINT, 20, true) == VK_FORMAT_R32_UINT);
     CHECK(vulkan_view_format(VK_FORMAT_UNDEFINED, 56) == VK_FORMAT_UNDEFINED);
 
+    // Equal compressed block sizes and channel orders do not make BC codecs compatible.
+    for (const bool cast : {false, true}) {
+        for (const auto& source : format_table) {
+            if (source.vulkan < VK_FORMAT_BC1_RGB_UNORM_BLOCK || source.vulkan > VK_FORMAT_BC7_SRGB_BLOCK)
+                continue;
+            for (const auto& target : format_table) {
+                const auto resolved = vulkan_view_format(source.vulkan, target.gfx10, cast);
+                if (resolved == VK_FORMAT_UNDEFINED) continue;
+                CHECK(resolved >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && resolved <= VK_FORMAT_BC7_SRGB_BLOCK);
+                CHECK((resolved - VK_FORMAT_BC1_RGB_UNORM_BLOCK) / 2 ==
+                      (source.vulkan - VK_FORMAT_BC1_RGB_UNORM_BLOCK) / 2);
+            }
+        }
+        CHECK(vulkan_view_format(VK_FORMAT_BC7_UNORM_BLOCK,
+                                format_from_vulkan(VK_FORMAT_BC7_SRGB_BLOCK), cast) == VK_FORMAT_BC7_SRGB_BLOCK);
+        CHECK(vulkan_view_format(VK_FORMAT_BC6H_UFLOAT_BLOCK,
+                                format_from_vulkan(VK_FORMAT_BC6H_SFLOAT_BLOCK), cast) == VK_FORMAT_BC6H_SFLOAT_BLOCK);
+    }
+
     // Depth/stencil images are only compatible with their own format, even with allow_channel_cast = true,
     // and colour images never resolve to a depth/stencil view format.
     for (const VkFormat ds : {VK_FORMAT_D16_UNORM, VK_FORMAT_X8_D24_UNORM_PACK32, VK_FORMAT_D32_SFLOAT,

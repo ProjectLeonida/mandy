@@ -421,6 +421,18 @@ inline constexpr bool is_depth_stencil_format(VkFormat format) {
 // when no channel-order match exists (R8G8B8A8_UINT viewed as R32_UINT, say). Depth/stencil images are only
 // compatible with their own format in Vulkan (VUID-VkImageViewCreateInfo-image-01762 / 09594), and colour
 // images can never be viewed as depth/stencil. VK_FORMAT_UNDEFINED: no compatible format exists.
+// Vulkan BC compatibility classes contain only the numeric variants of one codec.
+// Equal block footprints alone are insufficient (e.g. BC6H and BC7 are both 16 bytes).
+inline constexpr unsigned bc_format_class(VkFormat format) {
+    return format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && format <= VK_FORMAT_BC7_SRGB_BLOCK
+        ? unsigned(format - VK_FORMAT_BC1_RGB_UNORM_BLOCK) / 2 + 1 : 0;
+}
+
+inline constexpr bool compatible_bc_formats(VkFormat image, VkFormat view) {
+    const auto a = bc_format_class(image), b = bc_format_class(view);
+    return (!a && !b) || (a && a == b);
+}
+
 inline constexpr VkFormat vulkan_view_format(VkFormat image_format, std::uint32_t gfx10_format,
                                              bool allow_channel_cast = false) {
     const FormatRow* image = format_row(image_format);
@@ -436,7 +448,8 @@ inline constexpr VkFormat vulkan_view_format(VkFormat image_format, std::uint32_
     if (image_format == VK_FORMAT_B8G8R8A8_UNORM && gfx10_format == 136) return image_format;
     const FormatRow* fallback = nullptr;
     for (const FormatRow& row : format_table) {
-        if (row.gfx10 != gfx10_format || is_depth_stencil_format(row.vulkan)) continue;
+        if (row.gfx10 != gfx10_format || is_depth_stencil_format(row.vulkan) ||
+            !compatible_bc_formats(image_format, row.vulkan)) continue;
         if (row.channels == image->channels) return row.vulkan;
         if (!fallback) fallback = &row;
     }

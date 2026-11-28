@@ -574,6 +574,14 @@ What is implemented (all of it testable without the game):
     | a castable-format list | accepted on a texture when the formats map to Vulkan formats: the image is mutable and carries a `VkImageFormatListCreateInfo`; a buffer or an unmapped format is `E_INVALIDARG`. A cast whose texel size differs from the resource's is also `E_INVALIDARG` — the host refuses other sizes, and a size-mismatched format list is a Vulkan validation error (`VUID-VkImageCreateInfo-pNext-06722`). The list is kept on the resource, so an SRV whose format is neither the resource format nor in the list leaves a null descriptor. The resource's own format is always accepted and is added to the Vulkan format list when the D3D12 list omits it. A listed same-size cross-family cast, such as `R8G8B8A8_UINT` to `R32_UINT`, is accepted. An RTV in a listed RGBA8 family format on a typed `R8G8B8A8_UNORM` texture clears through the cast, the same reinterpretation a typeless RTV uses; without a list a typed resource still refuses a different-format RTV. `D3D12_OPTIONS12` reports `RelaxedFormatCastingSupported = TRUE` (this layer requires Vulkan 1.3, where the format list is core). `CreatePlacedResource2`'s list reaches its placed image through the same rules (D3D-90) |
     | `CreateCommandQueue1`'s creator ID | ignored |
 
+    Compressed BC views must stay in the same Vulkan compatibility class: equal block byte counts do not make
+    BC6H and BC7 interchangeable views of one image. Castable lists reject cross-codec entries. Numeric twins
+    within a codec (such as BC7 UNORM/sRGB) use mutable images. A CPU-filled slot-70 texture requested in another
+    same-footprint BC codec is recreated in that requested codec, retaining the original console layout for
+    untile/copy addressing. The replacement does not carry retired codecs in its Vulkan format list.
+    `gfx10_descriptors` checks format resolution; `d3d12_bc_stream_views` checks native view registration and
+    retirement with synthetic BC7/BC6H descriptors (run with `LEONIDA_VK_VALIDATION=1` to check Vulkan usage).
+
     `CreatePlacedResource1/2` wrap the placed path above; `2` carries the castable-format list. `CreateHeap1`
     remains a stub.
   - `CreateSampler2` as a wrapper over `CreateSampler` (D3D-28, part 2). Without flags it writes the same S#.
