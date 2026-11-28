@@ -13,6 +13,7 @@ import tempfile
 
 TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
+import bcpack
 import bcpack_history_calib as calib
 import bcpack_tables_bptc as bptc
 import gen_bcpack_runtime_tables as pack
@@ -77,6 +78,195 @@ def fit_slices(pools):
     # Existing array and cube fits keep precedence over supplemental 2D observations.
     extend_missing(docs, {calib.CODEC_KEYS[c]: f.build_document()[0] for c, f in tails.items()})
     return docs
+
+
+def _chunk_needs_missing_slot(codec, prefix, blocks, docs, static_bc7):
+    l0, l1, l15 = prefix[0], prefix[1], prefix[15]
+    if codec == 6:
+        eclass = docs["bc6h"]["endpointClass"]
+        iclass = docs["bc6h"]["indexClass"]
+        for i in range(blocks):
+            di = bcpack._inter8(l1[2 * i], l1[2 * i + 1])
+            de = (di + bcpack._unzig(bcpack._inter8(l0[2 * i], l0[2 * i + 1]))) & 255
+            if (de > i and not eclass[256 + i - de]) or (di > i and not iclass[256 + i - di]):
+                return True
+        return False
+    ep_bits = docs["bc7"]["historyEndpointBits"]
+    ix_bits = docs["bc7"]["historyIndexBits"]
+    cfg = static_bc7["config"]
+    rank_of = static_bc7["rank_of"]
+    for i in range(blocks):
+        di = bcpack._inter8(l1[2 * i], l1[2 * i + 1])
+        de = (di + bcpack._unzig(bcpack._inter8(l0[2 * i], l0[2 * i + 1]))) & 255
+        if de <= i and di <= i:
+            continue
+        s15a, s15b = l15[2 * i], l15[2 * i + 1]
+        rank = rank_of[s15a * 16 + s15b] if s15a < 32 and s15b < 16 else -1
+        if rank < 0 or cfg[rank][0] > 7:
+            continue
+        mode, _, rot, _ = cfg[rank]
+        if de > i:
+            row = ep_bits[256 + i - de]
+            bits = bcpack._bc7_field_bits(mode, rot)
+            for sub in range(bcpack._B7_NS[mode]):
+                base = sub * 8
+                for c, b in enumerate(bits):
+                    if b and (not row[base + c] or not row[base + 4 + c]):
+                        return True
+        if di > i:
+            ix_row = ix_bits[256 + i - di]
+            if any(not ix_row[p] for p in range(16)):
+                return True
+            if mode in (4, 5) and any(not ix_row[16 + p] for p in range(16)):
+                return True
+    return False
+
+
+def _make_multilevel_quads_getter(codec, layout, ref, tiled, delta_level, signed=False, block_cache=None):
+    if block_cache is None:
+        block_cache = {}
+    pw, ph = ref["pixels_w"], ref["pixels_h"]
+    nch = 3 if codec == 6 else 4
+
+    def _get_pixel(px, py):
+        px = min(pw - 1, max(0, px))
+        py = min(ph - 1, max(0, py))
+        key = (px >> 2, py >> 2)
+        blk = block_cache.get(key)
+        if blk is None:
+            off = calib.tiled_offset(layout, ref, key[0], key[1])
+            blk = (calib.decode_bc6h_block_unq(tiled, off, signed=signed) if codec == 6 else
+                   calib.decode_bc7_block_rgba(tiled, off))
+            block_cache[key] = blk
+        return blk[((py & 3) << 2) | (px & 3)]
+
+    if delta_level < 0:
+        shift = -delta_level
+        return lambda bx, by: tuple(
+            _get_pixel((4 * bx + 2 * qx) >> shift, (4 * by + 2 * qy) >> shift)
+            for qy in (0, 1) for qx in (0, 1)
+        )
+
+    step = 2 << delta_level
+    stride = max(1, step >> 3)
+    half = stride >> 1
+
+    def get_quads(bx, by):
+        out = []
+        for qy in (0, 1):
+            for qx in (0, 1):
+                x0 = (4 * bx + 2 * qx) << delta_level
+                y0 = (4 * by + 2 * qy) << delta_level
+                x1, y1 = min(pw, x0 + step), min(ph, y0 + step)
+                if x0 >= x1 or y0 >= y1:
+                    out.append(_get_pixel(x0, y0))
+                    continue
+                sx = x0 + half if x0 + half < x1 else x0
+                sy = y0 + half if y0 + half < y1 else y0
+                acc = [0.0] * nch
+                cnt = 0
+                for py in range(sy, y1, stride):
+                    for px in range(sx, x1, stride):
+                        pv = _get_pixel(px, py)
+                        for c in range(nch):
+                            acc[c] += pv[c]
+                        cnt += 1
+                out.append(tuple(v / cnt for v in acc))
+        return tuple(out)
+
+    return get_quads
+
+
+def fit_distant_mips(pools, docs):
+    """Fit remaining missing BPTC history slots from multi-level raw/zlib mips on the same layer."""
+    arrays = {6: calib.Bc6hCalibrator(), 7: calib.Bc7Calibrator()}
+    tails = {6: calib.Bc6hCalibrator(), 7: calib.Bc7Calibrator()}
+    static_bc7 = bptc._bc7_static()
+    for path in pools:
+        with closing(ttpf.Pool(path)) as pool:
+            codecs = {chunk[4] for chunk in pool.chunks}
+            if not (codecs & {6, 7}) or not (codecs & {0, 8}):
+                continue
+            lanes_cache = {}
+            wanted = set()
+            for _, size, offset, packed, mode, _ in pool.chunks:
+                if mode in arrays and size >= 16:
+                    pblocks = min(256, size // 16)
+                    prefix = calib.decode_lanes_prefix(
+                        pool.data[offset:offset + packed], mode, size, pblocks * 2)
+                    if _chunk_needs_missing_slot(mode, prefix, pblocks, docs, static_bc7):
+                        wanted.add((offset, packed, mode))
+                        lanes_cache[(offset, packed, pblocks)] = prefix
+            if not wanted:
+                continue
+            raw_cache = {}
+            for index in range(pool.textures):
+                d = pool.descriptor(index)
+                fit = tails if d["depth"] == 1 else arrays
+                codec = next((c for c in fit if d["format"] in calib.CODEC_DXGI[c]), None)
+                if not codec or d["dimension"] not in (1, 2):
+                    continue
+                span = pool.span(index, d["base"])
+                if not span:
+                    continue
+                try:
+                    cs = pool.codecs(d["base"], span)
+                except ValueError:
+                    continue
+                if codec not in cs or not (cs & {0, 8}):
+                    continue
+                a = ttpf.analyze(pool, index)
+                if not a.get("available") or a.get("blocked"):
+                    continue
+                mc = a["mip_codecs"]
+                if not any(codec in s for s in mc) or not any(0 in s or 8 in s for s in mc):
+                    continue
+                if d["depth"] == 1 and not any(s and set(s) <= {0, 8} for s in mc):
+                    continue
+                layout = a["layout"]
+                mips = layout["mips"]
+                for layer in range(d["depth"]):
+                    def address(m):
+                        return (d["base"] + layout.get("data_offset", 0) + m["offset"] +
+                                layer * m.get("slice_stride", layout.get("face_size", 0)))
+                    ref_levels = [
+                        lv for lv, m in enumerate(mips)
+                        if m["region"] <= 1048576 and not (pool.codecs(address(m), m["region"]) - {0, 8})
+                    ]
+                    if not ref_levels:
+                        continue
+                    ref_blocks = {}
+                    for level, mip in enumerate(mips):
+                        if level in ref_levels:
+                            continue
+                        start = address(mip)
+                        needy_chunks = [
+                            (size, offset, packed, virt - start, min(4096, size // 16))
+                            for virt, size, offset, packed, mode, _ in pool.chunks_for(start, mip["region"])
+                            if mode == codec and (offset, packed, mode) in wanted and start - virt < 4096 * 16
+                        ]
+                        if not needy_chunks:
+                            continue
+                        ref_lv = min(ref_levels, key=lambda rl: (abs(rl - level), rl))
+                        ref = mips[ref_lv]
+                        ref_addr = address(ref)
+                        tiled = pool.read_range(ref_addr, ref["region"], raw_cache, bcpack_mode="off")
+                        bcache = ref_blocks.setdefault((ref_addr, ref["region"]), {})
+                        getter = _make_multilevel_quads_getter(
+                            codec, layout, ref, tiled, level - ref_lv,
+                            signed=d["format"] == 96, block_cache=bcache)
+                        inverse = calib.make_inverse_tile_lookup(layout, mip)
+                        for size, offset, packed, relative, blocks in needy_chunks:
+                            lkey = (offset, packed, blocks)
+                            lanes = lanes_cache.get(lkey)
+                            if lanes is None:
+                                lanes = calib.decode_lanes_prefix(
+                                    pool.data[offset:offset + packed], codec, size, blocks * 2)
+                                lanes_cache[lkey] = lanes
+                            fit[codec].add_pool_chunk(lanes, blocks, inverse, relative, getter)
+    out = {calib.CODEC_KEYS[c]: f.build_document()[0] for c, f in arrays.items()}
+    extend_missing(out, {calib.CODEC_KEYS[c]: f.build_document()[0] for c, f in tails.items()})
+    return out
 
 
 def extend_missing(base, extra):
@@ -372,6 +562,7 @@ def build(game, output, trainer, base_history=None, json_out=None, if_needed=Fal
             calib.calibrate_from_pools(pools, fits)
             docs = {calib.CODEC_KEYS[c]: f.build_document()[0] for c, f in fits.items()}
         extend_missing(docs, fit_slices(pools))
+        extend_missing(docs, fit_distant_mips(pools, docs))
         fit_decoded_neighbors(pools, docs)
         history = temp/"history.json"
         history.write_text(json.dumps(docs), encoding="utf-8", newline="\n")

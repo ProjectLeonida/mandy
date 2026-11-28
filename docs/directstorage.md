@@ -203,16 +203,18 @@ The first boot with the executable settles most of this: the dry-run report show
   256 blocks of a stream. It combines adjacent mips from the same layer with full-stream index anchor
   and shared-p-bit constraints. A shared p-bit can relate low red endpoint bits even when its sibling
   mip supplies only the leading bits. These local fits preserve the recorded precision and exact reference
-  bits. A packed tail whose larger mips are BCPack-coded too has no raw or zlib sibling, so a history field that
-  only such tails use stayed unknown: in the game runs of 2026-11-25 two BC7 tail streams of one pool failed
-  with `missing-endpoint` (alpha fields of two history entries). For the streams that still start a chain at a
-  missing field, the fitter now decodes the nearest BCPack sibling with the profile so far and fits against it,
-  repeating while a round adds fields. The sibling may sit in the same refused BC7 stream: every block whose
-  chains start elsewhere is still determined, and the undetermined ones are left out of the reference. Those
-  fields are fitted, never confirmed, and fill only what the other fits left empty. On the 1.0.2.1 package this
-  raised the BC7 endpoint fields from 4,228 to 4,406 of 6,144; the runtime decoder then refuses 8 of 5,167 BC7
-  streams instead of 60 (both failing requests decode), and the 268 BC6H streams are unchanged (10 refused; a
-  refused BC6H sibling is not used as a reference yet). A profile can still lack endpoint values or exceed the reference consistency tolerance. Such a request reports a decompression error before publication.
+  bits. A packed tail whose larger mips are BCPack-coded too has no adjacent raw or zlib sibling, so a history
+  field that only such tails use stayed unknown: in the game runs of 2026-11-25 two BC7 tail streams of one pool
+  failed with `missing-endpoint` (alpha fields of two history entries). For streams that still start a chain at a
+  missing field after adjacent-mip fitting, the fitter first pairs their mips with the closest raw or zlib mip on
+  the same layer across multi-level mip distances, then decodes the nearest BCPack sibling with the profile so far
+  and fits against it, repeating while a round adds fields. The sibling may sit in the same refused BC7 stream:
+  every block whose chains start elsewhere is still determined, and the undetermined ones are left out of the
+  reference. Those fields are fitted, never confirmed, and fill only what the earlier fits left empty. On the
+  1.0.2.1 package this raised BC6H coverage from 210 to 226 of 256 endpoint rows and 249 to 251 of 256 index rows
+  (0 of 268 BC6H streams refused instead of 10) and raised BC7 endpoint fields from 4,228 to 4,406 of 6,144 (8 of
+  5,167 BC7 streams refused instead of 60; both failing requests decode). A profile can still lack endpoint values
+  or exceed the reference consistency tolerance. Such a request reports a decompression error before publication.
 - The four swizzle modes interleave stripes from request-wide component planes into 16 KiB (mode 1) or
   32 KiB (modes 2–4) groups. The enum names give the successive stripe widths. The shipped BC4 sample
   separates its endpoint planes from indices across the inflated source. The title's compute shader does
