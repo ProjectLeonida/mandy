@@ -19,6 +19,18 @@ Paths are placeholders: `<checkout>` is the repository, `<build>` the folder wit
   measures in their own copy (`runtime/src/main.cpp` describes the trap instruction the first must point at). The
   values are never committed. With `=0` alone the loader logs that the watchdog stays armed. (Measured by us; the
   watchdog was identified in [#2019](https://github.com/ubiquitarianism/leonida/issues/2019#issuecomment-7172996360).)
+- **Byte patches of the title (`LEONIDA_TITLE_PATCH`).** `LEONIDA_TITLE_PATCH=<rva>:<expected hex>:<new hex>`, several
+  separated by `,` or `+`, rewrites places of the executable before it runs, each only when the expected bytes are
+  there; the log says `applied` or `left alone` for each (`runtime/src/title_patch.h`). Like the watchdog's RVAs, the
+  values are not kept in the runtime. One use, measured on NVIDIA with `LEONIDA_DEVICE_TYPE=6` (Series S): there the
+  title upscales with its FidelityFX programs, which took about 400 ms of GPU time a world frame on an RTX 4070
+  (eight `fspx/amd_fidelityfx_upscaler_xbox_*` dispatches, wave32, not emulated). The d3d12 runtime's two patches
+  `OWN_UPSCALER` and the render-scale "maximum = minimum" in `d3d12/crates/leonida-loader/src/hooks.rs` switch the
+  title to its own temporal upscaler at a fixed 2/3 scale. Both are needed: with the first alone the own upscaler
+  sizes its targets for its largest scale and the title stops about 30 s in on its out-of-memory `int3`, when a
+  1,277 MiB pool that FidelityFX fills to 1,245 MiB is full (measured by us). With both, on an RTX 4070 12 GB
+  (driver 621.40, Windows 11), the world median over 280-600 s went from 0.99 to 1.75 frames/s, one run each, on a
+  runtime from `935a2cd5b` with `library/lib_cs_03010` translated by #2501's branch (not yet measured on later `main`).
 - **The GPU timeout.** World frames take seconds each. The OS's GPU timeout must be longer, or the driver resets the
   GPU: amdgpu's `lockup_timeout` on Linux, `TdrDelay` on Windows (sections below).
 - **Large ray-tracing programs.** 724 library compute programs have 2 MiB of SPIR-V or more (676 of them ray-tracing
