@@ -25,7 +25,7 @@ The `xma2-decoder` workflow builds and runs the C++ smoke test with MSVC. It lin
 `runtime/shims/acphal.cpp` uses `leonida_xma2_decoder_create_hardware` and decodes 2048-byte packets. The shim uses the frame bit positions in the packet to keep PCM through the selected 128-sample loop-end subframe on a repeating pass. If that frame continues in the next linked packet, the shim decodes the continuation before rewinding, including when the linked packet comes from the other input buffer. The shim starts the next pass at the selected loop-start frame with a fresh decoder. Unmatched frame metadata retains packet-level handling. Decoder errors still start a fresh decoder.
 
 Without `cargo`, when that build fails, or with the cl.exe fallback of `scripts/build_runtime.ps1`, XMA voices output silence.
-Use `-DLEONIDA_REQUIRE_XMA2_DECODER=ON` to require the decoder in a CMake build, as the Windows runtime CI does.
+Use `-DLEONIDA_XMA2_DECODER=ON` to opt in to building the decoder during a CMake configure, or `-DLEONIDA_REQUIRE_XMA2_DECODER=ON` to require it (as the Windows runtime CI does).
 
 To link an already-built `leonida_xma2_decoder.lib` without invoking `cargo` during CMake configure (for offline builds
 or Linux cross-builds whose distribution `rustc` omits the `x86_64-pc-windows-msvc` standard library), pass
