@@ -5,9 +5,7 @@
 //
 // - Guarded pages (sections / ordinary pages without MEM_WRITE_WATCH): watched through geometry_writes cells, with
 //   contiguous 64 KiB re-arms batched into single VirtualProtect syscalls in CellGuard::arm_batch(). One collect() is
-//   one submission interval (submission-hot: >= 6 of 8 submissions), and on_present() advances the presented-frame tier
-//   (frame-hot: >= 3 of 4 presented frames) so per-frame dynamic pages promote even on 30-45 submission frames instead
-//   of taking perpetual per-frame write faults.
+//   one submission interval; only pages written in >= 6 of 8 submissions stay unguarded.
 // - Write-watched pages (title_write_watch::contains): queried via cached region-batched runs in
 //   title_write_watch::ask() (GetWriteWatch with WRITE_WATCH_FLAG_RESET) in O(regions + dirty) without walking
 //   ww_pages_ on steady-state submissions, with zero guard faults, zero VirtualProtect syscalls, and zero interference
@@ -100,13 +98,6 @@ public:
         sync_pending_atomics();
     }
 
-    // Presented frame boundary: advances the frame-hot tier (TitleWritePolicy::present_frame()) so per-frame dynamic
-    // pages promote after kFramePromote of kFrameHistory frames and idle frame-hot pages demote cleanly.
-    void on_present() {
-        policy_.present_frame();
-        sync_pending_atomics();
-    }
-
     // Lock-free O(1) clean-submission check: false when no write faults are queued, no guarded pages are hot, dirty,
     // or decaying in history_active_, and no write-watched pages are active.
     bool has_pending_work() const noexcept {
@@ -114,7 +105,6 @@ public:
         if (active_work_.load(std::memory_order_acquire) != 0) return true;
         return ww_count_.load(std::memory_order_acquire) != 0;
     }
-    bool has_frame_work() const noexcept { return frame_work_.load(std::memory_order_acquire) != 0; }
 
     std::uint64_t take_refused() override {
         const std::uint64_t now = policy_.stats().arm_failures;
@@ -479,7 +469,6 @@ private:
     void sync_pending_atomics() noexcept {
         active_work_.store(policy_.hot_count() + policy_.dirty_count() + policy_.history_count() + ww_initial_.size(),
                            std::memory_order_release);
-        frame_work_.store(policy_.frame_hot_count() + policy_.frame_history_count(), std::memory_order_release);
         ww_count_.store(ww_pages_.size(), std::memory_order_release);
     }
 
@@ -489,7 +478,6 @@ private:
     std::vector<std::uintptr_t> tiles_;
     std::uint64_t refused_seen_ = 0;
     std::atomic<std::size_t> active_work_{0};
-    std::atomic<std::size_t> frame_work_{0};
     std::atomic<std::size_t> ww_count_{0};
 
     // Write-watched private pages (MEM_WRITE_WATCH via title_write_watch): zero guard faults, zero VirtualProtect.

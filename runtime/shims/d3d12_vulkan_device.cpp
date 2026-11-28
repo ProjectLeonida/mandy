@@ -5291,7 +5291,6 @@ struct DeviceState {
         std::atomic<std::int64_t> since_ns_atomic{
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
                 .count()};
-        std::atomic<std::uint64_t> last_present_serial{0};
         // Read-mostly snapshot of chunk coverage + plain/ensured intervals so title recording threads calling
         // page_mirror_resolve() take a shared lock and never contend on page_mirror.mutex against async workers.
         // Lock order: page_mirror.mutex -> resolve_cache.mutex (never reversed).
@@ -5353,7 +5352,7 @@ struct DeviceState {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
             std::vector<leonida::TitleMirror::HomeRef> remaining_refs;
             std::size_t remaining_cursor = 0;
-            std::chrono::steady_clock::time_point started{};
+            double cpu_ms = 0;
             double waited_ms = 0;
             std::uint64_t read_bytes = 0;
             std::uint64_t written = 0;
@@ -5522,9 +5521,6 @@ struct DeviceState {
         };
         page_mirror.mirror = std::make_unique<leonida::TitleMirror>(std::move(hooks));
         page_mirror.tracking = std::make_unique<leonida::HotColdTracking>();
-        page_mirror.last_present_serial.store(
-            leonida::submit_phases::totals().present_serial.load(std::memory_order_acquire),
-            std::memory_order_release);
         leonida::geometry_writes::subscribe(page_mirror.released);
         // A vertex, index, copy or indirect-argument address no buffer of ours holds is looked up in the mirror.
         context->set_mirror_buffer([this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
@@ -5921,10 +5917,11 @@ struct DeviceState {
     // held, page_mirror.mutex NOT held). Returns true if a copy is now in flight; false if no valid pages remained.
     bool kick_async_readback_locked(std::vector<leonida::TitleMirror::HomeRef>&& refs, std::size_t cursor,
                                     std::vector<std::pair<std::uint64_t, std::uint64_t>>&& ranges,
-                                    std::chrono::steady_clock::time_point started, double waited_ms,
+                                    double cpu_ms, double waited_ms,
                                     std::uint64_t read_bytes, std::uint64_t batch_written, std::uint64_t& written_out) {
         auto& m = page_mirror;
         using clock = std::chrono::steady_clock;
+        const auto kick_start = clock::now();
         std::vector<leonida::TitleMirror::HomeRef> slice;
         slice.reserve(kReadbackPages);
         while (cursor < refs.size()) {
@@ -5974,14 +5971,15 @@ struct DeviceState {
             m.readback_async.ranges = std::move(ranges);
             m.readback_async.remaining_refs = std::move(refs);
             m.readback_async.remaining_cursor = next_cursor;
-            m.readback_async.started = started;
+            m.readback_async.cpu_ms =
+                cpu_ms + std::chrono::duration<double, std::milli>(clock::now() - kick_start).count();
             m.readback_async.waited_ms = waited_ms;
             m.readback_async.read_bytes = read_bytes;
             m.readback_async.written = batch_written;
             return true;
         }
         // All slices of this batch finished (or were skipped due to pending/remap).
-        const double ms = std::chrono::duration<double, std::milli>(clock::now() - started).count();
+        const double ms = cpu_ms + std::chrono::duration<double, std::milli>(clock::now() - kick_start).count();
         {
             std::unique_lock mirror_lock(m.mutex, std::defer_lock);
             leonida::submit_phases::lock_timed(mirror_lock);
@@ -6021,8 +6019,9 @@ struct DeviceState {
             } else {
                 const auto wait_start = clock::now();
                 const bool ok = wait_readback_locked(m.readback_async.signal_value);
-                m.readback_async.waited_ms +=
-                    std::chrono::duration<double, std::milli>(clock::now() - wait_start).count();
+                const double wms = std::chrono::duration<double, std::milli>(clock::now() - wait_start).count();
+                m.readback_async.waited_ms += wms;
+                m.readback_async.cpu_ms += wms;
                 if (!ok) {
                     std::unique_lock mirror_lock(m.mutex, std::defer_lock);
                     leonida::submit_phases::lock_timed(mirror_lock);
@@ -6033,6 +6032,7 @@ struct DeviceState {
                     return true;
                 }
             }
+            const auto work_start = clock::now();
             std::uint64_t slice_written = 0;
             const std::size_t slice_pages = m.readback_async.slice.size();
             {
@@ -6062,15 +6062,17 @@ struct DeviceState {
                     m.readback_invalidated.clear();
                 }
             }
+            const double slice_cpu_ms =
+                std::chrono::duration<double, std::milli>(clock::now() - work_start).count();
             auto refs = std::move(m.readback_async.remaining_refs);
             const std::size_t cursor = m.readback_async.remaining_cursor;
             auto ranges = std::move(m.readback_async.ranges);
-            const auto started = m.readback_async.started;
+            const double cpu_ms = m.readback_async.cpu_ms + slice_cpu_ms;
             const double waited_ms = m.readback_async.waited_ms;
             const std::uint64_t read_bytes = m.readback_async.read_bytes + slice_pages * kPage;
             const std::uint64_t batch_written = m.readback_async.written + slice_written;
             m.readback_async = {};
-            const bool launched_next = kick_async_readback_locked(std::move(refs), cursor, std::move(ranges), started,
+            const bool launched_next = kick_async_readback_locked(std::move(refs), cursor, std::move(ranges), cpu_ms,
                                                                   waited_ms, read_bytes, batch_written, written_out);
             if (!wait_blocking && launched_next) return false;
         }
@@ -6140,7 +6142,7 @@ struct DeviceState {
                         if (m.mirror) refs = m.mirror->homes_in_ranges(merged);
                     }
                     if (!refs.empty() && make_readback_locked()) {
-                        if (kick_async_readback_locked(std::move(refs), 0, std::move(merged), clock::now(), 0.0, 0, 0,
+                        if (kick_async_readback_locked(std::move(refs), 0, std::move(merged), 0.0, 0.0, 0, 0,
                                                        written) &&
                             blocking) {
                             finish_async_readback_locked(true, retry_pages, written);
@@ -6231,14 +6233,11 @@ struct DeviceState {
         // due.
         {
             const bool log_due = (start_ns - m.since_ns_atomic.load(std::memory_order_acquire)) >= 10'000'000'000ll;
-            const std::uint64_t present_now =
-                leonida::submit_phases::totals().present_serial.load(std::memory_order_acquire);
-            const bool present_due = present_now != m.last_present_serial.load(std::memory_order_acquire);
             const bool in_place_dirty =
                 in_place_heaps.load(std::memory_order_acquire) != 0 &&
                 (slot_change_count.load(std::memory_order_acquire) != 0 ||
                  m.in_place_pending.load(std::memory_order_acquire));
-            if (!log_due && !present_due && !in_place_dirty &&
+            if (!log_due && !in_place_dirty &&
                 leonida::title_mirror_space::generation() == m.space_gen_atomic.load(std::memory_order_acquire) &&
                 !m.feed_pending.load(std::memory_order_acquire) &&
                 !leonida::geometry_writes::has_released(m.released) && !m.tracking->has_pending_work() &&
@@ -6304,18 +6303,6 @@ struct DeviceState {
         if (ensured_changed) {
             std::unique_lock rc_lock(m.resolve_cache.mutex);
             m.resolve_cache.ensured = m.ensured;
-        }
-        // Advance the frame-hot tier before collect() whenever Present has advanced so writes landed after Present
-        // start in the new frame's bit while the completed frame's history evaluates cleanly.
-        {
-            const std::uint64_t present_latest =
-                leonida::submit_phases::totals().present_serial.load(std::memory_order_acquire);
-            const std::uint64_t prev_present = m.last_present_serial.load(std::memory_order_relaxed);
-            if (present_latest > prev_present) {
-                const std::uint64_t delta = (std::min)(present_latest - prev_present, std::uint64_t(32));
-                for (std::uint64_t f = 0; f < delta; ++f) m.tracking->on_present();
-                m.last_present_serial.store(present_latest, std::memory_order_release);
-            }
         }
         m.tracking->collect(m.written);  // re-watched before the copies below
         for (const std::uint64_t page : m.written)
