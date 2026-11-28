@@ -2018,6 +2018,50 @@ class TestLocalDecoder(unittest.TestCase):
         dds = dec.dds(0)
         self.assertEqual(dds[148:], lin0 + lin1)
 
+    def test_dds_npot_mips_are_cropped_to_the_dds_grid(self):
+        # An NPOT mip can be stored on a wider or taller grid than its DDS grid: 17x13 BC1 stores the 8x6 mip 1 as
+        # 3x2 blocks where DDS holds 2x2, and a 513x520 BC7 mode-1 array stores mip 1 as 65x65 blocks (two 64-block
+        # tiles per row) where DDS holds 64x65. The export wrote the stored blocks (one block per row too many,
+        # every later mip shifted) or, for the array, took the DDS width as the tile pitch. Every block holds its
+        # own (slice, mip, x, y), so the expected payload is the DDS rows of each mip, slice by slice.
+        def block(s, i, x, y, bs):
+            return struct.pack("<BBHH", s, i, x, y).ljust(bs, b"\0")
+
+        for name, w, h, fmt, bs, mips, depth, mode in (("compact BC1", 17, 13, 71, 8, 2, 1, 4),
+                                                       ("mode-1 BC7 array", 513, 520, 98, 16, 2, 2, 1)):
+            with self.subTest(name):
+                tile = ttpf.tile_bytes(mode)
+                if depth > 1:
+                    lay = ttpf.array_surface_layout(w, h, depth, mips, bs, 4, tile)
+                else:
+                    lay = ttpf.surface_layout(w, h, fmt, mips, tile)
+                stored = [(m["blocks_w"], m["blocks_h"]) for m in lay["mips"]]
+                dds_grid = [((max(1, w >> i) + 3) // 4, (max(1, h >> i) + 3) // 4) for i in range(mips)]
+                self.assertNotEqual(stored[1], dds_grid[1])  # the case under test
+                tiled = bytearray(lay["size"])
+                expected = bytearray()
+                for s in range(depth):
+                    for m in lay["mips"]:
+                        i, (vw, vh) = m["index"], dds_grid[m["index"]]
+                        lin = b"".join(block(s, i, x, y, bs)
+                                       for y in range(m["blocks_h"]) for x in range(m["blocks_w"]))
+                        ttm.retile_to(lay, m, lin, tiled, base_offset=s * m.get("slice_stride", 0))
+                        expected += b"".join(block(s, i, x, y, bs) for y in range(vh) for x in range(vw))
+                pool, _ = self._open_pool(
+                    f"npot{depth}.ttpf",
+                    [ttm.pack_etpf_record(w, h, mips, 0, fmt, depth, 1, mode, 4096)],
+                    [(8, zlib.compress(bytes(tiled) + bytes(-len(tiled) % 4096)), len(tiled) + -len(tiled) % 4096)],
+                )
+                dds = ct.LocalDecoder(pool, {"version": 1}).dds(0)
+                hdr = tex_headers.parse_dds_header(dds)
+                self.assertEqual((hdr["mips"], hdr["array_size"]), (mips, depth))
+                got = dds[148:]
+                self.assertEqual(len(got), len(expected))
+                bad = next((k for k in range(0, len(got), bs) if got[k:k + bs] != expected[k:k + bs]), None)
+                if bad is not None:
+                    self.fail(f"block {bad // bs} of the payload is (slice, mip, x, y) "
+                              f"{struct.unpack_from('<BBHH', got, bad)}, want {struct.unpack_from('<BBHH', expected, bad)}")
+
     def test_compact_dds_layout_uses_tex_headers_tail_and_mips(self):
         # ASSET-568: NPOT chains and a single-mip sub-tile must use the measured compact
         # layout's first_tail/mips, not locally re-derived grids (the latter packed a
