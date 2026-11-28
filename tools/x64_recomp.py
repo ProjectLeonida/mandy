@@ -884,6 +884,8 @@ class Asm:
         start = len(self.words)
         if not nz:
             self.movz(rd, 0)
+        elif not nzc:
+            self.movn(rd, 0)
         elif len(nzc) < len(nz):
             self.movn(rd, chunks[nzc[0]] ^ 0xFFFF, nzc[0])
             for i in nzc[1:]:
@@ -1134,7 +1136,7 @@ class Asm:
         self._csel(0x9A800400, rd, rn, rm, cond, sf)
 
     def csinv(self, rd, rn, rm, cond, sf=1):
-        self._csel(0x9A808000, rd, rn, rm, cond, sf)
+        self._csel(0xDA800000, rd, rn, rm, cond, sf)
 
     def cset(self, rd, cond, sf=1):
         self.csinc(rd, 31, 31, INV[cond], sf)
@@ -1767,8 +1769,6 @@ class FunctionTranslator:
         m = ins.mnem
         dst, src = ins.ops
         sz = self._op_size(dst)
-        if sz < 4:
-            raise UnhandledInsn(ins, f"{m} size {sz}")
         sf = 1 if sz == 8 else 0
         # normalize arm C to the value adcs/sbcs needs:
         #   adc wants arm C = x86 CF, sbb wants arm C = !x86 CF (borrow).
@@ -1784,9 +1784,24 @@ class FunctionTranslator:
             if m == "sbb":
                 a.eor_i(T3, T3, 1, sf=0)
         a.cmp(T3, 1, sf=0)                      # arm C := prepared carry-in
-        self._load(ins, src, T1)
-        self._load(ins, dst, T0)
+        self._load(ins, src, T1, as_size=sz)
+        self._load(ins, dst, T0, as_size=sz)
+        need = self.needed.get(ins.addr, set())
+        if "A" in need or ins.addr in self.mat:
+            a.stur(T0, CTX_REG, CTX_A, size=8)
+            a.stur(T1, CTX_REG, CTX_B, size=8)
+        sh = (32 - sz * 8) if sz < 4 else 0
+        if sh:
+            a.lsl(T0, T0, sh, sf=0)
+            a.lsl(T1, T1, sh, sf=0)
+            # Fill low `sh` bits of T1 iff x86 CF=1 so ADCS/SBCS propagates carry/borrow into bit `sh`
+            # with exact 8/16-bit N, Z, C, V flags and zero low `sh` bits in the widened result.
+            a.csetm(T2, "cs" if m == "adc" else "cc", sf=0)
+            a.lsr(T2, T2, sz * 8, sf=0)
+            a.orr_r(T1, T1, T2, sf=0)
         (a.adcs if m == "adc" else a.sbcs)(T0, T0, T1, sf)
+        if sh:
+            a.lsr(T0, T0, sh, sf=0)
         self._store(ins, dst, T0)
         self._stash_res(ins, T0)
         self._maybe_mkflags(ins)
