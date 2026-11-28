@@ -841,6 +841,11 @@ if(BUILD_TESTING)
   target_link_libraries(image_memory_test PRIVATE Threads::Threads)
   add_test(NAME image_memory COMMAND image_memory_test)
 
+  # Synchronized one-time image binding (runtime/src/deferred_image_binding.h): pure stdlib, concurrent threads.
+  add_executable(deferred_image_binding_test test/deferred_image_binding_test.cpp)
+  target_link_libraries(deferred_image_binding_test PRIVATE Threads::Threads)
+  add_test(NAME deferred_image_binding COMMAND deferred_image_binding_test)
+
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
 
