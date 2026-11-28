@@ -513,12 +513,17 @@ public:
                                               const D3D12_CPU_DESCRIPTOR_HANDLE* depth) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return check(false);
-        render_targets_.fill({});
-        render_target_count_ = count;
-        draw_views_stale_ = true;
+        std::array<leonida::TargetView, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> bound{};
         for (UINT i = 0; i < count && targets; ++i) {
             const SIZE_T handle = single_range ? targets[0].ptr + SIZE_T(i) * descriptor_size : targets[i].ptr;
-            if (handle) render_targets_[i] = *reinterpret_cast<const leonida::TargetView*>(handle);
+            if (handle) bound[i] = *reinterpret_cast<const leonida::TargetView*>(handle);
+        }
+        // The same targets bound again keep the current views block (draw_views), so the draws after them do not
+        // each allocate a new one.
+        if (count != render_target_count_ || bound != render_targets_) {
+            render_targets_ = bound;
+            render_target_count_ = count;
+            draw_views_stale_ = true;
         }
         depth_ = depth && depth->ptr ? *reinterpret_cast<const leonida::TargetView*>(depth->ptr) : leonida::TargetView{};
     }
@@ -1877,8 +1882,10 @@ private:
         }
     }
 
+    // Only a slot whose view changes marks the views block stale (draw_views). Titles bind the same vertex buffer
+    // again before many of their draws, and a new block for each would be one allocation of about 700 bytes per
+    // draw, kept until the list's Reset.
     void set_vertex_buffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) {
-        if (count) draw_views_stale_ = true;
         for (UINT i = 0; i < count; ++i) {
             // A stream pool's GPU-only alias becomes the CPU view of the same pages (rule B, gfxgeom section 6): the
             // buffer made for it, and every other view naming that range, then use one host-readable address.
@@ -1888,9 +1895,12 @@ private:
                                          : 0;
             if (views) leonida::title_va_aliases().note(va, leonida::TitleVaAliases::vertex_view);
             if (views) leonida::title_va_aliases().want_buffer(va, views[i].SizeInBytes);
-            vertex_buffers_[start + i] = views ? leonida::VertexBufferView{va, views[i].SizeInBytes,
-                                                                          views[i].StrideInBytes}
-                                               : leonida::VertexBufferView{};
+            const leonida::VertexBufferView view =
+                views ? leonida::VertexBufferView{va, views[i].SizeInBytes, views[i].StrideInBytes}
+                      : leonida::VertexBufferView{};
+            if (view == vertex_buffers_[start + i]) continue;
+            vertex_buffers_[start + i] = view;
+            draw_views_stale_ = true;
         }
     }
 
