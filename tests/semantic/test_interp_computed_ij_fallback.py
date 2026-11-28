@@ -1,15 +1,16 @@
 """Computed I/J interpolation without PerVertexKHR (--f16-interp-fallback).
 
-Verifies the uniform %entry screen-quad barycentric Jacobian lowering (OpCapability DerivativeControl +
+Verifies the uniform %entry screen-quad barycentric Jacobian shortcut lowering (OpCapability DerivativeControl +
 FragmentBarycentricKHR + OpDPdxFine / OpDPdyFine + integer IEEE-754 normal determinant guard):
-  * exact perspective-projected 2x2 pixel quad evaluation (w0 != w1 != w2) at 64x64 and 1920x1080 for
-    snapped constants, zeroed provoking-vertex reads, sub-pixel offsets, halved weights, and J written
-    between p1 and p2;
+  * perspective-projected 2x2 pixel quad evaluation (w0 != w1 != w2) at 64x64, 1920x1080, and 2048x2048
+    for snapped constants, zeroed provoking-vertex reads, sub-pixel offsets, halved weights, and J written
+    between p1 and p2, pinned against a binary64 Jacobian oracle and the analytical finite-difference
+    error bound (1 + 2*|alpha| + 2*|beta|) * m_ulp;
   * --f16-interp-fallback (without --bary-fallback) on both f32 and decoded low/high f16 attributes,
     including fragmentShaderBarycentric feature recording and v_interp_p1lv_f16 vsrc2 invariance;
   * non-uniform per-lane branching / EXEC masking (all OpDPdxFine / OpDPdyFine instructions stay in %entry);
-  * degenerate zero-area, signed-zero, subnormal, infinite, and NaN barycentric determinants fall back
-    cleanly to P_c without OpFDiv-by-zero or non-finite contamination;
+  * degenerate zero-area, 1D line-primitive (constant J -> det == 0), signed-zero, subnormal, infinite,
+    and NaN barycentric determinants fall back cleanly to P_c without OpFDiv-by-zero or non-finite contamination;
   * existing refusals (--bary-fallback, mixed flat+smooth f32, v_interp_mov_f32 p10/p20, computed f32 on
     16-bit-flagged interpolant) remain intact.
 
@@ -48,6 +49,34 @@ def pack_f16_pair(lo: float, hi: float) -> int:
     return struct.unpack("<I", struct.pack("<ee", lo, hi))[0]
 
 
+def ulp32(x: float) -> float:
+    """Binary32 ULP of f32(x) (subnormal-aware, distinct from Python's binary64 math.ulp)."""
+    v = abs(f32(x))
+    if v == 0.0:
+        return math.ldexp(1.0, -149)
+    _, exp = math.frexp(v)
+    return math.ldexp(1.0, max(exp - 24, -149))
+
+
+def quad_jacobian_ref64(quad: list[dict[str, object]], lane: int, target_i: float, target_j: float,
+                        var_name: str, ch: int) -> tuple[float, float, float]:
+    """Exact binary64 Jacobian solve on the binary32-quantized 2x2 quad inputs for lane."""
+    x0, x1 = lane & ~1, (lane & ~1) | 1
+    y0, y1 = lane & ~2, (lane & ~2) | 2
+    _, ic, jc = quad[lane]["%bary"]
+    pc = quad[lane][var_name][ch]
+    dix = quad[x1]["%bary"][1] - quad[x0]["%bary"][1]
+    diy = quad[y1]["%bary"][1] - quad[y0]["%bary"][1]
+    djx = quad[x1]["%bary"][2] - quad[x0]["%bary"][2]
+    djy = quad[y1]["%bary"][2] - quad[y0]["%bary"][2]
+    det64 = dix * djy - diy * djx
+    alp64 = ((target_i - ic) * djy - (target_j - jc) * diy) / det64
+    bet64 = (dix * (target_j - jc) - djx * (target_i - ic)) / det64
+    dpx = quad[x1][var_name][ch] - quad[x0][var_name][ch]
+    dpy = quad[y1][var_name][ch] - quad[y0][var_name][ch]
+    return pc + alp64 * dpx + bet64 * dpy, alp64, bet64
+
+
 def translate_with(name: str, lines: list[str], *, f16: bool = False, bary: bool = False, fssm=None):
     old_f16, old_bary = rdna2spirv.F16_HALVES, rdna2spirv.BARY_FALLBACK
     rdna2spirv.F16_HALVES = f16
@@ -67,7 +96,7 @@ def perspective_quad_inputs(
     attrs_words: dict[int, list[tuple[int, int, int, int]]],
     pixel_xy: tuple[float, float] = (8.5, 12.5),
 ):
-    """Exact Vulkan perspective-correct fragment inputs for a 2x2 pixel quad (lanes 0..3) and per-lane (I, J)."""
+    """Binary32-quantized Vulkan perspective-correct fragment inputs for a 2x2 pixel quad (lanes 0..3) and (I, J)."""
     (x0, y0, w0), (x1, y1, w1), (x2, y2, w2) = verts_xyw
     area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
     quad = []
@@ -204,11 +233,19 @@ class ComputedIJDerivativeFallbackTests(unittest.TestCase):
             want_f16_lo = self.LO_HALVES[0]   # I' = J' = 0 -> P0 low half = 1.5
             want_f16_hi = self.HI_HALVES[0] + il * (self.HI_HALVES[1] - self.HI_HALVES[0]) + (
                 0.5 * jl) * (self.HI_HALVES[2] - self.HI_HALVES[0])
-            self.assertAlmostEqual(got[0], want_x, places=5)
-            self.assertAlmostEqual(got[1], want_y, places=4)
-            self.assertAlmostEqual(got[2], want_f16_lo, places=2)
-            self.assertAlmostEqual(got[3], float(struct.unpack("<e", struct.pack("<e", want_f16_hi))[0]),
-                                   places=2)
+            ref_y, _, _ = quad_jacobian_ref64(quad, lane, ii, jj, "%in_attr0", 1)
+            ref_lo, _, _ = quad_jacobian_ref64(quad, lane, 0.0, 0.0, "%in_f16h1_0", 0)
+            ref_hi, _, _ = quad_jacobian_ref64(quad, lane, il, f32(0.5 * jl), "%in_f16h1_1", 0)
+            # Channel 0 is a pristine center read: bit-exact to the smooth input word.
+            self.assertEqual(outs[lane]["%out_mrt0"][0], f32_bits(quad[lane]["%in_attr0"][0]))
+            self.assertLess(abs(got[0] - want_x), 2e-6)
+            self.assertLess(abs(got[1] - ref_y), 2e-6)
+            self.assertLess(abs(got[1] - want_y), 1e-4)
+            # On 64x64 (|alpha| + |beta| <= 32 px), 1.5 narrows to exact f16 (0 ulp); see 2048px test below for wide drift.
+            self.assertEqual(got[2], float(struct.unpack("<e", struct.pack("<e", ref_lo))[0]))
+            self.assertEqual(got[2], want_f16_lo)
+            self.assertEqual(got[3], float(struct.unpack("<e", struct.pack("<e", ref_hi))[0]))
+            self.assertLessEqual(abs(got[3] - float(struct.unpack("<e", struct.pack("<e", want_f16_hi))[0])), 2**-10)
 
     def test_j_written_between_ops_and_non_v0_v1_registers(self):
         """Computed I/J stored purely in v8/v9 (neither v0 nor v1 in frag_inputs) and J updated between p1 and p2."""
@@ -400,6 +437,108 @@ class ComputedIJDerivativeFallbackTests(unittest.TestCase):
                         self.assertLess(abs(got[1] - ref64), 2e-6)
                     # Channel 2 exports v_cvt_f32_f16(v3), where I' = J' = 0 targets LO_HALVES[0] = 1.5 (<= 1 f16 ulp).
                     self.assertLessEqual(abs(got[2] - 1.5), 2**-10)
+
+    def test_wide_2048px_perspective_extrapolation_bound_and_line_det_zero_fallback(self):
+        """Characterizes the shortcut's finite-difference amplification on a 2048px perspective triangle with P in
+        [1.5, 4096.0] (distant (0, 0) jump reaches >0.30 / >300 f16 ulps while obeying (1 + 2|alpha| + 2|beta|)*m_ulp,
+        whereas local sub-pixel shifts stay <2e-3), and verifies 1D line primitives (constant J -> det == 0) return P_c."""
+        lines = [
+            "v_add_f32_e32 v8, 0x39800000, v0",     # local sub-pixel offset I + 2^-12 (< 1 px on 2048px)
+            "v_add_f32_e32 v9, 0xb9800000, v1",     # J - 2^-12
+            "v_interp_p1_f32_e32 v4, v8, attr0.x",
+            "v_interp_p2_f32_e32 v4, v9, attr0.x",
+            "v_mov_b32_e32 v0, 0",
+            "v_mov_b32_e32 v1, 0",
+            "v_interp_p1_f32_e32 v2, v0, attr0.x",
+            "v_interp_p2_f32_e32 v2, v1, attr0.x",
+            "v_interp_p1ll_f16 v3, v0, attr1.x",
+            "v_interp_p2_f16 v3, v1, attr1.x, v3",
+            "v_cvt_f32_f16_e32 v3, v3",
+            "exp mrt0 v2, v3, v4, v2 done vm",
+            "s_endpgm",
+        ]
+        spv, _ = translate_with("ps_ij_wide_2048", lines, f16=True, bary=False)
+        self._validate_spirv(spv)
+
+        verts_2048 = ((0.0, 0.0, 1.0), (2048.0, 0.0, 1.3), (0.0, 2048.0, 1.7))
+        p_vals = (1.5, 4096.0, 5.5)
+        p10, p20 = p_vals[1] - p_vals[0], p_vals[2] - p_vals[0]
+        a0 = [tuple(f32_bits(x) for x in (p, 0.0, 0.0, 0.0)) for p in p_vals]
+        a1 = [(pack_f16_pair(p, 0.0), 0, 0, 0) for p in p_vals]
+        attrs = {0: a0, 1: a1}
+        delta = bits_f32(0x39800000)
+
+        peak_far_f32_err = 0.0
+        peak_far_f16_err = 0.0
+        for qx in (64.5, 512.5, 1024.5, 1387.5, 1750.5, 2000.5):
+            quad, ij = perspective_quad_inputs(spv, verts_2048, attrs, pixel_xy=(qx, 10.5))
+            outs = run_quad(spv, lambda lane, qs=quad: qs[lane])
+            m_ulp = max(
+                0.5 * ulp32(quad[q]["%in_attr0"][0])
+                + abs(p10) * 0.5 * ulp32(quad[q]["%bary"][1])
+                + abs(p20) * 0.5 * ulp32(quad[q]["%bary"][2])
+                for q in range(4)
+            )
+            residuals = [
+                quad[q]["%in_attr0"][0] - (p_vals[0] + quad[q]["%bary"][1] * p10 + quad[q]["%bary"][2] * p20)
+                for q in range(4)
+            ]
+            for lane in range(4):
+                got_far_f32, got_far_f16, got_local_f32, _ = [bits_f32(w) for w in outs[lane]["%out_mrt0"]]
+                ref_far, alp_far, bet_far = quad_jacobian_ref64(quad, lane, 0.0, 0.0, "%in_attr0", 0)
+                x0, x1 = lane & ~1, (lane & ~1) | 1
+                y0, y1 = lane & ~2, (lane & ~2) | 2
+                # Exact linear-functional identity on quantized inputs: ref64 - P0 == e_c + alp*(e_x1-e_x0) + bet*(e_y1-e_y0).
+                linear_err = (residuals[lane]
+                              + alp_far * (residuals[x1] - residuals[x0])
+                              + bet_far * (residuals[y1] - residuals[y0]))
+                self.assertLess(abs((ref_far - p_vals[0]) - linear_err), 1e-9)
+
+                dpx = quad[x1]["%in_attr0"][0] - quad[x0]["%in_attr0"][0]
+                dpy = quad[y1]["%in_attr0"][0] - quad[y0]["%in_attr0"][0]
+                alu_tol = 8.0 * ulp32(max(abs(quad[lane]["%in_attr0"][0]), abs(alp_far * dpx), abs(bet_far * dpy), 1.0))
+                self.assertLessEqual(abs(got_far_f32 - ref_far), alu_tol)
+                bound_far = (1.0 + 2.0 * abs(alp_far) + 2.0 * abs(bet_far)) * m_ulp + alu_tol
+                far_err = abs(got_far_f32 - p_vals[0])
+                self.assertLessEqual(far_err, bound_far)
+                peak_far_f32_err = max(peak_far_f32_err, far_err)
+                peak_far_f16_err = max(peak_far_f16_err, abs(got_far_f16 - p_vals[0]))
+
+                # Local sub-pixel offset on the same 2048px wide triangle stays small (< 2e-3).
+                it = f32(ij[lane][0] + delta)
+                jt = f32(ij[lane][1] - delta)
+                want_local = p_vals[0] + it * p10 + jt * p20
+                _, alp_loc, bet_loc = quad_jacobian_ref64(quad, lane, it, jt, "%in_attr0", 0)
+                self.assertLess(max(abs(alp_loc), abs(bet_loc)), 1.0)
+                bound_loc = (1.0 + 2.0 * abs(alp_loc) + 2.0 * abs(bet_loc)) * m_ulp + 8.0 * ulp32(want_local)
+                self.assertLessEqual(abs(got_local_f32 - want_local), bound_loc)
+                self.assertLess(abs(got_local_f32 - want_local), 2e-3)
+
+        # Pin that distant jumps across a 2048px primitive genuinely incur O(span * ulp) drift (> 300 f16 ulps at 1.5).
+        self.assertGreater(peak_far_f32_err, 0.30)
+        self.assertGreater(peak_far_f16_err, 300 * (2**-10))
+
+        # 1D line primitive: J == 0 across all 4 quad lanes -> dJ/dx = dJ/dy = 0 -> det == 0 -> returns P_c, not P(0,0).
+        line_asm = [
+            "v_mov_b32_e32 v0, 0",
+            "v_mov_b32_e32 v1, 0",
+            "v_interp_p1_f32_e32 v2, v0, attr0.x",
+            "v_interp_p2_f32_e32 v2, v1, attr0.x",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv_def, _ = translate_with("ps_line_def", line_asm, f16=False, bary=False)
+        spv_f16, _ = translate_with("ps_line_f16", line_asm, f16=True, bary=False)
+        line_bary = [(0.75, 0.25, 0.0), (0.50, 0.50, 0.0), (0.75, 0.25, 0.0), (0.50, 0.50, 0.0)]
+        line_pc = [(2.0, 0.0, 0.0, 0.0), (4.0, 0.0, 0.0, 0.0), (2.0, 0.0, 0.0, 0.0), (4.0, 0.0, 0.0, 0.0)]
+        line_pv = [(0.0, 0.0, 0.0, 0.0), (8.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)]
+        outs_def = run_quad(spv_def, lambda l: {"%bary": line_bary[l], "%in_attr0": line_pv,
+                                                "%frag_coord": (float(l & 1), float(l >> 1), 0.5, 1.0)})
+        outs_f16 = run_quad(spv_f16, lambda l: {"%bary": line_bary[l], "%in_attr0": line_pc[l],
+                                                "%frag_coord": (float(l & 1), float(l >> 1), 0.5, 1.0)})
+        for l in range(4):
+            self.assertEqual(bits_f32(outs_def[l]["%out_mrt0"][0]), 0.0)
+            self.assertEqual(bits_f32(outs_f16[l]["%out_mrt0"][0]), line_pc[l][0])
 
 
 if __name__ == "__main__":

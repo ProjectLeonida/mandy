@@ -15147,13 +15147,17 @@ class Gen:
         self.emit(f"{t} = OpBitcast %float {u}")
         return t
 
+    # shortcut: --f16-interp-fallback has no PerVertexKHR inputs, so computed (i, j) reconstructs P(i, j) from the
+    # smooth input P_c and 1-pixel OpDPdxFine / OpDPdyFine differences of (%bary.y, %bary.z, P). Binary32 rasterizer
+    # quantization on (%bary, P) (~0.5*ulp(P_c) + |P10|*0.5*ulp(I_c) + |P20|*0.5*ulp(J_c)) is amplified by the pixel
+    # step (1 + 2*|alpha| + 2*|beta|, ~|i - I_c| / |dI/dx| up to the primitive's pixel span), and det == 0 (including
+    # line primitives where J is constant across the quad) returns P_c instead of extrapolating along one axis.
     def ij_quad_eval(self, name, comp, ij):
-        """Evaluate P(i, j) = P0 + i*(P1 - P0) + j*(P2 - P0) without PerVertexKHR inputs (--f16-interp-fallback).
-        Because perspective-correct BaryCoordKHR (%bary) already absorbs 1/w, any smooth input P
-        satisfies P^(q) = P0 + I^(q)*(P1 - P0) + J^(q)*(P2 - P0) identically at every lane q of the 2x2 pixel quad.
-        %entry precomputes the uniform 2x2 screen-quad Jacobian of (I, J) and (P_c, dPdxFine, dPdyFine); each site
-        emits pure scalar ALU P_c + alpha*dPdxFine + beta*dPdyFine (falling back to P_c on a degenerate determinant),
-        so sites inside non-uniform branches or loops execute no derivative instructions."""
+        """Approximate P(i, j) = P0 + i*(P1 - P0) + j*(P2 - P0) without PerVertexKHR inputs (--f16-interp-fallback).
+        In real arithmetic perspective-correct BaryCoordKHR (%bary) makes smooth P affine in (I, J) across a 2x2 quad,
+        but binary32 quad finite differences scale input rounding by (|alpha| + |beta|) pixels and fall back to P_c on
+        a zero/subnormal/non-finite determinant. %entry precomputes the uniform 2x2 Jacobian and (P_c, dPdxFine,
+        dPdyFine) so sites inside non-uniform branches or loops execute pure scalar ALU with no derivative ops."""
         key = (name, comp)
         tag = self.ij_deriv.setdefault(key, len(self.ij_deriv))
         i, j = ij
@@ -17106,7 +17110,8 @@ def assemble(gen):
     elif gen.ij_deriv:
         fn += ["%bc = OpLoad %v3float %bary"]
     if gen.ij_deriv:
-        # Uniform %entry screen-quad barycentric Jacobian for computed-I/J pairs without PerVertexKHR.
+        # Uniform %entry screen-quad barycentric Jacobian for computed-I/J pairs without PerVertexKHR (shortcut: see
+        # Gen.ij_quad_eval for finite-difference error amplification proportional to pixel step and det == 0 -> P_c).
         # Test IEEE-754 normal range (0x00800000 <= |det|_bits < 0x7F800000) on integer bits so +-0, subnormals,
         # +-inf and NaNs fall back cleanly to P_c without OpFDiv-by-zero or MoltenVK OpFOrdNotEqual NaN hazards.
         fn += ["%ij_ic = OpCompositeExtract %float %bc 1",
@@ -17753,9 +17758,10 @@ def interp_ij_analysis(insns, g):
     between the ops, or read between them by anything but a p2's partial operand, any computed pair under
     --bary-fallback (no PerVertexKHR inputs), and a computed v_interp_*_f32 on a 16-bit-flagged interpolant
     (which half the 32-bit op reads is not established). Under --f16-interp-fallback (without --bary-fallback),
-    Gen.ij_quad_eval weights the smooth input via its %entry 2x2 screen-quad barycentric Jacobian instead of
-    refusing. Over the corpus all refused classes are empty under --f16-interp-fallback: 213 PS hold candidate
-    pairs (207 reaching), every pair sits in one block, and no partial is touched between the ops.
+    Gen.ij_quad_eval approximates P(i, j) from the smooth input via its %entry 2x2 screen-quad barycentric Jacobian
+    instead of refusing (shortcut: see Gen.ij_quad_eval). Over the corpus all refused classes are empty under
+    --f16-interp-fallback: 213 PS hold candidate pairs (207 reaching), every pair sits in one block, and no partial
+    is touched between the ops.
 
     Returns the set of attribute numbers the computed pairs need in g.per_vertex."""
     P1 = ("v_interp_p1_f32", "v_interp_p1ll_f16", "v_interp_p1lv_f16")
