@@ -38,9 +38,22 @@ public:
             const std::uint64_t start = (piece + alignment - 1) / alignment * alignment;
             const std::uint64_t lead = start - piece;
             if (lead > piece_size || size > piece_size - lead) continue;
-            erase(piece, piece_size);
-            insert(piece, lead);
-            insert(start + size, piece_size - lead - size);
+            const std::uint64_t tail = piece_size - lead - size;
+            auto size_node = by_size_.extract(it);
+            auto off_node = by_offset_.extract(piece);
+            try {
+                insert(piece, lead);
+                try {
+                    insert(start + size, tail);
+                } catch (...) {
+                    if (lead) erase(piece, lead);
+                    throw;
+                }
+            } catch (...) {
+                by_offset_.insert(std::move(off_node));
+                by_size_.insert(std::move(size_node));
+                throw;
+            }
             offset = start;
             reused = start < touched_;
             touched_ = std::max(touched_, start + size);
@@ -52,6 +65,7 @@ public:
 
     // Gives back a range allocate() returned.
     void release(std::uint64_t offset, std::uint64_t size) {
+        if (!size) return;
         in_use_ -= size;
         if (const auto next = by_offset_.lower_bound(offset); next != by_offset_.end() && offset + size == next->first) {
             const std::uint64_t next_size = next->second;
@@ -79,8 +93,13 @@ public:
 private:
     void insert(std::uint64_t offset, std::uint64_t size) {
         if (!size) return;
-        by_offset_[offset] = size;
-        by_size_.insert({size, offset});
+        const auto [it, added] = by_offset_.emplace(offset, size);
+        try {
+            by_size_.insert({size, offset});
+        } catch (...) {
+            if (added) by_offset_.erase(it);
+            throw;
+        }
     }
     void erase(std::uint64_t offset, std::uint64_t size) {
         by_offset_.erase(offset);
@@ -108,7 +127,9 @@ public:
     public:
         Range(const Range&) = delete;
         Range& operator=(const Range&) = delete;
-        ~Range() { pool_.release(*this); }
+        ~Range() {
+            if (block_) pool_.release(*this);
+        }
 
         Memory memory() const { return memory_; }
         std::uint64_t offset() const { return offset_; }
@@ -117,15 +138,21 @@ public:
 
     private:
         friend class ImageMemoryPool;
-        Range(ImageMemoryPool& pool, void* block, Memory memory, std::uint64_t offset, std::uint64_t size, bool reused)
-            : pool_(pool), block_(block), memory_(memory), offset_(offset), size_(size), reused_(reused) {}
+        explicit Range(ImageMemoryPool& pool) : pool_(pool) {}
+        void attach(void* block, Memory memory, std::uint64_t offset, std::uint64_t size, bool reused) noexcept {
+            block_ = block;
+            memory_ = memory;
+            offset_ = offset;
+            size_ = size;
+            reused_ = reused;
+        }
 
         ImageMemoryPool& pool_;
-        void* block_;
-        Memory memory_;
-        std::uint64_t offset_;
-        std::uint64_t size_;
-        bool reused_;
+        void* block_ = nullptr;
+        Memory memory_{};
+        std::uint64_t offset_ = 0;
+        std::uint64_t size_ = 0;
+        bool reused_ = false;
     };
 
     struct Stats {
@@ -146,6 +173,16 @@ public:
     // room for that block; the caller then makes its own allocation.
     std::unique_ptr<Range> allocate(std::uint32_t type, std::uint64_t size, std::uint64_t alignment,
                                     std::uint64_t block_bytes) {
+        if (!size || !alignment) return nullptr;
+        auto range = std::unique_ptr<Range>(new Range(*this));
+        struct MemoryGuard {
+            FreeFn& free_fn;
+            Memory memory{};
+            bool armed = false;
+            ~MemoryGuard() {
+                if (armed) free_fn(memory);
+            }
+        } guard{free_};
         std::lock_guard lock(mutex_);
         Type& pool = types_[type];
         std::uint64_t offset = 0;
@@ -153,24 +190,27 @@ public:
         for (const auto& block : pool.blocks) {
             if (block->ranges.largest() < size || !block->ranges.allocate(size, alignment, offset, reused)) continue;
             ++ranges_;
-            return std::unique_ptr<Range>(new Range(*this, block.get(), block->memory, offset, size, reused));
+            range->attach(block.get(), block->memory, offset, size, reused);
+            return range;
         }
         // A failed driver allocation is slow, and a full heap stays full until something is given back: do not ask for
         // another block at every texture until a range is released, or that many textures later.
         if (size > block_bytes || (pool.skip && pool.skip--)) return nullptr;
+        pool.blocks.reserve(pool.blocks.size() + 1);
         const Memory memory = allocate_(type, block_bytes);
         if (!memory) {
             pool.skip = kRetryAfter;
             return nullptr;
         }
+        guard.memory = memory;
+        guard.armed = true;
         auto block = std::make_unique<Block>(type, memory, block_bytes);
-        if (!block->ranges.allocate(size, alignment, offset, reused)) {
-            free_(memory);
-            return nullptr;
-        }
+        if (!block->ranges.allocate(size, alignment, offset, reused)) return nullptr;
         ++ranges_;
         pool.blocks.push_back(std::move(block));
-        return std::unique_ptr<Range>(new Range(*this, pool.blocks.back().get(), memory, offset, size, reused));
+        range->attach(pool.blocks.back().get(), memory, offset, size, reused);
+        guard.armed = false;
+        return range;
     }
 
     Stats stats() const {

@@ -7,12 +7,31 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <random>
 #include <set>
 #include <thread>
 #include <vector>
+
+// Single-threaded failure injection: armed only inside allocation_failures(), before threads().
+static int allocations_before_failure = -1;
+void* operator new(std::size_t size) {
+    if (allocations_before_failure == 0) {
+        allocations_before_failure = -1;
+        throw std::bad_alloc();
+    }
+    if (allocations_before_failure > 0) --allocations_before_failure;
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t size) { return operator new(size); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
 namespace {
 
@@ -155,6 +174,115 @@ void random_requests() {
     }
 }
 
+void invalid_requests() {
+    BlockRanges ranges(1000);
+    std::uint64_t a = 0;
+    bool reused = false;
+    check(ranges.allocate(100, 1, a, reused) && a == 0, "baseline range allocated");
+    ranges.release(0, 0);
+    ranges.release(100, 0);
+    check(ranges.in_use() == 100 && ranges.largest() == 900, "zero-size release leaves ranges untouched");
+
+    Driver driver;
+    Pool pool = driver.pool();
+    check(!pool.allocate(0, 0, 256, 64 * kMiB), "zero size is refused");
+    check(!pool.allocate(0, kMiB, 0, 64 * kMiB), "zero alignment is refused");
+    check(driver.allocations == 0 && driver.frees == 0 && pool.stats().blocks == 0 && pool.stats().ranges == 0,
+          "invalid requests do not ask the driver for a block");
+
+    driver.full = true;
+    check(!pool.allocate(0, kMiB, 1024, 64 * kMiB) && driver.allocations == 1, "first OOM arms retry skip");
+    for (int i = 0; i < 10; ++i) {
+        check(!pool.allocate(0, 0, 1024, 64 * kMiB), "zero size while full returns null");
+        check(!pool.allocate(0, kMiB, 0, 64 * kMiB), "zero alignment while full returns null");
+    }
+    for (int i = 0; i < 64; ++i) check(!pool.allocate(0, kMiB, 1024, 64 * kMiB), "full skip window intact");
+    check(driver.allocations == 1, "invalid requests do not consume the OOM retry skip window");
+}
+
+void allocation_failures() {
+    // BlockRanges::allocate with both a lead gap and a tail remainder must roll back cleanly on std::bad_alloc.
+    for (int fail_after = 0; fail_after < 4; ++fail_after) {
+        BlockRanges ranges(4096);
+        std::uint64_t a = 0, b = 0;
+        bool reused = false;
+        check(ranges.allocate(64, 1, a, reused) && a == 0, "seed prefix");
+        bool threw = false;
+        allocations_before_failure = fail_after;
+        try {
+            (void)ranges.allocate(128, 256, b, reused);
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        }
+        allocations_before_failure = -1;
+        check(threw, "injected BlockRanges allocation failure reached");
+        check(ranges.in_use() == 64 && ranges.largest() == 4032,
+              "failed BlockRanges::allocate preserves free space and in_use");
+        check(ranges.allocate(4032, 1, b, reused) && b == 64 && ranges.in_use() == 4096 && ranges.largest() == 0,
+              "entire remaining space is still usable after failed BlockRanges::allocate");
+    }
+
+    // ImageMemoryPool::allocate on both the new-block path and the existing-block path must not leak driver memory,
+    // corrupt stats().ranges, lose free space, or invoke free_ while holding mutex_.
+    for (bool existing_block : {false, true}) {
+        int threw_count = 0;
+        for (int fail_after = 0; fail_after < 8; ++fail_after) {
+            Driver driver;
+            {
+                Pool* pool_ptr = nullptr;
+                Pool pool(
+                    [&](std::uint32_t, std::uint64_t) -> std::uintptr_t {
+                        std::lock_guard lock(driver.mutex);
+                        ++driver.allocations;
+                        const std::uintptr_t h = driver.next++;
+                        driver.live.insert(h);
+                        return h;
+                    },
+                    [&](std::uintptr_t memory) {
+                        if (pool_ptr) (void)pool_ptr->stats();  // must not deadlock: free_ runs outside pool mutex_
+                        std::lock_guard lock(driver.mutex);
+                        ++driver.frees;
+                        check(driver.live.erase(memory) == 1, "failed allocate frees only live driver memory");
+                    });
+                pool_ptr = &pool;
+                std::unique_ptr<Pool::Range> seed;
+                if (existing_block) {
+                    seed = pool.allocate(1, 64, 1, 4096);
+                    check(seed != nullptr, "seed existing block");
+                }
+                const auto expected_blocks = existing_block ? 1u : 0u;
+                const auto expected_ranges = existing_block ? 1u : 0u;
+                bool threw = false;
+                std::unique_ptr<Pool::Range> probe;
+                allocations_before_failure = fail_after;
+                try {
+                    probe = pool.allocate(1, 128, 256, 4096);
+                } catch (const std::bad_alloc&) {
+                    threw = true;
+                }
+                allocations_before_failure = -1;
+                if (threw) {
+                    ++threw_count;
+                    check(!probe, "failed allocate returned nothing");
+                    check(pool.stats().blocks == expected_blocks && pool.stats().ranges == expected_ranges,
+                          "failed pool.allocate preserves block and range counts");
+                    check(driver.live.size() == expected_blocks, "failed pool.allocate leaks no driver memory");
+                    if (existing_block) {
+                        auto rest = pool.allocate(1, 4032, 1, 4096);
+                        check(rest && rest->offset() == 64 && pool.stats().blocks == 1,
+                              "failed existing-block allocate leaks no bytes inside the block");
+                    }
+                }
+                probe.reset();
+                seed.reset();
+                pool_ptr = nullptr;
+            }
+            check(driver.live.empty(), "pool teardown frees all driver memory after failure injection");
+        }
+        check(threw_count > 0, "injected pool.allocate failures were exercised");
+    }
+}
+
 void threads() {
     Driver driver;
     {
@@ -179,8 +307,10 @@ void threads() {
 
 int main() {
     block_ranges();
+    invalid_requests();
     shared_blocks();
     a_full_heap();
+    allocation_failures();
     random_requests();
     threads();
     if (!failures) std::printf("image memory: textures share blocks, and released ranges are used again\n");
