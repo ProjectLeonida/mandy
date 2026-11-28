@@ -8,7 +8,13 @@
 #   3. into the first journal again: both are journaled already, nothing is built;
 #   4. into the first journal as another build (LEONIDA_PIPELINE_JOURNAL_BUILD): both files are from another build,
 #      so both are built against them again and reported, and then stamped as that build's;
-#   5. as that build again: both are journaled already.
+#   5. as that build again: both are journaled already;
+#   6. with LEONIDA_DEVICE_FAULT=2 (fault info and checkpoints, no diagnostics config): when the device has either, the
+#      device-create config differs, so both files are from another device config and built against again;
+#   7. LEONIDA_DEVICE_FAULT=2 again: both are journaled already;
+#   8. with LEONIDA_DEVICE_FAULT=1: when the device has NVIDIA's diagnostics config, the pipelines are named apart and
+#      have no files yet, and both are reported as journaled only without that config;
+#   9. LEONIDA_DEVICE_FAULT=1 again: both are journaled already.
 # The verdicts are read from the output and the journal folders, since under Wine an exit status alone can look fine.
 cmake_minimum_required(VERSION 3.24)
 
@@ -33,7 +39,8 @@ file(WRITE "${TEST_DIR}/shaders/index.json"
 
 # Only what this test sets: a journal setting or helper from the caller's environment would change the counts.
 foreach(var LEONIDA_PIPELINE_JOURNAL LEONIDA_PIPELINE_CACHE_BYTES LEONIDA_PIPELINE_JOURNAL_BYTES
-            LEONIDA_PIPELINE_JOURNAL_SEED_DIR LEONIDA_PIPELINE_JOURNAL_BUILD LEONIDA_COMPILE_HELPER LEONIDA_LAZY_COMPUTE)
+            LEONIDA_PIPELINE_JOURNAL_SEED_DIR LEONIDA_PIPELINE_JOURNAL_BUILD LEONIDA_COMPILE_HELPER LEONIDA_LAZY_COMPUTE
+            LEONIDA_DEVICE_FAULT LEONIDA_AFTERMATH LEONIDA_DEVICE_MARKERS)
   unset(ENV{${var}})
 endforeach()
 file(TO_NATIVE_PATH "${TEST_DIR}/shaders" shaders)
@@ -141,6 +148,46 @@ if(journaled)
   expect_exit("another build again" 0)
   expect("another build again" "\n\\[precompile\\] done: 0 built \\(0 compiled, 0 from a cache\\), 2 journaled already, ")
   expect_not("another build again" "from another gta6rt build")
+
+  # 6. Another device-create config, same names: LEONIDA_DEVICE_FAULT=2 adds the fault and checkpoint extensions.
+  set(ENV{LEONIDA_DEVICE_FAULT} "2")
+  precompile("device fault 2" cache_all)
+  expect_exit("device fault 2" 0)
+  expect_not("device fault 2" "from another gta6rt build")
+  if(out MATCHES "device-fault: enabled \\(fault info on|checkpoints on")
+    expect("device fault 2" "\n\\[precompile\\] done: 2 built \\([0-9]+ compiled, [0-9]+ from a cache\\), 0 journaled already, ")
+    expect("device fault 2" "\n\\[precompile\\] 2 journal file\\(s\\) from this build under another device config \\([^)]*\\): [0-9]+ still found by the driver \\(now stamped with this config\\), [0-9]+ compiled again\n")
+  else()
+    message("note: no device fault extension here, so LEONIDA_DEVICE_FAULT=2 leaves the device config as it was")
+    expect("device fault 2" "\n\\[precompile\\] done: 0 built \\(0 compiled, 0 from a cache\\), 2 journaled already, ")
+  endif()
+  # 7. The same config again: its own files now.
+  precompile("device fault 2 again" cache_all)
+  expect_exit("device fault 2 again" 0)
+  expect("device fault 2 again" "\n\\[precompile\\] done: 0 built \\(0 compiled, 0 from a cache\\), 2 journaled already, ")
+  expect_not("device fault 2 again" "under another device config")
+
+  # 8. NVIDIA's diagnostics config: other names, so no files yet, and the ones without the config are reported.
+  set(ENV{LEONIDA_DEVICE_FAULT} "1")
+  precompile("device fault 1" cache_all)
+  expect_exit("device fault 1" 0)
+  if(out MATCHES "NVIDIA diagnostics config on")
+    expect("device fault 1" "\n\\[precompile\\] done: 2 built \\([0-9]+ compiled, [0-9]+ from a cache\\), 0 journaled already, ")
+    expect("device fault 1" "\n\\[precompile\\] 2 entries had a journal file only for a device without NVIDIA's diagnostics config: built for this setting\n")
+    expect_not("device fault 1" "under another device config")
+    journal_files(cache_all count)
+    if(NOT count EQUAL 4)
+      string(APPEND failures "device fault 1: ${count} journal files, not 4 (2 without, 2 with the diagnostics config)\n")
+    endif()
+    # 9. The same setting again: its own files now.
+    precompile("device fault 1 again" cache_all)
+    expect_exit("device fault 1 again" 0)
+    expect("device fault 1 again" "\n\\[precompile\\] done: 0 built \\(0 compiled, 0 from a cache\\), 2 journaled already, ")
+    expect_not("device fault 1 again" "only for a device")
+  else()
+    message("note: no NVIDIA diagnostics config here, so the LEONIDA_DEVICE_FAULT=1 checks are left out")
+  endif()
+  unset(ENV{LEONIDA_DEVICE_FAULT})
   unset(ENV{LEONIDA_PIPELINE_JOURNAL_BUILD})
 endif()
 

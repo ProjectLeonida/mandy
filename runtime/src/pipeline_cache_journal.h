@@ -17,11 +17,13 @@
 // The hash only picks the file. Whether the pipeline in it may be used is the driver's decision: it checks the blob
 // header (vendor, device, pipeline-cache UUID; checked here first too, so a driver update starts over) and its own key.
 //
-// Each file starts with a stamp naming the binary that wrote it (stamp_bytes: magic, size, a hash of the executable),
-// then the blob. The driver's own key can hold more than the header shows: on NVIDIA 621.40 files were found to give
-// hits only to the gta6rt build that wrote them. So gta6rt --precompile-pipelines counts a file as done only when this
-// binary wrote it (entry_current); a file from another build is built against again, which takes milliseconds when the
-// driver still takes it. Files without a stamp (older runtimes) are read like files from another build.
+// Each file starts with a stamp naming what wrote it (stamp_bytes: magic, size, a hash of the executable, and a hash of
+// the device-create config, vulkan_device_config.h), then the blob. The driver's own key can hold more than the header
+// shows: on NVIDIA 621.40 files were found to give hits only to the gta6rt build that wrote them, and on 621.01 files
+// written without NVIDIA's diagnostics config gave a device with it no hits. So gta6rt --precompile-pipelines counts a
+// file as done only when this binary wrote it for this device config (entry_current); any other file is built against
+// again, which takes milliseconds when the driver still takes it. Files without a stamp (older runtimes) are read like
+// files from another build.
 //
 // Upkeep (tidy, at the first pipeline of a device): staging files a killed writer left behind are removed once they are
 // ten minutes old, and past LEONIDA_PIPELINE_JOURNAL_BYTES the least recently used files go until three quarters of
@@ -56,13 +58,21 @@ inline constexpr std::uint32_t key_version = 1;
 // A file larger than this is not read (a corrupt or foreign file; one pipeline's cache is a few MiB at most).
 inline constexpr std::size_t entry_read_limit = std::size_t{256} << 20;
 
-// The stamp before the blob: "LPJ1", its own size, then the writing binary's build (little-endian, like the host).
+// The stamp before the blob: "LPJ1", its own size, the writing binary's build, then the device-create config it was
+// written under (little-endian, like the host).
 inline constexpr std::uint32_t stamp_magic = 0x314a504c;  // "LPJ1"
-inline constexpr std::size_t stamp_bytes = 16;
+inline constexpr std::size_t stamp_bytes = 24;
+
+// What wrote a file: the binary and the device-create config.
+struct Writer {
+    std::uint64_t build = 0;   // 0: the writer did not know its own build
+    std::uint64_t config = 0;  // 0: not recorded
+};
 
 struct Stamp {
     bool present = false;
-    std::uint64_t build = 0;  // 0: the writer did not know its own build
+    std::uint64_t build = 0;
+    std::uint64_t config = 0;
 };
 
 inline Stamp read_stamp(const void* data, std::size_t size) {
@@ -71,16 +81,21 @@ inline Stamp read_stamp(const void* data, std::size_t size) {
     const auto* p = static_cast<const std::uint8_t*>(data);
     if (pipeline_cache_store::read_u32(p) != stamp_magic || pipeline_cache_store::read_u32(p + 4) != stamp_bytes)
         return stamp;
+    const auto u64 = [p](std::size_t at) {
+        return std::uint64_t(pipeline_cache_store::read_u32(p + at)) |
+               (std::uint64_t(pipeline_cache_store::read_u32(p + at + 4)) << 32);
+    };
     stamp.present = true;
-    stamp.build = std::uint64_t(pipeline_cache_store::read_u32(p + 8)) |
-                  (std::uint64_t(pipeline_cache_store::read_u32(p + 12)) << 32);
+    stamp.build = u64(8);
+    stamp.config = u64(16);
     return stamp;
 }
 
-inline void put_stamp(void* out, std::uint64_t build) {
+inline void put_stamp(void* out, const Writer& writer) {
     auto* p = static_cast<std::uint8_t*>(out);
-    const std::uint64_t fields[2] = {std::uint64_t(stamp_magic) | (std::uint64_t(stamp_bytes) << 32), build};
-    for (int i = 0; i < 16; ++i) p[i] = static_cast<std::uint8_t>(fields[i / 8] >> (8 * (i % 8)));
+    const std::uint64_t fields[3] = {std::uint64_t(stamp_magic) | (std::uint64_t(stamp_bytes) << 32), writer.build,
+                                     writer.config};
+    for (std::size_t i = 0; i < stamp_bytes; ++i) p[i] = static_cast<std::uint8_t>(fields[i / 8] >> (8 * (i % 8)));
 }
 
 // 64-bit FNV-1a. Not cryptographic: it names a file, and a collision costs one compile, not a wrong pipeline.
@@ -190,6 +205,13 @@ struct EntryFile {
     bool other_build(std::uint64_t build) const {
         return !data.empty() && !(stamp.present && stamp.build && stamp.build == build);
     }
+    // `data` came from a stamped file written under another device-create config (an unstamped file says nothing of
+    // its config, and counts as from another build).
+    bool other_config(std::uint64_t config) const {
+        return !data.empty() && stamp.present && stamp.config != config;
+    }
+    // Either: not this writer's file, so a precompile builds against it again.
+    bool other_writer(const Writer& writer) const { return other_build(writer.build) || other_config(writer.config); }
 };
 
 inline EntryFile read_entry_file(const std::filesystem::path& path, const cached_pso::Identity& identity,
@@ -257,12 +279,14 @@ inline bool entry_usable(const std::filesystem::path& path, const cached_pso::Id
     return check_entry(path, identity, limit).usable;
 }
 
-// Whether the file is usable and this binary (`build`, nonzero) wrote it: what gta6rt --precompile-pipelines leaves
-// alone. A file from another build may still give the driver a hit, or may not; only building against it tells.
-inline bool entry_current(const std::filesystem::path& path, const cached_pso::Identity& identity, std::uint64_t build,
+// Whether the file is usable and this binary (`writer.build`, nonzero) wrote it under this device-create config: what
+// gta6rt --precompile-pipelines leaves alone. Any other file may still give the driver a hit, or may not; only building
+// against it tells.
+inline bool entry_current(const std::filesystem::path& path, const cached_pso::Identity& identity, const Writer& writer,
                           std::size_t limit = entry_read_limit) {
     const EntryCheck check = check_entry(path, identity, limit);
-    return check.usable && check.stamp.present && build && check.stamp.build == build;
+    return check.usable && check.stamp.present && writer.build && check.stamp.build == writer.build &&
+           check.stamp.config == writer.config;
 }
 
 enum class ReadRole { runtime, materialize_local };
@@ -451,10 +475,10 @@ inline std::error_code write_entry(const std::filesystem::path& path, const void
     return write_pipeline_cache_file(path, static_cast<const char*>(data), size);
 }
 
-// A journal file's bytes: the stamp for `build`, then the pipeline cache blob.
-inline std::vector<char> stamped(std::uint64_t build, const void* blob, std::size_t size) {
+// A journal file's bytes: the stamp for `writer`, then the pipeline cache blob.
+inline std::vector<char> stamped(const Writer& writer, const void* blob, std::size_t size) {
     std::vector<char> out(stamp_bytes + size);
-    put_stamp(out.data(), build);
+    put_stamp(out.data(), writer);
     if (size) std::memcpy(out.data() + stamp_bytes, blob, size);
     return out;
 }
