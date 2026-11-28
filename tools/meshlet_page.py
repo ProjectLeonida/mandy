@@ -76,6 +76,9 @@ import struct
 import sys
 import zlib
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # -I keeps the script directory off sys.path
+from report_paths import path_key, same_report_path as same_output_path  # noqa: E402
+
 BLOCK_MAGIC = 0x3063
 OTHER_BLOCK_MAGIC = 0x4042
 HEADER_SIZE = 0x60
@@ -915,15 +918,6 @@ def draw_binding(system, graphics, geometry):
     return {"vertex_block": vertex, "meshlet_group": index, "vertices": count}
 
 
-def same_output_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def is_scanned_input(path, input_path):
     """True when a report path is one of the files the scan reads: writing it would destroy the input."""
     if same_output_path(path, input_path):
@@ -935,9 +929,12 @@ def is_scanned_input(path, input_path):
         return True
     if not os.path.isfile(path):
         return False
-    root = os.path.normcase(os.path.abspath(input_path))
-    target = os.path.normcase(os.path.abspath(path))
-    if os.path.dirname(target) != root and not target.startswith(root + os.sep):
+    # path_key folds case on a volume that ignores it. normcase(abspath()) keeps the typed case on macOS, so a
+    # page.bin inside CARVE was not seen as inside carve.
+    root = path_key(input_path)
+    target = path_key(path)
+    prefix = root if root.endswith(os.sep) else root + os.sep
+    if target != root and not target.startswith(prefix):
         return False
     base = os.path.basename(target)
     return base.endswith(".bin") or base.endswith(".rpf")

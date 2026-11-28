@@ -1038,6 +1038,49 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("Traceback", r.stderr)
             self.assertFalse(os.path.exists(manifest))
 
+    def test_json_cannot_create_the_manifest_under_another_case(self):
+        # normcase keeps case on macOS, so carve/index.json and CARVE/index.json used to pass as two paths.
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            with open(os.path.join(carve, "0000.bin"), "wb") as fh:
+                fh.write(page(block(4)))
+            probe = os.path.join(carve, "Probe.tmp")
+            with open(probe, "wb"):
+                pass
+            insensitive = os.path.exists(os.path.join(carve, "probe.tmp"))
+            os.remove(probe)
+            if not insensitive:
+                self.skipTest("volume keeps case")
+            other = os.path.join(tmp, "CARVE", "index.json")
+            r = self.run_tool(carve, "--json", other, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertFalse(os.path.exists(os.path.join(carve, "index.json")))
+
+    def test_json_cannot_replace_a_page_under_another_case_of_the_folder(self):
+        # normcase(abspath()) keeps case on macOS, so CARVE/0000.bin was not inside carve.
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            bin_path = os.path.join(carve, "0000.bin")
+            data = page(block(4))
+            with open(bin_path, "wb") as fh:
+                fh.write(data)
+            probe = os.path.join(carve, "Probe.tmp")
+            with open(probe, "wb"):
+                pass
+            insensitive = os.path.exists(os.path.join(carve, "probe.tmp"))
+            os.remove(probe)
+            if not insensitive:
+                self.skipTest("volume keeps case")
+            other = os.path.join(tmp, "CARVE", "0000.bin")
+            r = self.run_tool(carve, "--json", other, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            with open(bin_path, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+
     def test_json_over_carve_dir_manifest_or_payload_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             carve = os.path.join(tmp, "carve")
