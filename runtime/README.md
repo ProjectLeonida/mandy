@@ -173,6 +173,15 @@ them the CPU runs them and the handler never sees them. Each emulated instructio
 hot loop of them is slow; patching such a site in place is a later step. `cpu_emulation_test` runs every form for
 real: natively on a Zen host, through the handler on an Intel one.
 
+Pre-Haswell `AVX1 + SSE4.2` hosts (Intel Sandy Bridge and Ivy Bridge) also lack VEX-encoded `BMI1`/`BMI2`, `MOVBE`,
+`LZCNT`, `F16C`, `FMA3`, and `AVX2`: `src/bmi_emulation.h` and `src/avx2_emulation.h` emulate them on `#UD`, while
+`Loader::protect_sections` compiles verified `>=5`-byte `BMI1`, `BMI2`, `MOVBE`, `FMA3` and `AVX2` sites ahead of time
+into in-place `AVX1` VEX rewrites or near native `AVX1`/`x86-64` stubs (`src/isa_jit_patch.h`, disabled with
+`LEONIDA_ISA_PATCH=0`; `LEONIDA_ISA_FUSE_4B=1` opts in to forward-fusing 4-byte `0xC5` `AVX2` sites across unmarked
+instruction boundaries) and patches `.pdata` and leaf `TZCNT`/`LZCNT` sites (`F3 0F BC`/`F3 0F BD`, which otherwise
+execute without faulting as `BSF`/`BSR`) to stubs or `#UD` traps (`LEONIDA_LZCNT_PATCH=0` disables the `LZCNT`/`TZCNT`
+rewrite).
+
 `module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
 reuse, existing ACP aliases, the wide and case-insensitive lookups, export execution, and path errors. On native Windows with Python available,
 `run_module_names` compares original renamed EXEs through native execution and `--dry-run`, `--init`,
