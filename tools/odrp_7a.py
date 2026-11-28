@@ -43,6 +43,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 SIGNATURE = b"0DRP"
 VERSION = 0x7A
@@ -1179,15 +1180,6 @@ def _positive_bytes_arg(text):
     return value
 
 
-def _same_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def _is_rpf_file(path):
     if not os.path.isfile(path) or os.path.getsize(path) < 4:
         return path.lower().endswith(".rpf")
@@ -1218,19 +1210,19 @@ def main(argv=None):
     parent = os.path.dirname(os.path.abspath(args.out))
     if not os.path.isdir(parent):
         ap.error(f"{parent} is not a folder, so {args.out} cannot be written")
-    if _same_path(args.source, args.out):
+    if same_report_path(args.source, args.out):
         ap.error("output must not overwrite the source")
 
     if os.path.isdir(args.source):
         if args.start is not None or args.limit is not None:
             ap.error("--start and --limit apply to an .rpf archive, not a directory")
         manifest = os.path.join(args.source, "index.json")
-        if os.path.isfile(manifest) and _same_path(manifest, args.out):
+        if os.path.isfile(manifest) and same_report_path(manifest, args.out):
             ap.error(f"output would overwrite the carve manifest: {args.out}")
         if os.path.isfile(args.out):
             for name in os.listdir(args.source):
                 cand = os.path.join(args.source, name)
-                if _is_carved_file(cand) and _same_path(cand, args.out):
+                if _is_carved_file(cand) and same_report_path(cand, args.out):
                     ap.error(f"output would overwrite an input file: {args.out}")
     elif os.path.isfile(args.source):
         is_rpf = _is_rpf_file(args.source)
