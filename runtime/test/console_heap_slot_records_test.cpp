@@ -768,6 +768,114 @@ int none_to_none_and_idempotent_fast_path() {
     return 0;
 }
 
+// Live texture callback: fires ONLY on kTexture kSettled 0 <-> 1 transitions per address per heap across attach,
+// detach, clear/clear_range, overwrite, reset(), move, and destructor (never on waiting states or V# records).
+int texture_live_callback() {
+    using R = ConsoleHeapSlotRecords;
+    struct Tracker {
+        std::map<std::uint64_t, int> live_heaps;
+        std::vector<std::pair<std::uint64_t, bool>> events;
+        static void on_live(void* user, std::uint64_t addr, bool bound) {
+            auto* self = static_cast<Tracker*>(user);
+            self->events.emplace_back(addr, bound);
+            if (bound) {
+                ++self->live_heaps[addr];
+            } else {
+                const auto it = self->live_heaps.find(addr);
+                if (it != self->live_heaps.end()) {
+                    if (--it->second == 0) self->live_heaps.erase(it);
+                } else {
+                    self->live_heaps[addr] = -1;  // underflow sentinel
+                }
+            }
+        }
+    } tracker;
+
+    constexpr std::uint64_t kTexA = 0x100001000ull;
+    constexpr std::uint64_t kTexB = 0x100002000ull;
+    constexpr std::uint64_t kTexC = 0x100003000ull;
+    constexpr std::uint64_t kTexWait = 0x100004000ull;
+
+    {
+        R heap1, heap2;
+        heap1.set_texture_live_callback(&Tracker::on_live, &tracker);
+        heap2.set_texture_live_callback(&Tracker::on_live, &tracker);
+        heap1.reset(64);
+        heap2.reset(64);
+
+        // Waiting T# and V# records at the same address never trigger callbacks.
+        heap1.set_texture(0, R::texture_waiting, kTexWait);
+        heap1.set_texture(1, R::texture_waiting_room, kTexWait);
+        heap1.set(2, 0, R::resolved, kTexA, 256, kArena + 0x1000);
+        EXPECT(tracker.events.empty() && tracker.live_heaps.empty());
+
+        // 0 -> 1 on kTexA fires (kTexA, true); 1 -> 2 and idempotent rewrite do not fire.
+        heap1.set_texture(3, R::texture_bound, kTexA);
+        EXPECT(tracker.events.size() == 1 && tracker.events.back() == std::make_pair(kTexA, true));
+        EXPECT(tracker.live_heaps.at(kTexA) == 1);
+        heap1.set_texture(4, R::texture_bound, kTexA);
+        heap1.set_texture(3, R::texture_bound, kTexA);
+        EXPECT(tracker.events.size() == 1);
+
+        // Second heap binding kTexA increments live_heaps[kTexA] to 2.
+        heap2.set_texture(10, R::texture_bound, kTexA);
+        EXPECT(tracker.events.size() == 2 && tracker.live_heaps.at(kTexA) == 2);
+
+        // One slot in heap1 transitions bound -> waiting: slot 4 still holds kTexA, so no false event yet.
+        heap1.set_texture(3, R::texture_waiting, kTexA);
+        EXPECT(tracker.events.size() == 2 && tracker.live_heaps.at(kTexA) == 2);
+
+        // Last slot in heap1 switches kTexA -> kTexB: fires (kTexA, false) then (kTexB, true).
+        heap1.set_texture(4, R::texture_bound, kTexB);
+        EXPECT(tracker.events.size() == 4);
+        EXPECT(tracker.events[2] == std::make_pair(kTexA, false));
+        EXPECT(tracker.events[3] == std::make_pair(kTexB, true));
+        EXPECT(tracker.live_heaps.at(kTexA) == 1 && tracker.live_heaps.at(kTexB) == 1);
+
+        // Overwriting kTexB with a V# fires (kTexB, false).
+        heap1.set(4, 0, R::resolved, 0x8000, 64, kArena + 0x8000);
+        EXPECT(tracker.events.size() == 5 && tracker.events.back() == std::make_pair(kTexB, false));
+        EXPECT(tracker.live_heaps.count(kTexB) == 0);
+
+        // Re-bind kTexB and kTexC in heap1, then clear_range drops kTexB only.
+        heap1.set_texture(5, R::texture_bound, kTexB);
+        heap1.set_texture(8, R::texture_bound, kTexC);
+        EXPECT(tracker.live_heaps.at(kTexB) == 1 && tracker.live_heaps.at(kTexC) == 1);
+        heap1.clear_range(5, 7);
+        EXPECT(tracker.live_heaps.count(kTexB) == 0 && tracker.live_heaps.at(kTexC) == 1);
+
+        // reset() notifies kTexC unbound (and NOT kTexWait), and keeps callback active afterward.
+        const std::size_t before_reset = tracker.events.size();
+        heap1.reset(32);
+        EXPECT(tracker.events.size() == before_reset + 1 && tracker.events.back() == std::make_pair(kTexC, false));
+        EXPECT(tracker.live_heaps.count(kTexC) == 0);
+
+        // Post-reset binding works, and move leaves moved-from silent.
+        heap1.set_texture(1, R::texture_bound, kTexC);
+        EXPECT(tracker.live_heaps.at(kTexC) == 1);
+        R moved_heap(std::move(heap1));
+        EXPECT(tracker.live_heaps.at(kTexC) == 1);
+
+        // Destructors of moved_heap (kTexC) and heap2 (kTexA) unbind both cleanly.
+    }
+    EXPECT(tracker.live_heaps.empty());
+
+    // Detaching callback with nullptr before destruction suppresses teardown callbacks.
+    {
+        R silent;
+        silent.set_texture_live_callback(&Tracker::on_live, &tracker);
+        silent.reset(16);
+        silent.set_texture(0, R::texture_bound, kTexA);
+        EXPECT(tracker.live_heaps.at(kTexA) == 1);
+        const std::size_t before_detach = tracker.events.size();
+        silent.set_texture_live_callback(nullptr, nullptr);
+        silent.reset(0);
+        EXPECT(tracker.events.size() == before_detach);
+    }
+    std::printf("texture_live_callback: ok\n");
+    return 0;
+}
+
 int main() {
     if (release_looks_at_its_slots_only()) return 1;
     if (cases()) return 1;
@@ -781,6 +889,7 @@ int main() {
     if (deferred_clear_and_repeated_answers()) return 1;
     if (waiting_source_added_and_tsharp_clear()) return 1;
     if (none_to_none_and_idempotent_fast_path()) return 1;
+    if (texture_live_callback()) return 1;
     std::printf("console_heap_slot_records_test: ok\n");
     return 0;
 }

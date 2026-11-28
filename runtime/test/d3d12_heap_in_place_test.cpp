@@ -422,6 +422,44 @@ int test() {
         EXPECT(!(late_out[0] | late_out[1] | late_out[2] | late_out[3]));
     }
 
+    // 10. With a live console resource heap (console_heap_count > 0), unpromoted slot-133 BC placements sharing
+    //     zero_sampled_image deduplicate onto a single bindless slot, and promoting one gives it a private slot
+    //     while leaving the other intact on the shared zero slot.
+    {
+        constexpr UINT width = 32, height = 32, pitch = width / 4 * 8;
+        void* bc_pages = VirtualAlloc(nullptr, 2 * kPage64k, MEM_RESERVE, PAGE_NOACCESS);
+        EXPECT(bc_pages);
+        D3D12_RESOURCE_DESC bc_desc{};
+        bc_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        bc_desc.Width = width;
+        bc_desc.Height = height;
+        bc_desc.DepthOrArraySize = bc_desc.MipLevels = bc_desc.SampleDesc.Count = 1;
+        bc_desc.Format = DXGI_FORMAT_BC1_UNORM;
+        Ref<ID3D12Resource> bc_a, bc_b;
+        EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(device.p, bc_pages, bc_desc, 0,
+                                                                  IID_PPV_ARGS(&bc_a.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(
+            device.p, static_cast<char*>(bc_pages) + kPage64k, bc_desc, 0, IID_PPV_ARGS(&bc_b.p))));
+        std::uint32_t av[8]{}, bv[8]{};
+        device.p->CreateShaderResourceView(bc_a.p, nullptr, {reinterpret_cast<SIZE_T>(av)});
+        device.p->CreateShaderResourceView(bc_b.p, nullptr, {reinterpret_cast<SIZE_T>(bv)});
+        const std::uint32_t first = rt::d3d12::bindless_hash_lookup(device.p, av);
+        const std::uint32_t second = rt::d3d12::bindless_hash_lookup(device.p, bv);
+        const bool shared = !rt::d3d12::vulkan_memory_flags(bc_a.p);
+        EXPECT(first && second);
+        if (shared) EXPECT(first == second);
+        std::array<std::uint8_t, pitch * height / 4> pattern{};
+        for (std::size_t i = 0; i < pattern.size(); ++i) pattern[i] = std::uint8_t(i * 11 + 37);
+        EXPECT(SUCCEEDED(bc_a.p->WriteToSubresource(0, nullptr, pattern.data(), pitch, UINT(pattern.size()))));
+        EXPECT(rt::d3d12::vulkan_memory_flags(bc_a.p));
+        const std::uint32_t private_a = rt::d3d12::bindless_hash_lookup(device.p, av);
+        EXPECT(private_a && (!shared || private_a != first));
+        EXPECT(rt::d3d12::bindless_hash_lookup(device.p, bv) == second);
+        bc_a.reset();
+        bc_b.reset();
+        EXPECT(VirtualFree(bc_pages, 0, MEM_RELEASE));
+    }
+
     // 3. The null slots after the heap.
     std::uint32_t tail[64]{};
     std::memset(tail, 0xff, sizeof(tail));
