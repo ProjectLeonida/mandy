@@ -12,14 +12,11 @@
 # is changed. LEONIDA_* variables already set win over the defaults below.
 set -eu
 
-dxvk=files/lib/wine/dxvk/x86_64-windows
-proton_vkd3d=files/lib/wine/vkd3d-proton/x86_64-windows
-
 proton_problem() {
     if [ ! -x "$1/files/bin/wine" ]; then
         echo "no files/bin/wine"
     elif [ ! -d "$1/files/lib/wine" ] && [ ! -d "$1/files/lib64/wine" ]; then
-        echo "incomplete, no files/lib/wine"
+        echo "incomplete, no files/lib/wine or files/lib64/wine"
     fi
 }
 
@@ -28,7 +25,25 @@ proton_ok() {
 }
 
 proton_dxvk() {
-    [ -f "$1/$dxvk/dxgi.dll" ]
+    for lib_dir in "$1/files/lib/wine/dxvk/x86_64-windows" "$1/files/lib64/wine/dxvk/x86_64-windows" \
+                   "$1/files/lib64/wine/dxvk"; do
+        if [ -f "$lib_dir/dxgi.dll" ]; then
+            printf '%s\n' "$lib_dir"
+            return 0
+        fi
+    done
+    return 1
+}
+
+proton_new_vkd3d() {
+    for lib_dir in "$1/files/lib/wine/vkd3d-proton/x86_64-windows" "$1/files/lib64/wine/vkd3d-proton/x86_64-windows" \
+                   "$1/files/lib64/wine/vkd3d-proton"; do
+        if vkd3d_new_structurizer "$lib_dir"; then
+            printf '%s\n' "$lib_dir"
+            return 0
+        fi
+    done
+    return 1
 }
 
 proton_name() {
@@ -108,7 +123,7 @@ vkd3d_new_structurizer() {
 proton_with_new_vkd3d() {
     { [ -z "$proton" ] || printf '%s\n' "$proton"; ranked_protons | cut -f 2-; } |
     while IFS= read -r dir; do
-        if vkd3d_new_structurizer "$dir/$proton_vkd3d"; then
+        if proton_new_vkd3d "$dir" >/dev/null; then
             printf '%s\n' "$dir"
             break
         fi
@@ -142,8 +157,7 @@ find_dxgi() {
         dxgi_label="DXVK's dxgi from $dxgi_dir (LEONIDA_DXVK)"
         return
     fi
-    if [ -n "$proton" ] && proton_dxvk "$proton"; then
-        dxgi_dir=$proton/$dxvk
+    if [ -n "$proton" ] && dxgi_dir=$(proton_dxvk "$proton"); then
         dxgi_label="DXVK's dxgi"
         return
     fi
@@ -159,10 +173,10 @@ find_dxgi() {
         return
     fi
     found=$(all_protons | cut -f 1,2 | while IFS= read -r line; do
-        if proton_dxvk "$(printf '%s\n' "$line" | cut -f 2-)"; then printf '%s\n' "$line"; break; fi
+        if proton_dxvk "$(printf '%s\n' "$line" | cut -f 2-)" >/dev/null; then printf '%s\n' "$line"; break; fi
     done)
     if [ -n "$found" ]; then
-        dxgi_dir=$(printf '%s\n' "$found" | cut -f 2-)/$dxvk
+        dxgi_dir=$(proton_dxvk "$(printf '%s\n' "$found" | cut -f 2-)")
         dxgi_label="DXVK's dxgi of $(printf '%s\n' "$found" | cut -f 1)"
         return
     fi
@@ -288,8 +302,8 @@ fi
 if [ -z "${LEONIDA_VKD3D:-}" ] && ! vkd3d_new_structurizer "$vkd3d"; then
     vkd3d_from=$(proton_with_new_vkd3d)
     if [ -n "$vkd3d_from" ]; then
-        vkd3d=$vkd3d_from/$proton_vkd3d
-        vkd3d_build=$(sed -n '1s/.*(\(.*\)).*/\1/p' "$vkd3d_from/${proton_vkd3d%/*}/version" 2>/dev/null || true)
+        vkd3d=$(proton_new_vkd3d "$vkd3d_from")
+        vkd3d_build=$(sed -n '1s/.*(\(.*\)).*/\1/p' "${vkd3d%/x86_64-windows}/version" 2>/dev/null || true)
         vkd3d_label="the VKD3D-Proton of $(proton_name "$vkd3d_from")${vkd3d_build:+ ($vkd3d_build)}"
     elif [ -f "$vkd3d/d3d12core.dll" ]; then
         echo "Leonida: the bundled VKD3D-Proton lacks dxil-spirv's new structurizer, and the Vulkan driver can" \
@@ -307,10 +321,11 @@ for dll in d3d12.dll d3d12core.dll; do
     fi
 done
 if [ -n "$proton" ]; then
-    for dir in "$proton/files/lib/wine" "$proton/files/lib/vkd3d"; do
+    for dir in "$proton/files/lib/wine" "$proton/files/lib/vkd3d" "$proton/files/lib64/wine" \
+               "$proton/files/lib64/vkd3d"; do
         if [ -d "$dir" ]; then WINEDLLPATH=$dir${WINEDLLPATH:+:$WINEDLLPATH}; fi
     done
-    for dir in "$proton/files/lib/i386-linux-gnu" "$proton/files/lib/x86_64-linux-gnu"; do
+    for dir in "$proton/files/lib/i386-linux-gnu" "$proton/files/lib/x86_64-linux-gnu" "$proton/files/lib64"; do
         if [ -d "$dir" ]; then LD_LIBRARY_PATH=$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}; fi
     done
     export WINEDLLPATH LD_LIBRARY_PATH
@@ -322,7 +337,8 @@ export WINEARCH=win64
 stamp=$WINEPREFIX/.leonida-proton
 system32=$WINEPREFIX/drive_c/windows/system32
 if [ ! -d "$system32" ] || [ "$(cat "$stamp" 2>/dev/null)" != "$wine_label $runner" ] ||
-   { [ -n "$proton" ] && [ -f "$proton/files/lib/vkd3d/x86_64-windows/libvkd3d-1.dll" ] &&
+   { [ -n "$proton" ] && { [ -f "$proton/files/lib/vkd3d/x86_64-windows/libvkd3d-1.dll" ] ||
+                           [ -f "$proton/files/lib64/vkd3d/x86_64-windows/libvkd3d-1.dll" ]; } &&
      [ ! -f "$system32/libvkd3d-1.dll" ]; }; then
     if [ -d "$system32" ]; then
         echo "Leonida: updating its Wine prefix in $WINEPREFIX for $wine_label"

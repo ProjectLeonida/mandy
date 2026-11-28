@@ -121,9 +121,9 @@ The script takes `LEONIDA_PROTON` (a Proton folder or its `files/bin/wine`), els
 as `wine`), else the usable Proton build with the highest version, else `wine` on `PATH`. Every folder with
 `files/bin/wine` counts as a Proton build, whatever its name, in Steam's `compatibilitytools.d` and `steamapps/common`
 (all libraries, Flatpak and Snap too), `STEAM_EXTRA_COMPAT_TOOLS_PATHS` and the system's `compatibilitytools.d`; it is
-usable when it also has `files/lib/wine`; others are left out. Builds are ranked by the numbers in their version.
-`--find-proton` prints the Proton or Wine the script would use, `--list-protons` every usable build; neither changes
-anything.
+usable when it also has `files/lib/wine` or `files/lib64/wine`; others are left out. Builds are ranked by the numbers
+in their version. `--find-proton` prints the Proton or Wine the script would use, `--list-protons` every usable build;
+neither changes anything.
 
 The game needs DXVK's `dxgi.dll`: with Wine's own (on `wined3d`) it crashes when it creates its swap chain, and Wine's
 own `d3d12.dll` (vkd3d) creates no device for it. The `dxgi.dll` comes from the Proton; if it has none, or under the

@@ -150,8 +150,8 @@ class PlayLinuxTest(unittest.TestCase):
         self.assertEqual(missing.returncode, 1)
         self.assertIn("LEONIDA_RUNTIME", missing.stderr)
 
-    def proton_vkd3d(self, core, build=None):
-        folder = self.proton / PROTON_VKD3D
+    def proton_vkd3d(self, core, build=None, lib="lib"):
+        folder = self.proton / "files" / lib / PROTON_VKD3D.relative_to(Path("files", "lib"))
         folder.mkdir(parents=True)
         (folder / "d3d12.dll").write_bytes(b"MZ proton d3d12")
         (folder / "d3d12core.dll").write_bytes(core)
@@ -171,6 +171,30 @@ class PlayLinuxTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("the VKD3D-Proton of proton (vkd3d-1.1-9999-g0123abcd)", result.stdout)
         self.assertNotIn("structurizer", result.stderr)
+        for dll in ("d3d12.dll", "d3d12core.dll"):
+            self.assertEqual(self.installed(dll), (folder / dll).read_bytes())
+
+    def test_a_proton_vkd3d_under_lib64_replaces_the_bundled_one(self):
+        self.touch(CROSS)
+        self.vkd3d(TARGET / "vkd3d-proton")
+        folder = self.proton_vkd3d(NEW_STRUCTURIZER, "vkd3d-1.1-9999-g0123abcd", lib="lib64")
+        result = self.play()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("the VKD3D-Proton of proton (vkd3d-1.1-9999-g0123abcd)", result.stdout)
+        for dll in ("d3d12.dll", "d3d12core.dll"):
+            self.assertEqual(self.installed(dll), (folder / dll).read_bytes())
+
+    def test_an_old_layout_proton_vkd3d_under_lib64_replaces_the_bundled_one(self):
+        self.touch(CROSS)
+        self.vkd3d(TARGET / "vkd3d-proton")
+        folder = self.proton / "files" / "lib64" / "wine" / "vkd3d-proton"
+        folder.mkdir(parents=True)
+        (folder / "d3d12.dll").write_bytes(b"MZ proton d3d12")
+        (folder / "d3d12core.dll").write_bytes(NEW_STRUCTURIZER)
+        (folder / "version").write_text(" 0123abcd vkd3d-proton (vkd3d-1.1-9999-g0123abcd)\n", encoding="utf-8")
+        result = self.play()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("the VKD3D-Proton of proton (vkd3d-1.1-9999-g0123abcd)", result.stdout)
         for dll in ("d3d12.dll", "d3d12core.dll"):
             self.assertEqual(self.installed(dll), (folder / dll).read_bytes())
 
@@ -285,11 +309,11 @@ class PlayLinuxProtonTest(unittest.TestCase):
         self.game.parent.mkdir()
         self.game.write_bytes(b"MZ")
 
-    def proton(self, folder, version=None, dxvk=True, wine=True, lib=True):
+    def proton(self, folder, version=None, dxvk=True, wine=True, lib=True, lib_name="lib"):
         folder = Path(folder)
         (folder / "files" / "bin").mkdir(parents=True)
         if lib:
-            (folder / "files" / "lib" / "wine").mkdir(parents=True, exist_ok=True)
+            (folder / "files" / lib_name / "wine").mkdir(parents=True, exist_ok=True)
         if wine:
             stub = folder / "files" / "bin" / "wine"
             stub.write_text(PROTON_WINE, encoding="utf-8", newline="\n")
@@ -298,8 +322,9 @@ class PlayLinuxProtonTest(unittest.TestCase):
             server.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8", newline="\n")
             server.chmod(0o755)
         if dxvk:
-            (folder / DXVK).mkdir(parents=True)
-            (folder / DXVK / "dxgi.dll").write_bytes(b"dxvk dxgi " + folder.name.encode())
+            dxgi = folder / "files" / lib_name / DXVK.relative_to(Path("files", "lib"))
+            dxgi.mkdir(parents=True)
+            (dxgi / "dxgi.dll").write_bytes(b"dxvk dxgi " + folder.name.encode())
         if version is not None:
             (folder / "version").write_text(version + "\n", encoding="utf-8")
         return folder
@@ -443,6 +468,52 @@ class PlayLinuxProtonTest(unittest.TestCase):
                          f"{real / 'vkd3d'}:{real / 'wine'}:/extra/dlls")
         self.assertEqual(Path(str(self.log) + ".ldpath").read_text(encoding="utf-8").strip(),
                          f"{real / 'x86_64-linux-gnu'}:{real / 'i386-linux-gnu'}:/extra/lib")
+
+    def test_a_proton_with_only_lib64_is_listed_found_and_runs_with_its_own_libraries(self):
+        proton = self.proton(self.steam / "compatibilitytools.d" / "Proton-lib64", "1 GE-Proton99-4",
+                             lib_name="lib64")
+        lib64 = proton / "files" / "lib64"
+        (lib64 / "vkd3d" / "x86_64-windows").mkdir(parents=True)
+        listed = self.run_script("--list-protons")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn(str(proton.resolve()), listed.stdout)
+        self.assertEqual(self.found(), ("GE-Proton99-4", proton.resolve()))
+        p = self.run_script(str(self.game), WINEDLLPATH="/extra/dlls", LD_LIBRARY_PATH="/extra/lib")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("with DXVK's dxgi", p.stdout)
+        real = lib64.resolve()
+        self.assertEqual(Path(str(self.log) + ".dllpath").read_text(encoding="utf-8").strip(),
+                         f"{real / 'vkd3d'}:{real / 'wine'}:/extra/dlls")
+        self.assertEqual(Path(str(self.log) + ".ldpath").read_text(encoding="utf-8").strip(), f"{real}:/extra/lib")
+        system32 = self.home / ".local" / "share" / "leonida" / "prefix" / "drive_c" / "windows" / "system32"
+        self.assertEqual((system32 / "dxgi.dll").read_bytes(),
+                         (lib64 / "wine" / "dxvk" / "x86_64-windows" / "dxgi.dll").read_bytes())
+        self.assert_system_wine_unused()
+
+    def test_with_lib_and_lib64_the_lib64_libraries_come_first(self):
+        proton = self.proton(self.steam / "compatibilitytools.d" / "GE-Proton99-4", "1 GE-Proton99-4")
+        for lib in ("lib", "lib64"):
+            for sub in ("wine", "vkd3d"):
+                (proton / "files" / lib / sub).mkdir(parents=True, exist_ok=True)
+        p = self.run_script(str(self.game))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        real = (proton / "files").resolve()
+        self.assertEqual(Path(str(self.log) + ".dllpath").read_text(encoding="utf-8").strip(),
+                         f"{real / 'lib64' / 'vkd3d'}:{real / 'lib64' / 'wine'}:{real / 'lib' / 'vkd3d'}:"
+                         f"{real / 'lib' / 'wine'}")
+
+    def test_an_old_layout_proton_dxvk_under_lib64_is_used(self):
+        proton = self.proton(self.steam / "compatibilitytools.d" / "Proton-5", "1 proton-5.13-6", dxvk=False,
+                             lib_name="lib64")
+        dxvk = proton / "files" / "lib64" / "wine" / "dxvk"
+        dxvk.mkdir(parents=True)
+        (dxvk / "dxgi.dll").write_bytes(b"dxvk dxgi old layout")
+        p = self.run_script(str(self.game))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("with DXVK's dxgi", p.stdout)
+        system32 = self.home / ".local" / "share" / "leonida" / "prefix" / "drive_c" / "windows" / "system32"
+        self.assertEqual((system32 / "dxgi.dll").read_bytes(), b"dxvk dxgi old layout")
+        self.assert_system_wine_unused()
 
     def test_the_vkd3d_shader_cache_goes_to_the_leonida_cache(self):
         self.proton(self.steam / "compatibilitytools.d" / "GE-Proton99-4", "1 GE-Proton99-4")
