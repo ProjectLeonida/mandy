@@ -288,7 +288,7 @@ public:
     void set(Address key, Address first, Address bytes) {
         erase(key);
         if (!bytes) return;
-        const Address last = first + std::min(bytes - 1, UINT64_MAX - first);
+        const Address last = first + (std::min)(bytes - 1, UINT64_MAX - first);
         const unsigned shift = unsigned(std::bit_width(first ^ last));
         const Address number = page(first, shift);
         pages_[shift][{number, key}] = {first, last};
@@ -319,7 +319,7 @@ inline void merge_title_writes(TitleWriteRanges& writes) {
     for (const auto [begin, end] : writes) {
         if (begin >= end) continue;
         if (count && begin <= writes[count - 1].second)
-            writes[count - 1].second = std::max(writes[count - 1].second, end);
+            writes[count - 1].second = (std::max)(writes[count - 1].second, end);
         else
             writes[count++] = {begin, end};
     }
@@ -344,7 +344,7 @@ template<class Registry>
 std::vector<std::pair<std::uint64_t, typename Registry::mapped_type>> title_texture_snapshot(
     const Registry& textures, std::uint64_t start = 0, std::size_t limit = SIZE_MAX) {
     std::vector<std::pair<std::uint64_t, typename Registry::mapped_type>> entries;
-    const auto count = std::min(textures.size(), limit);
+    const auto count = (std::min)(textures.size(), limit);
     entries.reserve(count);
     for (auto it = textures.lower_bound(start); it != textures.end() && entries.size() < count; ++it)
         entries.emplace_back(it->first, it->second);

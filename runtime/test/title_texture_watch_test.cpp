@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <deque>
 #include <map>
 #include <set>
 #include <vector>
@@ -693,9 +694,228 @@ int main() {
             EXPECT(leonida::mirror_range_sum_bytes(buf.data(), sz) == direct);
         }
     }
+    {  // examine_batch(): batched arming with arm_batch()-capable watch, deduplication of shared tiles & mutual alias
+       // peers, contiguous address ordering, busy > unwatched > armed precedence, hot tiles, and fallback without
+       // arm_batch().
+        struct BatchFakeWatch : FakeWatch {
+            std::uint64_t batch_calls = 0;
+            std::uint64_t batch_tiles_total = 0;
+            std::vector<std::uintptr_t> last_batch_vas;
+            void arm_batch(const std::uintptr_t* tiles, Cell* const* cells, std::int8_t* results, std::size_t count) {
+                ++batch_calls;
+                batch_tiles_total += count;
+                last_batch_vas.assign(tiles, tiles + count);
+                for (std::size_t i = 0; i < count; ++i) {
+                    const int r = arm(tiles[i], *cells[i]);
+                    results[i] = static_cast<std::int8_t>(r > 0 ? 1 : (r == 0 ? 0 : -1));
+                }
+            }
+        };
+        using BatchWatch = leonida::TitleTextureWatch<BatchFakeWatch>;
+        BatchFakeWatch bf;
+        BatchWatch bw(bf);
+
+        // Textures 1 & 2 share tile 0; texture 3 covers contiguous tiles 1..4; texture 4 & 5 are mutual aliases (tiles
+        // 10 and 20); texture 6 covers tiles 30 (unarmable) & 31 (pinned) to verify busy > unwatched precedence.
+        bw.track(1, base + 0 * kTile, 0x4000);
+        bw.track(2, base + 0 * kTile + 0x8000, 0x4000);
+        bw.track(3, base + 1 * kTile, 4 * kTile);
+        bf.alias[base + 10 * kTile] = {base + 20 * kTile};
+        bf.alias[base + 20 * kTile] = {base + 10 * kTile};
+        bw.track(4, base + 10 * kTile, kTile);
+        bw.track(5, base + 20 * kTile, kTile);
+        bf.unarmable.insert(base + 30 * kTile);
+        bf.pinned.insert(base + 31 * kTile);
+        bw.track(6, base + 30 * kTile, 2 * kTile);
+
+        std::vector<std::uint64_t> keys;
+        bw.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{1, 2, 3, 4, 5, 6}));
+
+        std::vector<BatchWatch::BatchExamine> results;
+        bw.examine_batch(keys, results);
+        bw.update_idle_hint();
+        EXPECT(results.size() == 6);
+        EXPECT(bf.batch_calls == 1);  // ALL 6 textures armed in ONE single arm_batch() call!
+        // Unique tiles armed: 0, 1, 2, 3, 4, 10, 20, 30, 31 = 9 unique tiles (shared tile 0 and mutual aliases 10/20
+        // deduplicated!), sorted in ascending address order for contiguous VirtualProtect coalescing.
+        EXPECT(bf.last_batch_vas.size() == 9);
+        EXPECT(std::is_sorted(bf.last_batch_vas.begin(), bf.last_batch_vas.end()));
+        EXPECT(results[0].look == BatchWatch::Look::armed && results[0].written.size() == 1);
+        EXPECT(results[1].look == BatchWatch::Look::armed && results[1].written.size() == 1);
+        EXPECT(results[2].look == BatchWatch::Look::armed && results[2].written.size() == 4);
+        EXPECT(results[3].look == BatchWatch::Look::armed && results[3].written.size() == 1);
+        EXPECT(results[4].look == BatchWatch::Look::armed && results[4].written.size() == 1);
+        // Texture 6 has tile 30 unarmable (-1) AND tile 31 pinned (0): busy MUST override unwatched!
+        EXPECT(results[5].look == BatchWatch::Look::busy && results[5].written.size() == 2);
+
+        // Release pin on tile 31 while tile 30 stays unarmable: texture 6 now reports Look::unwatched.
+        bf.pinned.clear();
+        keys.clear();
+        bw.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{6}));
+        bw.examine_batch(keys, results);
+        EXPECT(results.size() == 1 && results[0].look == BatchWatch::Look::unwatched);
+
+        // Clear unarmable too: texture 6 arms cleanly and steady state goes quiet.
+        bf.unarmable.clear();
+        keys.clear();
+        bw.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{6}));
+        bw.examine_batch(keys, results);
+        EXPECT(results.size() == 1 && results[0].look == BatchWatch::Look::armed);
+        keys.clear();
+        bw.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT(keys.empty());
+
+        // Duplicate tiles in write queue: tile 0 pushed 10 times still names textures 1 & 2 once each with 1 tile in
+        // written and 1 unique arm in arm_batch().
+        bf.write(base + 0 * kTile);
+        for (int dup = 0; dup < 9; ++dup) bf.queue.push_back(base + 0 * kTile);
+        const std::uint64_t calls_before = bf.batch_calls;
+        keys.clear();
+        bw.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{1, 2}));
+        bw.examine_batch(keys, results);
+        EXPECT(bf.batch_calls == calls_before + 1);
+        EXPECT(bf.last_batch_vas.size() == 1 && bf.last_batch_vas[0] == base + 0 * kTile);
+        EXPECT(results[0].look == BatchWatch::Look::armed && results[0].written.size() == 1);
+        EXPECT(results[1].look == BatchWatch::Look::armed && results[1].written.size() == 1);
+
+        // Peer busy > primary unwatched precedence: primary tile 10 unarmable (-1), peer tile 20 pinned (0) -> busy!
+        bf.write(base + 10 * kTile);
+        bf.unarmable.insert(base + 10 * kTile);
+        bf.pinned.insert(base + 20 * kTile);
+        keys.clear();
+        bw.collect([&](std::uint64_t k) { keys.push_back(k); });
+        EXPECT((keys == V{4, 5}));
+        bw.examine_batch(keys, results);
+        EXPECT(results[0].look == BatchWatch::Look::busy);
+        EXPECT(results[1].look == BatchWatch::Look::busy);
+        bf.unarmable.clear();
+        bf.pinned.clear();
+        keys.clear();
+        bw.collect([&](std::uint64_t k) { keys.push_back(k); });
+        bw.examine_batch(keys, results);
+
+        // Fallback examine_batch() on Watch WITHOUT arm_batch() (FakeWatch): identical semantics.
+        FakeWatch ff;
+        Watch fw(ff);
+        fw.track(1, base, 2 * kTile);
+        fw.track(2, base + kTile, kTile);
+        keys.clear();
+        fw.collect([&](std::uint64_t k) { keys.push_back(k); });
+        std::vector<Watch::BatchExamine> fres;
+        fw.examine_batch(keys, fres);
+        EXPECT(fres.size() == 2 && fres[0].look == Watch::Look::armed && fres[1].look == Watch::Look::armed);
+        EXPECT(fres[0].written.size() == 2 && fres[1].written.size() == 1);
+    }
+    {  // 41k-texture / 81k-tile / 350-written-tile microbenchmark: verifies collect() + examine_batch() throughput
+       // and arm_batch() syscall coalescing vs per-tile examine() at realistic open-world scale.
+        struct ScaleBatchWatch {
+            struct Cell {
+                std::atomic<std::uint64_t> version{1}, mapping{1};
+            };
+            std::deque<Cell> pool;
+            std::unordered_map<std::uintptr_t, std::size_t> index;
+            std::vector<std::uintptr_t> queue;
+            std::uint64_t arm_calls = 0;
+            std::uint64_t batch_calls = 0;
+            std::uint64_t contiguous_runs = 0;
+
+            Cell* acquire(std::uintptr_t tile) {
+                auto [it, fresh] = index.try_emplace(tile, pool.size());
+                if (fresh) pool.emplace_back();
+                return &pool[it->second];
+            }
+            void release(std::uintptr_t) {}
+            int arm(std::uintptr_t, Cell&) {
+                ++arm_calls;
+                return 1;
+            }
+            void arm_batch(const std::uintptr_t* tiles, Cell* const*, std::int8_t* results, std::size_t count) {
+                ++batch_calls;
+                for (std::size_t i = 0; i < count; ++i) {
+                    if (i == 0 || tiles[i] != tiles[i - 1] + kTile) ++contiguous_runs;
+                    results[i] = 1;
+                }
+            }
+            void aliases(std::uintptr_t, std::vector<std::uintptr_t>&) {}
+            void hot_tiles(std::vector<std::uintptr_t>& out) { out.clear(); }
+            void take_written(std::vector<std::uintptr_t>& out, bool& lost) {
+                out.swap(queue);
+                queue.clear();
+                lost = false;
+            }
+            bool enabled() const { return true; }
+            bool has_written() const { return !queue.empty(); }
+            std::uint64_t hot_generation() const { return 0; }
+        };
+        ScaleBatchWatch sw_watch;
+        leonida::TitleTextureWatch<ScaleBatchWatch> sw(sw_watch);
+        constexpr std::size_t kTextures = 41000;  // 41k textures over ~81k tiles
+        std::uintptr_t cursor = base;
+        std::vector<std::uintptr_t> texture_tiles;
+        texture_tiles.reserve(kTextures);
+        for (std::size_t i = 0; i < kTextures; ++i) {
+            const std::size_t ntiles = (i % 10 == 0) ? 1 : ((i % 10 == 1) ? 3 : 2);
+            sw.track(i + 1, cursor, ntiles * kTile);
+            texture_tiles.push_back(cursor);
+            cursor += ntiles * kTile;
+        }
+        EXPECT(sw.textures() == kTextures && sw.tiles() >= 81000);
+        // Initial arm pass via examine_batch.
+        std::vector<std::uint64_t> named;
+        sw.collect([&](std::uint64_t k) { named.push_back(k); });
+        std::vector<leonida::TitleTextureWatch<ScaleBatchWatch>::BatchExamine> batch_out;
+        sw.examine_batch(named, batch_out);
+        EXPECT(named.size() == kTextures);
+        EXPECT(sw_watch.batch_calls == 1);
+
+        // Simulate 200 passes: 350 written tiles/pass (300 unrelated buffer tiles + 50 watched texture tiles in
+        // contiguous runs across ~35 textures).
+        constexpr std::size_t kPasses = 200;
+        const std::uintptr_t buf_base = base + 0x400000000ull;
+        sw_watch.batch_calls = 0;
+        sw_watch.contiguous_runs = 0;
+        std::uint64_t serial = 2;
+        std::size_t total_named = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (std::size_t p = 0; p < kPasses; ++p) {
+            sw_watch.queue.clear();
+            for (std::size_t b = 0; b < 300; ++b) sw_watch.queue.push_back(buf_base + ((p * 37 + b) % 4096) * kTile);
+            const std::size_t start_tex = (p * 173) % (kTextures - 64);
+            for (std::size_t k = 0; k < 25; ++k) {
+                const std::uintptr_t a0 = texture_tiles[start_tex + k];
+                const std::uintptr_t a1 = a0 + kTile;
+                sw_watch.pool[sw_watch.index.at(a0)].version.store(++serial, std::memory_order_relaxed);
+                sw_watch.queue.push_back(a0);
+                if (const auto it = sw_watch.index.find(a1); it != sw_watch.index.end()) {
+                    sw_watch.pool[it->second].version.store(++serial, std::memory_order_relaxed);
+                    sw_watch.queue.push_back(a1);
+                }
+            }
+            named.clear();
+            sw.collect([&](std::uint64_t k) { named.push_back(k); });
+            sw.examine_batch(named, batch_out);
+            sw.update_idle_hint();
+            total_named += named.size();
+        }
+        const auto elapsed_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        const double per_pass_ms = double(elapsed_us) / 1000.0 / double(kPasses);
+        EXPECT(sw_watch.batch_calls == kPasses);
+        EXPECT(sw_watch.contiguous_runs < kPasses * 10);  // ~50 tiles coalesced into <= 3 contiguous runs/pass!
+        EXPECT(total_named >= kPasses * 25);
+        EXPECT(per_pass_ms < 0.25);
+        std::printf("41k-tex/81k-tile/350-written bench: %.4f ms/pass (%zu passes, %.1f contiguous runs/pass, %zu "
+                    "named/pass)\n",
+                    per_pass_ms, kPasses, double(sw_watch.contiguous_runs) / double(kPasses), total_named / kPasses);
+    }
     if (failures) return 1;
     std::puts("title texture watch: new, untouched, one page, two addresses, remap, every frame, unarmable, kernel "
               "write in progress, lost queue, O(1) fast-path, buffer-hot decoupling, 1-tile hash-before-reserve, "
-              "note_changed arm-skip, 86k-tile region index, hot_generation skip, non_hot_arms, mirror piece hash");
+              "note_changed arm-skip, 86k-tile region index, hot_generation skip, non_hot_arms, mirror piece hash, "
+              "examine_batch, 41k-tex scale bench");
     return 0;
 }
