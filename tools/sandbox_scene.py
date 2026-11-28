@@ -18,8 +18,10 @@ Usage: `python -I tools/sandbox_scene.py --help` lists the options.
 import argparse
 import math
 import os
+import stat
 import struct
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dds_png  # noqa: E402
@@ -159,10 +161,31 @@ def build(args):
             break
     z = sorted(stats.pop("z")) or [0.0]
     center = [args.center[0], args.center[1], z[len(z) // 2]]
-    with open(args.out, "wb") as f:
-        f.write(b"LSB1" + struct.pack("<4I3f", 1, len(textures), len(meshes), len(draws), *center))
-        for blob in textures + meshes + draws:
-            f.write(blob)
+    try:
+        output_mode = stat.S_IMODE(os.stat(args.out).st_mode)
+    except FileNotFoundError:
+        current_umask = os.umask(0)
+        os.umask(current_umask)
+        output_mode = 0o666 & ~current_umask
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(args.out)),
+                                     prefix="." + os.path.basename(args.out) + ".")
+    try:
+        os.chmod(tmp_path, output_mode)
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"LSB1" + struct.pack("<4I3f", 1, len(textures), len(meshes), len(draws), *center))
+            for blob in textures + meshes + draws:
+                f.write(blob)
+        os.replace(tmp_path, args.out)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     stats.update(textures=len(textures), meshes=len(meshes), draws=len(draws), center=center,
                  selected_rows=counts["selected"])
     return stats
