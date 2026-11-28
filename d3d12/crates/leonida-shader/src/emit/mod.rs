@@ -94,6 +94,7 @@ mod lds_exact;
 mod lds_flags;
 mod lds_init;
 mod lower;
+pub mod mesh_vs;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
@@ -127,10 +128,12 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna, take_pack_why};
+pub use lower::{host_settings, mesh_as_compute, set_host_max_wave, set_host_mesh_shaders, set_host_rdna, take_pack_why};
+pub use mesh_vs::mesh_vs;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, MeshOut, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
+    MESH_OUT_BYTES, MESH_OUT_HEADER, SLOT_MESH_IN, SLOT_MESH_OUT, SLOT_STRIDES,
     SLOT_STRIDE_CONSTANT, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_PACK_GROUPS, USER_PACK_X, USER_PACK_Y, PACK_FOLD, pack_grid, pack_group, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constant_marks, constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -543,6 +546,10 @@ pub struct HostShader {
     /// descriptor picked at run time keeps the float path (its slot, and so
     /// its format, is known only then).
     pub half_views: Vec<(u8, u32)>,
+    /// A mesh program lowered as compute ([`set_host_mesh_shaders`]): the
+    /// shader is `cs_6_6` and writes what its outputs would to the root UAV
+    /// [`SLOT_MESH_OUT`] in this layout; [`mesh_vs::mesh_vs`] reads it back.
+    pub mesh_out: Option<MeshOut>,
 }
 
 impl HostShader {
@@ -1276,6 +1283,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        mesh_compute: matches!(native.io, crate::native::StageIo::Ms(_)) && lower::host_mesh_compute(),
     })?;
     let counted = match early {
         EarlyDepth::NotAsked => None,
@@ -1309,6 +1317,7 @@ fn emit_program(
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
         half_views: l.half_views,
+        mesh_out: l.mesh_out,
     };
     Ok((shader, wave_size))
 }
@@ -1783,6 +1792,7 @@ mod tests {
                 outputs,
                 prims: vec![],
                 mesh_stride: 0,
+                mesh_compute: false,
             })
             .unwrap();
             let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
@@ -2218,6 +2228,7 @@ mod tests {
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            mesh_out: None,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -2231,6 +2242,7 @@ mod tests {
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
                 half_views: Vec::new(),
+                mesh_out: None,
             })
         };
         let ps = file("LEONIDA_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2390,6 +2402,7 @@ mod tests {
                         stride: 0,
                         size: (16, 16),
                         mesh_groups: 1,
+                        vertex_count: 0,
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
@@ -2515,6 +2528,75 @@ mod tests {
         }
     }
 
+    /// On a host without mesh shaders a mesh program translates as compute
+    /// (`D3D12-MESH-COMPUTE-FALLBACK`): no output signatures, the root UAV
+    /// [`SLOT_MESH_OUT`], and the layout of its outputs: one position (16
+    /// bytes a vertex) and three indices (12 bytes a primitive) for each of
+    /// its 32 vertices and primitives. dxil.dll, where there is one, takes
+    /// the module for every primitive export the native path takes.
+    #[test]
+    fn a_mesh_program_translates_as_compute_without_mesh_shaders() {
+        #[cfg(windows)]
+        let mut validator = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        super::lower::TEST_MESH_COMPUTE.set(Some(true));
+        for prim in [
+            TRIANGLE,
+            TRIANGLE | EDGE_FLAGS,
+            TRIANGLE | EDGE_FLAGS | CULL,
+        ] {
+            let cs = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            let layout = cs.mesh_out.as_ref().unwrap_or_else(|| panic!("{prim:#x}: no layout"));
+            assert_eq!(
+                (
+                    layout.max_vertices,
+                    layout.max_primitives,
+                    layout.vertex_stride,
+                    layout.primitive_stride
+                ),
+                (32, 32, 16, 12),
+                "{prim:#x}"
+            );
+            assert_eq!((&layout.vertex_at[..], &layout.primitive_at[..]), (&[0][..], &[][..]), "{prim:#x}");
+            // The mesh program's position, for the pass-through vertex shader.
+            let position = signature(&layout.osg1).unwrap();
+            assert_eq!(position.len(), 1, "{prim:#x}");
+            assert_eq!((position[0].kind, position[0].cols), (3, 4), "{prim:#x}");
+            assert!(cs.root_uavs.contains(&SLOT_MESH_OUT), "{prim:#x}: {:?}", cs.root_uavs);
+            let c = Container::parse(&cs.dxil).unwrap();
+            // A compute shader's output signature is there and empty.
+            let outputs = c.part(FourCC::OSG1).map(|p| signature(p.data).unwrap());
+            assert_eq!(outputs, Some(vec![]), "{prim:#x}");
+            assert!(c.part(FourCC::PSG1).is_none(), "{prim:#x}");
+            #[cfg(windows)]
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut cs.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            }
+        }
+        // Its pass-through vertex shader: SV_VertexID in, the program's
+        // position out (register for register), and dxil.dll takes it.
+        let cs = triangle_mesh(TRIANGLE).unwrap();
+        let vs = mesh_vs(cs.mesh_out.as_ref().unwrap(), None).unwrap();
+        let c = Container::parse(&vs).unwrap();
+        let inputs = signature(c.part(FourCC::ISG1).unwrap().data).unwrap();
+        assert_eq!(inputs.iter().map(|e| (e.kind, e.comp)).collect::<Vec<_>>(), [(1, 5), (2, 5)]);
+        let outputs = signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        assert_eq!(outputs.iter().map(|e| (e.kind, e.row, e.cols)).collect::<Vec<_>>(), [(3, Some(0), 4)]);
+        #[cfg(windows)]
+        if let Some(v) = validator.as_mut() {
+            v.validate(&mut vs.clone()).unwrap_or_else(|e| panic!("mesh_vs: {e}"));
+        }
+        // The same program on a host with mesh shaders stays one.
+        super::lower::TEST_MESH_COMPUTE.set(Some(false));
+        let ms = triangle_mesh(TRIANGLE).unwrap();
+        assert_eq!(ms.mesh_out, None);
+        assert!(!ms.root_uavs.contains(&SLOT_MESH_OUT));
+        super::lower::TEST_MESH_COMPUTE.set(None);
+    }
+
     /// A triangle mesh program on the host GPU and on WARP (where they have
     /// mesh shaders): triangle (0, 1, 2) covers the target with its corners'
     /// edge flags set as without them; with the culling bit, nothing is lit.
@@ -2573,6 +2655,7 @@ mod tests {
                             stride: 0,
                             size: (16, 16),
                             mesh_groups: 1,
+                            vertex_count: 0,
                         },
                     )
                     .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
@@ -2591,6 +2674,145 @@ mod tests {
         }
         if ran == 0 {
             eprintln!("no device with mesh shaders; skipped");
+        }
+    }
+
+    /// `D3D12-MESH-COMPUTE-FALLBACK` on a device: the triangle mesh program
+    /// run as compute, then drawn as a triangle list with its pass-through
+    /// vertex shader, lights the texels the mesh pipeline lights (all of
+    /// them in the pixel shader's colour, none when the program culls its
+    /// triangle), with or without edge flags. Where the device has mesh
+    /// shaders the two draws are compared texel for texel; the fallback
+    /// itself needs none (WARP, or a shader model 6.6 card).
+    #[test]
+    #[cfg(windows)]
+    fn a_mesh_program_run_as_compute_draws_what_the_mesh_pipeline_draws() {
+        use super::host::{Dispatch, Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_ALL,
+            D3D12_SHADER_VISIBILITY_MESH, D3D12_SHADER_VISIBILITY_VERTEX,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ps = constant_color();
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            // SAFETY: the query writes the structure of the given size.
+            let queried = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            let mesh_shaders =
+                queried.is_ok() && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+            let draw = |roots, mesh_groups, vertex_count| Draw {
+                roots,
+                textures: &[],
+                samplers: &[],
+                vertices: &[],
+                stride: 0,
+                size: (16, 16),
+                mesh_groups,
+                vertex_count,
+            };
+            for (prim, culled) in [
+                (TRIANGLE, false),
+                (TRIANGLE | EDGE_FLAGS, false),
+                (TRIANGLE | EDGE_FLAGS | CULL, true),
+            ] {
+                // The program as compute: its outputs into the root UAV.
+                super::lower::TEST_MESH_COMPUTE.set(Some(true));
+                let cs = triangle_mesh(prim);
+                super::lower::TEST_MESH_COMPUTE.set(None);
+                let cs = cs.unwrap();
+                let layout = cs.mesh_out.clone().unwrap();
+                let root = host
+                    .root_signature_for(&[(&cs, D3D12_SHADER_VISIBILITY_ALL)])
+                    .unwrap();
+                let pso = host
+                    .compute_pipeline_with(&root, &cs.dxil)
+                    .unwrap_or_else(|e| panic!("{label}: compute pipeline: {e}"));
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![
+                                (0, Root::Constants(vec![0])),
+                                (1, Root::Uav((MESH_OUT_HEADER + layout.group_bytes()) / 4)),
+                            ],
+                            views: &[],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch: {e}"));
+                let written = out.last().unwrap().clone();
+                // Drawn with the pass-through vertex shader.
+                let vs = mesh_vs(&layout, Some(&ps)).unwrap();
+                let vs_shader = HostShader {
+                    stage: HwStage::Vs,
+                    dxil: vs.clone(),
+                    user_data: vec![],
+                    samplers: vec![],
+                    static_samplers: vec![],
+                    root_cbvs: vec![],
+                    root_srvs: vec![SLOT_MESH_IN],
+                    root_uavs: vec![],
+                    root_indexed_views: vec![],
+                    half_views: vec![],
+                    mesh_out: None,
+                };
+                let root = host
+                    .root_signature_for(&[(&vs_shader, D3D12_SHADER_VISIBILITY_VERTEX)])
+                    .unwrap();
+                let pso = host
+                    .pipeline_with(&root, &vs, &ps)
+                    .unwrap_or_else(|e| panic!("{label}: pass-through pipeline: {e}"));
+                let roots = vec![
+                    (0, Root::Constants(vec![0])),
+                    (1, Root::View { srv: true, data: written }),
+                ];
+                let texels = host
+                    .draw(&root, &pso, &draw(roots, 0, 3 * layout.max_primitives))
+                    .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+                let lit = texels.iter().filter(|t| t[3] != 0.0).count();
+                if culled {
+                    assert_eq!(lit, 0, "{label}, {prim:#x}: a culled triangle lit texels");
+                } else {
+                    assert!(
+                        texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+                        "{label}, {prim:#x}: {lit} of 256 texels lit"
+                    );
+                }
+                if mesh_shaders {
+                    let ms = triangle_mesh(prim).unwrap();
+                    let root = host
+                        .root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])
+                        .unwrap();
+                    let pso = host
+                        .mesh_pipeline_with(&root, &ms.dxil, &ps)
+                        .unwrap_or_else(|e| panic!("{label}: mesh pipeline: {e}"));
+                    let native = host
+                        .draw(&root, &pso, &draw(vec![(0, Root::Constants(vec![0]))], 1, 0))
+                        .unwrap_or_else(|e| panic!("{label}: mesh draw: {e}"));
+                    assert_eq!(texels, native, "{label}, {prim:#x}: the fallback and the mesh pipeline differ");
+                }
+            }
+            eprintln!("{label}: the mesh program drew as compute (mesh shaders there: {mesh_shaders})");
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("no SM 6.6 device; skipped");
         }
     }
 
@@ -2815,6 +3037,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            mesh_compute: false,
         })
         .unwrap();
         // The calls that read the SRV: 28 a dword, 7 with four a call.
@@ -2841,6 +3064,7 @@ mod tests {
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            mesh_out: None,
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -2944,6 +3168,7 @@ mod tests {
                 outputs: Vec::new(),
                 prims: Vec::new(),
                 mesh_stride: 0,
+                mesh_compute: false,
             })
             .unwrap();
             super::shader::CONSTANTS_RAW_HERE.set(None);
@@ -2977,6 +3202,7 @@ mod tests {
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
                 half_views: Vec::new(),
+                mesh_out: None,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let views: Vec<super::host::View> = if raw {
@@ -3103,6 +3329,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            mesh_compute: false,
         })
         .unwrap();
         let mut dxil = l.dxil;
@@ -3125,6 +3352,7 @@ mod tests {
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
                 half_views: l.half_views,
+                mesh_out: None,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -3563,6 +3791,7 @@ mod barycentric_tests {
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            mesh_out: None,
         };
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.
@@ -3605,6 +3834,7 @@ mod barycentric_tests {
                             stride: 32,
                             size: (8, 8),
                             mesh_groups: 0,
+                            vertex_count: 0,
                         },
                     )
                     .expect("draw partial interpolation");
