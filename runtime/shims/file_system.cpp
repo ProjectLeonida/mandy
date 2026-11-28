@@ -43,6 +43,7 @@
 #include "file_system.h"
 #include "shims.h"
 #include "startup_trace.h"
+#include "io_trace.h"  // LEONIDA_IO_TRACE
 #include "../src/title_page_watch.h"
 
 namespace rt::fs {
@@ -1713,6 +1714,7 @@ using namespace rt::fs;
 // fails with ERROR_NOACCESS (998), and the title's read loop sleeps 1 ms and retries forever (measured on 1.0.2.1,
 // native Windows). Touching the pages from user mode commits them; the read is then retried once.
 BOOL WINAPI read_file(HANDLE file, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVERLAPPED overlapped) {
+    rt::io_trace::note_read_file(file, bytes, overlapped);
     if (leonida::kernel_writes::read_file(file, buffer, bytes, read, overlapped)) return TRUE;
     if (GetLastError() != ERROR_NOACCESS || !buffer || !bytes) return FALSE;
     static std::atomic<bool> logged{false};
@@ -1724,10 +1726,12 @@ BOOL WINAPI read_file(HANDLE file, LPVOID buffer, DWORD bytes, LPDWORD read, LPO
 }
 BOOL WINAPI read_file_ex(HANDLE file, LPVOID buffer, DWORD bytes, LPOVERLAPPED overlapped,
                          LPOVERLAPPED_COMPLETION_ROUTINE routine) {
+    rt::io_trace::note_read_file(file, bytes, overlapped);
     return leonida::kernel_writes::read_file_ex(file, buffer, bytes, overlapped, routine);
 }
 BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWORD bytes, LPDWORD reserved,
                               LPOVERLAPPED overlapped) {
+    rt::io_trace::note_read_file(file, bytes, overlapped);
     return leonida::kernel_writes::read_file_scatter(file, segments, bytes, reserved, overlapped);
 }
 

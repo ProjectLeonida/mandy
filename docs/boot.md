@@ -126,6 +126,13 @@ Useful switches:
   diagnostic).
 * `LEONIDA_DEVICE_FAULT=1` enables Vulkan device-loss diagnostics and checkpoints where available. The first
   observed loss prints a `[rt] device-fault:` report to stderr.
+* `LEONIDA_IO_TRACE=<file>` writes one line for every read the title asks for (`runtime/shims/io_trace.h`):
+  - `ds`: a DirectStorage request, with its file, file offset, source and destination sizes, zlib and BCPack, and the
+    request's name;
+  - `rf`: a ReadFile, ReadFileEx or ReadFileScatter on a disk file, with its path, offset and size.
+
+  Each line starts with the local time, as the `mem-probe` lines do. Each line is flushed at once and the file can be
+  read while the game runs, so the last reads before a crash or a device loss name what the title was loading.
 * `LEONIDA_TITLE_HUD=1` shows live counters in the title bar of the window the title presents in
   (`runtime/shims/title_hud.h`). It updates twice a second with:
   - the frame rate and the average and worst frame time from PresentX, or, when no frame came in that half
