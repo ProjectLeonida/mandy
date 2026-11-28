@@ -215,10 +215,29 @@ def _fold_scalar_alu(op, x, y):
         offset = y & 31
         width = min((y >> 16) & 0x7F, 32 - offset)
         return ((x & 0xFFFFFFFF) >> offset) & ((1 << width) - 1)
+    if op == "s_bfe_i32":
+        offset = y & 31
+        width = min((y >> 16) & 0x7F, 32 - offset)
+        if width == 0:
+            return 0
+        raw = ((x & 0xFFFFFFFF) >> offset) & ((1 << width) - 1)
+        sign_bit = 1 << (width - 1)
+        return ((raw ^ sign_bit) - sign_bit) & 0xFFFFFFFF
     if op == "s_min_u32":
         return min(x & 0xFFFFFFFF, y & 0xFFFFFFFF)
     if op == "s_max_u32":
         return max(x & 0xFFFFFFFF, y & 0xFFFFFFFF)
+    if op in ("s_min_i32", "s_max_i32"):
+        xu, yu = x & 0xFFFFFFFF, y & 0xFFFFFFFF
+        sx = xu - 0x100000000 if xu & 0x80000000 else xu
+        sy = yu - 0x100000000 if yu & 0x80000000 else yu
+        return (min(sx, sy) if op == "s_min_i32" else max(sx, sy)) & 0xFFFFFFFF
+    if op == "s_pack_ll_b32_b16":
+        return ((x & 0xFFFF) | ((y & 0xFFFF) << 16)) & 0xFFFFFFFF
+    if op == "s_pack_lh_b32_b16":
+        return ((x & 0xFFFF) | (y & 0xFFFF0000)) & 0xFFFFFFFF
+    if op == "s_pack_hh_b32_b16":
+        return (((x & 0xFFFFFFFF) >> 16) | (y & 0xFFFF0000)) & 0xFFFFFFFF
     return None
 
 
@@ -371,6 +390,16 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
         if c is not None:
             signed = c - 0x100000000 if c & 0x80000000 else c
             new_sym[a[0]["r"]] = ("const", abs(signed) & 0xFFFFFFFF)  # abs(0x80000000) stays 0x80000000
+    elif op in ("s_sext_i32_i8", "s_sext_i32_i16") and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+        c = _const_of(sym, a[1])
+        if c is not None:
+            if op == "s_sext_i32_i8":
+                b = c & 0xFF
+                val = ((b ^ 0x80) - 0x80) & 0xFFFFFFFF
+            else:
+                h = c & 0xFFFF
+                val = ((h ^ 0x8000) - 0x8000) & 0xFFFFFFFF
+            new_sym[a[0]["r"]] = ("const", val)
     elif op == "v_readfirstlane_b32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
         if a[1]["k"] == "vgpr" and a[1].get("n", 1) == 1 and a[1]["r"] in vscale:
             new_scale[a[0]["r"]] = vscale[a[1]["r"]]
@@ -387,7 +416,7 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
             cx, cy = _const_of(sym, a[1]), _const_of(sym, a[2])
             if cx is not None and cy is not None:
                 new_sym[d] = ("const", ((cx << LSHL_ADD_SHIFT[op]) + cy) & 0xFFFFFFFF)
-    elif op in ("s_add_u32", "s_add_i32", "s_sub_u32", "s_sub_i32") and len(a) >= 3 and a[0]["k"] == "sgpr":
+    elif op in ("s_add_u32", "s_add_i32", "s_sub_u32", "s_sub_i32") and len(a) >= 3 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
         d = a[0]["r"]
         cx, cy = _const_of(sym, a[1]), _const_of(sym, a[2])
         if cx is not None and cy is not None:
@@ -396,10 +425,10 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
             tx = sym.get(a[1]["r"]) if a[1]["k"] == "sgpr" and a[1].get("n", 1) == 1 else None
             ty = sym.get(a[2]["r"]) if a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1 else None
             ux, uy = _user_of(tx), _user_of(ty)
-            sx = scale.get(a[1]["r"], frozenset()) if a[1]["k"] == "sgpr" else frozenset()
-            sy = scale.get(a[2]["r"], frozenset()) if a[2]["k"] == "sgpr" else frozenset()
-            psx = ptr_stride.get(a[1]["r"], frozenset()) if a[1]["k"] == "sgpr" else frozenset()
-            psy = ptr_stride.get(a[2]["r"], frozenset()) if a[2]["k"] == "sgpr" else frozenset()
+            sx = scale.get(a[1]["r"], frozenset()) if a[1]["k"] == "sgpr" and a[1].get("n", 1) == 1 else frozenset()
+            sy = scale.get(a[2]["r"], frozenset()) if a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1 else frozenset()
+            psx = ptr_stride.get(a[1]["r"], frozenset()) if a[1]["k"] == "sgpr" and a[1].get("n", 1) == 1 else frozenset()
+            psy = ptr_stride.get(a[2]["r"], frozenset()) if a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1 else frozenset()
             if ux is not None and uy is None:
                 new_sym[d] = ("user_off", ux)
                 if psx or sy:
@@ -412,7 +441,7 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                 new_scale[d] = sx
             elif op.startswith("s_add") and sy and cx is not None:
                 new_scale[d] = sy
-    elif op in ("s_addc_u32", "s_subb_u32") and len(a) >= 3 and a[0]["k"] == "sgpr":
+    elif op in ("s_addc_u32", "s_subb_u32") and len(a) >= 3 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
         d = a[0]["r"]
         tx = sym.get(a[1]["r"]) if a[1]["k"] == "sgpr" and a[1].get("n", 1) == 1 else None
         ty = sym.get(a[2]["r"]) if a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1 else None
@@ -426,7 +455,9 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
             new_sym[d] = ("const", 0)
     elif op in ("s_lshl_b32", "s_lshr_b32", "s_mul_i32", "s_and_b32", "s_or_b32", "s_xor_b32",
                 "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32", "s_ashr_i32",
-                "s_bfm_b32", "s_bfe_u32", "s_min_u32", "s_max_u32") and len(a) >= 3 and a[0]["k"] == "sgpr":
+                "s_bfm_b32", "s_bfe_u32", "s_bfe_i32", "s_min_u32", "s_max_u32",
+                "s_min_i32", "s_max_i32", "s_pack_ll_b32_b16", "s_pack_lh_b32_b16",
+                "s_pack_hh_b32_b16") and len(a) >= 3 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
         d = a[0]["r"]
         cx, cy = _const_of(sym, a[1]), _const_of(sym, a[2])
         if cx is not None and cy is not None:
