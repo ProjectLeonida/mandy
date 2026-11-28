@@ -1268,6 +1268,26 @@ class HalfFloatTests(unittest.TestCase):
         raw = zlib.decompress(b"".join(p for t, p, _ in chunks if t == b"IDAT"))
         self.assertEqual(raw[1:], bytes((255, 0, 128, 255, 0, 255, 64, 128)))
 
+    def test_cli_cleanup_restores_write_mode_on_replace_failure(self):
+        payload = halves(0x3C00, 0x0000, 0x3800, 0x3C00, 0x7E00, 0x7C00, 0x3400, 0x3800)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.dds")
+            dst = os.path.join(tmp, "out.png")
+            with open(src, "wb") as f:
+                f.write(dds_buffer(2, 1, payload, pitch=16, dxgi=10, **HALF_FLOAT))
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def track_chmod(p, mode, **kwargs):
+                chmod_calls.append((p, mode))
+                return real_chmod(p, mode, **kwargs)
+
+            with mock.patch.object(dds.os, "replace", side_effect=OSError("replace failed")), \
+                 mock.patch.object(dds.os, "chmod", side_effect=track_chmod):
+                ret = dds.main([src, dst])
+                self.assertEqual(ret, 1)
+            self.assertTrue(any(mode == 0o600 for p, mode in chmod_calls))
+
 
 if __name__ == "__main__":
     unittest.main()
