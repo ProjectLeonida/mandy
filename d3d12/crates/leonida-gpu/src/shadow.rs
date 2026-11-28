@@ -3672,6 +3672,9 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    // The spare buffers of copies of views' own bytes that no copy took for
+    // the PC memory's idle time go too, whether or not there are windows.
+    let_go_idle_spares(crate::host::ram_idle_ms(crate::host::available_physical_ram()));
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -6546,15 +6549,17 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let width = len.next_multiple_of(256);
     let spare = {
         let mut spare = EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        for shadow in gone.drain(..) {
-            if spare.len() < SPARE_MOST && shadow.place.is_none() {
-                spare.push((shadow.width(), shadow.buffer.clone(), shadow.data as usize));
-            }
+        if !gone.is_empty() {
+            let let_go = gone
+                .drain(..)
+                .filter(|shadow| shadow.place.is_none())
+                .map(|shadow| (shadow.width(), shadow.buffer.clone(), shadow.data as usize));
+            park(&mut spare, let_go, crate::host::coarse_ms());
         }
         spare.iter().position(|(w, ..)| *w == width).map(|i| spare.swap_remove(i))
     };
     let (buffer, data) = match spare {
-        Some((_, buffer, data)) => (buffer, data as *mut u8),
+        Some((_, buffer, data, _)) => (buffer, data as *mut u8),
         None => host()?.shared_buffer(width)?,
     };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
@@ -6575,11 +6580,57 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
-/// Leonida: buffers of copies [`exact`] let go, with their widths and where
-/// they are mapped, for its next copies of the same width.
-static EXACT_SPARE: Mutex<Vec<(u64, ID3D12Resource, usize)>> = Mutex::new(Vec::new());
+/// Leonida: buffers of copies [`exact`] let go, for its next copies of the
+/// same width.
+static EXACT_SPARE: Mutex<Vec<Spare<ID3D12Resource>>> = Mutex::new(Vec::new());
+/// A spare buffer: its width, the buffer, where it is mapped, and when it
+/// was parked ([`crate::host::coarse_ms`]).
+type Spare<B> = (u64, B, usize, u64);
 /// At most so many are kept (what comes after goes, as before).
 const SPARE_MOST: usize = 1024;
+/// And at most so many bytes of the PC's memory, each buffer counted in the
+/// whole 64 KiB blocks a committed buffer takes. A spare is reused only for
+/// a view of the same width, and with the count alone a spare of a width
+/// that never came back stayed for the rest of the run: a full list was at
+/// least 64 MiB, since no buffer takes less than a block, and could be up
+/// to 64 MiB a buffer ([`exact`]'s largest view).
+const SPARE_BYTES: u64 = 64 << 20;
+
+/// Parks the buffers `let_go` (width, buffer, where it is mapped) among
+/// `spare` at `now`, while those hold fewer than [`SPARE_MOST`] and room
+/// for it within [`SPARE_BYTES`]; the others go, as before.
+fn park<B>(spare: &mut Vec<Spare<B>>, let_go: impl IntoIterator<Item = (u64, B, usize)>, now: u64) {
+    let committed = |width: u64| width.next_multiple_of(64 << 10);
+    let mut bytes: u64 = spare.iter().map(|&(width, ..)| committed(width)).sum();
+    for (width, buffer, data) in let_go {
+        if spare.len() < SPARE_MOST && bytes + committed(width) <= SPARE_BYTES {
+            bytes += committed(width);
+            spare.push((width, buffer, data, now));
+        }
+    }
+}
+
+/// Takes out of `spare` the buffers parked `idle_ms` or more before `now`.
+fn idle_spares<B>(spare: &mut Vec<Spare<B>>, now: u64, idle_ms: u64) -> Vec<B> {
+    spare
+        .extract_if(.., |&mut (.., parked)| now.saturating_sub(parked) >= idle_ms)
+        .map(|(_, buffer, ..)| buffer)
+        .collect()
+}
+
+/// Lets go of the spare buffers of [`exact`] that no copy took for
+/// `idle_ms` ([`crate::host::ram_idle_ms`]). The title's ring gives the same
+/// few widths every frame, so their spares are taken again long before
+/// that; one that stays so long is of a width that did not come back. As
+/// idle windows of title memory do, they go through
+/// [`crate::host::retire_resource`].
+fn let_go_idle_spares(idle_ms: u64) {
+    let now = crate::host::coarse_ms();
+    let gone = idle_spares(&mut EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()), now, idle_ms);
+    for buffer in gone {
+        crate::host::retire_resource(buffer);
+    }
+}
 
 /// Copies of single views' bytes made since the start.
 pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
@@ -6599,6 +6650,54 @@ pub(crate) fn exact_line(frames: f64) {
         asked as f64 / frames,
         made as f64 / frames
     );
+}
+
+#[cfg(test)]
+mod exact_spare_tests {
+    use super::{SPARE_MOST, Spare, idle_spares, park};
+
+    /// The memory a committed buffer of `width` bytes takes: whole 64 KiB
+    /// blocks.
+    fn committed(width: u64) -> u64 {
+        width.next_multiple_of(64 << 10)
+    }
+
+    /// Spare buffers of views whose widths never come back hold at most
+    /// 64 MiB of the PC's memory, and go once they have been parked for the
+    /// idle time: with the count alone the list kept 1,024 of them (up to
+    /// 64 MiB each) for the rest of the run.
+    #[test]
+    fn spares_of_widths_that_never_come_back_stay_under_64_mib_and_go_when_idle() {
+        const IDLE_MS: u64 = 10_000;
+        let mut spare: Vec<Spare<u32>> = Vec::new();
+        // 3,000 views of as many widths (256 bytes to 750 KiB), let go 30
+        // at a sweep, one sweep every 0.1 s.
+        for sweep in 0..100u32 {
+            let let_go = (0..30).map(|i| {
+                let n = sweep * 30 + i;
+                (u64::from(n + 1) * 256, n, 0usize)
+            });
+            park(&mut spare, let_go, u64::from(sweep) * 100);
+        }
+        let bytes: u64 = spare.iter().map(|&(width, ..)| committed(width)).sum();
+        assert!(spare.len() <= SPARE_MOST);
+        assert!(bytes <= 64 << 20, "{} spares hold {} MiB", spare.len(), bytes >> 20);
+        assert!(!spare.is_empty(), "spares are still kept");
+        // The idle time after the first second: what was parked by then
+        // goes, what came after stays.
+        let early = spare.iter().filter(|&&(.., at)| at <= 1_000).count();
+        assert!(early > 0 && early < spare.len());
+        let gone = idle_spares(&mut spare, 1_000 + IDLE_MS, IDLE_MS);
+        assert_eq!(gone.len(), early);
+        assert!(spare.iter().all(|&(.., at)| at > 1_000));
+        // Their room is free again for the views let go from then on.
+        let before = spare.len();
+        park(&mut spare, [(256, 9_999, 0)], 1_000 + IDLE_MS);
+        assert_eq!(spare.len(), before + 1, "a spare parked again once others went");
+        // And at the idle time after the last of them, none is left.
+        idle_spares(&mut spare, 1_000 + 2 * IDLE_MS, IDLE_MS);
+        assert!(spare.is_empty(), "{} spares left", spare.len());
+    }
 }
 
 #[cfg(test)]
