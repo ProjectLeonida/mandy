@@ -4722,6 +4722,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(clear_color_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME clear_color COMMAND clear_color_test)
+    # CPU side of the Depth24 emulation (src/depth24.h) under every floating-point rounding mode; no GPU, no Vulkan.
+    add_executable(depth24_cpu_test test/depth24_cpu_test.cpp)
+    target_link_libraries(depth24_cpu_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(depth24_cpu_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME depth24_cpu COMMAND depth24_cpu_test)
     # FramePacer of the Xbox presentation path on a fake clock (src/frame_pacer.h); no GPU, no Vulkan.
     add_executable(frame_pacer_test test/frame_pacer_test.cpp)
     find_package(Threads REQUIRED)
