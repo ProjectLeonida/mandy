@@ -1480,10 +1480,10 @@ void run_checks(const std::filesystem::path& root) {
                                         L"GAME:\\.gta6rt-deleted\\data\\gone.txt", L"GAME:\\.gta6rt-copy\\x.bin",
                                         L"GAME:\\.gta6rt-temp"}) {
             SetLastError(0);
-            const HANDLE h = create_w(reserved, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-            check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME,
+            const HANDLE refused = create_w(reserved, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            check(refused == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME,
                   "an explicit GAME: path into a reserved overlay folder is refused (CreateFileW)");
-            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+            if (refused != INVALID_HANDLE_VALUE) ::CloseHandle(refused);
             SetLastError(0);
             check(attributes_w(reserved) == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_INVALID_NAME,
                   "and has no attributes (GetFileAttributesW)");
