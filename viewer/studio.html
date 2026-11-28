@@ -246,6 +246,11 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
   min-width: 200px;
 }
 #stats-overlay b { color: #fff; }
+#stats-overlay summary { cursor: pointer; color: var(--text-main); margin-top: 2px; }
+#stat-material-list { max-height: 34vh; max-width: 340px; overflow-y: auto; margin-top: 4px; }
+.mat-row { padding: 3px 0; border-top: 1px solid rgba(255, 255, 255, 0.06); overflow-wrap: anywhere; }
+.mat-tex, .mat-none { padding-left: 10px; font-family: monospace; }
+.mat-none { color: var(--accent-gold); }
 
 /* Textures Gallery Layout */
 #textures-view {
@@ -426,6 +431,12 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
         <div>Полигонов (треугольников): <b id="stat-triangles">0</b></div>
         <div>Вершин: <b id="stat-vertices">0</b></div>
         <div>Размер файла: <b id="stat-size">—</b></div>
+        <div><span id="t-stat-dimensions">Габариты (Ш × В × Г):</span> <b id="stat-dimensions">—</b></div>
+        <div><span id="t-stat-parts">Мешей / материалов / текстур:</span> <b id="stat-parts">—</b></div>
+        <details id="stat-materials" hidden>
+          <summary id="t-stat-materials">Материалы и текстуры</summary>
+          <div id="stat-material-list"></div>
+        </details>
       </div>
     </div>
   </section>
@@ -481,6 +492,13 @@ const I18N = {
     statTriangles: "Полигонов (треугольников):",
     statVertices: "Вершин:",
     statSize: "Размер файла:",
+    statDimensions: "Габариты (Ш × В × Г):",
+    statParts: "Мешей / материалов / текстур:",
+    statMaterials: "Материалы и текстуры",
+    statMaterialMeshes: "мешей:",
+    unnamedMaterial: "(без имени)",
+    noTexture: "без текстур",
+    vertexColors: "цвета вершин",
     texHeading: "Галерея текстур (DDS & PNG)",
     texSearchPlaceholder: "Фильтр текстур...",
     texCountSuffix: "текстур найдено",
@@ -516,6 +534,13 @@ const I18N = {
     statTriangles: "Polygons (triangles):",
     statVertices: "Vertices:",
     statSize: "File size:",
+    statDimensions: "Size (W × H × D):",
+    statParts: "Meshes / materials / textures:",
+    statMaterials: "Materials and textures",
+    statMaterialMeshes: "meshes:",
+    unnamedMaterial: "(unnamed)",
+    noTexture: "no texture",
+    vertexColors: "vertex colours",
     texHeading: "Texture Gallery (DDS & PNG)",
     texSearchPlaceholder: "Filter textures...",
     texCountSuffix: "textures found",
@@ -560,6 +585,7 @@ function applyTranslations() {
 
   renderAccordionList();
   renderTexturesGrid();
+  renderModelDetails();
 }
 
 let allModels = [];
@@ -595,6 +621,66 @@ function formatBytes(bytes) {
 
 function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+}
+
+// What the stats panel lists for the shown model beyond its triangle and vertex counts, read from the loaded glTF
+// alone: its bounding-box size, its meshes (GLTFLoader makes one per glTF primitive, so this is the draw-call
+// count), and its materials with the textures each one uses and their sizes.
+// Null until a model is shown; a failed load keeps the previous model and so its details.
+let currentDetails = null;
+
+function textureSize(texture) {
+  const image = texture.image || {};
+  const width = image.naturalWidth || image.videoWidth || image.width || 0;
+  const height = image.naturalHeight || image.videoHeight || image.height || 0;
+  return width && height ? `${width}×${height}` : '?';
+}
+
+function describeModel(root) {
+  const materials = new Map(), textures = new Set();
+  let meshes = 0;
+  root.traverse(child => {
+    if (!child.isMesh) return;
+    meshes++;
+    // In clay/normals mode child.material is a shared studio material; the model's own is origMaterial.
+    for (const material of [].concat(child.userData.origMaterial || child.material || [])) {
+      const known = materials.get(material);
+      if (known) { known.meshes++; continue; }
+      const maps = Object.entries(material)
+        .filter(([, value]) => value && value.isTexture)
+        .map(([slot, texture]) => { textures.add(texture); return { slot, size: textureSize(texture) }; });
+      materials.set(material, { name: material.name || '', meshes: 1, vertexColors: !!material.vertexColors, maps });
+    }
+  });
+  return { meshes, materials: [...materials.values()], textures: textures.size };
+}
+
+// glTF units are metres. Three significant digits, so a ring reads 0.0215 m and a building 48.3 m.
+function formatDimensions(size) {
+  const axes = size ? [size.x, size.y, size.z] : [];
+  if (axes.length !== 3 || !axes.every(Number.isFinite)) return '—';
+  return axes.map(v => String(Number(v.toPrecision(3)))).join(' × ') + ' m';
+}
+
+function renderModelDetails() {
+  const t = I18N[currentLang], details = currentDetails;
+  document.getElementById('t-stat-dimensions').innerText = t.statDimensions;
+  document.getElementById('t-stat-parts').innerText = t.statParts;
+  document.getElementById('t-stat-materials').innerText = t.statMaterials;
+  document.getElementById('stat-dimensions').innerText = details ? formatDimensions(details.size) : '—';
+  document.getElementById('stat-parts').innerText = details
+    ? `${details.meshes} / ${details.materials.length} / ${details.textures}` : '—';
+  document.getElementById('stat-materials').hidden = !details || details.materials.length === 0;
+  document.getElementById('stat-material-list').innerHTML = (details ? details.materials : []).map(material => {
+    // A material with neither a texture nor vertex colours is a flat colour: often a texture the export lost.
+    const maps = material.maps.length
+      ? material.maps.map(map => `<div class="mat-tex">${escapeHtml(map.slot)} ${escapeHtml(map.size)}</div>`).join('')
+      : material.vertexColors
+        ? `<div class="mat-tex">${escapeHtml(t.vertexColors)}</div>`
+        : `<div class="mat-none">${escapeHtml(t.noTexture)}</div>`;
+    return `<div class="mat-row"><b>${escapeHtml(material.name || t.unnamedMaterial)}</b> · ` +
+      `${escapeHtml(t.statMaterialMeshes)} ${material.meshes}${maps}</div>`;
+  }).join('');
 }
 
 function switchTab(tab) {
@@ -770,6 +856,9 @@ function loadModel(url, name, category, size) {
     document.getElementById('stat-triangles').innerText = Math.round(tris).toLocaleString();
     document.getElementById('stat-vertices').innerText = Math.round(verts).toLocaleString();
     document.getElementById('stat-size').innerText = formatBytes(size);
+    const extent = new THREE.Box3().setFromObject(currentMesh).getSize(new THREE.Vector3());
+    currentDetails = { ...describeModel(currentMesh), size: { x: extent.x, y: extent.y, z: extent.z } };
+    renderModelDetails();
 
     // Auto-fit camera to bounding box
     const box = new THREE.Box3().setFromObject(currentMesh);
