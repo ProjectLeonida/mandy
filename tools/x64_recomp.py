@@ -884,6 +884,8 @@ class Asm:
         start = len(self.words)
         if not nz:
             self.movz(rd, 0)
+        elif not nzc:
+            self.movn(rd, 0)
         elif len(nzc) < len(nz):
             self.movn(rd, chunks[nzc[0]] ^ 0xFFFF, nzc[0])
             for i in nzc[1:]:
@@ -1600,11 +1602,11 @@ class FunctionTranslator:
         sz = self._op_size(dst)
         need = self.needed.get(ins.addr, set())
         flaggy = bool(need) or ins.addr in self.mat
-        self._load(ins, src, T1)
+        self._load(ins, src, T1, as_size=sz)
         self._load(ins, dst, T0, as_size=sz)
         # partial-width ops compute in a widened temp to get correct N/Z at sz;
         # stash unshifted operands first for lazy AF
-        if "A" in need:
+        if "A" in need or ins.addr in self.mat:
             a.stur(T0, CTX_REG, CTX_A, size=8)
             a.stur(T1, CTX_REG, CTX_B, size=8)
         sh = (32 - sz * 8) if sz < 4 else 0
@@ -1664,7 +1666,7 @@ class FunctionTranslator:
         dst, src = ins.ops
         sz = self._op_size(dst)
         need = self.needed.get(ins.addr, set())
-        self._load(ins, src, T1)
+        self._load(ins, src, T1, as_size=sz)
         self._load(ins, dst, T0, as_size=sz)
         # stash unshifted result/operands before widening for flag semantics
         if "P" in need or "A" in need or ins.addr in self.mat:
@@ -1673,7 +1675,7 @@ class FunctionTranslator:
             else:
                 a.and_r(T2, T0, T1, 1)
             a.stur(T2, CTX_REG, CTX_RES, size=8)
-            if "A" in need:
+            if "A" in need or ins.addr in self.mat:
                 a.stur(T0, CTX_REG, CTX_A, size=8)
                 a.stur(T1, CTX_REG, CTX_B, size=8)
         sh = (32 - sz * 8) if sz < 4 else 0
@@ -1796,18 +1798,12 @@ class FunctionTranslator:
         a = self.asm
         m = ins.mnem
         dst, src = ins.ops
-        if m == "mov":
-            if dst[0] == "r" and src[0] == "i" and dst[2] == 8 and src[2] == 4:
-                # C7 /0 form: the imm32 sign-extends into the 64-bit destination
-                v = src[1]
-                a.li(T0, v - (1 << 32) if v & 0x80000000 else v)
-                self._store(ins, dst, T0)
-                return
+        if m in ("mov", "movnti"):
             if dst[0] == "r" and src[0] == "r" and dst[2] == src[2] == 8:
                 if GMAP[dst[1]] != GMAP[src[1]]:
                     a.mov(GMAP[dst[1]], GMAP[src[1]])
                 return
-            self._load(ins, src, T0)
+            self._load(ins, src, T0, as_size=self._op_size(dst))
             self._store(ins, dst, T0)
         elif m == "movzx":
             self._load(ins, src, T0)
