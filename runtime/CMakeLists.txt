@@ -1404,6 +1404,39 @@ if(BUILD_TESTING)
       COMMAND dll_thread_calls_test "$<TARGET_FILE:dll_thread_calls>"
     )
 
+    # library_loader's module names (shims/library_loader.cpp): no ".dll" for an empty name or a path ending in a slash,
+    # and FreeLibrary drops a host module's cached name. The fixture has no relocations and one fixed base, so a second
+    # copy loads where the freed first one was. No game files.
+    add_library(fixed_base_probe SHARED test/fixtures/fixed_base_probe.cpp)
+    target_compile_options(fixed_base_probe PRIVATE /W4 /permissive- /utf-8 /GS-)
+    target_link_options(fixed_base_probe PRIVATE /NODEFAULTLIB /ENTRY:fixed_base_probe_main /FIXED /DYNAMICBASE:NO
+                        /BASE:0x7E0000000)
+    target_link_libraries(fixed_base_probe PRIVATE kernel32)
+    set_target_properties(fixed_base_probe PROPERTIES
+      OUTPUT_NAME fixed_base_probe
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+    add_executable(library_loader_names_test
+      test/library_loader_names_test.cpp
+      src/pe_loader.cpp
+      shims/library_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(library_loader_names_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims
+    )
+    target_compile_definitions(library_loader_names_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(library_loader_names_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(library_loader_names_test PRIVATE /OPT:NOREF)
+    target_link_libraries(library_loader_names_test PRIVATE psapi)
+    add_dependencies(library_loader_names_test fixed_base_probe)
+    add_test(NAME library_loader_names
+      COMMAND library_loader_names_test "$<TARGET_FILE:fixed_base_probe>"
+    )
+
     # The host GameInput path (docs/gameinput.md): mapped code that imports GameInputCreate from GameInput.dll, with no
     # GameInput shim linked. Needs the SDK's gameinput.lib and GameInput.h to build the fixture, and a GameInput.dll on
     # the machine to run (the test skips with 77 only when Windows cannot load GameInput.dll). No game files.

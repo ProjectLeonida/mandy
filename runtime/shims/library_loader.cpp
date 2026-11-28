@@ -70,7 +70,8 @@ bool is_ascii(const wchar_t* w) {
 std::wstring module_name_w(std::wstring path) {
     const size_t slash = path.find_last_of(L"\\/");
     if (slash != std::wstring::npos) path.erase(0, slash + 1);
-    if (!path.empty() && path.back() == L'.') path.pop_back();
+    if (path.empty()) return {};  // "" or a path ending in a slash: no module, not ".dll"
+    if (path.back() == L'.') path.pop_back();
     else if (path.find(L'.') == std::wstring::npos) path += L".dll";
     return path;
 }
@@ -87,14 +88,21 @@ std::string module_name(std::string path) {
     const size_t slash = path.find_last_of("\\/");
     if (slash != std::string::npos) path.erase(0, slash + 1);
     path = lower_ascii(path);
-    if (!path.empty() && path.back() == '.') path.pop_back();
+    if (path.empty()) return {};  // "" or a path ending in a slash: no module, not ".dll"
+    if (path.back() == '.') path.pop_back();
     else if (path.find('.') == std::string::npos) path += ".dll";
     return path;
 }
 
+// host_module_name's cache, HMODULE -> module name. loader_mutex() held.
+std::map<HMODULE, std::string>& host_module_names() {
+    static auto* names = new std::map<HMODULE, std::string>;
+    return *names;
+}
+
 std::string host_module_name(HMODULE module) {
     std::lock_guard lock(loader_mutex());
-    static auto* names = new std::map<HMODULE, std::string>;
+    auto* names = &host_module_names();
     if (auto it = names->find(module); it != names->end()) return it->second;
 
     std::vector<wchar_t> path(MAX_PATH);
@@ -280,7 +288,14 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
 BOOL WINAPI free_library(HMODULE module) {
     if (pseudo(module)) return TRUE;   // owned modules are never unloaded
     if (owns_bundled_module_handle(module)) return TRUE;  // mapped modules stay live until ~Loader detaches them
-    return FreeLibrary(module);
+    const BOOL freed = FreeLibrary(module);
+    // The module may be gone, and another DLL can be mapped at its base later: drop the name cached for the handle, so
+    // GetProcAddress on the new one does not serve the old one's shims. A module still loaded is looked up again.
+    if (freed) {
+        std::lock_guard lock(loader_mutex());
+        host_module_names().erase(module);
+    }
+    return freed;
 }
 
 // DisableThreadLibraryCalls(hinstance) from a mapped image's DllMain. The real function only accepts a module the
