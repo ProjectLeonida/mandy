@@ -5061,6 +5061,16 @@ if(TARGET Vulkan::Headers)
       endif()
     endif()
     add_test(NAME vk_xdxr_postbuild_readback COMMAND vk_xdxr_postbuild_readback_test)
+    # Round 3B runtime hooks: LiteralSamplerSpec, reads_glc_buffer barrier, writes_buffer hook, VulkanMemoryModel.
+    add_executable(r3b_runtime_hooks_test test/r3b_runtime_hooks_test.cpp)
+    target_link_libraries(r3b_runtime_hooks_test PRIVATE Vulkan::Headers Threads::Threads ${CMAKE_DL_LIBS})
+    if(WIN32)
+      target_compile_definitions(r3b_runtime_hooks_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      if(MSVC)
+        target_compile_options(r3b_runtime_hooks_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+      endif()
+    endif()
+    add_test(NAME r3b_runtime_hooks COMMAND r3b_runtime_hooks_test)
 
     # Title-placed buffer VAs (device slot 133) and the console VA shaders reach them by (src/title_va_alias.h).
     add_executable(title_va_alias_test test/title_va_alias_test.cpp)

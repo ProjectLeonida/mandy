@@ -1359,6 +1359,105 @@ int main() {
 
     CHECK(huffman_lut_checks() == 0);
 
+    // Round 3B metadata: reads_glc_buffer, writes_buffer (default true when absent + all_have_writes_buffer_meta()),
+    // buffer_write_slots (array of ints or "dynamic"), and literal_sampler_spec_base (absent vs present including 0).
+    {
+        const std::string h1 = sha256_hex(bytes("r3b_cs_glc_ro"));
+        const std::string h2 = sha256_hex(bytes("r3b_ps_rw_slots"));
+        const std::string h3 = sha256_hex(bytes("r3b_cs_dynamic_slots"));
+        const std::string h4 = sha256_hex(bytes("r3b_legacy_no_meta"));
+        std::filesystem::create_directories(dir);
+        const auto write_index = [&](const std::string& body) {
+            std::ofstream f(dir / "index.json", std::ios::binary | std::ios::trunc);
+            f << body;
+        };
+
+        // 1. All modules declare writes_buffer -> all_have_writes_buffer_meta() is true.
+        write_index(
+            "{"
+            "\"cs_glc\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + h1 +
+            "\", \"reads_glc_buffer\": true, \"writes_buffer\": false, \"buffer_write_slots\": [], "
+            "\"literal_samplers\": [[1, 2, 3, 4], [5, 6, 7, 8]], \"literal_sampler_spec_base\": 0},"
+            "\"ps_rw\": {\"stage\": \"ps\", \"fssm_sha256\": \"" + h2 +
+            "\", \"reads_glc_buffer\": false, \"writes_buffer\": true, \"buffer_write_slots\": [2, 5, 11], "
+            "\"literal_samplers\": [[9, 10, 11, 12]], \"literal_sampler_spec_base\": 100},"
+            "\"cs_dyn\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + h3 +
+            "\", \"writes_buffer\": true, \"buffer_write_slots\": \"dynamic\"}"
+            "}");
+        ShaderLibrary lib;
+        CHECK(!lib.all_have_writes_buffer_meta());  // empty library: false
+        CHECK(lib.load(dir.string(), &error) && lib.size() == 3);
+        CHECK(lib.all_have_writes_buffer_meta());
+        CHECK(lib.writes_buffer_census().present == 3 && lib.writes_buffer_census().missing == 0);
+
+        const ShaderEntry* e1 = lib.find("cs", h1);
+        CHECK(e1 != nullptr);
+        CHECK(e1->reads_glc_buffer == true);
+        CHECK(e1->has_writes_buffer == true && e1->writes_buffer == false);
+        CHECK(!e1->buffer_write_slots_dynamic && e1->buffer_write_slots.empty());
+        CHECK(e1->literal_sampler_spec_base.has_value() && *e1->literal_sampler_spec_base == 0u);
+        CHECK(e1->literal_samplers.size() == 2);
+
+        const ShaderEntry* e2 = lib.find("ps", h2);
+        CHECK(e2 != nullptr);
+        CHECK(e2->reads_glc_buffer == false);
+        CHECK(e2->has_writes_buffer == true && e2->writes_buffer == true);
+        CHECK(!e2->buffer_write_slots_dynamic &&
+              e2->buffer_write_slots == std::vector<std::uint32_t>({2u, 5u, 11u}));
+        CHECK(e2->literal_sampler_spec_base.has_value() && *e2->literal_sampler_spec_base == 100u);
+
+        const ShaderEntry* e3 = lib.find("cs", h3);
+        CHECK(e3 != nullptr);
+        CHECK(e3->reads_glc_buffer == false);
+        CHECK(e3->has_writes_buffer == true && e3->writes_buffer == true);
+        CHECK(e3->buffer_write_slots_dynamic && e3->buffer_write_slots.empty());
+        CHECK(!e3->literal_sampler_spec_base.has_value());
+
+        // 2. Mixed pack (one legacy module omitting writes_buffer) -> legacy defaults to writes_buffer == true,
+        //    reads_glc_buffer == false, literal_sampler_spec_base absent, and all_have_writes_buffer_meta() is false.
+        write_index(
+            "{"
+            "\"cs_glc\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + h1 + "\", \"writes_buffer\": false},"
+            "\"cs_legacy\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + h4 + "\"}"
+            "}");
+        CHECK(lib.load(dir.string(), &error) && lib.size() == 2);
+        CHECK(!lib.all_have_writes_buffer_meta());
+        CHECK(lib.writes_buffer_census().present == 1 && lib.writes_buffer_census().missing == 1);
+        const ShaderEntry* e4 = lib.find("cs", h4);
+        CHECK(e4 != nullptr);
+        CHECK(e4->reads_glc_buffer == false);
+        CHECK(e4->has_writes_buffer == false && e4->writes_buffer == true);
+        CHECK(!e4->buffer_write_slots_dynamic && e4->buffer_write_slots.empty());
+        CHECK(!e4->literal_sampler_spec_base.has_value());
+
+        // 3. FSPX bare program ambiguity when reads_glc_buffer, writes_buffer, or literal_sampler_spec_base differ.
+        const auto code = fspx_code(0x6000);
+        std::vector<std::uint8_t> st_a(28, 0), st_b(28, 0);
+        st_a[12] = 32;
+        st_b[12] = 64;
+        const std::uint32_t spv_words[5] = {0x07230203, 0x00010500, 7, 1, 0};
+        std::filesystem::create_directories(dir / "fspx");
+        for (const char* nm : {"a.spv", "b.spv"}) {
+            std::ofstream s(dir / "fspx" / nm, std::ios::binary | std::ios::trunc);
+            s.write(reinterpret_cast<const char*>(spv_words), sizeof(spv_words));
+        }
+        write_index("{}");
+        {
+            std::ofstream sub(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
+            sub << "{\"a\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(code)
+                << "\", \"fspx_state_sha256\": \"" << sha256_hex(st_a)
+                << "\", \"reads_glc_buffer\": true, \"writes_buffer\": false, \"literal_sampler_spec_base\": 10},"
+                << "\"b\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(code)
+                << "\", \"fspx_state_sha256\": \"" << sha256_hex(st_b)
+                << "\", \"reads_glc_buffer\": false, \"writes_buffer\": false, \"literal_sampler_spec_base\": 10}}";
+        }
+        CHECK(lib.load(dir.string(), &error) && lib.size() == 2 && lib.all_have_writes_buffer_meta());
+        bool ambig = false;
+        CHECK(lib.program_candidates("cs", compute_program(code), &ambig).empty() && ambig);
+
+        std::filesystem::remove_all(dir);
+    }
+
     std::printf("SHA-256, inflate (stored/fixed/dynamic), JSON, FSSM extraction, FSPX programs and index lookup OK\n");
     return 0;
 }

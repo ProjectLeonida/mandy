@@ -255,6 +255,9 @@ int main(int argc, char** argv) {
     enable12.descriptorBindingStorageImageUpdateAfterBind = device_flags.update_after_bind;
     enable12.descriptorBindingStorageBufferUpdateAfterBind = device_flags.update_after_bind;
     enable12.descriptorBindingPartiallyBound = device_flags.partially_bound;
+    enable12.vulkanMemoryModel = have12.vulkanMemoryModel;
+    enable12.vulkanMemoryModelDeviceScope =
+        have12.vulkanMemoryModel && have12.vulkanMemoryModelDeviceScope ? VK_TRUE : VK_FALSE;
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &enable12};
     enable.features.shaderInt64 = int64 ? VK_TRUE : VK_FALSE;
     enable.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;

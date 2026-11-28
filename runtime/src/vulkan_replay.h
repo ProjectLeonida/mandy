@@ -885,6 +885,8 @@ struct ComputePipeline {
     // one). Null: nobody is told. Called while a submission is prepared: it must never block or allocate (the only lock it may take is a non-blocking try_lock, on the first request of a pipeline and of a variant).
     void (*requested)(void*, std::uint32_t variant) = nullptr;
     void* request_context = nullptr;
+    bool reads_glc_buffer = false;  // coherent (glc/dlc) buffer/global loads: pre-dispatch COMPUTE->COMPUTE barrier
+    bool writes_buffer = true;      // false only when shader metadata proves no buffer/global/flat store or atomic
 };
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
@@ -923,6 +925,8 @@ struct GraphicsPipeline {
     bool async_build = false;
     bool nonunit_vertex_divisor = false;  // an actual instance divisor > 1, not a zero-stride emulation
     std::uint64_t estimate = 0;  // as ComputePipeline::estimate
+    bool reads_glc_buffer = false;  // true when any stage emits coherent glc/dlc buffer loads needing a pre-draw barrier
+    bool writes_buffer = true;   // false only when every stage's shader metadata proves no buffer/global/flat write
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -1237,6 +1241,10 @@ struct ReplayFunctions {
     PFN_vkCmdDrawMeshTasksIndirectCountEXT draw_mesh_tasks_indirect_count = nullptr;
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
+    // Called during emit when a draw or dispatch whose pipeline has `writes_buffer == true` (or a legacy indirect
+    // command without pipeline metadata) is emitted. Null: nobody is told.
+    void (*on_buffer_write)(void*) = nullptr;
+    void* on_buffer_write_context = nullptr;
     // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
     // cut to what the buffer holds from there: vertex and index views use what fits, WriteBufferImmediate needs all
     // of it.
@@ -3106,6 +3114,8 @@ public:
     // Set when any command writes to a host_readable (READBACK) buffer so VulkanQueue only flushes to HOST_BIT when needed.
     bool wrote_readback = false;
     VkPipelineStageFlags2 readback_src_stages = 0;
+    // Set when any prepared draw or dispatch uses a pipeline with `writes_buffer == true` (or legacy untyped indirect).
+    bool wrote_buffer = false;
     std::vector<detail::PreparedKhrPostbuild> khr_postbuilds;
 };
 
@@ -3485,6 +3495,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     std::uint32_t so_active = 0;
     out.wrote_readback = false;
     out.readback_src_stages = 0;
+    out.wrote_buffer = false;
 
     // Successive plane transfers use the same transient range and order their buffer accesses in emit().
     VkBuffer plane_scratch = VK_NULL_HANDLE;
@@ -4164,6 +4175,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // Legacy graphics IR carries no graphics state of its own: the recorded, stateful graphics indirects are
             // Draw commands (IndirectRasterDraw) and open their own rendering scope. A legacy one is emitted as it is
             // - the clamp pass above is what keeps its arguments safe - and its dispatch-side work ends here.
+            if (ind->kind != IndirectKind::dispatch) {
+                if (ind->max_count) out.wrote_buffer = true;
+            } else if (!ind->pipeline) {
+                if (ind->max_count) out.wrote_buffer = true;
+            }
             if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
                 if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return unsupported_at(__LINE__);
                 const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
@@ -4174,6 +4190,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!found && p.pipeline.async_build && !strict_replay()) continue;
                 if (!found) return unresolved_at(__LINE__);
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
+                if (ind->max_count && p.pipeline.writes_buffer) out.wrote_buffer = true;
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
@@ -4299,6 +4316,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 continue;
             }
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
+            if (p.pipeline.writes_buffer) out.wrote_buffer = true;
         } else if (const auto draw = draw_command(command); draw.state) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
@@ -4309,11 +4327,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 const bool strict = strict_replay();
                 if (r != ReplayResult::unresolved_resource || strict) return r;
                 prepared_draw.skipped = true;  // dropped at emit (see the dispatch branch above)
-            } else if (draw.state->indexed && !draw.state->mesh && draw.state->topology == topology_quad_list) {
-                // The index expansion is a helper dispatch: inside a statistics query it needs the segment pool.
-                if (statistics_active && !statistics_helpers && draw.state->count >= 4) return ReplayResult::unsupported;
-                if (const auto r = detail::prepare_quad_indices(*draw.state, vk, prepared_draw); r != ReplayResult::success)
-                    return r;
+            } else {
+                if (!prepared_draw.skipped && prepared_draw.graphics && prepared_draw.graphics->writes_buffer)
+                    out.wrote_buffer = true;
+                if (draw.state->indexed && !draw.state->mesh && draw.state->topology == topology_quad_list) {
+                    // The index expansion is a helper dispatch: inside a statistics query it needs the segment pool.
+                    if (statistics_active && !statistics_helpers && draw.state->count >= 4) return ReplayResult::unsupported;
+                    if (const auto r = detail::prepare_quad_indices(*draw.state, vk, prepared_draw); r != ReplayResult::success)
+                        return r;
+                }
             }
             // A stateful indirect draw takes the same clamp pass (vulkan_indirect_clamp.h) as a legacy ExecuteIndirect:
             // the arguments it reads are copied and bounded on the GPU before its rendering scope opens, and the draw
@@ -5401,6 +5423,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                                           (ind->count_buffer ? marked_draw::counted : 0u)),
                                       {records, stride, 0});
                 }
+                if (records && vk.on_buffer_write) vk.on_buffer_write(vk.on_buffer_write_context);
                 if (ind->count_buffer) {
                     if (ind->kind == IndirectKind::draw)
                         vk.draw_indirect_count(command_buffer, indirect_buffer, arguments, count_buffer, count_offset,
@@ -5443,7 +5466,14 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
                                   &data);
             }
+            if (records && (!ind->pipeline || p.pipeline.writes_buffer) && vk.on_buffer_write)
+                vk.on_buffer_write(vk.on_buffer_write_context);
             for (std::uint32_t k = 0; k < records; ++k) {
+                if (ind->pipeline && p.pipeline.reads_glc_buffer && vk.pipeline_barrier) {
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, shader_stages,
+                                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                }
                 vk.dispatch_indirect(command_buffer, indirect_buffer, arguments + VkDeviceSize(k) * stride);
             }
             if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
@@ -5562,6 +5592,12 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                                         &set0, 0, nullptr);
             }
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
+            if (p.pipeline.reads_glc_buffer && vk.pipeline_barrier) {
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, shader_stages,
+                                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            }
+            if (p.pipeline.writes_buffer && vk.on_buffer_write) vk.on_buffer_write(vk.on_buffer_write_context);
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
             if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
         } else if (raster.state) {
@@ -5616,6 +5652,13 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             rendering.colorAttachmentCount = std::uint32_t(d.colors.size());
             rendering.pColorAttachments = colors.data();
             const GraphicsPipeline& graphics = *d.graphics;
+            if (d.pipeline && graphics.reads_glc_buffer && vk.pipeline_barrier) {
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, shader_stages,
+                                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT);
+            }
+            if (d.pipeline && graphics.writes_buffer && vk.on_buffer_write)
+                vk.on_buffer_write(vk.on_buffer_write_context);
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
             vk.begin_rendering(command_buffer, &rendering);

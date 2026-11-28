@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -876,6 +877,20 @@ struct ShaderEntry {
     // The S#s the shader builds from immediates (the index's literal_samplers): no heap slot names them, so a
     // pipeline that uses the shader registers them in the bindless set itself (docs/design.md, Literal samplers).
     std::vector<std::array<std::uint32_t, 4>> literal_samplers;
+    // Optional SPIR-V SpecId base for literal_samplers (index.json `literal_sampler_spec_base`). Absent when the
+    // shader was translated without literal-sampler specialization constants.
+    std::optional<std::uint32_t> literal_sampler_spec_base;
+    // Whether the shader performs coherent (glc/dlc) buffer/global loads (index.json `reads_glc_buffer`). False when
+    // absent (older shader packs).
+    bool reads_glc_buffer = false;
+    // Whether the shader can write buffer/global/flat memory (index.json `writes_buffer`). Defaults to true when
+    // absent so older shader packs conservatively keep full mirror write-back.
+    bool has_writes_buffer = false;
+    bool writes_buffer = true;
+    // Optional descriptor slot list written by buffer stores (index.json `buffer_write_slots`: array of ints or
+    // `"dynamic"`).
+    bool buffer_write_slots_dynamic = false;
+    std::vector<std::uint32_t> buffer_write_slots;
     // Mesh shaders: the output array sizes the SPIR-V declares (OutputVertices / OutputPrimitivesEXT), checked
     // against the device's maxMeshOutputVertices / maxMeshOutputPrimitives when a pipeline is created. 0: not given.
     std::uint32_t max_vertices = 0;
@@ -979,6 +994,16 @@ struct VsharpBaseCensus {
     bool signed_offsets() const { return zero_extended == 0; }
 };
 
+// Whether every loaded module declared `"writes_buffer"` in its index.json metadata. Passive write-back gating is
+// enabled only when at least one module is loaded and none omits the key, preserving conservative write-back for
+// older shader packs and shader-less tests.
+struct WritesBufferCensus {
+    std::size_t present = 0;
+    std::size_t missing = 0;
+    std::size_t total() const { return present + missing; }
+    bool all_present() const { return present > 0 && missing == 0; }
+};
+
 class ShaderLibrary {
 public:
     // Reads <dir>/index.json, then the indexes of the programs make_game.py translates from the package's DLLs and the
@@ -1043,6 +1068,7 @@ public:
         descriptor_table_census_ = {};
         tsharp_index_census_ = {};
         vsharp_base_census_ = {};
+        writes_buffer_census_ = {};
         for (const char* folder : {"fspx", "fspx_gfx"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
@@ -1076,6 +1102,9 @@ public:
     // How the loaded modules read a V#'s 48-bit base: the device names buffers below heap_base (negative offsets) only
     // when every one of them sign-extends it.
     const VsharpBaseCensus& vsharp_base_census() const { return vsharp_base_census_; }
+    // Whether every loaded module declared `"writes_buffer"` in its index.json metadata.
+    const WritesBufferCensus& writes_buffer_census() const { return writes_buffer_census_; }
+    bool all_have_writes_buffer_meta() const { return writes_buffer_census_.all_present(); }
     // Entries loaded from <dir>/fspx/index.json and <dir>/library/index.json. A corpus of RPF containers never
     // reaches these: their programs come from FidelityFX DLLs and the pipeline library, so callers comparing reached
     // entries with size() must leave them out.
@@ -1138,7 +1167,9 @@ public:
             const auto first = spirv(*all.front());
             const auto runtime_metadata = [](const ShaderEntry& e) {
                 return std::tie(e.binding_count, e.push_constant_bytes, e.local_size, e.lds_bytes, e.uses_code_base,
-                                e.wave64, e.subgroup_size, e.wave64_exchange, e.literal_samplers);
+                                e.wave64, e.subgroup_size, e.wave64_exchange, e.literal_samplers,
+                                e.literal_sampler_spec_base, e.reads_glc_buffer, e.has_writes_buffer, e.writes_buffer,
+                                e.buffer_write_slots_dynamic, e.buffer_write_slots);
             };
             for (std::size_t i = 1; i < all.size(); ++i) {
                 if (first.empty() || runtime_metadata(*all[i]) != runtime_metadata(*all.front()) ||
@@ -1258,6 +1289,7 @@ private:
             descriptor_table_census_ = {};
             tsharp_index_census_ = {};
             vsharp_base_census_ = {};
+            writes_buffer_census_ = {};
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -1344,6 +1376,27 @@ private:
                     e.literal_samplers.push_back(words);
                 }
             }
+            if (const Json* lsb = meta.find("literal_sampler_spec_base");
+                lsb && lsb->kind == Json::Kind::number && lsb->number >= 0 && lsb->number <= 4294967295.0)
+                e.literal_sampler_spec_base = u32(lsb);
+            if (const Json* glc = meta.find("reads_glc_buffer"); glc && glc->kind == Json::Kind::boolean)
+                e.reads_glc_buffer = glc->boolean;
+            if (const Json* wb = meta.find("writes_buffer"); wb && wb->kind == Json::Kind::boolean) {
+                e.has_writes_buffer = true;
+                e.writes_buffer = wb->boolean;
+                ++writes_buffer_census_.present;
+            } else {
+                ++writes_buffer_census_.missing;
+            }
+            if (const Json* bws = meta.find("buffer_write_slots")) {
+                if (bws->kind == Json::Kind::string && bws->string == "dynamic") {
+                    e.buffer_write_slots_dynamic = true;
+                } else if (bws->kind == Json::Kind::array) {
+                    for (const Json& item : bws->array)
+                        if (item.kind == Json::Kind::number && item.number >= 0 && item.number <= 4294967295.0)
+                            e.buffer_write_slots.push_back(u32(&item));
+                }
+            }
             e.max_vertices = u32(meta.find("max_vertices"));
             e.max_primitives = u32(meta.find("max_primitives"));
             // Which finalizer this module's shader probes the descriptor table with (descriptor_table.h). Absent, or not
@@ -1396,6 +1449,7 @@ private:
     DescriptorTableCensus descriptor_table_census_;
     TsharpIndexCensus tsharp_index_census_;
     VsharpBaseCensus vsharp_base_census_;
+    WritesBufferCensus writes_buffer_census_;
 };
 
 } // namespace leonida
