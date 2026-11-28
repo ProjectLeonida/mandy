@@ -24,6 +24,7 @@ void log_title_image_uses(const Registry& textures, std::size_t retired_count, s
     using Shape = std::tuple<std::uint64_t, unsigned, unsigned, unsigned, unsigned>;
     std::map<Shape, AllocationClass> classes;
     for (const auto& [address, t] : textures) {
+        if (!t) continue;
         if (t->owned) {
             unbound += t->unbound_bytes != 0;
             unbound_bytes += t->unbound_bytes;
@@ -32,6 +33,7 @@ void log_title_image_uses(const Registry& textures, std::size_t retired_count, s
         unbound_placed += t->unbound_bytes != 0;
         unbound_placed_bytes += t->unbound_bytes;
         placed_addresses.insert(t->cpu);
+        if (!t->resource) continue;
         const auto& d = t->resource->desc();
         auto& c = classes[{d.Width, d.Height, unsigned(d.Format), unsigned(d.Flags), d.SampleDesc.Count}];
         ++c.count;
@@ -52,7 +54,7 @@ void log_title_image_uses(const Registry& textures, std::size_t retired_count, s
         else if (!t->fills) cpu_unfilled += t->backing_bytes;
     }
     for (const auto& [address, t] : textures) {
-        if (!t->owned || !placed_addresses.contains(t->cpu)) continue;
+        if (!t || !t->owned || !placed_addresses.contains(t->cpu)) continue;
         ++duplicate_count;
         duplicates += t->backing_bytes;
     }
@@ -63,7 +65,7 @@ void log_title_image_uses(const Registry& textures, std::size_t retired_count, s
                          "shader descriptors; %.1f MiB with no replay, shader descriptor, map or fill "
                          "(%.1f MiB 4K attachments)\n", replayed * mib, shader_only * mib, cold * mib, cold_4k * mib);
     std::vector<std::pair<Shape, AllocationClass>> ranked(classes.begin(), classes.end());
-    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+    std::stable_sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
         return a.second.bytes + a.second.unbound > b.second.bytes + b.second.unbound;
     });
     for (std::size_t i = 0; i < std::min<std::size_t>(8, ranked.size()); ++i) {
