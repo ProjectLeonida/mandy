@@ -362,5 +362,172 @@ class BadCarveIndexTest(unittest.TestCase):
         self.assertIn("fixed_table_1296", r.stdout)
 
 
+class GamedataBlobsSafetyTests(unittest.TestCase):
+    def test_cross_reference_sgd5_unshipped_does_not_double_count_overlap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive_bytes, layouts = synthetic_sgd5_archive(
+                ["shared_fx", "db0_only"],
+                ["shared_fx", "db1_only"],
+            )
+            shaders_path = os.path.join(tmp, "shaders.rpf")
+            with open(shaders_path, "wb") as f:
+                f.write(archive_bytes)
+            payload = {
+                "kind": "fx_preload_list",
+                "offset_hex": "0x1000",
+                "entries": 3,
+                "_stems": ["shared_fx", "db0_only", "missing_fx"],
+            }
+            with mock.patch.object(sgd5_effects, "DATABASES", layouts):
+                xref = gamedata_blobs.cross_reference_sgd5([payload], shaders_path)
+            row = xref["preload_lists"][0]
+            self.assertEqual(row["in_db0"], 2)
+            self.assertEqual(row["in_db1"], 1)
+            self.assertEqual(row["unshipped"], 1)
+
+    def test_bad_index_types_recursion_error_and_single_index_parse(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for row in (
+                {"off": True, "stored": 0},
+                {"off": -1, "stored": 0},
+                {"off": 0, "stored": "4"},
+            ):
+                with self.subTest(row=row):
+                    folder = os.path.join(tmp, "bad")
+                    os.makedirs(folder, exist_ok=True)
+                    with open(os.path.join(folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                        json.dump({"files": [row]}, f)
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        rc = gamedata_blobs.main([folder])
+                    self.assertEqual(rc, 1)
+                    self.assertIn("row 0", err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+
+            rec_folder = os.path.join(tmp, "rec")
+            os.makedirs(rec_folder)
+            with open(os.path.join(rec_folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}")
+            err = io.StringIO()
+            with (
+                mock.patch.object(gamedata_blobs.json, "load", side_effect=RecursionError("deep")),
+                contextlib.redirect_stderr(err),
+            ):
+                rc = gamedata_blobs.main([rec_folder])
+            self.assertEqual(rc, 1)
+            self.assertIn("is not valid JSON", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
+            # Empty valid carve must parse index.json once across check_report_path + read_payloads.
+            ok_folder = os.path.join(tmp, "ok")
+            os.makedirs(ok_folder)
+            with open(os.path.join(ok_folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": []}, f)
+            out_json = os.path.join(tmp, "out.json")
+            with (
+                mock.patch.object(gamedata_blobs, "check_carve_index", wraps=gamedata_blobs.check_carve_index) as spy,
+                mock.patch.object(gamedata_blobs.json, "load", wraps=json.load) as load_spy,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                rc = gamedata_blobs.main([ok_folder, "--json", out_json])
+            self.assertEqual(rc, 0)
+            spy.assert_called_once_with(ok_folder)
+            load_spy.assert_called_once()
+
+    def test_trailing_separator_json_and_missing_shaders_fail_before_read_payloads(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": []}, f)
+            missing_shaders = os.path.join(tmp, "missing.rpf")
+            dir_shaders = os.path.join(tmp, "shaders_dir")
+            os.makedirs(dir_shaders)
+
+            for args in (
+                [carve, "--json", os.path.join(tmp, "dir") + "/"],
+                [carve, "--json", os.path.join(tmp, "dir") + "\\"],
+                [carve, "--shaders", missing_shaders],
+                [carve, "--shaders", dir_shaders],
+            ):
+                with self.subTest(args=args[1:]):
+                    err = io.StringIO()
+                    with (
+                        mock.patch.object(gamedata_blobs, "read_payloads", side_effect=AssertionError("should not run")),
+                        contextlib.redirect_stderr(err),
+                    ):
+                        rc = gamedata_blobs.main(args)
+                    self.assertEqual(rc, 1)
+                    self.assertIn("error:", err.getvalue())
+
+    def test_atomic_json_lf_and_failure_preserves_existing_report(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": []}, f)
+            out_dir = os.path.join(tmp, "reports")
+            out_json = os.path.join(out_dir, "blobs.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(gamedata_blobs.main([carve, "--json", out_json]), 0)
+            with open(out_json, "rb") as f:
+                raw = f.read()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", raw)
+
+            def fail_dump(_obj, f, **_kw):
+                f.write("{partial")
+                raise OSError("disk full")
+
+            for target, effect in (
+                ((gamedata_blobs.json, "dump"), fail_dump),
+                ((gamedata_blobs.replace_retry, "replace"), OSError("replace denied")),
+            ):
+                with self.subTest(target=target[1]):
+                    err = io.StringIO()
+                    with (
+                        mock.patch.object(target[0], target[1], side_effect=effect),
+                        contextlib.redirect_stdout(io.StringIO()),
+                        contextlib.redirect_stderr(err),
+                    ):
+                        rc = gamedata_blobs.main([carve, "--json", out_json])
+                    self.assertEqual(rc, 1)
+                    self.assertIn("cannot write", err.getvalue())
+                    with open(out_json, "rb") as f:
+                        self.assertEqual(f.read(), raw)
+                    self.assertEqual([n for n in os.listdir(out_dir) if n.startswith(".blobs-")], [])
+
+
+    def test_json_refuses_bink2_carve_input_alias(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            bk2 = os.path.join(carve, "000000001000.bk2")
+            with open(bk2, "wb") as f:
+                f.write(b"KB2nDATA")
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": [{"off": 4096, "stored": 8, "type": "bink2"}]}, f)
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = gamedata_blobs.main([carve, "--json", bk2])
+            self.assertEqual(rc, 1)
+            self.assertIn("overwrite", err.getvalue())
+            with open(bk2, "rb") as f:
+                self.assertEqual(f.read(), b"KB2nDATA")
+
+
 if __name__ == "__main__":
     unittest.main()

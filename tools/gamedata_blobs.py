@@ -20,14 +20,17 @@ import os
 import posixpath
 import struct
 import sys
+import tempfile
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing sibling helpers.
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
+from file_mode import published_mode  # noqa: E402
 import gamedata_index as gi  # noqa: E402
 import gamedata_maps as gm  # noqa: E402
+import replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 import sgd5_effects as se  # noqa: E402
 
@@ -290,22 +293,40 @@ def check_carve_index(directory: str) -> list[dict]:
             index = json.load(f)
     except OSError as e:
         raise ValueError(f"cannot read {index_path}: {e.strerror or e}") from e
-    except ValueError as e:
+    except UnicodeDecodeError as e:
+        raise ValueError(f"{index_path} is not valid UTF-8: {e}") from e
+    except (ValueError, RecursionError) as e:
         raise ValueError(f"{index_path} is not valid JSON: {e}") from e
     rows = index.get("files") if isinstance(index, dict) else None
     if not isinstance(rows, list):
         raise ValueError(f"{index_path} has no 'files' list")
     for i, row in enumerate(rows):
-        if not isinstance(row, dict) or "off" not in row or "stored" not in row:
-            raise ValueError(f"{index_path}: row {i} needs an 'off' and a 'stored'")
+        if (
+            not isinstance(row, dict)
+            or type(row.get("off")) is not int
+            or row["off"] < 0
+            or type(row.get("stored")) is not int
+            or row["stored"] < 0
+        ):
+            raise ValueError(f"{index_path}: row {i} needs nonnegative integer 'off' and 'stored'")
     return sorted(rows, key=lambda r: r["off"])
 
 
-def read_payloads(target: str) -> list[dict]:
+class _LoadedDirectorySource(gi.DirectorySource):
+    """DirectorySource initialized from an already-validated sorted row list."""
+
+    def __init__(self, directory: str, rows: list[dict]):
+        self.directory = directory
+        self.index = {"files": rows}
+        self.rows = rows
+
+
+def read_payloads(target: str, *, _checked_index: bool = False, _rows: list[dict] | None = None) -> list[dict]:
     """Decode all text and binary payloads from an rpf9_carve.py dir or .rpf archive."""
     if os.path.isdir(target):
-        check_carve_index(target)
-        source = gi.DirectorySource(target)
+        if _rows is None and not _checked_index:
+            _rows = check_carve_index(target)
+        source = _LoadedDirectorySource(target, _rows) if _rows is not None else gi.DirectorySource(target)
         return _analyze_from_source(source)
     if not os.path.isfile(target):
         raise ValueError(f"{target}: no such file or folder")
@@ -342,7 +363,7 @@ def cross_reference_sgd5(payloads: list[dict], shaders_rpf: str) -> dict:
                 "entries": p["entries"],
                 "in_db0": len(in_db0),
                 "in_db1": len(in_db1),
-                "unshipped": p["entries"] - len(in_db0) - len(in_db1),
+                "unshipped": sum(1 for s in stems if s not in db0_set and s not in db1_set),
                 "exact_order_db0": in_db0 == db0_list and _is_subsequence(db0_list, stems),
                 "exact_order_db1": in_db1 == db1_list and _is_subsequence(db1_list, stems),
             })
@@ -370,18 +391,50 @@ def cross_reference_sgd5(payloads: list[dict], shaders_rpf: str) -> dict:
 def check_report_path(out_path: str, target: str, shaders_rpf: str | None = None,
                       rows: list[dict] | None = None) -> None:
     """Refuse a --json destination that is a directory or aliases any input file."""
-    if os.path.isdir(out_path):
+    if os.path.isdir(out_path) or out_path.endswith(("/", "\\")):
         raise ValueError(f"--json is a directory: {out_path}")
     if shaders_rpf and same_report_path(out_path, shaders_rpf):
         raise ValueError(f"--json would overwrite the input {shaders_rpf}")
     if os.path.isdir(target):
         gm.check_report_path(out_path, target, rows=rows)
+        for row in rows or ():
+            ext = ".bk2" if row.get("type") == "bink2" else ".bin"
+            cand = os.path.join(target, f'{row["off"]:012x}{ext}')
+            if same_report_path(out_path, cand):
+                raise ValueError(f"--json would overwrite the input {cand}")
     elif same_report_path(out_path, target):
         raise ValueError(f"--json would overwrite the input {target}")
 
 
 def _public(payload: dict) -> dict:
     return {k: v for k, v in payload.items() if not k.startswith("_")}
+
+
+def _write_json_atomic(out_path: str, payload: dict) -> None:
+    dest = os.path.realpath(out_path)
+    gm._make_parent(dest)
+    dest_dir = os.path.dirname(dest) or "."
+    fd, temp = tempfile.mkstemp(dir=dest_dir, prefix=".blobs-", suffix=".tmp")
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f, indent=1)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp, published_mode(dest))
+        replace_retry.replace(temp, dest)
+    except BaseException:
+        try:
+            os.chmod(temp, 0o600)
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
 
 
 def main(argv=None) -> int:
@@ -395,15 +448,19 @@ def main(argv=None) -> int:
         print(f"ERROR: cannot read {a.target}: no such file or folder", file=sys.stderr)
         return 2
     try:
+        if a.shaders and not os.path.isfile(a.shaders):
+            raise ValueError(f"{a.shaders}: no such file")
         if a.json:
             check_report_path(a.json, a.target, a.shaders)
-        if os.path.isdir(a.target):
+        is_dir = os.path.isdir(a.target)
+        rows = None
+        if is_dir:
             rows = check_carve_index(a.target)
             if a.json:
                 check_report_path(a.json, a.target, a.shaders, rows=rows)
-        payloads = read_payloads(a.target)
+        payloads = read_payloads(a.target, _checked_index=is_dir, _rows=rows)
         xref = cross_reference_sgd5(payloads, a.shaders) if a.shaders else None
-    except (OSError, ValueError, KeyError, TypeError, struct.error, RuntimeError) as e:
+    except (OSError, ValueError, KeyError, TypeError, RecursionError, struct.error, RuntimeError) as e:
         print("error:", e, file=sys.stderr)
         return 1
 
@@ -437,9 +494,7 @@ def main(argv=None) -> int:
         if xref is not None:
             out["sgd5_xref"] = xref
         try:
-            gm._make_parent(a.json)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(out, f, indent=1)
+            _write_json_atomic(a.json, out)
         except OSError as e:
             print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 1
