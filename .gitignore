@@ -45,3 +45,6 @@ __pycache__/
 # Predictor profiles are fitted from the user's own texture pools.
 *.bcph
 *.bcph.stamp
+
+# Generated tool output: tools/navmesh_decode.py writes <input>.navmesh-decode.json (docs/navmesh.md).
+*.navmesh-decode.json
