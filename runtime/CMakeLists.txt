@@ -4070,6 +4070,7 @@ if(TARGET Vulkan::Headers)
           VERBATIM)
       endforeach()
       add_executable(d3d12_draw_test test/d3d12_draw_test.cpp test/d3d12_stateful_indirect_pixels.cpp
+                     test/d3d12_draw_views_sharing.cpp
                      shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_VS}
                      ${LEONIDA_TEST_PS} ${LEONIDA_TEST_PS_UINT} ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_VS_INT})
       target_link_libraries(d3d12_draw_test PRIVATE gta6rt_d3d12_com)
@@ -4094,6 +4095,8 @@ if(TARGET Vulkan::Headers)
                            d3d12_stateful_indirect_nonindexed_counted_pixels PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
       add_test(NAME d3d12_title_index_window COMMAND d3d12_draw_test --title-index-window)
       add_test(NAME d3d12_title_vertex_window COMMAND d3d12_draw_test --title-vertex-window)
+      # Draws that keep the same render targets and vertex buffers share one views block (recording only).
+      add_test(NAME d3d12_draw_views_sharing COMMAND d3d12_draw_test --draw-views-sharing)
       # LEONIDA_STUB_PIPELINES: a pipeline with no translated shader is a no-op stub when the switch is on.
       add_executable(d3d12_stub_pipelines_test test/d3d12_stub_pipelines_test.cpp)
       target_link_libraries(d3d12_stub_pipelines_test PRIVATE gta6rt_d3d12_com)
@@ -4101,7 +4104,8 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_stub_pipelines_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_stub_pipelines COMMAND d3d12_stub_pipelines_test)
       set_tests_properties(d3d12_stub_pipelines PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
-      set_tests_properties(d3d12_draw d3d12_title_index_window d3d12_title_vertex_window PROPERTIES SKIP_RETURN_CODE 77)
+      set_tests_properties(d3d12_draw d3d12_title_index_window d3d12_title_vertex_window d3d12_draw_views_sharing
+                           PROPERTIES SKIP_RETURN_CODE 77)
       # Graphics & compute PSO descriptor validation parity against live Windows D3D12 (WARP and HW).
       add_executable(d3d12_pso_validation_test test/d3d12_pso_validation_test.cpp ${LEONIDA_TEST_VS}
                      ${LEONIDA_TEST_PS} ${LEONIDA_TEST_PS_UINT} ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_CS})

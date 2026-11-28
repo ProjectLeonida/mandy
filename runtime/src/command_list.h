@@ -229,6 +229,8 @@ struct TargetView {
     std::uint32_t first_layer;
     std::uint32_t layer_count;
     ColorViewFormat format = ColorViewFormat::resource;
+
+    bool operator==(const TargetView&) const = default;
 };
 
 // D3D12_RECT: right and bottom are exclusive.
@@ -399,6 +401,8 @@ struct VertexBufferView {
     std::uint64_t va;
     std::uint32_t size;
     std::uint32_t stride;
+
+    bool operator==(const VertexBufferView&) const = default;
 };
 
 struct IndexBufferView {
