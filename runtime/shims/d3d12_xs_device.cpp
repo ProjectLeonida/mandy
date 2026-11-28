@@ -842,8 +842,9 @@ HRESULT WINAPI dxgi_get_adapter(void* self, IDXGIAdapter** out) {
     note_dxgi("XboxIDXGIDevice::GetAdapter");
     return dxgi_adapter(dxgi_owner(self), __uuidof(IDXGIAdapter), reinterpret_cast<void**>(out));
 }
-// CreateSurface and QueryResourceResidency are D3D10/11-era methods no D3D12 title has a use for; what the console
-// answers is not measured, so they are refused and say so once.
+// CreateSurface is a D3D10/11-era method no D3D12 title has a use for, so it stays refused and logs once.
+// QueryResourceResidency validates its inputs and each ID3D12Pageable's owning device, reporting
+// DXGI_RESIDENCY_FULLY_RESIDENT for resources/heaps belonging to this device (matching Xbox unified physical memory).
 HRESULT WINAPI dxgi_create_surface(void*, const DXGI_SURFACE_DESC*, UINT, DXGI_USAGE, const DXGI_SHARED_RESOURCE*,
                                    IDXGISurface** out) {
     static std::atomic<bool> logged{false};
@@ -852,12 +853,39 @@ HRESULT WINAPI dxgi_create_surface(void*, const DXGI_SURFACE_DESC*, UINT, DXGI_U
     if (out) *out = nullptr;
     return E_NOTIMPL;
 }
-HRESULT WINAPI dxgi_query_resource_residency(void*, IUnknown* const*, DXGI_RESIDENCY*, UINT) {
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true, std::memory_order_relaxed))
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: IDXGIDevice::QueryResourceResidency is not implemented; returning E_NOTIMPL\n");
-    return E_NOTIMPL;
+bool same_com_identity(IUnknown* a, IUnknown* b) {
+    if (a == b) return a != nullptr;
+    if (!a || !b) return false;
+    IUnknown *ua = nullptr, *ub = nullptr;
+    const HRESULT ha = a->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void**>(&ua));
+    const HRESULT hb = b->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void**>(&ub));
+    const bool same = SUCCEEDED(ha) && SUCCEEDED(hb) && ua && ua == ub;
+    if (ua) ua->Release();
+    if (ub) ub->Release();
+    return same;
+}
+bool owns_pageable(DeviceProxy* owner, IUnknown* object) {
+    if (!owner || !object) return false;
+    ID3D12Pageable* pageable = nullptr;
+    if (FAILED(object->QueryInterface(__uuidof(ID3D12Pageable), reinterpret_cast<void**>(&pageable))) || !pageable)
+        return false;
+    ID3D12Device* dev = nullptr;
+    const HRESULT hr = pageable->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&dev));
+    pageable->Release();
+    if (FAILED(hr) || !dev) return false;
+    const bool owned = same_com_identity(dev, reinterpret_cast<IUnknown*>(owner)) || same_com_identity(dev, owner->real);
+    dev->Release();
+    return owned;
+}
+HRESULT WINAPI dxgi_query_resource_residency(void* self, IUnknown* const* resources, DXGI_RESIDENCY* residency,
+                                             UINT count) {
+    if (!resources || !residency) return E_INVALIDARG;
+    if (count == 0) return S_OK;
+    DeviceProxy* owner = dxgi_owner(self);
+    for (UINT i = 0; i < count; ++i)
+        if (!owns_pageable(owner, resources[i])) return E_INVALIDARG;
+    for (UINT i = 0; i < count; ++i) residency[i] = DXGI_RESIDENCY_FULLY_RESIDENT;
+    return S_OK;
 }
 // The priority and the frame latency are kept and read back; nothing acts on them (the Xbox presenter's latency is
 // SetFrameIntervalX's). The ranges are the documented ones: -7..7, and 1..16 with 0 for the default of 3.

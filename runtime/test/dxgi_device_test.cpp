@@ -155,7 +155,73 @@ int check_backend(const char* label, ID3D12Device* device, ID3D12Device* real, b
     EXPECT(dxgi->GetGPUThreadPriority(nullptr) == E_POINTER);
     IDXGISurface* surface = reinterpret_cast<IDXGISurface*>(std::uintptr_t{1});
     EXPECT(dxgi->CreateSurface(nullptr, 0, 0, nullptr, &surface) == E_NOTIMPL && !surface);
-    EXPECT(dxgi->QueryResourceResidency(nullptr, nullptr, 0) == E_NOTIMPL);
+    {
+        D3D12_HEAP_PROPERTIES buf_heap{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC buf_desc{};
+        buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buf_desc.Width = 256;
+        buf_desc.Height = 1;
+        buf_desc.DepthOrArraySize = 1;
+        buf_desc.MipLevels = 1;
+        buf_desc.SampleDesc.Count = 1;
+        buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        Ref<ID3D12Resource> resource;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&buf_heap, D3D12_HEAP_FLAG_NONE, &buf_desc,
+                                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                         IID_PPV_ARGS(&resource.p))));
+        D3D12_HEAP_DESC heap_desc{65536, {D3D12_HEAP_TYPE_DEFAULT}, 0, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS};
+        Ref<ID3D12Heap> heap;
+        EXPECT(SUCCEEDED(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+
+        DXGI_RESIDENCY residency[2] = {DXGI_RESIDENCY(99), DXGI_RESIDENCY(99)};
+        IUnknown* const good_list[2] = {resource.p, heap.p};
+        IUnknown* const null_entry_list[2] = {resource.p, nullptr};
+        IUnknown* const device_entry[1] = {device};
+        IUnknown* const dxgi_entry[1] = {dxgi.p};
+        IUnknown* const adapter_entry[1] = {adapter.p};
+        EXPECT(dxgi->QueryResourceResidency(nullptr, nullptr, 0) == E_INVALIDARG);
+        EXPECT(dxgi->QueryResourceResidency(nullptr, residency, 1) == E_INVALIDARG);
+        EXPECT(dxgi->QueryResourceResidency(good_list, nullptr, 1) == E_INVALIDARG);
+        EXPECT(dxgi->QueryResourceResidency(good_list, residency, 0) == S_OK);
+        EXPECT(dxgi->QueryResourceResidency(null_entry_list, residency, 2) == E_INVALIDARG);
+        EXPECT(dxgi->QueryResourceResidency(device_entry, residency, 1) == E_INVALIDARG);
+        EXPECT(dxgi->QueryResourceResidency(dxgi_entry, residency, 1) == E_INVALIDARG);
+        EXPECT(dxgi->QueryResourceResidency(adapter_entry, residency, 1) == E_INVALIDARG);
+        EXPECT(residency[0] == DXGI_RESIDENCY(99) && residency[1] == DXGI_RESIDENCY(99));
+
+        Ref<ID3D12Device> other_device;
+        if (vulkan) {
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&other_device.p))));
+        } else if (!GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version")) {
+            const LUID real_luid = real->GetAdapterLuid();
+            Ref<IDXGIFactory4> other_factory;
+            if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&other_factory.p)))) {
+                Ref<IDXGIAdapter1> warp;
+                DXGI_ADAPTER_DESC1 other_desc{};
+                if (SUCCEEDED(other_factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) &&
+                    SUCCEEDED(warp->GetDesc1(&other_desc)) && !same_luid(other_desc.AdapterLuid, real_luid))
+                    D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&other_device.p));
+                for (UINT i = 0; !other_device.p; ++i) {
+                    Ref<IDXGIAdapter1> hw;
+                    if (other_factory->EnumAdapters1(i, &hw.p) == DXGI_ERROR_NOT_FOUND) break;
+                    if (SUCCEEDED(hw->GetDesc1(&other_desc)) && !same_luid(other_desc.AdapterLuid, real_luid))
+                        D3D12CreateDevice(hw.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&other_device.p));
+                }
+            }
+        }
+        if (other_device.p) {
+            Ref<ID3D12Resource> foreign;
+            EXPECT(SUCCEEDED(other_device->CreateCommittedResource(&buf_heap, D3D12_HEAP_FLAG_NONE, &buf_desc,
+                                                                   D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                   IID_PPV_ARGS(&foreign.p))));
+            IUnknown* const mixed[2] = {resource.p, foreign.p};
+            EXPECT(dxgi->QueryResourceResidency(mixed, residency, 2) == E_INVALIDARG);
+            EXPECT(residency[0] == DXGI_RESIDENCY(99) && residency[1] == DXGI_RESIDENCY(99));
+        }
+
+        EXPECT(dxgi->QueryResourceResidency(good_list, residency, 2) == S_OK);
+        EXPECT(residency[0] == DXGI_RESIDENCY_FULLY_RESIDENT && residency[1] == DXGI_RESIDENCY_FULLY_RESIDENT);
+    }
 
     // Private data set through the DXGI interface is the device's, and the other way round.
     const std::uint32_t written = 0x12345678;
@@ -331,6 +397,7 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.buffer_device_address = true;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         inner->AddRef();  // the backend's own reference; the proxy takes the other
