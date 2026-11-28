@@ -89,8 +89,21 @@ public:
         return find(va, hit, bytes) && bytes <= hit.size - (va - hit.start);
     }
 
+    // Whether any range overlaps [va, va + bytes) (bytes 0 counts as 1).
+    bool overlaps(std::uint64_t va, std::uint64_t bytes) const {
+        Hit hit{};
+        if (find(va, hit)) return true;
+        const auto it = ranges_.lower_bound({va, Id{}});
+        return it != ranges_.end() && it->first.first - va < (bytes ? bytes : 1);
+    }
+
     std::size_t size() const { return ranges_.size(); }
     std::uint64_t longest() const { return longest_; }
+    // f(first VA, bytes) for every range, in VA order.
+    template <class F>
+    void for_each(F&& f) const {
+        for (const auto& [key, bytes] : ranges_) f(key.first, bytes);
+    }
 
 private:
     static constexpr Id max_id() { return ~Id(0); }
