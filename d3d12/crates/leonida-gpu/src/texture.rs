@@ -473,8 +473,9 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
         let mut read = take_read(&mut LARGE_READS.lock().unwrap_or_else(|e| e.into_inner()), size);
         if read.len() < size {
             // None there was large enough (or none was there): the largest
-            // goes before a new one is made, outside the lock. A new buffer
-            // comes zeroed from the allocator, without a second pass.
+            // goes before a new one is made, outside the lock. The new one
+            // is asked for zeroed, which lets the allocator skip writing
+            // pages that come fresh from the system.
             drop(read);
             read = vec![0u8; size];
         }
