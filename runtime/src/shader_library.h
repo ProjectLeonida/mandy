@@ -853,6 +853,9 @@ struct ShaderEntry {
     std::uint32_t lds_bytes = 0;
     bool uses_code_base = false;
     bool code_base_known = false;
+    // The index's needs_maintenance8: an image sample takes a texel offset outside a gather (the SPIR-V Offset image
+    // operand), valid only with VK_KHR_maintenance8; a pipeline on a device without it is refused.
+    bool needs_maintenance8 = false;
     bool wave64 = false;
     // The subgroup size the translator assumed (64 for a wave64 shader, 32 otherwise); 0 when the entry says null,
     // as one translated with --wave64-emulate does, or has none.
@@ -1252,6 +1255,8 @@ private:
                 e.uses_code_base = c->boolean;
                 e.code_base_known = true;
             }
+            if (const Json* m = meta.find("needs_maintenance8"); m && m->kind == Json::Kind::boolean)
+                e.needs_maintenance8 = m->boolean;
             if (const Json* w = meta.find("wave64"); w && w->kind == Json::Kind::boolean) e.wave64 = w->boolean;
             if (const Json* g = meta.find("subgroup_size"); g && g->kind == Json::Kind::number)
                 e.subgroup_size = u32(g);

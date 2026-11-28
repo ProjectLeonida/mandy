@@ -675,7 +675,7 @@ int main() {
                  " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"inputs\": [0, 1, 28, 29], "
                  "\"outputs\": [0, 2], \"f16_halves\": {\"0\": [28, 29], \"bad\": [1], \"-1\": [1, 2], "
                  "\"+2\": [3, 4], \" 3\": [5, 6], \"4294967296\": [9, 10], \"99999999999999999999\": [11, 12], "
-                 "\"7\": [20, 21]}},\n"
+                 "\"7\": [20, 21]}, \"needs_maintenance8\": true},\n"
                  " \"ps_native\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
                  "\"subgroup_size\": 64},\n"
                  " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
@@ -704,6 +704,7 @@ int main() {
           vs_all[1]->input_signature[0].register_index == 0);
     const ShaderEntry* ps = library.find("ps", hash);
     CHECK(ps && ps->outputs.size() == 2 && ps->outputs[1] == 2);
+    CHECK(ps->needs_maintenance8 && !vs->needs_maintenance8);  // read from the index; absent means false
     CHECK(ps->inputs.size() == 4 && ps->inputs[0] == 0 && ps->inputs[3] == 29);
     CHECK(ps->f16_halves.size() == 2 && ps->f16_halves.at(0)[0] == 28 && ps->f16_halves.at(0)[1] == 29 &&
           ps->f16_halves.at(7)[0] == 20 && ps->f16_halves.at(7)[1] == 21);
