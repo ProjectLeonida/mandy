@@ -12281,6 +12281,7 @@ private:
                 device_.staging_queue = std::make_unique<leonida::VulkanQueue>(*device_.context, device_.info.queue,
                                                                                device_.info.queue_family);
                 device_.staging_queue->make_synchronous();  // waited for at once (idle below)
+                device_.staging_queue->set_skip_before_execute(true);  // internal staging copy only; never reads world heaps/mirror
             }
             if (device_.staging_queue->ok()) {
                 const leonida::CommandList* lists[] = {&list};
