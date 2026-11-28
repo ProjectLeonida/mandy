@@ -86,7 +86,66 @@ public:
     static bool is_texture(State s) { return s >= texture_bound; }
     static bool is_waiting(State s) { return s == waiting || s == waiting_room || s >= texture_waiting; }
 
+    // Optional observer notified ONLY on kTexture kSettled 0 <-> 1 transitions per address for this heap
+    // (`bound == true` when the first slot in this heap binds `address`, `bound == false` when the last leaves,
+    // including across reset() and destruction).
+    using TextureLiveCallback = void (*)(void* user, std::uint64_t address, bool bound);
+
+    ConsoleHeapSlotRecords() = default;
+    ~ConsoleHeapSlotRecords() { notify_all_textures_unbound(); }
+    ConsoleHeapSlotRecords(const ConsoleHeapSlotRecords&) = delete;
+    ConsoleHeapSlotRecords& operator=(const ConsoleHeapSlotRecords&) = delete;
+    ConsoleHeapSlotRecords(ConsoleHeapSlotRecords&& other) noexcept
+        : slots_(other.slots_),
+          halves_(std::move(other.halves_)),
+          indexes_(std::move(other.indexes_)),
+          room_(std::move(other.room_)),
+          groups_(std::move(other.groups_)),
+          free_groups_(std::move(other.free_groups_)),
+          recorded_(other.recorded_),
+          waiting_(other.waiting_),
+          textures_count_(other.textures_count_),
+          textures_waiting_(other.textures_waiting_),
+          looked_at_(other.looked_at_),
+          groups_looked_at_(other.groups_looked_at_),
+          epoch_(other.epoch_),
+          texture_live_cb_(other.texture_live_cb_),
+          texture_live_user_(other.texture_live_user_) {
+        other.slots_ = 0;
+        other.texture_live_cb_ = nullptr;
+        other.texture_live_user_ = nullptr;
+    }
+    ConsoleHeapSlotRecords& operator=(ConsoleHeapSlotRecords&& other) noexcept {
+        if (this == &other) return *this;
+        notify_all_textures_unbound();
+        slots_ = other.slots_;
+        halves_ = std::move(other.halves_);
+        indexes_ = std::move(other.indexes_);
+        room_ = std::move(other.room_);
+        groups_ = std::move(other.groups_);
+        free_groups_ = std::move(other.free_groups_);
+        recorded_ = other.recorded_;
+        waiting_ = other.waiting_;
+        textures_count_ = other.textures_count_;
+        textures_waiting_ = other.textures_waiting_;
+        looked_at_ = other.looked_at_;
+        groups_looked_at_ = other.groups_looked_at_;
+        epoch_ = other.epoch_;
+        texture_live_cb_ = other.texture_live_cb_;
+        texture_live_user_ = other.texture_live_user_;
+        other.slots_ = 0;
+        other.texture_live_cb_ = nullptr;
+        other.texture_live_user_ = nullptr;
+        return *this;
+    }
+
+    void set_texture_live_callback(TextureLiveCallback cb, void* user) noexcept {
+        texture_live_cb_ = cb;
+        texture_live_user_ = user;
+    }
+
     void reset(std::size_t slots) {
+        notify_all_textures_unbound();
         slots_ = slots;
         // calloc: the pages of slots never written are never touched (the retail heap uses a tenth of its slots).
         halves_.reset(slots ? static_cast<Half*>(std::calloc(slots * 2, sizeof(Half))) : nullptr);
@@ -398,11 +457,13 @@ private:
         Group& g = groups_[it->second];
         const bool waited = g.waits();
         auto& list = g.keys[list_index];
+        const bool became_settled = which == kTexture && list_index == kSettled && list.empty();
         Half& h = halves_[key];
         h.group[n] = it->second + 1;
         h.place[n] = std::uint32_t(list.size());
         list.push_back(key);
         if (list_index >= kWaiting && !waited) g.waiting_at = index.waiting_by_start.emplace(g.start, it->second);
+        if (became_settled && texture_live_cb_) texture_live_cb_(texture_live_user_, g.start, true);
     }
 
     // Takes `key` out of its group[n], from the list of its current state.
@@ -419,13 +480,24 @@ private:
         halves_[last].place[n] = at;
         list.pop_back();
         h.group[n] = 0;
+        const bool became_unsettled = g.index == kTexture && which_list == kSettled && list.empty();
+        const std::uint64_t addr = g.start;
         if (which_list >= kWaiting && !g.waits()) index.waiting_by_start.erase(g.waiting_at);
-        if (!g.empty()) return;
-        index.by_range.erase(Range{g.start, g.end});
-        index.by_start[g.cls].erase(g.at);
-        if (index.by_start[g.cls].empty()) index.used[g.cls >> 6] &= ~(std::uint64_t(1) << (g.cls & 63));
-        for (auto& keys : g.keys) std::vector<std::uint32_t>().swap(keys);
-        free_groups_.push_back(id);
+        if (g.empty()) {
+            index.by_range.erase(Range{g.start, g.end});
+            index.by_start[g.cls].erase(g.at);
+            if (index.by_start[g.cls].empty()) index.used[g.cls >> 6] &= ~(std::uint64_t(1) << (g.cls & 63));
+            for (auto& keys : g.keys) std::vector<std::uint32_t>().swap(keys);
+            free_groups_.push_back(id);
+        }
+        if (became_unsettled && texture_live_cb_) texture_live_cb_(texture_live_user_, addr, false);
+    }
+
+    void notify_all_textures_unbound() {
+        if (!texture_live_cb_) return;
+        for (const auto& [r, id] : indexes_[kTexture].by_range) {
+            if (!groups_[id].keys[kSettled].empty()) texture_live_cb_(texture_live_user_, r.start, false);
+        }
     }
 
     // A list of `g` into `out`, unless this call has visited it already.
@@ -477,6 +549,8 @@ private:
     std::size_t recorded_ = 0, waiting_ = 0, textures_count_ = 0, textures_waiting_ = 0;
     std::uint64_t looked_at_ = 0, groups_looked_at_ = 0;
     std::uint32_t epoch_ = 0;  // touched() calls, for Group::seen
+    TextureLiveCallback texture_live_cb_ = nullptr;
+    void* texture_live_user_ = nullptr;
 };
 
 }  // namespace leonida
