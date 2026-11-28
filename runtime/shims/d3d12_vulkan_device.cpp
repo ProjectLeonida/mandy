@@ -19962,7 +19962,9 @@ public:
     // TitleVaAliases::want_buffer: a vertex or index view names `va` in the title's own memory and no buffer covers
     // it. A buffer over the 64 KiB-aligned committed pages around it is made the way slot 133 makes one (the pages
     // imported, or a shadow copied from them before every submission) and kept until the device goes, up to
-    // LEONIDA_TITLE_BUFFERS_MB (512 by default).
+    // LEONIDA_TITLE_BUFFERS_MB (512 by default). Only a buffer that covers the view is made and kept. After a range
+    // got none, no range is tried for a second (title_buffer_retry_), and a range refused again waits twice as long
+    // as the last time, up to 64 s (refused_title_ranges_).
     void make_title_buffer(std::uint64_t va, std::uint64_t bytes) {
         if (!&context()) return;
         static const bool check_size = [] {
@@ -19988,9 +19990,23 @@ public:
             const bool set = getenv_s(&length, text, "LEONIDA_TITLE_BUFFERS_MB") == 0 && length > 1;
             return (set ? std::strtoull(text, nullptr, 10) : 512ull) << 20;
         }();
+        // The title binds the same views draw after draw, and many views of one pool when its pages are refused. Each
+        // try asks for an import and a shadow, and their memory, under memory_mutex(), where the title's own
+        // allocations wait. So after a refusal no range is tried for a second, whichever range it is, and a range
+        // refused before waits its own time too, which doubles at each refusal: one that keeps failing (its pages
+        // cannot be imported, and no shadow of its size fits) does not take every second's try from ranges that
+        // could get a buffer. Both are checked before the page walk below (its VirtualQuery calls), which only
+        // shortens `asked`.
+        const auto now = std::chrono::steady_clock::now();
+        if (now < title_buffer_retry_) return;
         constexpr std::uint64_t align = 65536, most = 64ull << 20;
         const std::uint64_t start = std::max(va & ~(align - 1), lo);
-        std::uint64_t end = std::min(hi, (va + std::clamp<std::uint64_t>(bytes, 1, most) + align - 1) & ~(align - 1));
+        const std::uint64_t asked =
+            std::min(hi, (va + std::clamp<std::uint64_t>(bytes, 1, most) + align - 1) & ~(align - 1));
+        const auto refused = refused_title_ranges_.find(start);
+        if (refused != refused_title_ranges_.end() && asked <= refused->second.end && now < refused->second.retry)
+            return;
+        std::uint64_t end = asked;
         for (std::uint64_t at = start; at < end;) {  // the committed, readable part only
             MEMORY_BASIC_INFORMATION region{};
             if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &region, sizeof(region)) ||
@@ -20016,13 +20032,35 @@ public:
         desc.SampleDesc.Count = 1;
         desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         ID3D12Resource* made = nullptr;
+        // When the pages can be neither imported nor shadowed, slot 133 answers with an ordinary DEFAULT buffer that
+        // has neither the title's VA nor its bytes. It would not cover the view: kept, it would hold its memory until
+        // the device goes, and another would be made at the next bind of the same view, until
+        // LEONIDA_TITLE_BUFFERS_MB is used up. So it is not asked for (the shadow's failure comes back instead), and
+        // a buffer that still does not cover the view is let go.
         const HRESULT hr = create_at_host_address(reinterpret_cast<void*>(static_cast<std::uintptr_t>(start)), desc,
                                                   0xFFFFFFFFu, __uuidof(ID3D12Resource),
-                                                  reinterpret_cast<void**>(&made), nullptr);
-        if (FAILED(hr) || !made) {
-            log_once("a buffer over the title's memory for a vertex or index view could not be made; HRESULT", int(hr));
+                                                  reinterpret_cast<void**>(&made), nullptr, false);
+        const bool kept = SUCCEEDED(hr) && made && state_.context->knows_buffer_va(va, check_size ? end - va : 1);
+        if (!kept) {
+            if (SUCCEEDED(hr) && made)
+                log_once("a buffer over the title's memory for a vertex or index view does not cover it, so it is not "
+                         "kept; KiB",
+                         int((end - start) >> 10));
+            else
+                log_once("a buffer over the title's memory for a vertex or index view could not be made; HRESULT",
+                         int(hr));
+            if (made) made->Release();
+            constexpr std::chrono::steady_clock::duration first = std::chrono::seconds(1),
+                                                          longest = std::chrono::seconds(64);
+            const auto delay =
+                refused != refused_title_ranges_.end() ? std::min(refused->second.delay * 2, longest) : first;
+            if (refused_title_ranges_.size() >= 256)
+                std::erase_if(refused_title_ranges_, [&](const auto& range) { return range.second.retry <= now; });
+            refused_title_ranges_[start] = {asked, now + delay, delay};
+            title_buffer_retry_ = now + first;
             return;
         }
+        if (refused != refused_title_ranges_.end()) refused_title_ranges_.erase(refused);
         title_buffers_.push_back(made);
         title_buffer_bytes_ += end - start;
         if (title_buffers_.size() <= 8 || !(title_buffers_.size() & (title_buffers_.size() - 1)))
@@ -20036,9 +20074,21 @@ public:
     std::mutex title_buffer_mutex_;
     std::vector<ID3D12Resource*> title_buffers_;  // kept: the title's views name their addresses frame after frame
     std::uint64_t title_buffer_bytes_ = 0;
+    // Ranges [start, end) that got no buffer, by start (`end` as asked, before the page walk), with when they may be
+    // tried again and how long they waited last. Under title_buffer_mutex_; the entries past their time are dropped
+    // once there are 256.
+    struct RefusedTitleRange {
+        std::uint64_t end;
+        std::chrono::steady_clock::time_point retry;
+        std::chrono::steady_clock::duration delay;
+    };
+    std::map<std::uint64_t, RefusedTitleRange> refused_title_ranges_;
+    std::chrono::steady_clock::time_point title_buffer_retry_{};  // no range is tried before then (a refusal's second)
 
+    // `ordinary_fallback` false: a buffer whose pages can be neither imported nor shadowed fails with the shadow's
+    // HRESULT instead of being an ordinary DEFAULT buffer (make_title_buffer).
     HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, std::uint32_t layout, REFIID riid,
-                                   void** out, const D3D12_CLEAR_VALUE* clear) {
+                                   void** out, const D3D12_CLEAR_VALUE* clear, bool ordinary_fallback = true) {
         constexpr auto method = "Xbox CreatePlacedResourceX (device slot 133)";
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
             // A texture cannot be placed on the title's pages (the PC GPU does not sample the console layout): it gets
@@ -20158,8 +20208,11 @@ public:
             }
             // No memory for the shadow either: the boot goes on with an ordinary DEFAULT buffer of the same
             // description, as #6915's stand-in did. The title gets a resource, but neither its VA nor its writes at
-            // `address` reach it.
+            // `address` reach it. make_title_buffer asks for no such buffer: it would not cover the view it is made
+            // for, and making it would only take device-local memory, under the pressure that refused the shadow,
+            // to be let go at once.
             resource->Release();
+            if (!ordinary_fallback) return d3d12_trace::result(method, shadow);
             log_once("a title-placed buffer (device slot 133) could neither import its pages nor get a shadow, so it "
                      "is an ordinary buffer the title's writes do not reach; HRESULT",
                      int(shadow));
