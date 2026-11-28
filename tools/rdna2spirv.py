@@ -13648,6 +13648,8 @@ class Gen:
             else:
                 last_end = self.cl(imm + 4 * n)
             self.emit(f"{all_ok} = OpUGreaterThanEqual %bool {lim} {last_end}")
+            if coherent:
+                get_ptr()
             lbl_fast, lbl_slow, lbl_join = self.tmp() + "_all", self.tmp() + "_part", self.tmp() + "_join"
             self.emit(f"OpSelectionMerge {lbl_join} None")
             self.emit(f"OpBranchConditional {all_ok} {lbl_fast} {lbl_slow}")

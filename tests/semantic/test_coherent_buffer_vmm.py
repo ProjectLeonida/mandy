@@ -172,6 +172,22 @@ class CoherentBufferVmmTests(unittest.TestCase):
         self.assertTrue(meta.get("reads_glc_buffer"))
         validate_v12(self, asm, "mixed_vmm_img")
 
+    def test_wide_s_buffer_load_glc_runtime_bound_dominates_slow_path(self):
+        lines = [
+            "s_buffer_load_dwordx4 s[8:11], s[4:7], s12 glc",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32 v0, s8",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        asm, meta = translate_with_meta("ps_wide_sbuf_glc_rt", lines)
+        self.assertIn("OpMemoryModel PhysicalStorageBuffer64 Vulkan", asm)
+        self.assertIn("Aligned|MakePointerVisible|NonPrivatePointer 4 %c1", asm)
+        self.assertNotIn("%sbuf_slow_x4", asm)
+        self.assertNotIn("%_ptr_PSB_sl_blk", asm)
+        self.assertTrue(meta.get("reads_glc_buffer"))
+        validate_v12(self, asm, "wide_sbuf_glc_rt")
+
 
 if __name__ == "__main__":
     unittest.main()
