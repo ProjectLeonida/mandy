@@ -203,8 +203,10 @@ HINTERNET WINAPI open_connection(HINTERNET session, LPCWSTR server, INTERNET_POR
         return nullptr;
     }
     if (!server || !*server) {
+        // As the host's winhttp.dll answers (measured on Windows 11): no name is ERROR_INVALID_PARAMETER, an empty
+        // one ERROR_WINHTTP_INVALID_URL.
         release(s);
-        SetLastError(ERROR_INVALID_PARAMETER);
+        SetLastError(server ? ERROR_WINHTTP_INVALID_URL : ERROR_INVALID_PARAMETER);
         return nullptr;
     }
     return make_handle(Kind::Connect, s, s->async, server, port);  // keeps the reference on the session
@@ -342,7 +344,7 @@ BOOL WINAPI set_option(HINTERNET handle, DWORD option, LPVOID buffer, DWORD leng
             release(h);
             return fail(ERROR_INVALID_PARAMETER);
         }
-        if (length < sizeof(DWORD_PTR)) {
+        if (length != sizeof(DWORD_PTR)) {  // the host takes exactly a DWORD_PTR: 4 and 16 bytes both fail (measured)
             release(h);
             return fail(ERROR_INSUFFICIENT_BUFFER);
         }

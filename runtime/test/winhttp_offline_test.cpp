@@ -342,6 +342,18 @@ int main() {
         check(set_option(request, WINHTTP_OPTION_CONTEXT_VALUE, &short_ctx, sizeof(short_ctx)) == FALSE &&
                   GetLastError() == ERROR_INSUFFICIENT_BUFFER,
               "a 4-byte WINHTTP_OPTION_CONTEXT_VALUE fails with ERROR_INSUFFICIENT_BUFFER");
+        const DWORD_PTR long_ctx[2] = {0x5678, 0x9abc};
+        SetLastError(0);
+        check(set_option(request, WINHTTP_OPTION_CONTEXT_VALUE, const_cast<DWORD_PTR*>(long_ctx), sizeof(long_ctx)) ==
+                      FALSE &&
+                  GetLastError() == ERROR_INSUFFICIENT_BUFFER,
+              "a 16-byte WINHTTP_OPTION_CONTEXT_VALUE fails with ERROR_INSUFFICIENT_BUFFER too, as on the host");
+        {
+            DWORD_PTR kept = 0;
+            DWORD kept_size = sizeof(kept);
+            check(query_option(request, WINHTTP_OPTION_CONTEXT_VALUE, &kept, &kept_size) != FALSE && kept == 0x1234,
+                  "and the context set before stays");
+        }
         SetLastError(0);
         check(set_option(nullptr, WINHTTP_OPTION_CONTEXT_VALUE, &value, sizeof(value)) == FALSE &&
                   GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE,
@@ -364,6 +376,9 @@ int main() {
         SetLastError(0);
         check(connect(session, nullptr, 80, 0) == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
               "a connection needs a server name");
+        SetLastError(0);
+        check(connect(session, L"", 80, 0) == nullptr && GetLastError() == ERROR_WINHTTP_INVALID_URL,
+              "an empty server name fails with ERROR_WINHTTP_INVALID_URL, as on the host");
 
         check(close(request) != FALSE && close(connection) != FALSE && close(session) != FALSE,
               "the handles close, children first");
