@@ -66,31 +66,49 @@ public:
         const std::uint64_t aw = std::uint64_t(whole.width) * whole.app_texel_words();
         const std::uint64_t sw = std::uint64_t(whole.width) * whole.scratch_texel_words();
         if (!loaded_ || !make_pipeline() || !whole.app || !whole.width || !whole.height || !whole.slices ||
-            whole.app_offset % 4 || whole.app_row_words < aw ||
-            whole.app_slice_words < std::uint64_t(whole.app_row_words) * (whole.height - 1) + aw)
+            whole.app_offset % 4 || (whole.scratch && whole.scratch_offset % 4) || whole.app_row_words < aw)
             return false;
         const std::uint64_t h = whole.height, s = whole.slices;
-        const std::uint64_t span_words = (s - 1) * whole.app_slice_words + (h - 1) * whole.app_row_words + aw;
-        if (whole.app_offset + span_words * 4 > whole.app_size) return false;
-        if (!whole.scratch && !scratch(sw * h * s * 4, whole.scratch, whole.scratch_offset)) return false;
+        const std::uint64_t row_span = std::uint64_t(whole.app_row_words) * (h - 1);
+        if (row_span > UINT64_MAX - aw) return false;
+        const std::uint64_t one_slice_words = row_span + aw;
+        if (whole.app_slice_words < one_slice_words) return false;
+        const std::uint64_t slice_span = std::uint64_t(whole.app_slice_words) * (s - 1);
+        if (slice_span > UINT64_MAX - one_slice_words) return false;
+        const std::uint64_t span_words = slice_span + one_slice_words;
+        if (span_words > UINT64_MAX / 4) return false;
+        const std::uint64_t span_bytes = span_words * 4;
+        if (span_bytes > whole.app_size || whole.app_offset > whole.app_size - span_bytes) return false;
+        if (h > UINT64_MAX / sw) return false;
+        const std::uint64_t slice_scratch_words = sw * h;
+        if (s > UINT64_MAX / slice_scratch_words) return false;
+        const std::uint64_t total_scratch_words = slice_scratch_words * s;
+        if (total_scratch_words > UINT64_MAX / 4) return false;
+        const std::uint64_t total_scratch_bytes = total_scratch_words * 4;
+        if (whole.scratch && total_scratch_bytes > UINT64_MAX - whole.scratch_offset) return false;
 
         // A window starts at a multiple of 256 (the largest minStorageBufferOffsetAlignment), which costs up to 252 bytes.
         constexpr std::uint64_t slack = 256;
-        const std::uint64_t limit = max_range_;
-        const auto app_bytes = [&](std::uint64_t slices, std::uint64_t rows) {
-            return ((slices - 1) * whole.app_slice_words + (rows - 1) * whole.app_row_words + aw) * 4 + slack;
-        };
-        const auto scratch_bytes = [&](std::uint64_t slices, std::uint64_t rows) { return slices * rows * sw * 4 + slack; };
+        if (max_range_ <= slack) return false;
+        const std::uint64_t usable_words = (max_range_ - slack) / 4;
         std::uint64_t slices_per_part = 0;  // 0: a slice alone is too big
-        while (slices_per_part < s && app_bytes(slices_per_part + 1, h) <= limit && scratch_bytes(slices_per_part + 1, h) <= limit)
-            ++slices_per_part;
+        if (one_slice_words <= usable_words && slice_scratch_words <= usable_words) {
+            const std::uint64_t app_cap = 1 + (usable_words - one_slice_words) / whole.app_slice_words;
+            const std::uint64_t scratch_cap = usable_words / slice_scratch_words;
+            slices_per_part = std::min({s, app_cap, scratch_cap});
+        }
         std::uint64_t rows_per_part = h;
         if (!slices_per_part) {
-            rows_per_part = 0;
-            while (rows_per_part < h && app_bytes(1, rows_per_part + 1) <= limit && scratch_bytes(1, rows_per_part + 1) <= limit)
-                ++rows_per_part;
+            if (aw > usable_words || sw > usable_words) return false;
+            const std::uint64_t app_cap = 1 + (usable_words - aw) / whole.app_row_words;
+            const std::uint64_t scratch_cap = usable_words / sw;
+            rows_per_part = std::min({h, app_cap, scratch_cap});
             if (!rows_per_part) return false;
         }
+        const VkBuffer saved_scratch = whole.scratch;
+        const VkDeviceSize saved_scratch_offset = whole.scratch_offset;
+        if (!whole.scratch && !scratch(total_scratch_bytes, whole.scratch, whole.scratch_offset)) return false;
+
         parts.clear();
         for (std::uint64_t z = 0; z < s;) {
             const std::uint64_t n = slices_per_part ? std::min(slices_per_part, s - z) : 1;
@@ -101,7 +119,12 @@ public:
                 part.height = std::uint32_t(rows);
                 part.app_offset = whole.app_offset + (z * whole.app_slice_words + y * whole.app_row_words) * 4;
                 part.scratch_offset = whole.scratch_offset + ((z * h + y) * sw) * 4;
-                if (!make_part(part, whole.app_size)) return false;
+                if (!make_part(part, whole.app_size)) {
+                    parts.clear();
+                    whole.scratch = saved_scratch;
+                    whole.scratch_offset = saved_scratch_offset;
+                    return false;
+                }
                 parts.push_back(part);
             }
             z += n;
@@ -112,6 +135,7 @@ public:
 
     // Records the dispatch. The caller records the barriers around it.
     void run(VkCommandBuffer command_buffer, const Depth24Job& job) const {
+        if (!loaded_ || !pipeline_ || !job.width || !job.height || !job.slices) return;
         struct Push {
             std::uint32_t width, height, slices, to_float, app_base, app_row, app_slice, scratch_base;
         } push{job.width, job.height, job.slices, (job.to_float ? 1u : 0u) | (job.rgb96 ? 2u : 0u), job.app_base_words,
@@ -120,7 +144,7 @@ public:
         vk_.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &job.set, 0,
                                     nullptr);
         vk_.vkCmdPushConstants(command_buffer, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-        vk_.vkCmdDispatch(command_buffer, (job.width + 7) / 8, (job.height + 7) / 8, job.slices);
+        vk_.vkCmdDispatch(command_buffer, (job.width - 1u) / 8u + 1u, (job.height - 1u) / 8u + 1u, job.slices);
     }
 
     // The jobs prepared since the last call belong to a submission that `timeline` reaches `ticket` for.
@@ -134,27 +158,51 @@ public:
 
     // The submissions on `timeline` are over and the semaphore is about to go (its queue is idle).
     void forget(VkSemaphore timeline) {
-        for (std::size_t i = 0; i < retired_.size();) {
-            if (retired_[i].timeline != timeline) {
-                ++i;
-                continue;
+        std::size_t keep = 0;
+        for (std::size_t i = 0; i < retired_.size(); ++i) {
+            if (retired_[i].timeline == timeline) {
+                release(retired_[i]);
+            } else {
+                if (keep != i) retired_[keep] = std::move(retired_[i]);
+                ++keep;
             }
-            release(retired_[i]);
-            retired_.erase(retired_.begin() + std::ptrdiff_t(i));
         }
+        retired_.resize(keep);
     }
 
     // Frees (or keeps for reuse) what finished submissions used.
     void collect() {
-        for (std::size_t i = 0; i < retired_.size();) {
+        struct SemaphoreCacheEntry {
+            VkSemaphore semaphore = VK_NULL_HANDLE;
+            std::uint64_t value = 0;
+            bool ok = false;
+        };
+        SemaphoreCacheEntry cache[8];
+        std::size_t cache_count = 0;
+        const auto query_semaphore = [&](VkSemaphore timeline, std::uint64_t& done) -> bool {
+            for (std::size_t c = 0; c < cache_count; ++c) {
+                if (cache[c].semaphore == timeline) {
+                    done = cache[c].value;
+                    return cache[c].ok;
+                }
+            }
+            done = 0;
+            const bool ok =
+                DeviceFaultDiagnostics::observe(diagnostics_,
+                    vk_.vkGetSemaphoreCounterValue(device_, timeline, &done),
+                    "vkGetSemaphoreCounterValue (scratch)") == VK_SUCCESS;
+            if (cache_count < 8) cache[cache_count++] = {timeline, done, ok};
+            return ok;
+        };
+
+        std::size_t keep = 0;
+        for (std::size_t i = 0; i < retired_.size(); ++i) {
             if (retired_[i].ticket != 0) {
                 std::uint64_t done = 0;
-                if (!retired_[i].timeline ||
-                    DeviceFaultDiagnostics::observe(diagnostics_,
-                        vk_.vkGetSemaphoreCounterValue(device_, retired_[i].timeline, &done),
-                        "vkGetSemaphoreCounterValue (scratch)") != VK_SUCCESS ||
+                if (!retired_[i].timeline || !query_semaphore(retired_[i].timeline, done) ||
                     done < retired_[i].ticket) {
-                    ++i;
+                    if (keep != i) retired_[keep] = std::move(retired_[i]);
+                    ++keep;
                     continue;
                 }
             }
@@ -165,8 +213,8 @@ public:
             }
             retired_[i].chunks.clear();
             release(retired_[i]);
-            retired_.erase(retired_.begin() + std::ptrdiff_t(i));
         }
+        retired_.resize(keep);
     }
 
 private:
@@ -196,6 +244,7 @@ private:
 #undef LEONIDA_DEPTH24_MEMBER
 
         bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
+            if (!get || !device) return false;
             bool all = true;
 #define LEONIDA_DEPTH24_LOAD(name)                              \
     name = reinterpret_cast<PFN_##name>(get(device, #name));    \
@@ -257,12 +306,12 @@ private:
         const std::uint64_t span = ((std::uint64_t(part.slices) - 1) * part.app_slice_words +
                                     (std::uint64_t(part.height) - 1) * part.app_row_words +
                                     std::uint64_t(part.width) * part.app_texel_words()) * 4;
-        const std::uint64_t window = part.app_offset / alignment * alignment;
+        const std::uint64_t window = part.app_offset & ~(alignment - 1);
         const std::uint64_t range = part.app_offset - window + span;
         const std::uint64_t tight = std::uint64_t(part.width) * part.scratch_texel_words() * part.height * part.slices * 4;
-        const std::uint64_t scratch_window = part.scratch_offset / alignment * alignment;
+        const std::uint64_t scratch_window = part.scratch_offset & ~(alignment - 1);
         const std::uint64_t scratch_range = part.scratch_offset - scratch_window + tight;
-        if (window + range > app_size) return false;
+        if (range > app_size || window > app_size - range) return false;
         part.app_base_words = std::uint32_t((part.app_offset - window) / 4);
         part.scratch_base_words = std::uint32_t((part.scratch_offset - scratch_window) / 4);
         part.set = allocate_set();
@@ -307,9 +356,11 @@ private:
     // `bytes` of scratch, aligned for a descriptor offset, from this submission's chunks.
     bool scratch(std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
         constexpr VkDeviceSize alignment = 256, minimum = 4u << 20;
+        if (!bytes || bytes > UINT64_MAX - (alignment - 1)) return false;
         for (auto& chunk : current_.chunks) {
-            const VkDeviceSize start = (chunk.used + alignment - 1) / alignment * alignment;
-            if (start + bytes <= chunk.size) {
+            if (chunk.used > UINT64_MAX - (alignment - 1)) continue;
+            const VkDeviceSize start = (chunk.used + alignment - 1) & ~(alignment - 1);
+            if (start <= chunk.size && bytes <= chunk.size - start) {
                 chunk.used = start + bytes;
                 buffer = chunk.buffer;
                 offset = start;

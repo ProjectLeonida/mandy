@@ -2412,6 +2412,15 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vulkan_scratch COMMAND vulkan_scratch_test)
   endif()
+  # CPU-only: Depth24Converter overflow/partition/rollback/collect/forget checks (runtime/src/vulkan_depth24.h).
+  add_executable(vulkan_depth24_unit_test test/vulkan_depth24_unit_test.cpp)
+  target_link_libraries(vulkan_depth24_unit_test PRIVATE Vulkan::Headers)
+  if(MSVC)
+    target_compile_options(vulkan_depth24_unit_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vulkan_depth24_unit COMMAND vulkan_depth24_unit_test)
+  endif()
   if(WIN32)
     # CPU-only: a completed GPU label is stored into a page the D3D12 layer watches (read-only until written) and
     # dropped for a page that is read-only by the title's own doing (runtime/src/vulkan_gpu_labels.h).
