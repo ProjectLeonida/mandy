@@ -74,6 +74,7 @@
 #include "../src/title_va_alias.h"
 #include "../src/console_heap_slot_records.h"
 #include "../src/title_window_plan.h"
+#include "../src/title_write_ranges.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/host_image_copy_policy.h"
@@ -3743,27 +3744,14 @@ struct DeviceState {
         if (!leonida::title_va_aliases().title_memory(va, lo, hi) || va >= hi) return;
         const std::uint64_t end = va + std::min(bytes, hi - va);
         std::lock_guard lock(title_write_back_mutex);
-        auto it = title_write_back.lower_bound(va);
-        if (it != title_write_back.begin()) {
-            auto previous = std::prev(it);
-            if (previous->second >= va) {
-                if (previous->second < end) previous->second = end;
-                return;
-            }
-        }
-        if (it != title_write_back.end() && it->first <= end) {
-            it->second = std::max(it->second, end);
-            return;
-        }
-        if (title_write_back.size() >= kTitleWriteBackRanges || title_write_back_bytes >= kTitleWriteBackBytes) {
-            if (!title_write_back_refused++)
-                log_once("past LEONIDA_TITLE_WRITEBACK's caps: reached ranges are not copied back this submission; "
-                         "ranges refused:",
-                         1);
-            return;
-        }
-        title_write_back_bytes += end - va;
-        title_write_back.emplace(va, end);
+        // Joins every range it overlaps or touches (src/title_write_ranges.h): none of it is dropped, and the byte
+        // count stays the union's.
+        if (!leonida::add_reached_range(title_write_back, title_write_back_bytes, va, end, kTitleWriteBackRanges,
+                                        kTitleWriteBackBytes) &&
+            !title_write_back_refused++)
+            log_once("past LEONIDA_TITLE_WRITEBACK's caps: reached ranges are not copied back this submission; "
+                     "ranges refused:",
+                     1);
     }
 
     // What the GPU wrote into those copies goes back to the title's pages, so a later read by the title or the next
@@ -3772,7 +3760,7 @@ struct DeviceState {
     // context reports that ticket done. Runs at the start of a refresh, under shadow_mutex and before the forward
     // copies, so a page the title wrote again is copied forward over the result.
     void write_back_titles() {
-        if (!&context) return;
+        if (!context) return;
         const std::uint64_t done = context->completed_retire_ticket();
         std::vector<std::pair<uint64_t, std::uint64_t>> finished;  // one entry per range, collected under the lock
         {
