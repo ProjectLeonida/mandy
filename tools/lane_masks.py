@@ -249,6 +249,29 @@ def step(state, ins, wave64=True):
         elif op == "s_not_b32" and dst_t == "vcc_hi" and wave64 and state.get("vcc") in MASK_KINDS and _maskable_b32(a[1]):
             return
         put(state, a[0], k, wave64)
+    elif op == "s_movk_i32" and len(a) >= 2:
+        k = EITHER if (a[1]["k"] == "imm" and (a[1]["v"] & 0xFFFF) in (0, 0xFFFF)) else None
+        put(state, a[0], k, wave64)
+    elif op in ("s_cmov_b32", "s_cmovk_i32") and len(a) >= 2:
+        s0 = ({"k": "imm", "v": -1 if (a[1]["v"] & 0xFFFF) == 0xFFFF else (a[1]["v"] & 0xFFFF)}
+              if op == "s_cmovk_i32" and a[1]["k"] == "imm" else a[1])
+        srcs = (s0, a[0])
+        kinds = [kind(state, x, wave64) for x in srcs]
+        ms = {k for k in kinds if k in MASK_KINDS}
+        dst_t = a[0].get("t") if a[0]["k"] == "special" else None
+        if None not in kinds:
+            if dst_t == "vcc_hi" and wave64 and state.get("vcc") in MASK_KINDS:
+                return
+            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else EITHER, wave64)
+        elif not wave64 and dst_t in ("vcc", "vcc_lo") and all(_maskable_b32(x) for x in srcs):
+            put(state, a[0], MASK, wave64)
+        elif wave64 and dst_t in ("vcc_lo", "vcc_hi") and (state.get("vcc") in MASK_KINDS or ms) and \
+                all(_maskable_b32(x) for x in srcs):
+            if dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS:
+                return
+            put(state, a[0], MASK, wave64)
+        else:
+            put(state, a[0], None, wave64)
     elif op.startswith(BITWISE):
         kinds = [kind(state, x, wave64) for x in a[1:]]
         ms = {k for k in kinds if k in MASK_KINDS}

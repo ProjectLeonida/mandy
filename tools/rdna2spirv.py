@@ -11509,18 +11509,26 @@ class Gen:
                 self.sgpr_imm[a[0]["r"]] = val
         elif op in ("s_cmov_b32", "s_cmovk_i32"):
             # D = SCC ? S0 : D (s_cmovk_i32: S0 is the 16-bit immediate, sign-extended). SCC is read, not written.
-            if a[0]["k"] != "sgpr":
-                raise Unsupported(op + " destination")
+            d = a[0]
+            if d["k"] == "special" and d.get("t") == "null":
+                return
             if op == "s_cmovk_i32":
                 v = a[1]["v"] & 0xFFFF
-                x = self.cu((v - 0x10000 if v & 0x8000 else v) & 0xFFFFFFFF)
+                s0 = {"k": "imm", "v": v - 0x10000 if v & 0x8000 else v}
             else:
-                x = self.src_u(a[1])
-            old, c, r = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{old} = OpCopyObject %uint {self.load_reg('sgpr', a[0]['r'])}")
+                s0 = a[1]
+            to_mask_dst, dst_half = self._mask_b32_dst_half(d, [s0, d])
+            use_mask = to_mask_dst and self._maskable_b32(s0) and self._maskable_b32(d)
+            if use_mask:
+                x = self._mask_b32_src(s0, dst_half)
+                old = self._mask_b32_src(d, dst_half)
+            else:
+                x = self.src_u(s0)
+                old = self.src_u(d)
+            c, r = self.tmp(), self.tmp()
             self.emit(f"{c} = OpLoad %uint %scc")
             self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(c)} {x} {old}")
-            self.dst(a[0], r)
+            self._store_b32_mask_dst(d, r, use_mask, dst_half)
         elif op == "s_cmov_b64":
             # RDNA2 ISA SOP1: D = SCC ? S0 : D, SCC read and not written (LLVM AMDGPU SOPInstructions.td:
             # S_CMOV_B64 : SOP1_64 under Uses = [SCC]). Plain 64-bit data only: a lane-mask pair holds one
