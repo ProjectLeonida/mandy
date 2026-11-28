@@ -660,18 +660,31 @@ def native_ask(tool: str, exe: str, start: str) -> str:
     else:
         cmd = [exe, "--file-selection", "--directory", "--title=" + PICK_TITLE,
                "--filename=" + os.path.join(start, "")]
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    # The folder's own bytes: a name the locale's encoding can't read decodes with surrogateescape, and
+    # os.fsencode turns it back to what the dialog printed. subprocess.run(text=True) would raise instead.
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     if r.returncode == 1:       # both tools: the dialog was cancelled or closed
         return ""
     if r.returncode != 0:
         raise OSError(f"{tool} exited with {r.returncode}")
-    return r.stdout.strip("\r\n")
+    return os.fsdecode(r.stdout).strip("\r\n")
 
 
 def native_warn(tool: str, exe: str, msg: str) -> None:
     cmd = ([exe, "--title", "Leonida", "--sorry", msg] if tool == "kdialog"
            else [exe, "--warning", "--title=Leonida", "--text=" + msg])
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def show_path(p: str) -> str:
+    """A chosen folder as text for a log or fail line only: a name whose bytes the locale's encoding can't decode
+    keeps them in the str as surrogates, which print() raises on a UTF-8 terminal, so they show up escaped,
+    byte by byte. The folder itself still reaches the build unchanged."""
+    try:
+        p.encode("utf-8")
+        return p
+    except UnicodeEncodeError:   # os.fsdecode left a byte of the name in as a surrogate
+        return os.fsencode(p).decode("utf-8", "backslashreplace")
 
 
 def pick_game() -> str:
@@ -688,7 +701,7 @@ def pick_game() -> str:
                 d = os.path.normpath(d)
                 v = match_version(d)
                 if v:
-                    log(f"chose {v['title']} {v['version']} in {d}")
+                    log(f"chose {v['title']} {v['version']} in {show_path(d)}")
                     return d
                 notes = "".join(f"\n\n{container_message(p, h)}" for p, h in containers_in(d))
                 native_warn(*native, PICK_UNSUPPORTED + notes)
@@ -711,7 +724,7 @@ def pick_game() -> str:
             d = os.path.normpath(d)
             v = match_version(d)
             if v:
-                log(f"chose {v['title']} {v['version']} in {d}")
+                log(f"chose {v['title']} {v['version']} in {show_path(d)}")
                 return d
             notes = "".join(f"\n\n{container_message(p, h)}" for p, h in containers_in(d))
             messagebox.showwarning("Leonida", PICK_UNSUPPORTED + notes, parent=root)
