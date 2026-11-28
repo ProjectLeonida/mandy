@@ -57,7 +57,7 @@ CC_FLAGS = {
 FLAG_WRITERS = {
     "add": "NZCVPA", "or": "NZCVPA", "adc": "NZCVPA", "sbb": "NZCVPA",
     "and": "NZCVPA", "sub": "NZCVPA", "xor": "NZCVPA", "cmp": "NZCVPA",
-    "test": "NZCVPA", "neg": "NZCVPA",
+    "test": "NZCVPA", "neg": "NZCVPA", "cmpxchg": "NZCVPA", "xadd": "NZCVPA",
     "inc": "NZVPA", "dec": "NZVPA",
     "shl": "NZCP", "shr": "NZCP", "sar": "NZCP", "sal": "NZCP",
     "rol": "C", "ror": "C", "rcl": "C", "rcr": "C",
@@ -76,7 +76,7 @@ FLAG_READERS = {
 }
 
 # producer-kind groupings used by the condition tables
-SUB_KIND = {"sub", "cmp", "sbb", "dec", "neg", "cmps", "scas"}
+SUB_KIND = {"sub", "cmp", "sbb", "dec", "neg", "cmps", "scas", "cmpxchg"}
 # producers whose arm C already holds the x86-polarity carry/borrow value
 # (explicit materialization for shifts/multiplies, register load for popf/sahf)
 ADD_KIND = {"add", "adc", "inc", "shl", "sal", "shr", "sar", "rol", "ror",
@@ -461,7 +461,6 @@ def _classify(ins, mnem, cc_index, state):
         ins.kind = "xchg"
         if mnem != "xchg":
             ins.flags_w = "NZCVPA"
-            ins.flags_r = "NZCVPA"
     elif mnem in ("cbtw", "cwtd"):
         ins.kind = "conv"
     elif mnem == "bswap":
@@ -1122,6 +1121,19 @@ class Asm:
         base = {1: 0x38000C00, 2: 0x78000C00, 4: 0xB8000C00, 8: 0xF8000C00}[size]
         assert -256 <= off <= 255
         self.emit(base | (off & 0x1FF) << 12 | rn << 5 | rt)
+
+    # exclusive load/store (ARMv8.0 LL/SC atomics)
+    def ldaxr(self, rt, rn, size=8):
+        base = {1: 0x085FFC00, 2: 0x485FFC00, 4: 0x885FFC00, 8: 0xC85FFC00}[size]
+        self.emit(base | rn << 5 | rt)
+
+    def stlxr(self, rs, rt, rn, size=8):
+        assert rs != rt and rs != rn
+        base = {1: 0x0800FC00, 2: 0x4800FC00, 4: 0x8800FC00, 8: 0xC800FC00}[size]
+        self.emit(base | rs << 16 | rn << 5 | rt)
+
+    def clrex(self):
+        self.emit(0xD5033F5F)
 
     # conditional select
     def _csel(self, base, rd, rn, rm, cond, sf):
@@ -1877,13 +1889,169 @@ class FunctionTranslator:
             raise UnhandledInsn(ins, m)
 
     def _emit_xchg(self, ins):
-        if ins.mnem != "xchg":
-            raise UnhandledInsn(ins, f"{ins.mnem} needs atomics")
+        m = ins.mnem
+        if m == "cmpxchg":
+            self._emit_cmpxchg(ins)
+            return
+        if m == "xadd":
+            self._emit_xadd(ins)
+            return
+        if m != "xchg":
+            raise UnhandledInsn(ins, f"{m} needs atomics")
+        a = self.asm
         d, s = ins.ops
+        if s[0] == "m":
+            d, s = s, d
+        if d[0] == "m":
+            # x86 memory XCHG always asserts LOCK and preserves all flags (never touch NZCV).
+            sz = self._op_size(d)
+            self._mem_addr(d[1], ADDR_T)
+            self._load(ins, s, T1)
+            retry = self._skip_lbl()
+            if sz > 1:
+                unaligned = self._skip_lbl()
+                done = self._skip_lbl()
+                a.and_i(T2, ADDR_T, sz - 1)
+                a.cbnz(T2, unaligned)
+            a.label(retry)
+            a.ldaxr(T0, ADDR_T, size=sz)
+            a.stlxr(T2, T1, ADDR_T, size=sz)
+            a.cbnz(T2, retry, sf=0)
+            if sz > 1:
+                a.b(done)
+                a.label(unaligned)
+                a.ldr(T0, ADDR_T, 0, size=sz)
+                a.str(T1, ADDR_T, 0, size=sz)
+                a.label(done)
+            self._store(ins, s, T0)
+            return
         self._load(ins, d, T0)
         self._load(ins, s, T1)
         self._store(ins, d, T1)
         self._store(ins, s, T0)
+
+    def _emit_cmpxchg(self, ins):
+        a = self.asm
+        d, s = ins.ops
+        sz = self._op_size(d)
+        sf = 1 if sz == 8 else 0
+        acc = ("r", 0, sz)
+        need = self.needed.get(ins.addr, set())
+        flaggy = bool(need) or ins.addr in self.mat
+        self._load(ins, acc, T1)
+        self._load(ins, s, T2)
+        after = self._skip_lbl()
+        if d[0] == "r":
+            miss = self._skip_lbl()
+            self._load(ins, d, T0)
+            a.cmp_r(T1, T0, sf)
+            a.bcond("ne", miss)
+            self._store(ins, d, T2)
+            a.b(after)
+            a.label(miss)
+            self._store(ins, acc, T0)
+            if sz == 4:
+                # Intel SDM: 32-bit CMPXCHG writes back DEST even on mismatch, zero-extending r32.
+                self._store(ins, d, T0)
+        else:
+            self._mem_addr(d[1], ADDR_T)
+            if ins.lock:
+                if sz > 1:
+                    unaligned = self._skip_lbl()
+                    a.and_i(T3, ADDR_T, sz - 1)
+                    a.cbnz(T3, unaligned)
+                retry = self._skip_lbl()
+                miss_ll = self._skip_lbl()
+                a.label(retry)
+                a.ldaxr(T0, ADDR_T, size=sz)
+                a.cmp_r(T1, T0, sf)
+                a.bcond("ne", miss_ll)
+                a.stlxr(T3, T2, ADDR_T, size=sz)
+                a.cbnz(T3, retry, sf=0)
+                a.b(after)
+                a.label(miss_ll)
+                a.clrex()
+                self._store(ins, acc, T0)
+                a.b(after)
+                if sz > 1:
+                    a.label(unaligned)
+            if not ins.lock or sz > 1:
+                miss_plain = self._skip_lbl()
+                a.ldr(T0, ADDR_T, 0, size=sz)
+                a.cmp_r(T1, T0, sf)
+                a.bcond("ne", miss_plain)
+                a.str(T2, ADDR_T, 0, size=sz)
+                a.b(after)
+                a.label(miss_plain)
+                self._store(ins, acc, T0)
+        a.label(after)
+        if flaggy:
+            if "P" in need or "A" in need or ins.addr in self.mat:
+                a.sub_r(T2, T1, T0, 1)
+                a.stur(T2, CTX_REG, CTX_RES, size=8)
+                if "A" in need or ins.addr in self.mat:
+                    a.stur(T1, CTX_REG, CTX_A, size=8)
+                    a.stur(T0, CTX_REG, CTX_B, size=8)
+            sh = (32 - sz * 8) if sz < 4 else 0
+            if sh:
+                a.lsl(T1, T1, sh, sf=0)
+                a.lsl(T0, T0, sh, sf=0)
+            a.subs_r(31, T1, T0, sf)
+            self._maybe_mkflags(ins)
+
+    def _emit_xadd(self, ins):
+        a = self.asm
+        d, s = ins.ops
+        sz = self._op_size(d)
+        sf = 1 if sz == 8 else 0
+        need = self.needed.get(ins.addr, set())
+        flaggy = bool(need) or ins.addr in self.mat
+        self._load(ins, s, T1)
+        if d[0] == "r":
+            self._load(ins, d, T0)
+            a.add_r(T2, T0, T1, sf)
+            # Store src before dst so `xadd reg, reg` leaves 2*reg in dst.
+            self._store(ins, s, T0)
+            self._store(ins, d, T2)
+        else:
+            self._mem_addr(d[1], ADDR_T)
+            if ins.lock:
+                if sz > 1:
+                    unaligned = self._skip_lbl()
+                    done = self._skip_lbl()
+                    a.and_i(T3, ADDR_T, sz - 1)
+                    a.cbnz(T3, unaligned)
+                retry = self._skip_lbl()
+                a.label(retry)
+                a.ldaxr(T0, ADDR_T, size=sz)
+                a.add_r(T2, T0, T1, sf)
+                a.stlxr(T3, T2, ADDR_T, size=sz)
+                a.cbnz(T3, retry, sf=0)
+                if sz > 1:
+                    a.b(done)
+                    a.label(unaligned)
+                    a.ldr(T0, ADDR_T, 0, size=sz)
+                    a.add_r(T2, T0, T1, sf)
+                    a.str(T2, ADDR_T, 0, size=sz)
+                    a.label(done)
+            else:
+                a.ldr(T0, ADDR_T, 0, size=sz)
+                a.add_r(T2, T0, T1, sf)
+                a.str(T2, ADDR_T, 0, size=sz)
+            self._store(ins, s, T0)
+        if flaggy:
+            if "A" in need or ins.addr in self.mat:
+                a.stur(T0, CTX_REG, CTX_A, size=8)
+                a.stur(T1, CTX_REG, CTX_B, size=8)
+            sh = (32 - sz * 8) if sz < 4 else 0
+            if sh:
+                a.lsl(T0, T0, sh, sf=0)
+                a.lsl(T1, T1, sh, sf=0)
+            a.adds_r(T2, T0, T1, sf)
+            if sh:
+                a.lsr(T2, T2, sh, sf=0)
+            self._stash_res(ins, T2)
+            self._maybe_mkflags(ins)
 
     def _emit_conv(self, ins):
         a = self.asm
