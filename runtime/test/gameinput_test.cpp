@@ -26,6 +26,7 @@
 
 #include "gameinput.h"
 #include "gameinput_abi.h"
+#include "gameinput_script.h"
 #include "shims.h"
 
 using namespace gi;
@@ -1715,6 +1716,21 @@ void test_haptic_motors(IGameInput* input) {
 
 }  // namespace
 
+// INPUT-SCRIPT-PAD-OFF-NOTE: a script with the keyboard pad off is never read, so the shim has to say so. The decision
+// is a pure function; the shim prints its text once at configuration time.
+void test_script_pad_off_note() {
+    namespace script = rt::gameinput::script;
+    const char* note = script::pad_off_note("a@40,a@50", false);
+    check(note != nullptr, "pad-off note: a script with the keyboard pad off is reported");
+    check(note && std::strstr(note, "LEONIDA_INPUT_SCRIPT") && std::strstr(note, "LEONIDA_KEYBOARD_PAD=always"),
+          "pad-off note: it names the script variable and the setting that makes it run");
+    check(script::pad_off_note("a@40,a@50", true) == nullptr, "pad-off note: silent when the pad is on");
+    check(script::pad_off_note("", false) == nullptr, "pad-off note: silent without a script");
+    check(script::pad_off_note(" \t ", false) == nullptr, "pad-off note: a script of white space is no script");
+    check(script::pad_off_note("unknown@0", false) != nullptr,
+          "pad-off note: a script whose entries would all be rejected is still reported (it is not parsed here)");
+}
+
 int main(int argc, char** argv) {
     // Only virtual pads: no real controller on the test machine may show up.
     for (const char* hint : {SDL_HINT_JOYSTICK_HIDAPI, SDL_HINT_JOYSTICK_RAWINPUT, SDL_HINT_JOYSTICK_WGI,
@@ -1727,6 +1743,7 @@ int main(int argc, char** argv) {
     set_env("LEONIDA_DS_LIGHTBAR", nullptr);
     set_env("LEONIDA_RUMBLE", nullptr);
     test_add_ref_if_live();
+    test_script_pad_off_note();
 
     auto create = reinterpret_cast<GameInputCreateFn>(rt::shims::find("gameinput.dll", "GameInputCreate"));
     check(create != nullptr, "gameinput.dll!GameInputCreate is registered");

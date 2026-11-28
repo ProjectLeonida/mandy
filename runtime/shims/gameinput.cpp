@@ -194,6 +194,13 @@ rt::gameinput::Config read_config() {
     else if (!k.empty() && k != "0" && k != "off")
         std::fprintf(stderr, "[rt] gameinput: LEONIDA_KEYBOARD_PAD=%s unknown (1, always or off), keyboard pad off\n",
                      k.c_str());
+    // A script with no pad to drive would otherwise do nothing and say nothing (gameinput_script.h, pad_off_note).
+    // Once a process: reload_config reads the configuration again and the answer does not need repeating.
+    if (const char* note = rt::gameinput::script::pad_off_note(
+            env("LEONIDA_INPUT_SCRIPT"), c.keyboard_pad != rt::gameinput::KeyboardPadMode::Off)) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) std::fprintf(stderr, "[rt] gameinput: %s\n", note);
+    }
     using leonida::InputFamily;
     const std::string p = env("LEONIDA_PROMPTS");
     if (p == "xbox") c.prompts = InputFamily::Xbox;
