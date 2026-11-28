@@ -271,13 +271,13 @@ public:
     uint32_t STDMETHODCALLTYPE GetControllerAxisCount() override { return kAxisCount; }
     uint32_t STDMETHODCALLTYPE GetControllerAxisState(uint32_t count, float* out) override {
         const uint32_t n = out ? std::min(count, kAxisCount) : 0;
-        std::memcpy(out, s_.axes, n * sizeof(float));
+        if (n) std::memcpy(out, s_.axes, n * sizeof(float));  // never with a null buffer, even for 0 bytes
         return n;
     }
     uint32_t STDMETHODCALLTYPE GetControllerButtonCount() override { return kButtonCount; }
     uint32_t STDMETHODCALLTYPE GetControllerButtonState(uint32_t count, bool* out) override {
         const uint32_t n = out ? std::min(count, kButtonCount) : 0;
-        std::memcpy(out, s_.buttons, n * sizeof(bool));
+        if (n) std::memcpy(out, s_.buttons, n * sizeof(bool));
         return n;
     }
     uint32_t STDMETHODCALLTYPE GetControllerSwitchCount() override { return 0; }
@@ -2179,16 +2179,22 @@ void Device::SetRumbleState(const GameInputRumbleParams* params) {
 HRESULT Device::CreateForceFeedbackEffect(uint32_t motorIndex, const void* params, void** effect) {
     if (!effect) return E_POINTER;
     *effect = nullptr;
-    if (!params || motorIndex >= info.forceFeedbackMotorCount) return E_INVALIDARG;
+    if (!params) return E_INVALIDARG;
     const auto* p = static_cast<const GameInputForceFeedbackParams*>(params);
-    // Only what the motor reported. SDL is not asked here: this is a title call, so the cached feature mask decides,
-    // and the poll thread is what finds out if SDL refuses the effect anyway.
-    if (!valid_kind(p->kind) || !(ff_features & kind_feature(p->kind))) return E_INVALIDARG;
+    {
+        // The motor count and features are the poll thread's (open_pad, close_pad), written under g().mu.
+        std::lock_guard lock(g().mu);
+        if (motorIndex >= info.forceFeedbackMotorCount) return E_INVALIDARG;
+        // Only what the motor reported. SDL is not asked here: this is a title call, so the cached feature mask
+        // decides, and the poll thread is what finds out if SDL refuses the effect anyway.
+        if (!valid_kind(p->kind) || !(ff_features & kind_feature(p->kind))) return E_INVALIDARG;
+    }
     *effect = new ForceFeedbackEffect(this, motorIndex, *p);
     return S_OK;
 }
 
 bool Device::IsForceFeedbackMotorPoweredOn(uint32_t motorIndex) {
+    std::lock_guard lock(g().mu);  // haptic and the motor count change on the poll thread
     return motorIndex < info.forceFeedbackMotorCount && haptic != nullptr && status.load() != GameInputDeviceNoStatus;
 }
 
@@ -2291,6 +2297,10 @@ void STDMETHODCALLTYPE ForceFeedbackEffect::GetParams(GameInputForceFeedbackPara
 bool STDMETHODCALLTYPE ForceFeedbackEffect::SetParams(const GameInputForceFeedbackParams* params) {
     if (!params || !valid_kind(params->kind)) return false;
     std::lock_guard lock(g().mu);
+    // The kind is the effect's for life: SetParams changes the parameters of that kind only, and another kind is
+    // refused with the effect left as it was (a title makes a second effect for it). The motor reported this kind
+    // when the effect was created, so SDL's effect keeps its type and is only ever updated.
+    if (params->kind != params_.kind) return false;
     params_ = *params;
     ++version_;
     return true;
