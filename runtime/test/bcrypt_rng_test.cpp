@@ -86,6 +86,25 @@ void test_provider_handles_and_validation() {
     check(gen_random(nullptr, sys_buf, sizeof(sys_buf), BCRYPT_USE_SYSTEM_PREFERRED_RNG) == kStatusSuccess,
           "BCryptGenRandom succeeds with BCRYPT_USE_SYSTEM_PREFERRED_RNG");
 
+    // The RNG's CNG pseudo-handle (0x81) needs no open call; Windows 11's bcrypt.dll returns STATUS_SUCCESS for it,
+    // STATUS_INVALID_HANDLE for another algorithm's pseudo-handle and for closing it, and STATUS_INVALID_PARAMETER
+    // with BCRYPT_USE_SYSTEM_PREFERRED_RNG.
+    uint8_t pseudo_buf[32]{};
+    check(gen_random(BCRYPT_RNG_ALG_HANDLE, pseudo_buf, sizeof(pseudo_buf), 0) == kStatusSuccess,
+          "BCryptGenRandom takes BCRYPT_RNG_ALG_HANDLE without an open call");
+    bool pseudo_nonzero = false;
+    for (uint8_t b : pseudo_buf) {
+        if (b != 0) pseudo_nonzero = true;
+    }
+    check(pseudo_nonzero, "BCryptGenRandom writes random bytes through BCRYPT_RNG_ALG_HANDLE");
+    check(gen_random(BCRYPT_SHA256_ALG_HANDLE, pseudo_buf, sizeof(pseudo_buf), 0) == kStatusInvalidHandle,
+          "BCryptGenRandom refuses another algorithm's pseudo-handle");
+    check(gen_random(BCRYPT_RNG_ALG_HANDLE, pseudo_buf, sizeof(pseudo_buf), BCRYPT_USE_SYSTEM_PREFERRED_RNG) ==
+              kStatusInvalidParameter,
+          "BCryptGenRandom rejects BCRYPT_RNG_ALG_HANDLE with BCRYPT_USE_SYSTEM_PREFERRED_RNG");
+    check(close_alg(BCRYPT_RNG_ALG_HANDLE, 0) == kStatusInvalidHandle,
+          "BCryptCloseAlgorithmProvider refuses the RNG pseudo-handle, which was never opened");
+
     check(close_alg(nullptr, 0) == kStatusInvalidHandle,
           "BCryptCloseAlgorithmProvider rejects nullptr");
     check(close_alg(reinterpret_cast<BCRYPT_ALG_HANDLE>(static_cast<uintptr_t>(0x1234)), 0) == kStatusInvalidHandle,
@@ -129,6 +148,16 @@ void test_fail_closed_when_host_rng_unavailable(bool seeded) {
     check(sys_st == kStatusUnsuccessful && sys_untouched,
           "BCryptGenRandom fails closed with STATUS_UNSUCCESSFUL without mutating buffer (system RNG path)");
 
+    uint8_t pseudo_buf[16]{};
+    std::memset(pseudo_buf, 0x33, sizeof(pseudo_buf));
+    const NTSTATUS pseudo_st = gen_random(BCRYPT_RNG_ALG_HANDLE, pseudo_buf, sizeof(pseudo_buf), 0);
+    bool pseudo_untouched = true;
+    for (uint8_t b : pseudo_buf) {
+        if (b != 0x33) pseudo_untouched = false;
+    }
+    check(pseudo_st == kStatusUnsuccessful && pseudo_untouched,
+          "BCryptGenRandom fails closed with STATUS_UNSUCCESSFUL without mutating buffer (pseudo-handle path)");
+
     rt::bcrypt_rng::set_host_rng_enabled_for_test(true);
     close_alg(h, 0);
 }
@@ -149,6 +178,18 @@ void test_seeded_determinism(bool seeded) {
     check(gen_random(nullptr, second, sizeof(second), BCRYPT_USE_SYSTEM_PREFERRED_RNG) == kStatusSuccess &&
               std::memcmp(buf, second, sizeof(buf)) != 0,
           "seeded PRNG advances cleanly across consecutive calls");
+    // With the host RNG off, only the seeded stream can fill the buffer.
+    rt::bcrypt_rng::set_host_rng_enabled_for_test(false);
+    uint8_t third[16]{};
+    std::memset(third, 0x77, sizeof(third));
+    const NTSTATUS pseudo_st = gen_random(BCRYPT_RNG_ALG_HANDLE, third, sizeof(third), 0);
+    bool written = false;
+    for (uint8_t b : third) {
+        if (b != 0x77) written = true;
+    }
+    check(pseudo_st == kStatusSuccess && written,
+          "seeded BCryptGenRandom serves BCRYPT_RNG_ALG_HANDLE from the seeded stream");
+    rt::bcrypt_rng::set_host_rng_enabled_for_test(true);
     close_alg(h, 0);
 }
 

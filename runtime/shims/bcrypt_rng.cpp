@@ -6,13 +6,19 @@
 //     STATUS_INVALID_HANDLE (0xC0000008) instead of corrupting or faulting in host bcryptprimitives.dll;
 //   - delegates hardware CSPRNG generation to dynamically loaded host bcrypt.dll (with SystemFunction036 fallback);
 //   - supports an optional deterministic LEONIDA_RNG_SEED=<uint64> mode (decimal or 0x hex) for reproducible
-//     testing/debugging runs.
+//     testing/debugging runs;
+//   - accepts BCRYPT_RNG_ALG_HANDLE, the CNG pseudo-handle of the RNG, which needs no open call (Windows 10+).
 #include <windows.h>
 
 #ifndef _NTDEF_
 using NTSTATUS = LONG;
 #endif
 #include <bcrypt.h>
+
+// bcrypt.h declares the pseudo-handles only for NTDDI_WINTHRESHOLD (Windows 10) and later; the value is fixed.
+#ifndef BCRYPT_RNG_ALG_HANDLE
+#define BCRYPT_RNG_ALG_HANDLE ((BCRYPT_ALG_HANDLE)0x00000081)
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -192,6 +198,12 @@ NTSTATUS WINAPI gen_random(BCRYPT_ALG_HANDLE hAlgorithm, PUCHAR pbBuffer, ULONG 
     bool is_rng = use_system;
     if (use_system) {
         if (hAlgorithm != nullptr) return kStatusInvalidParameter;
+    } else if (hAlgorithm == BCRYPT_RNG_ALG_HANDLE) {
+        // The RNG's pseudo-handle is valid wherever an RNG algorithm handle is, without BCryptOpenAlgorithmProvider
+        // ("CNG Algorithm Pseudo-handles"), and the host's BCryptGenRandom takes it as it is. It was looked up as a
+        // handle this shim opened, found nowhere, and the call failed with the buffer left as it was.
+        host_handle = hAlgorithm;
+        is_rng = true;
     } else {
         if (!hAlgorithm || !lookup_live_handle(hAlgorithm, host_handle, is_rng)) return kStatusInvalidHandle;
         if (!is_rng) return kStatusInvalidHandle;
