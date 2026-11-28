@@ -695,45 +695,111 @@ std::uint64_t ask(std::uint64_t reader, const Runs& runs, Dirty&& dirty, Refused
     const auto me = s.readers.find(reader);
     const std::uint64_t since = me != s.readers.end() ? me->second : 0;
     const std::uint64_t now = s.asked.fetch_add(1, std::memory_order_acq_rel) + 1;
-    s.refusals.assign(runs.size(), 0);
-    for (std::size_t r = 0; r < runs.size(); ++r) {
-        const auto [from, to] = runs[r];
-        ULONG_PTR count = (to - from) / kPage;
-        if (s.found.size() < count) s.found.resize(count);
-        ULONG granularity = 0;
-        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(from), to - from, s.found.data(), &count,
-                          &granularity) != 0) {
-            s.refusals[r] = 1;
-            continue;
-        }
-        for (ULONG_PTR k = 0; k < count; ++k)
-            s.written[reinterpret_cast<std::uintptr_t>(s.found[k]) & ~(kPage - 1)] = now;
-    }
-    for (std::size_t r = 0; r < runs.size(); ++r) {
-        const auto [from, to] = runs[r];
-        if (s.refusals[r]) {
-            refused(from, to);
-            continue;
-        }
-        // Forgotten before this reader saw it, or a reservation new to it: all of it. Looked up after `now` was
-        // taken, so a reservation recorded later has a higher number and is all written at the next asking too.
-        const std::uint64_t reserved = born(from);
-        if (since < s.floor || !reserved || reserved > since) {
-            dirty(from, to);
-            continue;
-        }
-        std::uintptr_t run_from = 0, run_to = 0;
-        for (auto it = s.written.lower_bound(from); it != s.written.end() && it->first < to; ++it) {
-            if (it->second <= since) continue;
-            if (it->first != run_to) {
-                if (run_from != run_to) dirty(run_from, run_to);
-                run_from = it->first;
+
+    // Single-reader fast path: avoid inserting GetWriteWatch results into s.written (zero host_heap RB-tree node
+    // allocations per dirty 4 KiB page), while still reporting and erasing any s.written entries within [from, to)
+    // produced by title_write_watch::mark() or earlier multi-reader askings (leaving entries outside [from, to) alone).
+    if (me != s.readers.end() && s.readers.size() == 1) {
+        for (std::size_t r = 0; r < runs.size(); ++r) {
+            const auto [from, to] = runs[r];
+            ULONG_PTR count = (to - from) / kPage;
+            if (s.found.size() < count) s.found.resize(count);
+            ULONG granularity = 0;
+            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(from), to - from, s.found.data(), &count,
+                              &granularity) != 0) {
+                refused(from, to);
+                continue;
             }
-            run_to = it->first + kPage;
+            const std::uint64_t reserved = born(from);
+            if (since < s.floor || !reserved || reserved > since) {
+                if (!s.written.empty()) {
+                    auto it = s.written.lower_bound(from);
+                    while (it != s.written.end() && it->first < to) it = s.written.erase(it);
+                }
+                dirty(from, to);
+                continue;
+            }
+            if (!s.written.empty()) {
+                for (auto it = s.written.lower_bound(from); it != s.written.end() && it->first < to;) {
+                    if (it->second > since) {
+                        if (s.found.size() <= count) s.found.resize(count + 1);
+                        s.found[count++] = reinterpret_cast<void*>(it->first);
+                    }
+                    it = s.written.erase(it);
+                }
+            }
+            if (!count) continue;
+            bool sorted = true;
+            std::uintptr_t prev_p = reinterpret_cast<std::uintptr_t>(s.found[0]) & ~(kPage - 1);
+            for (ULONG_PTR k = 1; k < count; ++k) {
+                const std::uintptr_t cur_p = reinterpret_cast<std::uintptr_t>(s.found[k]) & ~(kPage - 1);
+                if (cur_p < prev_p) {
+                    sorted = false;
+                    break;
+                }
+                prev_p = cur_p;
+            }
+            if (!sorted) {
+                std::sort(s.found.begin(), s.found.begin() + static_cast<std::ptrdiff_t>(count),
+                          [](void* a, void* b) {
+                              return (reinterpret_cast<std::uintptr_t>(a) & ~(kPage - 1)) <
+                                     (reinterpret_cast<std::uintptr_t>(b) & ~(kPage - 1));
+                          });
+            }
+            std::uintptr_t run_from = 0, run_to = 0;
+            for (ULONG_PTR k = 0; k < count; ++k) {
+                const std::uintptr_t p = reinterpret_cast<std::uintptr_t>(s.found[k]) & ~(kPage - 1);
+                if (run_from != run_to && p < run_to) continue;
+                if (p != run_to) {
+                    if (run_from != run_to) dirty(run_from, run_to);
+                    run_from = p;
+                }
+                run_to = p + kPage;
+            }
+            if (run_from != run_to) dirty(run_from, run_to);
         }
-        if (run_from != run_to) dirty(run_from, run_to);
+        me->second = now;
+    } else {
+        s.refusals.assign(runs.size(), 0);
+        for (std::size_t r = 0; r < runs.size(); ++r) {
+            const auto [from, to] = runs[r];
+            ULONG_PTR count = (to - from) / kPage;
+            if (s.found.size() < count) s.found.resize(count);
+            ULONG granularity = 0;
+            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(from), to - from, s.found.data(), &count,
+                              &granularity) != 0) {
+                s.refusals[r] = 1;
+                continue;
+            }
+            for (ULONG_PTR k = 0; k < count; ++k)
+                s.written[reinterpret_cast<std::uintptr_t>(s.found[k]) & ~(kPage - 1)] = now;
+        }
+        for (std::size_t r = 0; r < runs.size(); ++r) {
+            const auto [from, to] = runs[r];
+            if (s.refusals[r]) {
+                refused(from, to);
+                continue;
+            }
+            // Forgotten before this reader saw it, or a reservation new to it: all of it. Looked up after `now` was
+            // taken, so a reservation recorded later has a higher number and is all written at the next asking too.
+            const std::uint64_t reserved = born(from);
+            if (since < s.floor || !reserved || reserved > since) {
+                dirty(from, to);
+                continue;
+            }
+            std::uintptr_t run_from = 0, run_to = 0;
+            for (auto it = s.written.lower_bound(from); it != s.written.end() && it->first < to; ++it) {
+                if (it->second <= since) continue;
+                if (it->first != run_to) {
+                    if (run_from != run_to) dirty(run_from, run_to);
+                    run_from = it->first;
+                }
+                run_to = it->first + kPage;
+            }
+            if (run_from != run_to) dirty(run_from, run_to);
+        }
+        if (me != s.readers.end()) me->second = now;
     }
-    if (me != s.readers.end()) me->second = now;
     // What every reader has seen goes, once the journal doubled or every kPruneEvery askings (a pruning that dropped
     // little, readers being behind then, must not stop the next); past kMaxPages, what is more than kKeep askings old
     // goes too.

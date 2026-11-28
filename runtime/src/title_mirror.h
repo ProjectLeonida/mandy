@@ -64,6 +64,11 @@ struct TitleMirrorHooks {
     // Copies a physical page's 64 KiB into its home; false when its bytes cannot be read (the home keeps zeros).
     // May be called concurrently from internal worker threads during batched upload(); must be thread-safe.
     std::function<bool(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes)> copy;
+    // Optional fused strip copy + 256-byte piece hashing: copies `pieces * 256` bytes from `from` into `to` and fills
+    // `sums[0..pieces)` with bit-for-bit identical `shadow_keep::sum_of(..., 256)` hashes in one pass; false when any
+    // byte cannot be read (falls back to per-piece `copy`). Must be thread-safe.
+    std::function<bool(std::uint8_t* to, const std::uint8_t* from, std::size_t pieces, std::uint64_t* sums)>
+        copy_and_sum;
     // Fills the filtered copy of a page in an aliased range (alias): the title's bytes at `from` (the page shown at
     // title address `va`) in, what the GPU reads at the alias into `to`. Called after the page's own home took the
     // title's bytes, when they changed. `fresh`: the copy holds nothing of an earlier fill (made now, or a failed fill
@@ -90,7 +95,7 @@ public:
     static constexpr std::size_t kStripBytes = 16384;
     static constexpr std::size_t kStripPieces = kStripBytes / shadow_keep::kPiece;
     static constexpr std::size_t kParallelThreshold = 16;
-    static constexpr std::size_t kMaxWorkers = 6;
+    static constexpr std::size_t kMaxWorkers = 8;
     // Sentinel ticket for freed homes waiting for flush() + note_mirror_bind() to publish the sparse unbind before
     // stamping their retire ticket via stamp_freed().
     static constexpr std::uint64_t kUnstamped = UINT64_MAX;
@@ -1404,24 +1409,35 @@ private:
             const std::size_t strip_off = strip * kStripBytes;
             const std::size_t base_k = strip * kStripPieces;
             std::uint8_t* const strip_buf = scratch ? (scratch + strip_off) : local_strip;
+            std::uint64_t* const target_sums = whole ? (sums + base_k) : strip_sums;
 
-            const bool strip_ok = hooks_.copy ? hooks_.copy(strip_buf, frame + strip_off, kStripBytes)
-                                              : (std::memcpy(strip_buf, frame + strip_off, kStripBytes), true);
+            bool sums_ready = false;
+            bool strip_ok = false;
+            if (hooks_.copy_and_sum) {
+                strip_ok = hooks_.copy_and_sum(strip_buf, frame + strip_off, kStripPieces, target_sums);
+                sums_ready = strip_ok;
+            } else if (hooks_.copy) {
+                strip_ok = hooks_.copy(strip_buf, frame + strip_off, kStripBytes);
+            } else {
+                shadow_keep::copy_and_sum_256(strip_buf, frame + strip_off, kStripPieces, target_sums);
+                strip_ok = true;
+                sums_ready = true;
+            }
             if (!strip_ok) {
                 for (std::size_t p = 0; p < kStripPieces; ++p) {
                     std::uint8_t* const piece = strip_buf + p * kPiece;
-                    if (!hooks_.copy(piece, frame + strip_off + p * kPiece, kPiece)) {
+                    if (!hooks_.copy || !hooks_.copy(piece, frame + strip_off + p * kPiece, kPiece)) {
                         std::memset(piece, 0, kPiece);
                         failed = true;
                     }
                 }
+                sums_ready = false;
             }
+            if (!sums_ready) shadow_keep::sum_of_batch_256(strip_buf, kStripPieces, target_sums);
 
             if (whole) {
-                shadow_keep::sum_of_batch_256(strip_buf, kStripPieces, sums + base_k);
                 std::memcpy(to + strip_off, strip_buf, kStripBytes);
             } else {
-                shadow_keep::sum_of_batch_256(strip_buf, kStripPieces, strip_sums);
                 std::uint64_t strip_mask = 0;
                 for (std::size_t p = 0; p < kStripPieces; ++p) {
                     if (strip_sums[p] != sums[base_k + p]) {

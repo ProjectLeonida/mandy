@@ -382,6 +382,176 @@ int main() {
         std::printf("WS1 fast paths (all_armed, reserve/ro cache, range-scoped reopen, 32-gap bridge, disarm_batch, WC): ok\n");
     }
 
+    // Verify Round 10 WS2 improvements & guardrails:
+    //  1. Shared Cell::known_* populated on all_armed skip -> subsequent re-arm takes 0 VQ, 1 VP fast path.
+    //  2. Cross-pass PAGE_NOACCESS and MEM_RESERVE caching in CellGuard (0 VQ, 0 VP on repeat arm; invalidated by
+    //     title_memory_map::changed()), while PAGE_READONLY is NEVER cached cross-pass (reopened RO->RW without
+    //     map change MUST be re-queried and re-guarded!).
+    //  3. BB1-BB4: bridging across already_armed batch tiles (no double-counting), bridging across a tile watched
+    //     only by another owner (s.cells.find fallback), and 48-tile gap (<= kMaxBridgeGap = 64) in 1 VirtualProtect.
+    //  4. C1: title_write_watch::ask() single-reader fast path reports+erases mark() entries inside [from, to),
+    //     preserves mark() entries outside [from, to), and does not insert GetWriteWatch pages into s.written.
+    {
+        std::vector<std::uint64_t> out;
+
+        // 1. Shared Cell::known_* seeded from all_armed skip.
+        {
+            TextureCells other;
+            leonida::geometry_writes::Cell* cell = other.acquire(base);
+            EXPECT(other.arm(base, *cell) == 1);
+            leonida::HotColdTracking tracking;
+            tracking.watch(base);
+            tracking.collect(out);  // all_armed skip seeds Cell::known_*
+            EXPECT(tracking.last_arm_stats().already_armed_skips == 1 && tracking.last_arm_stats().vq_calls == 0);
+            leonida::geometry_writes::notify(base, base + 1, leonida::geometry_writes::Event::open);
+            tracking.collect(out);  // repeat arm hits shared Cell::known_* -> 0 VQ, 1 VP!
+            const auto arm_s = tracking.last_arm_stats();
+            EXPECT(arm_s.vq_calls == 0 && arm_s.vp_calls == 1 && arm_s.fast_tiles == 1);
+            tracking.unwatch(base);
+            other.release(base);
+        }
+
+        // 2. Cross-pass PAGE_NOACCESS / MEM_RESERVE caching + PAGE_READONLY NEVER cached cross-pass.
+        {
+            auto* res = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, kPage, MEM_RESERVE, PAGE_NOACCESS));
+            auto* noacc =
+                static_cast<std::uint8_t*>(VirtualAlloc(nullptr, kPage, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS));
+            auto* ro =
+                static_cast<std::uint8_t*>(VirtualAlloc(nullptr, kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY));
+            EXPECT(res && noacc && ro);
+            if (res && noacc && ro) {
+                const auto res_va = reinterpret_cast<std::uintptr_t>(res);
+                const auto noacc_va = reinterpret_cast<std::uintptr_t>(noacc);
+                const auto ro_va = reinterpret_cast<std::uintptr_t>(ro);
+                leonida::HotColdTracking tracking;
+                std::vector<std::uint64_t> mix = {res_va, noacc_va, ro_va};
+                tracking.watch_batch(mix.data(), mix.size());
+                tracking.collect(out);  // initial arm queries all 3
+                // Re-arm MEM_RESERVE and PAGE_NOACCESS -> 0 VQ, 0 VP!
+                leonida::geometry_writes::notify(res_va, res_va + 1, leonida::geometry_writes::Event::write);
+                leonida::geometry_writes::notify(noacc_va, noacc_va + 1, leonida::geometry_writes::Event::write);
+                tracking.collect(out);
+                const auto s_noguard = tracking.last_arm_stats();
+                EXPECT(s_noguard.vq_calls == 0 && s_noguard.vp_calls == 0);
+
+                // Reopen PAGE_READONLY -> PAGE_READWRITE WITHOUT title_memory_map::changed() (ShadowPages::reopen):
+                // re-arm MUST re-query and protect it!
+                DWORD old_prot = 0;
+                EXPECT(VirtualProtect(ro, kPage, PAGE_READWRITE, &old_prot) != 0);
+                leonida::geometry_writes::notify(ro_va, ro_va + 1, leonida::geometry_writes::Event::write);
+                tracking.collect(out);
+                const auto s_ro = tracking.last_arm_stats();
+                EXPECT(s_ro.vq_calls >= 1 && s_ro.vp_calls == 1);
+                MEMORY_BASIC_INFORMATION mbi{};
+                EXPECT(VirtualQuery(ro, &mbi, sizeof mbi) && mbi.Protect == PAGE_READONLY);
+
+                tracking.unwatch_batch(mix.data(), mix.size());
+            }
+            if (res) VirtualFree(res, 0, MEM_RELEASE);
+            if (noacc) VirtualFree(noacc, 0, MEM_RELEASE);
+            if (ro) VirtualFree(ro, 0, MEM_RELEASE);
+        }
+
+        // 3. BB1-BB4: bridge across already_armed batch tile, other-owner-only gap tile, and 48-tile gap (<=64).
+        {
+            constexpr std::size_t kBigBridge = 56;
+            auto* bmem = static_cast<std::uint8_t*>(
+                VirtualAlloc(nullptr, kBigBridge * kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            EXPECT(bmem != nullptr);
+            if (bmem) {
+                const auto bbase = reinterpret_cast<std::uintptr_t>(bmem);
+                leonida::HotColdTracking tracking;
+                TextureCells other;
+                std::vector<std::uint64_t> bpages;
+                for (std::size_t p = 0; p < kBigBridge; ++p) {
+                    if (p == 2) continue;  // watched ONLY by `other` (s.cells.find fallback!)
+                    bpages.push_back(bbase + p * kPage);
+                }
+                leonida::geometry_writes::Cell* c2 = other.acquire(bbase + 2 * kPage);
+                EXPECT(other.arm(bbase + 2 * kPage, *c2) == 1);
+                // Populate shared known_* on tile 2 via a brief watch+collect or direct arm (already armed via other).
+                {
+                    leonida::HotColdTracking seed;
+                    seed.watch(bbase + 2 * kPage);
+                    seed.collect(out);  // all_armed skip populates Cell::known_* on tile 2
+                    seed.unwatch(bbase + 2 * kPage);
+                }
+                tracking.watch_batch(bpages.data(), bpages.size());
+                tracking.collect(out);  // arms all remaining tiles and populates Cell::known_*
+
+                // Open tiles 0 and 50 (gap of 49 tiles: includes tile 2 owned only by `other`, plus tile 1 armed in
+                // batch via write-notify on already-armed tile 1? Wait: make tile 1 already-armed in this batch by
+                // opening tile 1 via `other` re-arming it before collect!).
+                leonida::geometry_writes::notify(bbase + 0 * kPage, bbase + 0 * kPage + 1,
+                                                 leonida::geometry_writes::Event::open);
+                leonida::geometry_writes::notify(bbase + 1 * kPage, bbase + 1 * kPage + 1,
+                                                 leonida::geometry_writes::Event::open);
+                leonida::geometry_writes::notify(bbase + 50 * kPage, bbase + 50 * kPage + 1,
+                                                 leonida::geometry_writes::Event::open);
+                // Re-arm tile 1 via `other` so tile 1 is in this batch's dirty list AND already_armed!
+                leonida::geometry_writes::Cell* c1 = other.acquire(bbase + 1 * kPage);
+                EXPECT(other.arm(bbase + 1 * kPage, *c1) == 1);
+                tracking.collect(out);
+                const auto arm_s = tracking.last_arm_stats();
+                EXPECT(arm_s.bridged_runs == 1 && arm_s.vp_calls == 1 && arm_s.vq_calls == 0);
+                EXPECT(arm_s.already_armed_skips == 1 && arm_s.fast_tiles == 2);  // tile 1 NOT double-counted!
+
+                tracking.unwatch_batch(bpages.data(), bpages.size());
+                other.release(bbase + 1 * kPage);
+                other.release(bbase + 2 * kPage);
+                VirtualFree(bmem, 0, MEM_RELEASE);
+            }
+        }
+
+        // 4. C1: title_write_watch::ask() single-reader fast path with mark() inside and outside [from, to).
+        {
+            auto* ww = static_cast<std::uint8_t*>(
+                VirtualAlloc(nullptr, 4 * kPage, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE));
+            if (ww) {
+                EXPECT(VirtualAlloc(ww, 4 * kPage, MEM_COMMIT, PAGE_READWRITE) != nullptr);
+                const auto ww_base = reinterpret_cast<std::uintptr_t>(ww);
+                leonida::title_write_watch::add(ww_base, 4 * kPage);
+                const std::uint64_t r = leonida::title_write_watch::open_reader();
+                const std::vector<std::pair<std::uintptr_t, std::uintptr_t>> run0 = {{ww_base, ww_base + 2 * kPage}};
+                const std::vector<std::pair<std::uintptr_t, std::uintptr_t>> run1 = {
+                    {ww_base + 2 * kPage, ww_base + 4 * kPage}};
+                // Prime reader past reservation's `born`.
+                leonida::title_write_watch::ask(r, run0, [](std::uintptr_t, std::uintptr_t) {},
+                                                [](std::uintptr_t, std::uintptr_t) {});
+                // Write page 0 via CPU and mark page 1 (inside run0) + page 3 (outside run0).
+                ww[10] = 0x42;
+                leonida::title_write_watch::mark(ww_base + kPage, ww_base + kPage + 4096);
+                leonida::title_write_watch::mark(ww_base + 3 * kPage, ww_base + 3 * kPage + 4096);
+                std::vector<std::pair<std::uintptr_t, std::uintptr_t>> got;
+                leonida::title_write_watch::ask(
+                    r, run0, [&](std::uintptr_t a, std::uintptr_t b) { got.emplace_back(a, b); },
+                    [](std::uintptr_t, std::uintptr_t) {});
+                bool saw_p0 = false, saw_p1 = false;
+                for (const auto& [a, b] : got) {
+                    if (a <= ww_base && b >= ww_base + 4096) saw_p0 = true;
+                    if (a <= ww_base + kPage && b >= ww_base + kPage + 4096) saw_p1 = true;
+                }
+                EXPECT(saw_p0 && saw_p1);
+                // Entry outside run0 (page 3) was preserved in s.written; entries inside run0 were erased and
+                // GetWriteWatch page 0 was never inserted into s.written.
+                {
+                    auto& st = leonida::title_write_watch::state();
+                    std::lock_guard lock(st.journal);
+                    EXPECT(st.written.find(ww_base) == st.written.end());
+                    EXPECT(st.written.find(ww_base + kPage) == st.written.end());
+                    EXPECT(st.written.find(ww_base + 3 * kPage) != st.written.end());
+                }
+                // Drain run1 so s.written stays clean.
+                leonida::title_write_watch::ask(r, run1, [](std::uintptr_t, std::uintptr_t) {},
+                                                [](std::uintptr_t, std::uintptr_t) {});
+                leonida::title_write_watch::close_reader(r);
+                leonida::title_write_watch::remove(ww_base);
+                VirtualFree(ww, 0, MEM_RELEASE);
+            }
+        }
+        std::printf("WS2 fast paths (shared Cell::known_*, no-guard cache + RO guardrail, 64-gap bridge, C1): ok\n");
+    }
+
     VirtualFree(memory, 0, MEM_RELEASE);
     return failures ? 1 : 0;
 }

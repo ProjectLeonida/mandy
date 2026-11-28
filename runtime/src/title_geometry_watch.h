@@ -20,6 +20,19 @@ struct Cell {
     // State::mutex). When title_memory_map::generation() still equals armed_map_gen and `restore` is uniform, reopen()
     // skips VirtualQuery and calls VirtualProtect directly (falling back on unexpected `old`).
     std::uint64_t armed_map_gen = kNoMapGen;
+    // Shared per-tile uniform protection/state cache (under State::mutex), populated by CellGuard::arm_batch(),
+    // TitleTextureCells::arm_batch(), and xmem::map_view(). Valid only while `known_mapping == mapping` and no
+    // title_memory_map change after `known_map_gen` overlapped this tile.
+    //   - `known_state == MEM_COMMIT && known_protect != 0 && known_guarded != 0`: uniform writable tile.
+    //   - `known_state == MEM_COMMIT && known_protect == PAGE_NOACCESS && known_guarded == 0`: uniform no-access tile.
+    //   - `known_state == MEM_RESERVE && known_protect == 0 && known_guarded == 0`: uniform reserved tile (CellGuard
+    //     only; TitleTextureCells must NOT rely on cross-pass MEM_RESERVE because mapped planes may raw-commit).
+    // NEVER store PAGE_READONLY / PAGE_EXECUTE_READ here (ShadowPages::reopen() reopens RO->RW without map change).
+    std::uint64_t known_mapping = 0;
+    std::uint64_t known_map_gen = kNoMapGen;
+    DWORD known_state = 0;
+    DWORD known_protect = 0;
+    DWORD known_guarded = 0;
     unsigned refs = 0;
     // Owners that leave the tile writable and copy it at every submission instead (the page mirror's hot pages,
     // src/title_write_policy.h). While it is nonzero the cell guards nothing (arm() does not protect it) and its tile

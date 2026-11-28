@@ -263,6 +263,17 @@ bool copy_guarded_host(std::uint8_t* to, const std::uint8_t* from, std::size_t b
     }
 }
 
+// Fused guarded copy + 256-byte piece hashing for cached (non-WC) pages: one __try per 16 KiB strip, single read pass
+// from `from` into `to` + in-register AVX2 hash. Intentionally NOT noexcept (SEH under /EHsc).
+bool copy_and_sum_guarded_host(std::uint8_t* to, const std::uint8_t* from, std::size_t pieces, std::uint64_t* sums) {
+    __try {
+        leonida::guarded::copy_and_sum_256(to, from, pieces, sums);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // The same, reading the title's pages that xmem's frame table holds through their frames: a stream pool's GPU-only
 // pages and their CPU twins after queue slot 31's copies have no host view (src/title_frames.h). A frame is a section's
 // scratch view, cached memory, so it is not read streaming.
@@ -1677,37 +1688,6 @@ struct TitleTextureCells {
     // VirtualQuery on repeat tile re-arms), and contiguous VirtualQuery/VirtualProtect runs across all examined
     // textures in a pass.
     // results[i]: 1 = armed (or hot & unpinned), 0 = busy (pinned), -1 = failed / raced write.
-    void sync_known_protect() {
-        const std::uint64_t cur = leonida::title_memory_map::generation();
-        if (cur == known_protect_gen_) return;
-        if (!has_known_protect_) {
-            known_protect_gen_ = cur;
-            return;
-        }
-        std::uint64_t now = cur;
-        bool invalidate_all = false;
-        if (!leonida::title_memory_map::changes_since(
-                known_protect_gen_, now, 0, UINTPTR_MAX, [&](std::uintptr_t c_from, std::uintptr_t c_to) {
-                    if (invalidate_all || c_from >= c_to) return;
-                    constexpr std::uintptr_t kTile = leonida::geometry_writes::tile_size;
-                    const std::uintptr_t first = c_from & ~(kTile - 1);
-                    const std::uintptr_t span = c_to - first;
-                    const std::size_t tiles = std::size_t((span - 1) / kTile) + 1;
-                    if (tiles > known_protect_.size() / 2 + 64) {
-                        invalidate_all = true;
-                        return;
-                    }
-                    for (std::size_t t = 0; t < tiles; ++t) known_protect_.erase(first + std::uintptr_t(t) * kTile);
-                })) {
-            invalidate_all = true;
-        }
-        if (invalidate_all || known_protect_.empty()) {
-            known_protect_.clear();
-            has_known_protect_ = false;
-        }
-        known_protect_gen_ = now;
-    }
-
     bool is_tile_pinned(std::uintptr_t tile) const noexcept {
         constexpr std::uintptr_t kTile = leonida::geometry_writes::tile_size;
         const std::uintptr_t tile_hi = (tile <= UINTPTR_MAX - kTile) ? (tile + kTile) : UINTPTR_MAX;
@@ -1720,6 +1700,7 @@ struct TitleTextureCells {
     // True when no title_memory_map change after `since` overlapped [lo, hi). Sets `gen_out` to the generation
     // checked up to (leaf SRWLOCK shared read when generation moved).
     static bool range_clean_since(std::uint64_t since, std::uintptr_t lo, std::uintptr_t hi, std::uint64_t& gen_out) {
+        if (since == Cell::kNoMapGen) return false;
         const std::uint64_t cur = leonida::title_memory_map::generation();
         if (cur == since) {
             gen_out = cur;
@@ -1735,6 +1716,56 @@ struct TitleTextureCells {
         }
         gen_out = now;
         return !overlapped;
+    }
+
+    static bool restore_uniform(const Cell& c, DWORD expected) noexcept {
+        if (!expected) return false;
+        for (const DWORD r : c.restore)
+            if (r != expected) return false;
+        return true;
+    }
+
+    static bool cell_known_writable(const Cell& c, DWORD& kp, DWORD& kg, std::uint64_t& gen) noexcept {
+        if (c.known_state != MEM_COMMIT || !c.known_protect || !c.known_guarded || c.known_map_gen == Cell::kNoMapGen ||
+            c.known_mapping != c.mapping.load(std::memory_order_acquire))
+            return false;
+        kp = c.known_protect;
+        kg = c.known_guarded;
+        gen = c.known_map_gen;
+        return true;
+    }
+
+    // Cross-pass no-guard cache for TitleTextureCells: PAGE_NOACCESS ONLY!
+    // NEVER cache PAGE_READONLY (ShadowPages::reopen() reopens RO->RW without title_memory_map::changed()), and NEVER
+    // trust cross-pass MEM_RESERVE here (check_mapped_plane may raw VirtualAlloc(MEM_COMMIT) without map change;
+    // MEM_RESERVE is cached intra-pass only via cached_state).
+    static bool cell_known_noaccess(const Cell& c, std::uint64_t& gen) noexcept {
+        if (c.known_state != MEM_COMMIT || c.known_protect != PAGE_NOACCESS || c.known_guarded != 0 ||
+            c.known_map_gen == Cell::kNoMapGen || c.known_mapping != c.mapping.load(std::memory_order_acquire))
+            return false;
+        gen = c.known_map_gen;
+        return true;
+    }
+
+    static void clear_cell_known(Cell& c) noexcept {
+        c.known_state = 0;
+        c.known_protect = 0;
+        c.known_guarded = 0;
+        c.known_map_gen = Cell::kNoMapGen;
+    }
+
+    static void seed_known_from_armed(Cell& c, DWORD r0) noexcept {
+        if (c.armed_map_gen == Cell::kNoMapGen) return;
+        const std::uint64_t cur_map = c.mapping.load(std::memory_order_acquire);
+        if (c.known_state != 0 && c.known_mapping == cur_map && c.known_map_gen != Cell::kNoMapGen) return;
+        const DWORD g = leonida::geometry_writes::read_only(r0);
+        if (g != 0 && !(r0 & PAGE_GUARD)) {
+            c.known_state = MEM_COMMIT;
+            c.known_protect = r0;
+            c.known_guarded = g;
+            c.known_mapping = cur_map;
+            c.known_map_gen = c.armed_map_gen;
+        }
     }
 
     struct ArmStats {
@@ -1753,18 +1784,22 @@ struct TitleTextureCells {
         constexpr std::size_t kMaxBatchRunPages = 1024;  // up to 64 MiB per contiguous VirtualProtect run
         constexpr std::size_t kMaxLockBatchPages = 128;  // pages per pin check + geometry_writes lock hold
         constexpr std::size_t kMaxBridgeGap = 8;         // max already-armed cold gap tiles to bridge in one VP
-        constexpr std::size_t kMaxKnownProtectEntries = 262144;
         constexpr std::uintptr_t kTile = leonida::geometry_writes::tile_size;
         constexpr std::uintptr_t kHostPage = leonida::geometry_writes::page_size;
 
         if (!count) return;
 
+        // Intra-pass VirtualQuery region cache persisted across outer i..j lock batches (validated via
+        // range_clean_since). Includes MEM_RESERVE, MEM_FREE, PAGE_NOACCESS, and writable MEM_COMMIT regions; NEVER
+        // caches PAGE_READONLY / PAGE_EXECUTE_READ (ShadowPages::reopen() reopens RO->RW without map change).
+        std::uintptr_t cached_lo = 0;
+        std::uintptr_t cached_hi = 0;
+        DWORD cached_state = 0;
+        DWORD cached_protect = 0;
+        DWORD cached_guarded = 0;
+        std::uint64_t cached_gen = 0;
+
         for (std::size_t i = 0; i < count;) {
-            sync_known_protect();
-            if (known_protect_.size() > kMaxKnownProtectEntries) {
-                known_protect_.clear();
-                has_known_protect_ = false;
-            }
             std::size_t j = i + 1;
             while (j < count) {
                 const bool contiguous = (tiles[j] == tiles[j - 1] + kTile);
@@ -1784,6 +1819,7 @@ struct TitleTextureCells {
             run_versions_.resize(batch_n);
             run_pinned_.assign(batch_n, 0);
             run_eligible_.assign(batch_n, 0);
+            run_already_armed_.assign(batch_n, 0);
             run_failed_.assign(batch_n, 0);
             run_pin_ranges_.clear();
             run_need_backed_idx_.clear();
@@ -1830,14 +1866,20 @@ struct TitleTextureCells {
                     // Zero-syscall fast path: all 16 host pages already guarded read-only (e.g. armed by
                     // HotColdTracking::CellGuard earlier in this leader pass; guaranteed cleared by reopen(),
                     // Event::replaced, TitleVirtualProtect, and unmap_page).
-                    bool all_armed = true;
-                    for (const DWORD r : c->restore) {
-                        if (!r) {
+                    const DWORD r0 = c->restore[0];
+                    bool all_armed = r0 != 0;
+                    bool uniform_restore = all_armed;
+                    for (std::size_t sp = 1; all_armed && sp < c->restore.size(); ++sp) {
+                        if (!c->restore[sp]) {
                             all_armed = false;
-                            break;
+                            uniform_restore = false;
+                        } else if (c->restore[sp] != r0) {
+                            uniform_restore = false;
                         }
                     }
                     if (all_armed) {
+                        if (uniform_restore) seed_known_from_armed(*c, r0);
+                        run_already_armed_[k] = 1;
                         results[i + k] = 1;
                         ++arm_stats.already;
                         continue;
@@ -1871,14 +1913,20 @@ struct TitleTextureCells {
                             results[i + k] = -1;  // write/remap/pin raced during backed_batch
                             continue;
                         }
-                        bool all_armed = true;
-                        for (const DWORD r : c->restore) {
-                            if (!r) {
+                        const DWORD r0 = c->restore[0];
+                        bool all_armed = r0 != 0;
+                        bool uniform_restore = all_armed;
+                        for (std::size_t sp = 1; all_armed && sp < c->restore.size(); ++sp) {
+                            if (!c->restore[sp]) {
                                 all_armed = false;
-                                break;
+                                uniform_restore = false;
+                            } else if (c->restore[sp] != r0) {
+                                uniform_restore = false;
                             }
                         }
                         if (all_armed) {
+                            if (uniform_restore) seed_known_from_armed(*c, r0);
+                            run_already_armed_[k] = 1;
                             results[i + k] = 1;
                             ++arm_stats.already;
                             continue;
@@ -1892,14 +1940,6 @@ struct TitleTextureCells {
                     }
                 }
 
-                // Short-lived VirtualQuery cache within this lock hold: reuse uniform writable or already-read-only
-                // MEM_COMMIT regions across non-contiguous tiles while no map change overlapped [p, cached_hi).
-                std::uintptr_t cached_lo = 0;
-                std::uintptr_t cached_hi = 0;
-                DWORD cached_protect = 0;
-                DWORD cached_guarded = 0;
-                std::uint64_t cached_gen = 0;
-
                 for (std::size_t sub_start = 0; sub_start < batch_n;) {
                     if (!run_eligible_[sub_start]) {
                         ++sub_start;
@@ -1912,95 +1952,95 @@ struct TitleTextureCells {
                     }
 
                     // Gap-bridging fast path: coalesce scattered eligible tiles separated by <= kMaxBridgeGap
-                    // already-armed, unpinned cold tiles sharing identical known_protect/known_guarded/mapping and
-                    // uniform restore[0..15] == kp. Falls back to eligible-only [sub_start, sub_end) on any failure
-                    // or unexpected old protect (with mandatory VirtualProtect(old) rollback).
-                    if (has_known_protect_) {
-                        const auto it0 = known_protect_.find(batch_tiles[sub_start]);
-                        if (it0 != known_protect_.end() && it0->second.protect != 0 &&
-                            it0->second.mapping == batch_cells[sub_start]->mapping.load(std::memory_order_acquire)) {
-                            const DWORD kp = it0->second.protect;
-                            const DWORD kg = it0->second.guarded;
-                            const std::uintptr_t span_lo = batch_tiles[sub_start];
-                            std::size_t bridge_end = sub_start + 1;
-                            while (bridge_end < batch_n && run_eligible_[bridge_end]) {
-                                const std::uintptr_t prev_va = batch_tiles[bridge_end - 1];
-                                const std::uintptr_t next_va = batch_tiles[bridge_end];
-                                if (prev_va > UINTPTR_MAX - kTile || next_va > UINTPTR_MAX - kTile) break;
-                                const std::uintptr_t prev_end = prev_va + kTile;
-                                if (next_va < prev_end) break;
-                                const std::uintptr_t gap_bytes = next_va - prev_end;
-                                if (gap_bytes > kMaxBridgeGap * kTile) break;
-                                if ((next_va + kTile - span_lo) > kMaxBatchRunPages * kTile) break;
-                                const auto itn = known_protect_.find(next_va);
-                                if (itn == known_protect_.end() || itn->second.protect != kp ||
-                                    itn->second.guarded != kg ||
-                                    itn->second.mapping !=
-                                        batch_cells[bridge_end]->mapping.load(std::memory_order_acquire))
-                                    break;
-                                bool gap_ok = true;
-                                for (std::uintptr_t gap_va = prev_end; gap_va < next_va; gap_va += kTile) {
-                                    if (is_tile_pinned(gap_va)) {
-                                        gap_ok = false;
-                                        break;
-                                    }
-                                    const auto git = known_protect_.find(gap_va);
-                                    if (git == known_protect_.end() || git->second.protect != kp ||
-                                        git->second.guarded != kg) {
-                                        gap_ok = false;
-                                        break;
-                                    }
-                                    const auto cit = s.cells.find(gap_va);
-                                    if (cit == s.cells.end()) {
-                                        gap_ok = false;
-                                        break;
-                                    }
-                                    const Cell& gc = cit->second;
-                                    if (gc.hot ||
-                                        git->second.mapping != gc.mapping.load(std::memory_order_acquire)) {
-                                        gap_ok = false;
-                                        break;
-                                    }
-                                    for (const DWORD r : gc.restore) {
-                                        if (r != kp) {
-                                            gap_ok = false;
-                                            break;
-                                        }
-                                    }
-                                    if (!gap_ok) break;
-                                }
-                                if (!gap_ok) break;
-                                ++bridge_end;
+                    // already-armed, unpinned cold tiles sharing identical Cell::known_protect/known_guarded/mapping
+                    // and uniform restore[0..15] == kp. Falls back to eligible-only [sub_start, sub_end) on any
+                    // failure or unexpected old protect (with mandatory VirtualProtect(old) rollback).
+                    DWORD kp = 0, kg = 0;
+                    std::uint64_t gen0 = 0;
+                    if (cell_known_writable(*batch_cells[sub_start], kp, kg, gen0)) {
+                        const std::uintptr_t span_lo = batch_tiles[sub_start];
+                        std::size_t bridge_end = sub_start + 1;
+                        std::size_t last_eligible = sub_start;
+                        std::uint64_t run_min_gen = gen0;
+                        std::uint64_t last_min_gen = gen0;
+                        while (bridge_end < batch_n &&
+                               (run_eligible_[bridge_end] || run_already_armed_[bridge_end])) {
+                            const std::uintptr_t prev_va = batch_tiles[bridge_end - 1];
+                            const std::uintptr_t next_va = batch_tiles[bridge_end];
+                            if (prev_va > UINTPTR_MAX - kTile || next_va > UINTPTR_MAX - kTile) break;
+                            const std::uintptr_t prev_end = prev_va + kTile;
+                            if (next_va < prev_end) break;
+                            const std::uintptr_t eligible_gap = next_va - (batch_tiles[last_eligible] + kTile);
+                            if (eligible_gap > kMaxBridgeGap * kTile) break;
+                            if ((next_va + kTile - span_lo) > kMaxBatchRunPages * kTile) break;
+                            const Cell& cn = *batch_cells[bridge_end];
+                            DWORD nkp = 0, nkg = 0;
+                            std::uint64_t ngen = 0;
+                            if (!cell_known_writable(cn, nkp, nkg, ngen) || nkp != kp || nkg != kg) break;
+                            if (run_already_armed_[bridge_end] &&
+                                (run_pinned_[bridge_end] || is_tile_pinned(next_va) || cn.hot ||
+                                 !restore_uniform(cn, kp))) {
+                                break;
                             }
-                            if (bridge_end > sub_end) {
-                                const std::uintptr_t span_hi = batch_tiles[bridge_end - 1] + kTile;
-                                std::uint64_t verified_gen = 0;
-                                if (range_clean_since(known_protect_gen_, span_lo, span_hi, verified_gen)) {
-                                    DWORD old{};
-                                    if (VirtualProtect(reinterpret_cast<void*>(span_lo), span_hi - span_lo, kg,
-                                                       &old)) {
-                                        if (old == kp || old == kg) {
-                                            const std::uint64_t armed_gen =
-                                                (leonida::title_memory_map::generation() == verified_gen)
-                                                    ? verified_gen
-                                                    : Cell::kNoMapGen;
-                                            for (std::size_t k = sub_start; k < bridge_end; ++k) {
+                            std::uint64_t cand_min_gen = (std::min)(run_min_gen, ngen);
+                            bool gap_ok = true;
+                            for (std::uintptr_t gap_va = prev_end; gap_va < next_va; gap_va += kTile) {
+                                if (is_tile_pinned(gap_va)) {
+                                    gap_ok = false;
+                                    break;
+                                }
+                                const auto cit = s.cells.find(gap_va);
+                                if (cit == s.cells.end()) {
+                                    gap_ok = false;
+                                    break;
+                                }
+                                const Cell& gc = cit->second;
+                                DWORD gkp = 0, gkg = 0;
+                                std::uint64_t ggen = 0;
+                                if (gc.hot || !restore_uniform(gc, kp) ||
+                                    !cell_known_writable(gc, gkp, gkg, ggen) || gkp != kp || gkg != kg) {
+                                    gap_ok = false;
+                                    break;
+                                }
+                                cand_min_gen = (std::min)(cand_min_gen, ggen);
+                            }
+                            if (!gap_ok) break;
+                            run_min_gen = cand_min_gen;
+                            if (run_eligible_[bridge_end]) {
+                                last_eligible = bridge_end;
+                                last_min_gen = run_min_gen;
+                            }
+                            ++bridge_end;
+                        }
+                        const std::size_t bridge_end_eff = last_eligible + 1;
+                        if (bridge_end_eff > sub_end) {
+                            const std::uintptr_t span_hi = batch_tiles[last_eligible] + kTile;
+                            std::uint64_t verified_gen = 0;
+                            if (range_clean_since(last_min_gen, span_lo, span_hi, verified_gen)) {
+                                DWORD old{};
+                                if (VirtualProtect(reinterpret_cast<void*>(span_lo), span_hi - span_lo, kg, &old)) {
+                                    if (old == kp || old == kg) {
+                                        for (std::size_t k = sub_start; k < bridge_end_eff; ++k) {
+                                            if (run_eligible_[k]) {
                                                 batch_cells[k]->restore.fill(kp);
-                                                batch_cells[k]->armed_map_gen = armed_gen;
+                                                batch_cells[k]->armed_map_gen = verified_gen;
+                                                batch_cells[k]->known_map_gen = verified_gen;
                                                 results[i + k] = 1;
+                                            } else {
+                                                batch_cells[k]->armed_map_gen = verified_gen;
+                                                batch_cells[k]->known_map_gen = verified_gen;
                                             }
-                                            ++arm_stats.fast_vp;
-                                            ++arm_stats.bridged;
-                                            if (cached_hi && span_lo >= cached_lo && span_hi <= cached_hi)
-                                                cached_lo = span_hi;
-                                            sub_start = bridge_end;
-                                            continue;
                                         }
-                                        // Unexpected prior protection: restore `old` and fall back to eligible-only.
-                                        DWORD dummy{};
-                                        VirtualProtect(reinterpret_cast<void*>(span_lo), span_hi - span_lo, old,
-                                                       &dummy);
+                                        ++arm_stats.fast_vp;
+                                        ++arm_stats.bridged;
+                                        if (cached_hi && span_lo >= cached_lo && span_hi <= cached_hi)
+                                            cached_lo = span_hi;
+                                        sub_start = bridge_end_eff;
+                                        continue;
                                     }
+                                    // Unexpected prior protection: restore `old` and fall back to eligible-only.
+                                    DWORD dummy{};
+                                    VirtualProtect(reinterpret_cast<void*>(span_lo), span_hi - span_lo, old, &dummy);
                                 }
                             }
                         }
@@ -2010,38 +2050,45 @@ struct TitleTextureCells {
                     const std::uintptr_t sub_hi = sub_lo + (sub_end - sub_start) * kTile;
 
                     for (std::uintptr_t p = sub_lo; p < sub_hi;) {
-                        // Fast path: tile-aligned repeat arm with verified uniform protection and no map change
-                        // overlapping [p, end) since known_protect_gen_ -> VirtualProtect directly with 0 VirtualQuery.
-                        if ((p & (kTile - 1)) == 0 && sub_hi - p >= kTile && has_known_protect_) {
+                        // Fast path: tile-aligned repeat arm with verified uniform protection or cached PAGE_NOACCESS
+                        // (NEVER cross-pass MEM_RESERVE or PAGE_READONLY) -> 0 VirtualQuery syscalls.
+                        if ((p & (kTile - 1)) == 0 && sub_hi - p >= kTile) {
                             const std::size_t tile_k = sub_start + std::size_t((p - sub_lo) / kTile);
-                            const auto it0 = known_protect_.find(batch_tiles[tile_k]);
-                            if (it0 != known_protect_.end() && it0->second.protect != 0 &&
-                                it0->second.mapping == batch_cells[tile_k]->mapping.load(std::memory_order_acquire)) {
-                                const DWORD kp = it0->second.protect;
-                                const DWORD kg = it0->second.guarded;
+                            Cell* const c0 = batch_cells[tile_k];
+                            DWORD fkp = 0, fkg = 0;
+                            std::uint64_t fgen0 = 0;
+                            if (cell_known_writable(*c0, fkp, fkg, fgen0)) {
                                 std::size_t fast_end = tile_k + 1;
+                                std::uint64_t min_gen = fgen0, max_gen = fgen0;
                                 while (fast_end < sub_end) {
-                                    const auto itn = known_protect_.find(batch_tiles[fast_end]);
-                                    if (itn == known_protect_.end() || itn->second.protect != kp ||
-                                        itn->second.guarded != kg ||
-                                        itn->second.mapping !=
-                                            batch_cells[fast_end]->mapping.load(std::memory_order_acquire))
+                                    DWORD nkp = 0, nkg = 0;
+                                    std::uint64_t ngen = 0;
+                                    if (!cell_known_writable(*batch_cells[fast_end], nkp, nkg, ngen) || nkp != fkp ||
+                                        nkg != fkg)
                                         break;
+                                    min_gen = (std::min)(min_gen, ngen);
+                                    max_gen = (std::max)(max_gen, ngen);
                                     ++fast_end;
                                 }
-                                const std::uintptr_t end = p + (fast_end - tile_k) * kTile;
+                                std::uintptr_t end = p + (fast_end - tile_k) * kTile;
                                 std::uint64_t verified_gen = 0;
-                                if (range_clean_since(known_protect_gen_, p, end, verified_gen)) {
+                                bool clean = range_clean_since(min_gen, p, end, verified_gen);
+                                if (!clean && min_gen != max_gen && fast_end > tile_k + 1) {
+                                    std::size_t prefix_end = tile_k + 1;
+                                    while (prefix_end < fast_end && batch_cells[prefix_end]->known_map_gen == fgen0)
+                                        ++prefix_end;
+                                    fast_end = prefix_end;
+                                    end = p + (fast_end - tile_k) * kTile;
+                                    clean = range_clean_since(fgen0, p, end, verified_gen);
+                                }
+                                if (clean) {
                                     DWORD old{};
-                                    if (VirtualProtect(reinterpret_cast<void*>(p), end - p, kg, &old)) {
-                                        if (old == kp || old == kg) {
-                                            const std::uint64_t armed_gen =
-                                                (leonida::title_memory_map::generation() == verified_gen)
-                                                    ? verified_gen
-                                                    : Cell::kNoMapGen;
+                                    if (VirtualProtect(reinterpret_cast<void*>(p), end - p, fkg, &old)) {
+                                        if (old == fkp || old == fkg) {
                                             for (std::size_t t = tile_k; t < fast_end; ++t) {
-                                                batch_cells[t]->restore.fill(kp);
-                                                batch_cells[t]->armed_map_gen = armed_gen;
+                                                batch_cells[t]->restore.fill(fkp);
+                                                batch_cells[t]->armed_map_gen = verified_gen;
+                                                batch_cells[t]->known_map_gen = verified_gen;
                                             }
                                             ++arm_stats.fast_vp;
                                             if (cached_hi && p >= cached_lo && end <= cached_hi) cached_lo = end;
@@ -2053,9 +2100,37 @@ struct TitleTextureCells {
                                         DWORD dummy{};
                                         VirtualProtect(reinterpret_cast<void*>(p), end - p, old, &dummy);
                                     }
-                                    for (std::size_t t = tile_k; t < fast_end; ++t)
-                                        known_protect_.erase(batch_tiles[t]);
+                                    for (std::size_t t = tile_k; t < fast_end; ++t) clear_cell_known(*batch_cells[t]);
                                     cached_hi = 0;
+                                }
+                            } else if (cell_known_noaccess(*c0, fgen0)) {
+                                std::size_t fast_end = tile_k + 1;
+                                std::uint64_t min_gen = fgen0, max_gen = fgen0;
+                                while (fast_end < sub_end) {
+                                    std::uint64_t ngen = 0;
+                                    if (!cell_known_noaccess(*batch_cells[fast_end], ngen)) break;
+                                    min_gen = (std::min)(min_gen, ngen);
+                                    max_gen = (std::max)(max_gen, ngen);
+                                    ++fast_end;
+                                }
+                                std::uintptr_t end = p + (fast_end - tile_k) * kTile;
+                                std::uint64_t verified_gen = 0;
+                                bool clean = range_clean_since(min_gen, p, end, verified_gen);
+                                if (!clean && min_gen != max_gen && fast_end > tile_k + 1) {
+                                    std::size_t prefix_end = tile_k + 1;
+                                    while (prefix_end < fast_end && batch_cells[prefix_end]->known_map_gen == fgen0)
+                                        ++prefix_end;
+                                    fast_end = prefix_end;
+                                    end = p + (fast_end - tile_k) * kTile;
+                                    clean = range_clean_since(fgen0, p, end, verified_gen);
+                                }
+                                if (clean) {
+                                    for (std::size_t t = tile_k; t < fast_end; ++t)
+                                        batch_cells[t]->known_map_gen = verified_gen;
+                                    arm_stats.vq_cache += (fast_end - tile_k);
+                                    if (cached_hi && p >= cached_lo && end <= cached_hi) cached_lo = end;
+                                    p = end;
+                                    continue;
                                 }
                             }
                         }
@@ -2070,11 +2145,10 @@ struct TitleTextureCells {
 
                         std::uint64_t cache_now = 0;
                         if (p >= cached_lo && p < cached_hi &&
-                            range_clean_since(cached_gen, p, cached_hi, cache_now)) {
-                            cached_gen = cache_now;
+                            range_clean_since(cached_gen, p, (std::min)(sub_hi, cached_hi), cache_now)) {
                             region_base = cached_lo;
                             region_end = cached_hi;
-                            state = MEM_COMMIT;
+                            state = cached_state;
                             protect = cached_protect;
                             guarded = cached_guarded;
                             query_gen = cached_gen;
@@ -2096,12 +2170,16 @@ struct TitleTextureCells {
                             protect = m.Protect;
                             guarded = leonida::geometry_writes::read_only(m.Protect);
                             const DWORD base_prot = protect & 255u;
-                            const bool cacheable_prot =
-                                guarded != 0 || base_prot == PAGE_READONLY || base_prot == PAGE_EXECUTE_READ;
-                            if (state == MEM_COMMIT && !(protect & PAGE_GUARD) && cacheable_prot &&
-                                region_end > sub_hi) {
+                            // Intra-pass region cache: MEM_RESERVE, MEM_FREE, PAGE_NOACCESS, and writable MEM_COMMIT.
+                            // NEVER cache PAGE_READONLY / PAGE_EXECUTE_READ (ShadowPages::reopen() bypasses map_gen).
+                            const bool cacheable_region =
+                                state == MEM_RESERVE || state == MEM_FREE ||
+                                (state == MEM_COMMIT && !(protect & PAGE_GUARD) &&
+                                 (guarded != 0 || base_prot == PAGE_NOACCESS));
+                            if (cacheable_region && region_end > sub_hi) {
                                 cached_lo = p;
                                 cached_hi = region_end;
+                                cached_state = state;
                                 cached_protect = protect;
                                 cached_guarded = guarded;
                                 cached_gen = query_gen;
@@ -2133,19 +2211,18 @@ struct TitleTextureCells {
                                 std::uint64_t after_gen = 0;
                                 if (first_full < last_full && region_base <= first_full && region_end >= last_full &&
                                     range_clean_since(query_gen, first_full, last_full, after_gen)) {
-                                    const std::uint64_t armed_gen =
-                                        (leonida::title_memory_map::generation() == after_gen) ? after_gen
-                                                                                               : Cell::kNoMapGen;
                                     for (std::uintptr_t t = first_full; t < last_full; t += kTile) {
                                         const std::size_t tile_k = sub_start + std::size_t((t - sub_lo) / kTile);
-                                        known_protect_[batch_tiles[tile_k]] = {
-                                            batch_cells[tile_k]->mapping.load(std::memory_order_acquire), protect,
-                                            guarded};
-                                        batch_cells[tile_k]->armed_map_gen = armed_gen;
+                                        Cell* const c = batch_cells[tile_k];
+                                        c->known_state = MEM_COMMIT;
+                                        c->known_protect = protect;
+                                        c->known_guarded = guarded;
+                                        c->known_mapping = c->mapping.load(std::memory_order_acquire);
+                                        c->known_map_gen = after_gen;
+                                        c->armed_map_gen = after_gen;
                                     }
-                                    has_known_protect_ = true;
                                 }
-                                if (cached_hi) cached_lo = end;
+                                if (cached_hi && p >= cached_lo && end <= cached_hi) cached_lo = end;
                             } else if (from_cache) {
                                 cached_hi = 0;
                                 continue;
@@ -2167,8 +2244,35 @@ struct TitleTextureCells {
                                     t = t_end;
                                 }
                             }
-                        } else if (cached_hi && p >= cached_lo && end <= cached_hi) {
-                            cached_lo = end;
+                        } else {
+                            const std::uintptr_t first_full = (p + kTile - 1) & ~(kTile - 1);
+                            const std::uintptr_t last_full = end & ~(kTile - 1);
+                            if (first_full < last_full) {
+                                const bool is_noaccess =
+                                    state == MEM_COMMIT && !(protect & PAGE_GUARD) && (protect & 255u) == PAGE_NOACCESS;
+                                std::uint64_t after_gen = 0;
+                                if (is_noaccess && region_base <= first_full && region_end >= last_full &&
+                                    range_clean_since(query_gen, first_full, last_full, after_gen)) {
+                                    for (std::uintptr_t t = first_full; t < last_full; t += kTile) {
+                                        const std::size_t tile_k = sub_start + std::size_t((t - sub_lo) / kTile);
+                                        Cell* const c = batch_cells[tile_k];
+                                        c->known_state = MEM_COMMIT;
+                                        c->known_protect = PAGE_NOACCESS;
+                                        c->known_guarded = 0;
+                                        c->known_mapping = c->mapping.load(std::memory_order_acquire);
+                                        c->known_map_gen = after_gen;
+                                    }
+                                } else {
+                                    // Clear stale writable cache without trampling CellGuard's MEM_RESERVE cache.
+                                    for (std::uintptr_t t = first_full; t < last_full; t += kTile) {
+                                        const std::size_t tile_k = sub_start + std::size_t((t - sub_lo) / kTile);
+                                        Cell* const c = batch_cells[tile_k];
+                                        if (!(state == MEM_RESERVE && c->known_state == MEM_RESERVE))
+                                            clear_cell_known(*c);
+                                    }
+                                }
+                            }
+                            if (cached_hi && p >= cached_lo && end <= cached_hi) cached_lo = end;
                         }
                         p = end;
                     }
@@ -2181,17 +2285,10 @@ struct TitleTextureCells {
             i = j;
         }
     }
-    struct KnownProtect {
-        std::uint64_t mapping = 0;
-        DWORD protect = 0;
-        DWORD guarded = 0;
-    };
-    std::unordered_map<std::uintptr_t, KnownProtect> known_protect_;
-    std::uint64_t known_protect_gen_ = 0;
-    bool has_known_protect_ = false;
     std::vector<std::uint64_t> run_versions_;
     std::vector<std::uint8_t> run_pinned_;
     std::vector<std::uint8_t> run_eligible_;
+    std::vector<std::uint8_t> run_already_armed_;
     std::vector<std::uint8_t> run_failed_;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> run_pin_ranges_;
     std::vector<std::size_t> run_need_backed_idx_;
@@ -6074,6 +6171,17 @@ struct DeviceState {
                 page_mirror.tracking && page_mirror.tracking->is_wc_page(reinterpret_cast<std::uintptr_t>(from));
             return copy_guarded_host(to, from, bytes, streaming);
         };
+        hooks.copy_and_sum = [this](std::uint8_t* to, const std::uint8_t* from, std::size_t pieces,
+                                    std::uint64_t* sums) {
+            const bool streaming =
+                page_mirror.tracking && page_mirror.tracking->is_wc_page(reinterpret_cast<std::uintptr_t>(from));
+            if (streaming) {
+                if (!copy_guarded_host(to, from, pieces * leonida::shadow_keep::kPiece, true)) return false;
+                leonida::shadow_keep::sum_of_batch_256(to, pieces, sums);
+                return true;
+            }
+            return copy_and_sum_guarded_host(to, from, pieces, sums);
+        };
         // The pages of a console heap read in place (add_heap_in_place): their home holds the filtered slots.
         hooks.filter = [this](std::uint64_t va, std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool fresh) {
             return filter_heap_page(va, to, from, bytes, fresh);
@@ -8413,6 +8521,27 @@ struct DeviceState {
                     if (last_frame) note_readback_frame_invalidated_locked(last_frame);
                 }
                 if (last_copy) {
+                    using Records = leonida::ConsoleHeapSlotRecords;
+                    const auto st = heap.records.state(slot, 0);
+                    if (st == Records::texture_waiting || st == Records::texture_waiting_room) {
+                        std::uint32_t w[kDescriptorSize / 4];
+                        std::memcpy(w, heap.previous + std::size_t(slot) * kDescriptorSize, kDescriptorSize);
+                        if ((w[0] | w[1] | w[2] | w[3]) && (w[3] >> 30)) {
+                            leonida::gfx10::ImageWords words;
+                            std::memcpy(words.data(), w, sizeof(words));
+                            leonida::gfx10::Image image{};
+                            if (leonida::gfx10::is_image(words) && leonida::gfx10::decode(words, image)) {
+                                // Waiting T# already has filtered dword 6 == 0 in `last_copy`: enqueue directly for
+                                // finish_in_place() without rewriting identical bytes to WC BAR VRAM.
+                                if (!heap.deferred_mark[slot]) {
+                                    heap.deferred_mark[slot] = 1;
+                                    heap.deferred.push_back(slot);
+                                }
+                                heap.in_place_work_pending.store(true, std::memory_order_release);
+                                continue;
+                            }
+                        }
+                    }
                     const std::size_t at = std::size_t(va & kOffMask);
                     const std::size_t page_slot = at >> 5;
                     filter_slot_locked(heap, slot, out_guard.ptr + at, cache_scope.cache, false);
@@ -8620,6 +8749,7 @@ struct DeviceState {
             std::uint64_t changed_class[4] = {};
             std::uint64_t vsharp_halves = 0;
             std::uint64_t vsharps_as_written = 0;
+            std::uint64_t vsharps_rejected = 0;
             std::uint64_t resolved = 0;
             std::vector<ClearOp> clear_ops;
             std::vector<std::uint32_t> defer_slots;
@@ -8636,6 +8766,7 @@ struct DeviceState {
                 changed_class[0] = changed_class[1] = changed_class[2] = changed_class[3] = 0;
                 vsharp_halves = 0;
                 vsharps_as_written = 0;
+                vsharps_rejected = 0;
                 resolved = 0;
                 clear_ops.clear();
                 defer_slots.clear();
@@ -8707,8 +8838,9 @@ struct DeviceState {
                 std::uint64_t span = 0;
                 std::uint32_t gen = 0;
             };
-            std::array<LocalMirrorEntry, 256> local_mirror{};
+            std::array<LocalMirrorEntry, 1024> local_mirror{};
             std::uint32_t local_gen = 0;
+            ConsoleHeap* prev_heap = nullptr;
 
             std::uint8_t* const worker_fallback_buf = pool ? pool->scratch(tid) : nullptr;
             std::unique_ptr<std::uint8_t[]> serial_fallback_buf;
@@ -8731,9 +8863,15 @@ struct DeviceState {
                         out_buf = serial_fallback_buf.get();
                     }
                 }
-                if (++local_gen == 0) {
-                    local_mirror = {};
-                    local_gen = 1;
+                // Persist `local_mirror` across consecutive pages of the same ConsoleHeap* so repeated mirror V#s
+                // avoid redundant page_mirror_is_resolved_readonly() walks and duplicate mirror_ranges pushes; reset
+                // immediately when ConsoleHeap* changes so each heap receives all of its own mirror_ranges.
+                if (heap != prev_heap) {
+                    prev_heap = heap;
+                    if (++local_gen == 0) {
+                        local_mirror = {};
+                        local_gen = 1;
+                    }
                 }
 
                 const std::uint64_t heap_base_va = heap->console_va;
@@ -8779,8 +8917,11 @@ struct DeviceState {
                                 if (clr) pw.clear_ops.push_back({std::uint32_t(slot), clr});
                             } else if (!(w[3] >> 30)) {
                                 // Pure read-only check for both V# halves; commit Phase A only if BOTH halves resolve.
+                                const bool has_h0 = (w[2] != 0);
+                                const bool has_h1 = (w[6] != 0);
                                 bool half_ok[2] = {false, false};
                                 bool half_as_written[2] = {false, false};
+                                bool half_rejected[2] = {false, false};
                                 bool half_mirrored[2] = {false, false};
                                 bool half_resolved_new[2] = {false, false};
                                 std::uint64_t half_base[2] = {0, 0};
@@ -8788,7 +8929,7 @@ struct DeviceState {
                                 std::uint8_t clr = 0;
 
                                 for (unsigned half = 0; half < 2; ++half) {
-                                    const std::uint32_t* const h = w + 4 * half;
+                                    std::uint32_t* const h = w + 4 * half;
                                     if ((h[3] >> 30) || !h[2]) {
                                         half_ok[half] = true;
                                         if (records.state(slot, half) != Records::none)
@@ -8799,7 +8940,15 @@ struct DeviceState {
                                         std::uint64_t(h[0]) | (std::uint64_t(h[1] & 0xffff) << 32);
                                     const std::uint32_t stride = (h[1] >> 16) & 0x3fffu;
                                     const std::uint64_t span = std::uint64_t(h[2]) * (stride ? stride : 1);
-                                    if (base && (!signed_vsharp || !(base & (1ull << 47)))) {
+                                    if (!base) {
+                                        h[0] = h[1] = h[2] = h[3] = 0;
+                                        half_ok[half] = true;
+                                        half_rejected[half] = true;
+                                        if (records.state(slot, half) != Records::none)
+                                            clr |= static_cast<std::uint8_t>(1u << half);
+                                        continue;
+                                    }
+                                    if (!signed_vsharp || !(base & (1ull << 47))) {
                                         if (base < arena_size && (span ? span : 1) <= arena_size - base) {
                                             half_ok[half] = true;
                                             half_as_written[half] = true;
@@ -8810,7 +8959,7 @@ struct DeviceState {
                                         if (has_mirror) {
                                             const std::size_t lb =
                                                 static_cast<std::size_t>(((base >> 4) ^ (span * 0x9e3779b97f4a7c15ull)) &
-                                                                         255u);
+                                                                         1023u);
                                             LocalMirrorEntry& le = local_mirror[lb];
                                             if (le.gen == local_gen && le.base == base && le.span == span) {
                                                 half_ok[half] = true;
@@ -8839,11 +8988,12 @@ struct DeviceState {
                                 if (half_ok[0] && half_ok[1]) {
                                     if (!same) {
                                         ++pw.changed_class[1];
-                                        if (w[2]) ++pw.vsharp_halves;
-                                        if (w[6]) ++pw.vsharp_halves;
+                                        if (has_h0) ++pw.vsharp_halves;
+                                        if (has_h1) ++pw.vsharp_halves;
                                     }
                                     for (unsigned half = 0; half < 2; ++half) {
                                         if (half_as_written[half]) ++pw.vsharps_as_written;
+                                        if (half_rejected[half]) ++pw.vsharps_rejected;
                                         if (half_resolved_new[half]) ++pw.resolved;
                                         if (half_mirrored[half]) pw.mirror_ranges.emplace_back(half_base[half], half_span[half]);
                                     }
@@ -8879,12 +9029,14 @@ struct DeviceState {
                     }
                 }
 
-                // Pages with zero Phase B full-filter slots (or overflow pages without persistent buffers) flush their
-                // Phase A runs to WC BAR VRAM right here in parallel.
-                if (pw.written_count && (pw.phase_b_full.empty() || !pw.persistent_buf)) {
+                // Always flush Phase A's own written_slots to WC BAR VRAM in parallel (disjoint from phase_b_full) and
+                // reset them so Phase B flushes only the few remaining phase_b_full slots.
+                if (pw.written_count) {
                     flush_written_slot_runs(job.to, out_buf, pw.written_slots, pw.written_count);
-                    if (pw.phase_b_full.empty()) pw.flushed = true;
+                    pw.written_slots = {};
+                    pw.written_count = 0;
                 }
+                if (pw.phase_b_full.empty()) pw.flushed = true;
             }
         };
 
@@ -8911,6 +9063,7 @@ struct DeviceState {
             ++heap->pages_filtered;
             heap->copied += pw.changed * kDescriptorSize;
             heap->vsharps_as_written += pw.vsharps_as_written;
+            heap->vsharps_rejected += pw.vsharps_rejected;
             heap->vsharp_halves += pw.vsharp_halves;
             for (int c = 0; c < 4; ++c) heap->changed[c] += pw.changed_class[c];
             page_mirror.resolved += pw.resolved;
@@ -8949,36 +9102,20 @@ struct DeviceState {
 
             if (!pw.phase_b_full.empty()) {
                 const std::uint64_t heap_base_va = heap->console_va;
-                if (pw.persistent_buf) {
-                    for (const std::uint16_t packed : pw.phase_b_full) {
-                        const std::size_t page_slot = std::size_t(packed & 0x7fffu);
-                        const std::size_t at = page_slot << 5;
-                        const bool slot_changed = (packed & 0x8000u) != 0;
-                        const std::size_t slot = std::size_t((job.va + at - heap_base_va) / kDescriptorSize);
-                        filter_slot_locked(*heap, slot, pw.out_buf + at, cache_scope.cache, slot_changed);
-                        pw.written_slots[page_slot >> 6] |= std::uint64_t(1) << (page_slot & 63);
-                        ++pw.written_count;
-                    }
-                    if (pw.written_count) flush_written_slot_runs(job.to, pw.out_buf, pw.written_slots, pw.written_count);
-                } else {
-                    std::array<std::uint64_t, 32> phase_b_slots{};
-                    std::size_t phase_b_written = 0;
-                    for (const std::uint16_t packed : pw.phase_b_full) {
-                        const std::size_t page_slot = std::size_t(packed & 0x7fffu);
-                        const std::size_t at = page_slot << 5;
-                        const bool slot_changed = (packed & 0x8000u) != 0;
-                        const std::size_t slot = std::size_t((job.va + at - heap_base_va) / kDescriptorSize);
-                        filter_slot_locked(*heap, slot, overflow_phase_b_guard.ptr + at, cache_scope.cache,
-                                           slot_changed);
-                        phase_b_slots[page_slot >> 6] |= std::uint64_t(1) << (page_slot & 63);
-                        ++phase_b_written;
-                    }
-                    if (phase_b_written)
-                        flush_written_slot_runs(job.to, overflow_phase_b_guard.ptr, phase_b_slots, phase_b_written);
+                std::uint8_t* const phase_b_buf = pw.persistent_buf ? pw.out_buf : overflow_phase_b_guard.ptr;
+                std::array<std::uint64_t, 32> phase_b_slots{};
+                std::size_t phase_b_written = 0;
+                for (const std::uint16_t packed : pw.phase_b_full) {
+                    const std::size_t page_slot = std::size_t(packed & 0x7fffu);
+                    const std::size_t at = page_slot << 5;
+                    const bool slot_changed = (packed & 0x8000u) != 0;
+                    const std::size_t slot = std::size_t((job.va + at - heap_base_va) / kDescriptorSize);
+                    filter_slot_locked(*heap, slot, phase_b_buf + at, cache_scope.cache, slot_changed);
+                    phase_b_slots[page_slot >> 6] |= std::uint64_t(1) << (page_slot & 63);
+                    ++phase_b_written;
                 }
-                pw.flushed = true;
-            } else if (!pw.flushed && pw.written_count && pw.persistent_buf) {
-                flush_written_slot_runs(job.to, pw.out_buf, pw.written_slots, pw.written_count);
+                if (phase_b_written)
+                    flush_written_slot_runs(job.to, phase_b_buf, phase_b_slots, phase_b_written);
                 pw.flushed = true;
             }
             ok_out[p] = 1;
