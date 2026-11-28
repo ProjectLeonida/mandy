@@ -950,3 +950,51 @@ test('camera hash round-trips and malformed hashes are ignored', () => {
         assert.equal(camHelpers.parseCamHash(bad), null, String(bad));
     }
 });
+
+test('an open viewer follows a camera link that changes only the hash, and ignores a malformed one', async () => {
+    class Vector3 {
+        constructor(x = 0, y = 0, z = 0) { Object.assign(this, { x, y, z }); }
+        set(x, y, z) { return Object.assign(this, { x, y, z }); }
+        fromArray([x, y, z]) { return this.set(x, y, z); }
+        toArray() { return [this.x, this.y, this.z]; }
+    }
+    const handlers = new Map();
+    const location = { search: '', hash: '#cam=10,20,30,0.5,-0.5' };
+    const state = await vm.runInNewContext(`(async () => { ${viewerModule}
+        return { position: () => camera.position.toArray(), look: () => [yaw, pitch] }; })()`, {
+        THREE: {
+            WebGLRenderer: class {
+                domElement = { addEventListener() {} };
+                setPixelRatio() {} setSize() {} setAnimationLoop() {}
+            },
+            Scene: class { add() {} },
+            PerspectiveCamera: class { position = new Vector3(); },
+            DirectionalLight: class { position = { set() {} }; },
+            Clock: class {}, Color: class {}, Fog: class {}, HemisphereLight: class {}, MeshStandardMaterial: class {},
+            Group: class { add() {} },
+            Vector3,
+            MathUtils: { clamp: (v, low, high) => Math.min(high, Math.max(low, v)) },
+        },
+        document: { body: { prepend() {} }, getElementById: () => ({}), addEventListener() {} },
+        addEventListener: (type, handler) => handlers.set(type, handler),
+        devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location,
+        AbortController, setTimeout: () => 1, clearTimeout() {},
+        fetch: manifestResponse({ spawn: [0, 0, 0], chunks: [] }), GLTFLoader: class {},
+    });
+    // Arrays from the sandbox have its prototypes; copy them for deepEqual.
+    const view = { position: () => Array.from(state.position()), look: () => Array.from(state.look()) };
+    // The link the page was opened with still places the camera.
+    assert.deepEqual(view.position(), [10, 20, 30]);
+    assert.deepEqual(view.look(), [0.5, -0.5]);
+    // A link pasted into the address bar of the open page, or Back/Forward between two links, fires hashchange.
+    const follow = hash => { location.hash = hash; handlers.get('hashchange')(); };
+    follow('#cam=-300.5,150,-200,3.000,-2.000');
+    assert.deepEqual(view.position(), [-300.5, 150, -200]);
+    assert.deepEqual(view.look(), [3, -1.55]);
+    // A hash that is not a camera link leaves the view where it is.
+    for (const hash of ['', '#', '#cam=1,2,3', '#cam=1,2,3,4,NaN', '#section']) {
+        follow(hash);
+        assert.deepEqual(view.position(), [-300.5, 150, -200], hash);
+        assert.deepEqual(view.look(), [3, -1.55], hash);
+    }
+});
