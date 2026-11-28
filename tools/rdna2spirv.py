@@ -2531,12 +2531,14 @@ class Gen:
         element of that size: a load out of range gives 0 (in the half it writes, for d16), a store out of range
         writes nothing. Each byte is its own access, so a 16-bit one that crosses a dword is exact (in a swizzled
         buffer the next dword is `step` bytes on); a store merges each byte into its dword with atomic and / or, as
-        buffer byte format stores do. Inactive lanes neither load nor store."""
-        if any(m in mods for m in ("lds", "tfe")):
-            raise Unsupported(op + " form")
+        buffer byte format stores do. Inactive lanes neither load nor store. The loads take tfe like
+        buffer_load (the status dword is not written); the stores refuse it."""
         nbytes, store, signed, half = self.BUFFER_SUB16[op]
+        if "lds" in mods or (store and "tfe" in mods):
+            raise Unsupported(op + " form")
         vd = a[0]
-        if vd["k"] != "vgpr" or vd.get("n", 1) != 1:
+        # tfe's status dword is part of the VDATA range: one data VGPR plus it.
+        if vd["k"] != "vgpr" or vd.get("n", 1) != 1 + int("tfe" in mods):
             raise Unsupported(op + " data")
         addr, _, in_b, step = self.buffer_address(a, mods, elem="fmt", fixed_fmt=1 if nbytes == 1 else 7)
         old = self.load_reg("vgpr", vd["r"])
@@ -2597,19 +2599,21 @@ class Gen:
         self.emit(f"{got} = OpPhi %uint {value} {lbl_do} {self.cu(0)} {pre}")   # out of range / inactive: 0
         if half is None:
             # a whole-register load: inactive lanes keep vdata (dst writes active lanes only)
-            self.dst(vd, got)
+            self.dst({"k": "vgpr", "r": vd["r"], "n": 1}, got)
         else:
             new = self.tmp()
             self.emit(f"{new} = OpBitFieldInsert %uint {old} {got} {self.cu(16 * half)} {self.cu(16)}")
-            self.dst(vd, new)
+            self.dst({"k": "vgpr", "r": vd["r"], "n": 1}, new)
 
     def buffer_load(self, op, a, mods):
         """buffer_load_dword[xN] vD, vaddr, s[V#], soffset [offen|idxen] offset:N  -> buffer-device-address loads.
         addr = V#.base + soffset + inst_offset + (offen ? vaddr : 0) + (idxen ? vindex * V#.stride : 0), byte exact.
         Each dword is loaded only when it is in range per the V#'s OOB_SELECT (buffer_address; docs/design.md, Buffer
         bounds checking): for modes 0 and 3 dword i ends inside the stride / num_records, else it is 0 and memory is
-        not read; modes 1 and 2 check the index / num_records once. Inactive lanes don't load."""
-        if any(m in mods for m in ("lds", "tfe")) or "format" in op:
+        not read; modes 1 and 2 check the index / num_records once. Inactive lanes don't load. With tfe the VDATA
+        range holds one more dword after the data, the fetch status (RDNA ISA: written only when the fetch NACKs,
+        which a Vulkan buffer cannot, so it keeps its prior value — the resident image_load tfe case)."""
+        if "lds" in mods or "format" in op:
             raise Unsupported(op + " form")
         n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
         vd = a[0]
@@ -2660,12 +2664,14 @@ class Gen:
     def buffer_load_sub(self, op, a, mods):
         """buffer_load_{u,s}byte / buffer_load_{u,s}short vD, vaddr, s[V#], soffset [offen|idxen] offset:N.
         Loads 1 or 2 bytes from V#.base + offsets, zero- or sign-extended to 32 bits. Out-of-bounds lanes
-        (OOB_SELECT with element size 1 or 2) return 0 without reading memory; inactive lanes keep vD."""
-        if any(m in mods for m in ("lds", "tfe", "d16")):
+        (OOB_SELECT with element size 1 or 2) return 0 without reading memory; inactive lanes keep vD. tfe's status
+        dword follows the data VGPR and is left unwritten, as for buffer_load."""
+        if any(m in mods for m in ("lds", "d16")):
             raise Unsupported(op + " form")
         nbytes, signed = self.BUFFER_SUB[op]
         vd = a[0]
-        if vd["k"] != "vgpr" or vd.get("n", 1) != 1:
+        # tfe's status dword is part of the VDATA range: one data VGPR plus it.
+        if vd["k"] != "vgpr" or vd.get("n", 1) != 1 + int("tfe" in mods):
             raise Unsupported(op + " destination")
         addr, _, in_b, step = self.buffer_address(a, mods, elem=nbytes)
         act = self.active_b()
@@ -2706,7 +2712,7 @@ class Gen:
         self.emit(f"{lbl_end} = OpLabel")
         res = self.tmp()
         self.emit(f"{res} = OpPhi %uint {val} {lbl_do} {self.cu(0)} {pre_label}")
-        self.dst(vd, res)
+        self.dst({"k": "vgpr", "r": vd["r"], "n": 1}, res)
 
     # GFX10 buffer formats (from Mesa src/amd/registers/gfx10-rsrc.json, GFX10_FORMAT):
     #   code: (bytes, kind, component bit widths from bit 0)
@@ -3368,6 +3374,8 @@ class Gen:
         address). With 'glc' the pre-op value is returned in vdata. Inactive lanes don't touch memory and keep vdata;
         active OOB or unaligned (addr % 4 != 0) lanes leave memory untouched and write 0 with glc (measured on gfx1036)."""
         kind = op[len("buffer_atomic_"):]
+        if "tfe" in mods:
+            raise Unsupported(op + " form")   # an atomic is no fetch: the ISA defines no status dword (llvm-mc rejects it)
         if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
             return self.buffer_atomic_x2(op, kind[:-3], a, mods)
         if kind in ("fmin", "fmax"):
@@ -3804,7 +3812,7 @@ class Gen:
             self.fixed_format_codes.add(fixed_fmt)
         else:
             self.dynamic_format = True
-        if any(m in mods for m in ("lds", "tfe", "d16")):
+        if any(m in mods for m in ("lds", "d16")):
             raise Unsupported(op + " form")
         d16 = "_d16_" in op
         ncomp = len(op.rsplit("_", 1)[1])

@@ -1118,7 +1118,7 @@ class TestNegativeControlsAndMutations(unittest.TestCase):
     def test_unsupported_modifiers_rejected(self):
         harness = MubufSpirvHarness()
         self.addCleanup(harness.cleanup)
-        for mod in ("lds", "tfe"):
+        for mod in ("lds",):
             with self.subTest(mod=mod):
                 asm = (
                     f"; test_unsupported_{mod}\n"
