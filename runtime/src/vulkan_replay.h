@@ -1319,10 +1319,14 @@ struct ReplayFunctions {
     std::function<bool(const BuildAccelerationStructure&)> xdxr_check;
     std::function<void(VkCommandBuffer, const BuildAccelerationStructure&, const XdxrBlasTable&)> xdxr_record;
     std::function<ReplayResult(VkDeviceAddress& address, std::uint32_t& count)> prepare_xdxr_table;
-    // CopyRaytracingAccelerationStructure (CLONE, COMPACT) of XDXR structures: `bytes` is the room the destination
-    // resource has; and one postbuild value (COMPACTED_SIZE, CURRENT_SIZE) of the structure at `src` to `dest`.
-    std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dst_va, std::uint64_t bytes)> xdxr_copy;
-    std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dest_va)> xdxr_postbuild;
+    // CopyRaytracingAccelerationStructure (CLONE, COMPACT, SERIALIZE, DESERIALIZE: the D3D12 copy mode) of XDXR
+    // structures: the byte counts bound the destination and source; and one postbuild desc (COMPACTED_SIZE,
+    // SERIALIZATION, CURRENT_SIZE: the D3D12 info type) of the structure at `src` to `dest`.
+    std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dst_va, std::uint64_t bytes,
+                       std::uint32_t mode, std::uint64_t source_bytes)>
+        xdxr_copy;
+    std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dest_va, std::uint32_t type)>
+        xdxr_postbuild;
     std::function<VkAccelerationStructureKHR(std::uint64_t)> resolve_acceleration_structure;
     // CopyRaytracingAccelerationStructure (CLONE, COMPACT) and COMPACTED_SIZE postbuild on KHR acceleration structures.
     PFN_vkCmdCopyAccelerationStructureKHR copy_acceleration_structure = nullptr;
@@ -1458,6 +1462,7 @@ struct Prepared {
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
     VkDeviceAddress khr_instances = 0;  // staged ARRAY_OF_POINTERS instance list for a KHR TLAS; 0: use the VA directly
     std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
+    std::uint64_t xdxr_source_bytes = 0;
     XdxrBlasTable xdxr_blases;        // an XDXR TLAS build: how its instances' BLAS addresses are translated
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
     std::uint32_t khr_postbuild = ~0u;  // index into PreparedList::khr_postbuilds; ~0u: skipped or XDXR
@@ -1756,6 +1761,10 @@ inline void clip(std::span<const Rect> rects, VkExtent2D extent, std::uint32_t l
                        0, layers});
     }
 }
+
+// Bytes one XDXR postbuild desc takes at its destination: D3D12's SERIALIZATION desc (type 2) is two UINT64s, the
+// COMPACTED_SIZE and CURRENT_SIZE descs one (xdxr_build.h XdxrBuilder::postbuild_size).
+inline constexpr std::uint64_t xdxr_postbuild_stride(std::uint32_t type) { return type == 2 ? 16 : 8; }
 
 inline constexpr VkPipelineStageFlags2 queue_stages_copy =
     VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT |
@@ -4204,7 +4213,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (vk.xdxr_copy) {
                 // XDXR structures: the destination's room bounds the copy, as the size is only known to the GPU. A
                 // side the layer resolved into a copy of the title's memory brings its room (CopyAccelerationStructure).
-                if (!vk.buffer_at || copy->mode > 1) return unsupported_at(__LINE__);
+                if (!vk.buffer_at || copy->mode > 4 || copy->mode == 2) return unsupported_at(__LINE__);
                 std::uint64_t room = copy->dst_room ? copy->dst_room : ~std::uint64_t(0);
                 VkBuffer buffer = VK_NULL_HANDLE;
                 VkDeviceSize offset = 0;
@@ -4212,7 +4221,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 std::uint64_t source = copy->src_room ? copy->src_room : ~std::uint64_t(0);
                 if (!copy->src_room && !vk.buffer_at(copy->src_va, source, buffer, offset))
                     return unresolved_at(__LINE__);
-                p.xdxr_bytes = std::min(room, source);
+                // Serialization adds a header and pointer list. Deserialization removes them.
+                p.xdxr_bytes = copy->mode >= 3 ? room : std::min(room, source);
+                p.xdxr_source_bytes = source;
             } else {
                 if (vk.queue_stages == detail::queue_stages_copy || !vk.copy_acceleration_structure ||
                     !vk.resolve_acceleration_structure || copy->mode > 1)
@@ -4225,13 +4236,16 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
         } else if (const auto* info = std::get_if<AccelerationStructurePostbuild>(&command)) {
             if (vk.xdxr_postbuild) {
-                if (!vk.buffer_at || (info->type != 0 && info->type != 3)) return unsupported_at(__LINE__);
-                std::uint64_t room = info->dest_room ? info->dest_room : 8 * info->sources.size();
+                // TOOLS_VISUALIZATION (1) has no XDXR form; SERIALIZATION descs are 16 bytes, the sizes 8.
+                if (!vk.buffer_at || (info->type != 0 && info->type != 2 && info->type != 3))
+                    return unsupported_at(__LINE__);
+                const std::uint64_t need = detail::xdxr_postbuild_stride(info->type) * info->sources.size();
+                std::uint64_t room = info->dest_room ? info->dest_room : need;
                 VkBuffer buffer = VK_NULL_HANDLE;
                 VkDeviceSize offset = 0;
                 if (!info->dest_room && !vk.buffer_at(info->dest_va, room, buffer, offset))
                     return unresolved_at(__LINE__);
-                if (room < 8 * info->sources.size()) return ReplayResult::invalid_copy;
+                if (room < need) return ReplayResult::invalid_copy;
                 if (!info->sources.empty()) {
                     // dest_va is resolved by VA and may target a host-readable buffer; XDXR postbuild writes from compute.
                     out.wrote_readback = true;
@@ -5393,7 +5407,8 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
             if constexpr (Checkpoints) checkpoints->record(command_buffer, i, CheckpointKind::copy);
             if (vk.xdxr_copy) {
-                vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
+                vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes, copy->mode,
+                             p.xdxr_source_bytes);
             } else {
                 VkCopyAccelerationStructureInfoKHR copy_info{VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR};
                 copy_info.src = p.accel_src;
@@ -5405,8 +5420,10 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
         } else if (const auto* postbuild = std::get_if<AccelerationStructurePostbuild>(&command);
                    postbuild && !p.skip) {
             if (vk.xdxr_postbuild) {
+                const std::uint64_t stride = detail::xdxr_postbuild_stride(postbuild->type);
                 for (std::size_t s = 0; s < postbuild->sources.size(); ++s)
-                    vk.xdxr_postbuild(command_buffer, postbuild->sources[s], postbuild->dest_va + 8 * s);
+                    vk.xdxr_postbuild(command_buffer, postbuild->sources[s], postbuild->dest_va + stride * s,
+                                      postbuild->type);
             } else if (p.khr_postbuild < prepared.khr_postbuilds.size()) {
                 const auto& pb = prepared.khr_postbuilds[p.khr_postbuild];
                 const auto count = static_cast<std::uint32_t>(pb.sources.size());

@@ -638,6 +638,33 @@ int main(int argc, char** argv) {
         EXPECT(after == guard);                          // the copy stops at the source's own size
         EXPECT(dump_blas("blas_compacted", packed, packed_at, std::size_t(compacted)));
 
+        constexpr std::size_t serialization_header = 56;
+        const std::size_t serialized_size = std::size_t(compacted) + serialization_header;
+        Buffer serialized = make(gpu, serialized_size);
+        Buffer restored = make(gpu, std::size_t(compacted));
+        EXPECT(serialized.buffer && restored.buffer);
+        EXPECT(gpu.run([&](VkCommandBuffer cb) {
+            const bool ok = builder.record_copy(cb, random.address, serialized.address, serialized_size,
+                                                XdxrBuilder::copy_serialize, compacted);
+            barrier_to_host(gpu, cb);
+            return ok;
+        }));
+        EXPECT(std::memcmp(serialized.map, xdxr_serialized_id, sizeof xdxr_serialized_id) == 0);
+        const auto deserialize = [&](std::size_t source_bytes) {
+            return gpu.run([&](VkCommandBuffer cb) {
+                const bool ok = builder.record_copy(cb, serialized.address, restored.address, compacted,
+                                                    XdxrBuilder::copy_deserialize, source_bytes);
+                barrier_to_host(gpu, cb);
+                return ok;
+            });
+        };
+        std::memset(restored.map, 0xab, std::size_t(compacted));
+        EXPECT(deserialize(serialized_size - 4));
+        EXPECT(static_cast<const std::uint8_t*>(restored.map)[0] == 0xab);
+        EXPECT(deserialize(serialized_size));
+        const auto* clone_bytes = static_cast<const char*>(clone.map) + (clone_at - clone.address);
+        EXPECT(std::memcmp(restored.map, clone_bytes, std::size_t(compacted)) == 0);
+
         Buffer tclone = make(gpu, layout.size + 256);
         EXPECT(tclone.buffer);
         const std::uint64_t tclone_at = (tclone.address + 255) & ~std::uint64_t(255);

@@ -1263,13 +1263,15 @@ public:
                                            xdxr_pair(b));
                     }
                 };
-                replay_.xdxr_copy = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t bytes) {
+                replay_.xdxr_copy = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t bytes,
+                                          std::uint32_t mode, std::uint64_t source_bytes) {
                     const std::uint64_t base = replay_.heap_base;
-                    xdxr_->record_copy(cb, base + src, base + dst, bytes);
+                    xdxr_->record_copy(cb, base + src, base + dst, bytes, mode, source_bytes);
                 };
-                replay_.xdxr_postbuild = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dest) {
+                replay_.xdxr_postbuild = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dest,
+                                                std::uint32_t type) {
                     const std::uint64_t base = replay_.heap_base;
-                    xdxr_->record_postbuild(cb, base + src, base + dest);
+                    xdxr_->record_postbuild(cb, base + src, base + dest, type);
                 };
             } else {
                 xdxr_.reset();
