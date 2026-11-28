@@ -3967,9 +3967,9 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   values; the layer does not yet). A held `ExecuteCommandLists` that fails when it is released does not return its
   result to a call that has returned: it is printed, `last_execute_result` and `VulkanQueue::take_held_failure`
   report it, the `Signal` behind it still signals (the work did not run; nothing waits forever, as for a failure that is
-  not held), and its waits stay for the queue's next submission, as after a failed `vkQueueSubmit`. A queue does not
-  hold `UpdateTileMappings` / `CopyTileMappings`: they still submit at once, before earlier held work, and take the
-  queue's pending waits (documented limit). `VulkanQueue::idle` waits for submitted work only.
+  not held), and its waits stay for the queue's next submission, as after a failed `vkQueueSubmit`.
+  `UpdateTileMappings` and `CopyTileMappings` follow the same queue order. A held copy reads its source mapping
+  when released, after earlier updates. `VulkanQueue::idle` waits for submitted work only.
   `Present` (`VulkanPresenter`): when any queue holds work, a presented back buffer would be blitted as it was before
   that work, so the Present is queued instead (`QueueHolds::after_held`), returns success as a held
   `ExecuteCommandLists` does, and is submitted, in order with the presents queued before it, by the thread that

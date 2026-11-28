@@ -2673,72 +2673,67 @@ public:
     bool update_tiles(ResourceId id, std::span<const TileRegion> regions,
                       std::span<const TileRange> ranges, GetHeap&& get_heap) {
         flush_async();  // after the calls queued before it (LEONIDA_SUBMIT_ASYNC)
-        std::lock_guard state(state_mutex_);  // outermost: held batches are released from other threads
+        std::unique_lock state(state_mutex_);  // outermost: held batches are released from other threads
         std::unique_lock lock(context_.resource_mutex_);
         const auto it = context_.sparse_resources_.find(id);
         if (it == context_.sparse_resources_.end()) return false;
         const auto& sparse = it->second;
-        for (const auto& region : regions)
-            if (!valid_tiles(*sparse, region)) return false;
-        const auto heap = get_heap(sparse->image != VK_NULL_HANDLE, sparse->memory_types);
-
-        std::map<std::uint64_t, TileMapping> changes;
-        std::size_t region_index = 0;
-        std::uint64_t consumed = 0;
+        std::uint64_t remaining = 0;
+        for (const auto& region : regions) {
+            if (!valid_tiles(*sparse, region) || region.count > UINT64_MAX - remaining) return false;
+            remaining += region.count;
+        }
+        std::shared_ptr<const TileHeapAllocation> heap = get_heap(sparse->image != VK_NULL_HANDLE, sparse->memory_types);
+        const std::uint64_t heap_count = heap ? heap->size / tile_size_in_bytes : 0;
         for (const auto& range : ranges) {
+            if (range.count > remaining) return false;
+            remaining -= range.count;
             const bool backed = range.mode == TileRangeMode::sequential || range.mode == TileRangeMode::reuse;
-            const std::uint64_t heap_count = heap ? heap->size / tile_size_in_bytes : 0;
             const std::uint64_t required = range.mode == TileRangeMode::reuse ? 1 : range.count;
             if (backed && (!heap || range.first > heap_count || required > heap_count - range.first)) return false;
-            for (std::uint64_t i = 0; i < range.count;) {
-                if (region_index == regions.size()) return false;
-                const auto& region = regions[region_index];
-                const auto count = std::min(range.count - i, region.count - consumed);
-                const auto first = region.first + consumed;
-                if (range.mode == TileRangeMode::unmap) {
-                    const auto end = first + count;
-                    for (auto old = sparse->mapped.lower_bound(first); old != sparse->mapped.end() && old->first < end; ++old)
-                        changes[old->first] = {};
-                    for (auto change = changes.lower_bound(first); change != changes.end() && change->first < end; ++change)
-                        change->second = {};
-                } else if (backed) {
-                    for (std::uint64_t j = 0; j < count; ++j) {
-                        const auto page = range.first + (range.mode == TileRangeMode::sequential ? i + j : 0);
-                        changes[first + j] = {heap, heap->offset + page * tile_size_in_bytes};
-                    }
-                }
-                i += count;
-                consumed += count;
-                if (consumed == region.count) {
-                    ++region_index;
-                    consumed = 0;
-                }
-            }
         }
-        return region_index == regions.size() && bind_tiles(id, sparse, changes);
+        if (remaining) return false;
+        if (!must_hold()) return update_tiles_now(id, sparse, regions, ranges, heap);
+        if (context_.is_device_lost() || !context_.vk.vkQueueBindSparse) return false;
+
+        const std::weak_ptr<SparseResource> expected = sparse;
+        lock.unlock();
+        return hold_tile_mapping(state, [this, id, expected, heap = std::move(heap),
+                                         regions = std::vector<TileRegion>(regions.begin(), regions.end()),
+                                         ranges = std::vector<TileRange>(ranges.begin(), ranges.end())] {
+            std::lock_guard lock(context_.resource_mutex_);
+            const auto resource = expected.lock();
+            return current_sparse_resource(id, resource) && update_tiles_now(id, resource, regions, ranges, heap);
+        });
     }
 
     bool copy_tile_mappings(ResourceId dst, std::span<const TileRegion> dst_regions, ResourceId src,
                             std::span<const TileRegion> src_regions) {
         flush_async();
-        std::lock_guard state(state_mutex_);
+        std::unique_lock state(state_mutex_);
         std::unique_lock lock(context_.resource_mutex_);
         const auto source = context_.sparse_resources_.find(src), target = context_.sparse_resources_.find(dst);
         if (source == context_.sparse_resources_.end() || target == context_.sparse_resources_.end() ||
             bool(source->second->image) != bool(target->second->image) || src_regions.size() != dst_regions.size())
             return false;
-        // Read the complete source mapping before changing any destination slot, including copies within one resource.
-        std::map<std::uint64_t, TileMapping> changes;
         for (std::size_t row = 0; row < src_regions.size(); ++row) {
             const auto from = src_regions[row], to = dst_regions[row];
             if (!valid_tiles(*source->second, from) || !valid_tiles(*target->second, to) || from.count != to.count)
                 return false;
-            for (std::uint64_t i = 0; i < from.count; ++i) {
-                const auto page = source->second->mapped.find(from.first + i);
-                changes.emplace(to.first + i, page == source->second->mapped.end() ? TileMapping{} : page->second);
-            }
         }
-        return bind_tiles(dst, target->second, changes);
+        if (!must_hold()) return copy_tile_mappings_now(dst, target->second, dst_regions, *source->second, src_regions);
+        if (context_.is_device_lost() || !context_.vk.vkQueueBindSparse) return false;
+
+        const std::weak_ptr<SparseResource> expected_source = source->second, expected_target = target->second;
+        lock.unlock();
+        return hold_tile_mapping(state, [this, dst, src, expected_target, expected_source,
+                                         dst_regions = std::vector<TileRegion>(dst_regions.begin(), dst_regions.end()),
+                                         src_regions = std::vector<TileRegion>(src_regions.begin(), src_regions.end())] {
+            std::lock_guard lock(context_.resource_mutex_);
+            const auto target = expected_target.lock(), source = expected_source.lock();
+            return current_sparse_resource(dst, target) && current_sparse_resource(src, source) &&
+                   copy_tile_mappings_now(dst, target, dst_regions, *source, src_regions);
+        });
     }
 
     // ExecuteCommandLists: every list is checked before any is written, so a failure submits nothing and leaves
@@ -3893,7 +3888,7 @@ private:
 
     // One held operation, with the waits that were pending when it was asked for.
     struct Deferred {
-        enum class Kind : std::uint8_t { batch, signal, marker };
+        enum class Kind : std::uint8_t { batch, signal, marker, tile_mapping };
         Kind kind = Kind::batch;
         std::uint64_t seq = 0;  // QueueHolds::next_seq(): the order operations were held in, across queues
         std::uint64_t execute_call = 0;  // original ExecuteCommandLists call for a held batch
@@ -3904,6 +3899,7 @@ private:
         std::uint64_t value = 0;
         DebugMarker::Kind marker_kind = DebugMarker::Kind::set;  // marker
         std::string label;
+        std::function<bool()> tile_mapping;
         // Alive until the operation has run: the fences it waits on and signals, the pipeline states and root
         // signatures of the lists (the application may release them right after the call).
         std::vector<std::shared_ptr<void>> pins;
@@ -3970,6 +3966,16 @@ private:
         context_.holds().held_changed(1);
     }
 
+    bool hold_tile_mapping(std::unique_lock<std::mutex>& state, std::function<bool()> replay) {
+        Deferred op;
+        op.kind = Deferred::Kind::tile_mapping;
+        op.tile_mapping = std::move(replay);
+        hold(std::move(op));
+        state.unlock();
+        context_.holds().pump_ready();
+        return true;
+    }
+
     // Runs one held operation as the call would have, with its own waits and none of the ones queued since.
     // A submission that fails leaves its waits for the next one, as when the call is not held (a transient
     // vkQueueSubmit failure is retried by the application's next call), ahead of the waits asked for since.
@@ -4002,6 +4008,12 @@ private:
             break;
         case Deferred::Kind::marker:
             marker_now(op.marker_kind, op.label.c_str());
+            break;
+        case Deferred::Kind::tile_mapping:
+            if (!op.tile_mapping())
+                std::fputs("[rt] d3d12: a held tile mapping failed when it was released\n", stderr);
+            if (!waits_.empty() && !submit(VK_NULL_HANDLE, VK_NULL_HANDLE, 0))
+                std::fputs("[rt] d3d12: submitting the waits of a held tile mapping failed\n", stderr);
             break;
         }
         retire_pins(op.pins, submitted_);  // the fence it signals, the pipeline states: until its submission is done
@@ -4142,6 +4154,60 @@ private:
 
     static bool valid_tiles(const SparseResource& resource, TileRegion region) {
         return region.count && region.first < resource.tile_count && region.count <= resource.tile_count - region.first;
+    }
+
+    bool current_sparse_resource(ResourceId id, const std::shared_ptr<SparseResource>& expected) const {
+        const auto resource = context_.sparse_resources_.find(id);
+        return expected && resource != context_.sparse_resources_.end() && resource->second == expected;
+    }
+
+    bool update_tiles_now(ResourceId id, const std::shared_ptr<SparseResource>& sparse,
+                          std::span<const TileRegion> regions, std::span<const TileRange> ranges,
+                          const std::shared_ptr<const TileHeapAllocation>& heap) {
+        std::map<std::uint64_t, TileMapping> changes;
+        std::size_t region_index = 0;
+        std::uint64_t consumed = 0;
+        for (const auto& range : ranges) {
+            const bool backed = range.mode == TileRangeMode::sequential || range.mode == TileRangeMode::reuse;
+            for (std::uint64_t i = 0; i < range.count;) {
+                const auto& region = regions[region_index];
+                const auto count = std::min(range.count - i, region.count - consumed);
+                const auto first = region.first + consumed;
+                if (range.mode == TileRangeMode::unmap) {
+                    const auto end = first + count;
+                    for (auto old = sparse->mapped.lower_bound(first); old != sparse->mapped.end() && old->first < end; ++old)
+                        changes[old->first] = {};
+                    for (auto change = changes.lower_bound(first); change != changes.end() && change->first < end; ++change)
+                        change->second = {};
+                } else if (backed) {
+                    for (std::uint64_t j = 0; j < count; ++j) {
+                        const auto page = range.first + (range.mode == TileRangeMode::sequential ? i + j : 0);
+                        changes[first + j] = {heap, heap->offset + page * tile_size_in_bytes};
+                    }
+                }
+                i += count;
+                consumed += count;
+                if (consumed == region.count) {
+                    ++region_index;
+                    consumed = 0;
+                }
+            }
+        }
+        return bind_tiles(id, sparse, changes);
+    }
+
+    bool copy_tile_mappings_now(ResourceId dst, const std::shared_ptr<SparseResource>& target,
+                                std::span<const TileRegion> dst_regions, const SparseResource& source,
+                                std::span<const TileRegion> src_regions) {
+        std::map<std::uint64_t, TileMapping> changes;
+        for (std::size_t row = 0; row < src_regions.size(); ++row) {
+            const auto from = src_regions[row], to = dst_regions[row];
+            for (std::uint64_t i = 0; i < from.count; ++i) {
+                const auto page = source.mapped.find(from.first + i);
+                changes.emplace(to.first + i, page == source.mapped.end() ? TileMapping{} : page->second);
+            }
+        }
+        return bind_tiles(dst, target, changes);
     }
 
     bool initialize_sparse_image_layout(ResourceId id) {
