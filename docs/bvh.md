@@ -1099,26 +1099,42 @@ zeroed 64-byte unit after the last node it wrote, and the header's size counts i
 64-byte node would otherwise be read past the structure, or past a compacted copy of it.
 
 **TRI1 pairing.** A bottom-level build without `ALLOW_UPDATE` pairs triangles into TRI0/TRI1 leaves, as the console
-builder does in its offline BLASes (§4a, check 4 of "How a match is verified"). The pass that writes the nodes
-pairs each triangle child of a node with a later triangle child of the same node (among its at most four children)
+builder does in its offline BLASes (§4a, check 4 of "How a match is verified"). A pass after the tree is known
+(`MODE_PAIR`) pairs each triangle child of a node with a later triangle child of the same node (among its at most four children)
 when four things hold. The two must share an edge in opposite directions, with the same two vertices bit for bit. They must come from
 the same geometry, since a leaf holds one `GeometryIndexAndFlags`. And both must be active. The first triangle is
 rotated so the shared edge is slots 1 -> 2, the sibling's third vertex goes in slot 3, its primitive index in
 `PrimitiveIndex2`, and each node type's remap byte returns D3D12's barycentrics for its own vertex order. The node
-still has one child per triangle, each with its own box: the TRI1 child points at the first triangle's leaf, and the
-sibling's own leaf is left unused. The tree, the layout and the sizes are therefore the same as without pairing.
-Nothing is saved yet: reclaiming the unused leaves would need a compaction that moves records and rewrites pointers,
-and compaction here copies bytes. What pairing gives is the console's leaf format, with a pair's two triangles in
-one 64-byte record. Because pairs never cross nodes, one thread owns each leaf it rewrites, and both pointers of a
-pair have the same parent, so the parent table has one writer per entry. The pass records each triangle's pointer
+still has one child per triangle, each with its own box: the TRI1 child points at the first triangle's leaf, so the
+tree is the same as without pairing.
+
+The leaves are laid out densely, one 64-byte record a pair, as the console's are (§4a: one `Leaf` per entry, an entry
+holding the second primitive). A paired build writes its leaves to scratch first; once the pairs are chosen, a scan
+over the leaves that stay (the dropped ones are the siblings') gives each its place, they are copied into the
+element region in element order, and the nodes start right after the last one. `offsetToNodes` (+40) says where, and
+the nodes, their pointers and the parent table are written for those places directly, so nothing is moved
+afterwards. `numElements` stays the triangle count, as `build_blas` writes it, the count of triangle pointers. The
+build is therefore 64 bytes smaller per pair: its header's size, `COMPACTED_SIZE` and `CURRENT_SIZE`, and what a
+`COMPACT` copy keeps. The prebuild room is unchanged (a leaf per triangle, since the pairs are not known before the
+build); the scratch grows by 80 bytes a triangle for the leaves and their bookkeeping, and only for a bottom-level
+build without `ALLOW_UPDATE` (`XdxrLayout::pair`, which `GetRaytracingAccelerationStructurePrebuildInfo` reads from
+the same flag). On the 288-triangle grid of `vk_xdxr_build_test`, 80 pairs make it 34,048 bytes against 39,168
+unpaired; the 7,200-triangle grid's 2,208 pairs, 846,848 against 988,160 (14%). The pairing step only records each
+pair and its rotation; the step that copies the leaves into the structure writes a pair's leaf from the two staged
+ones, so no invocation stores to a word it loaded earlier in the same dispatch (the SPIRV-Cross reordering in MoltenVK
+1.4.2 noted in `xdxr_build.comp`; rewriting the first triangle's staged leaf in place lost pairs on an Apple M5 Pro).
+Because pairs never cross nodes, one thread owns each pair, and both pointers of a
+pair have the same parent, so the parent table has one writer per entry. The node pass records each triangle's pointer
 (TRI0, or TRI1 for the sibling) in scratch, so the bottom-up box pass finds the sibling's slot through the first
 triangle's leaf. On a sorted grid of 7,200 triangles, 2,208 of the 3,600 possible pairs form (2,625 with the tree of four
 consecutive elements: a radix-tree node often has an inner node among its children, and only triangle children
 pair). A refit rewrites every leaf as one triangle, so a structure that may be updated is
 not paired. **ASSUMPTION:** that pairing only siblings is close enough. The console builder's pairing rule is not
 traced; `tools/xdxr_bvh.py` `build_blas(pair=True)` pairs greedily over the whole mesh instead, and both traverse
-the same way. `check-build` compares barycentrics as well as hits, and checks that a paired case has TRI1 nodes and
-that cases that must not pair (other geometry, same direction) have none.
+the same way. `check-build` compares barycentrics as well as hits, and checks that a paired case has TRI1 nodes,
+that cases that must not pair (other geometry, same direction) have none, and that no 64-byte unit of a BLAS's
+element region is left without a triangle pointer (`unreferenced_leaves`: the unused sibling leaves the builder
+kept before it laid the leaves out densely).
 
 The node count depends on the keys. A kept node has two children only when both of its binary children are
 elements, so with N elements there are at most (3N - 2) / 4 nodes. `XdxrLayout` computes the result and scratch
@@ -1155,12 +1171,36 @@ names its BLASes by address, which a clone keeps. The size comes from the source
 a copy can follow a build in the same command list, and it is bounded by the destination resource. A build's size
 is the nodes it wrote, so `COMPACTED_SIZE` and `CURRENT_SIZE` (from
 `EmitRaytracingAccelerationStructurePostbuildInfo` or the postbuild descs of a build) are both
-`64 * (totalSizeIn64BNodes + 1)`, and compaction gives back the room the layout left for more nodes. Serialization, deserialization and the tools-visualization
-mode are refused at replay as unsupported, not faked. In `LEONIDA_RT_AS=khr` mode the postbuild descs stay ignored,
-as before.
+`64 * (totalSizeIn64BNodes + 1)`, and compaction gives back the room the layout left for more nodes and, in a
+paired build, the 64 bytes a pair its leaves no longer take. The
+tools-visualization copy mode and postbuild type are refused at replay as unsupported, not faked. In
+`LEONIDA_RT_AS=khr` mode the postbuild descs stay ignored and serialization is refused, as before.
 
-Not done yet: serialization; a compaction that reclaims the leaves that pairing leaves unused. A surface-area
-collapse of the radix tree, or treelet restructuring, would trim a few more steps.
+**Serialization.** `CopyRaytracingAccelerationStructure` with `SERIALIZE` writes D3D12's serialized form
+(`xdxr_build.comp` `MODE_SERIALIZE`): the 56-byte `D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER`, then
+`NumBottomLevelAccelerationStructurePointersAfterHeader` 8-byte BLAS addresses, then the structure's bytes as they
+are. The header's driver matching identifier is the layer's own (`xdxr_build.h` `xdxr_serialized_id`: the GUID is the
+ASCII `Leonida XDXR AS `, the versioning data the header version 6 and the serialized layout version 1), and
+`CheckDriverMatchingIdentifier` answers `COMPATIBLE_WITH_DEVICE` for it, `INCOMPATIBLE_VERSION` for the same GUID
+with other versioning data, and `UNRECOGNIZED` otherwise (always, with `LEONIDA_RT_AS=khr`). A TLAS carries one
+pointer per INSTANCE record, in record order, read from the record's BLAS address (+60, 256-byte units; 0 for an
+instance without a BLAS); a BLAS carries none. The deserialized size is the structure's own. `DESERIALIZE` copies the
+bytes back and writes each INSTANCE record's BLAS address from the pointer list, so an application that moved its
+BLASes (deserialized them elsewhere) and rewrote the pointers gets a TLAS that names them; the rest of the record
+stays, since a deserialized BLAS is the same structure and its records count from its own start. The `SERIALIZATION`
+postbuild desc (16 bytes) gives the serialized size, `56 + 8 * pointers + 64 * (totalSizeIn64BNodes + 1)`, and the
+pointer count. Both copies are bounded by the destination resource only, since a serialized structure is larger than
+the structure. The payload after the pointers is this layer's: the console's own serialized form (`XboxBvhBuilder.dll`
+writes `SERIALIZATION` postbuild info in a handler of its own, [xdxr.md](xdxr.md) section 4) is not measured, and a
+blob with the console's identifier would be `UNRECOGNIZED`. `d3d12_xdxr_rt_test` serializes a BLAS and a three-instance
+TLAS, deserializes the BLAS to another address, rewrites the TLAS's pointers to it and deserializes the TLAS; the
+copies must equal the originals byte for byte but for the three BLAS addresses, and `d3d12_xdxr_rt_check` traces
+1,000 rays through each against brute force (RTX 5070 Ti, NVIDIA 617.42, and the Ryzen 9 7900X's Radeon 610M, AMD
+2026.04.17, Windows 11: 0 rays differ).
+
+Not done yet: a surface-area collapse of the radix tree, or treelet restructuring, would trim a few more steps; the
+room the layout keeps for the most nodes a tree can have, and for a leaf per triangle, is only given back by a
+`COMPACT` copy.
 
 ```powershell
 python -I tools/xdxr_bvh.py selftest --seed 1 --rays 400   # build BLASes, compare closest hits with brute force

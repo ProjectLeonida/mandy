@@ -4206,7 +4206,7 @@ struct DeviceState {
         leonida::XdxrLayout layout;
         // A count the format cannot hold: left as it was, and refused when the list is prepared (xdxr_check).
         if (!layout.compute(leonida::VulkanContext::xdxr_elements(b), b.is_tlas,
-                            leonida::VulkanContext::xdxr_box16(b)))
+                            leonida::VulkanContext::xdxr_box16(b), leonida::VulkanContext::xdxr_pair(b)))
             return true;
         const std::uint64_t title_dst = b.dst_va;
         std::uint64_t out = 0;
@@ -4272,7 +4272,8 @@ struct DeviceState {
     // copy by it). The source's size comes from its build when the layer saw it, else from its header only.
     bool resolve_xdxr_copy(leonida::CopyAccelerationStructure& c) {
         if (!context || !context->xdxr_acceleration_structures()) return true;
-        const std::uint64_t known = bvh_known_size(c.src_va);
+        const bool deserialize = c.mode == leonida::XdxrBuilder::copy_deserialize;
+        const std::uint64_t known = deserialize ? 0 : bvh_known_size(c.src_va);
         const std::uint64_t want = known ? known : leonida::XdxrLayout::header_size;
         const std::uint64_t title_dst = c.dst_va;
         std::uint64_t out = 0, room = 0;
@@ -4284,15 +4285,15 @@ struct DeviceState {
             return bvh_refuse(bvh_copy_dst, c.dst_va, want), false;
         c.dst_va = out;
         c.dst_room = room;
-        if (known) bvh_note_size(title_dst, known);
+        if (known && c.mode != leonida::XdxrBuilder::copy_serialize) bvh_note_size(title_dst, known);
         return true;
     }
 
-    // A postbuild: its destination (8 bytes a source) and each source structure's header, which it reads.
+    // A postbuild: its destination and each source structure's header, which it reads.
     bool resolve_xdxr_postbuild(leonida::AccelerationStructurePostbuild& info) {
         if (!context || !context->xdxr_acceleration_structures()) return true;
         std::uint64_t out = 0, room = 0;
-        const std::uint64_t bytes = 8ull * info.sources.size();
+        const std::uint64_t bytes = std::uint64_t(leonida::XdxrBuilder::postbuild_size(info.type)) * info.sources.size();
         if (!bvh_va(info.dest_va, bytes, true, out, &room) || (out & 7))
             return bvh_refuse(bvh_postbuild_dst, info.dest_va, bytes), false;
         info.dest_va = out;
@@ -17991,12 +17992,22 @@ public:
         return E_INVALIDARG;
     }
 
-    // STUB
+    // Serialized acceleration structures this device writes start with leonida::xdxr_serialized_id (xdxr_build.h):
+    // the same GUID and versioning data are compatible, the same GUID with other versioning data is another layout.
+    // With LEONIDA_RT_AS=khr nothing is serialized (the KHR path refuses SERIALIZE), so nothing is recognised.
     D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE CheckDriverMatchingIdentifier(
-        D3D12_SERIALIZED_DATA_TYPE type, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER*) override {
-        return type == D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE
-                   ? D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED
-                   : D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE;
+        D3D12_SERIALIZED_DATA_TYPE type, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER* id) override {
+        if (type != D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE)
+            return D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE;
+        if (!id || !state_.info.xdxr_acceleration_structures || !state_.info.buffer_device_address)
+            return D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
+        static_assert(sizeof(D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER) == sizeof(leonida::xdxr_serialized_id));
+        const auto* ours = reinterpret_cast<const unsigned char*>(leonida::xdxr_serialized_id);
+        if (std::memcmp(&id->DriverOpaqueGUID, ours, sizeof(GUID)) != 0)
+            return D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
+        return std::memcmp(id->DriverOpaqueVersioningData, ours + sizeof(GUID), sizeof(id->DriverOpaqueVersioningData)) == 0
+                   ? D3D12_DRIVER_MATCHING_IDENTIFIER_COMPATIBLE_WITH_DEVICE
+                   : D3D12_DRIVER_MATCHING_IDENTIFIER_INCOMPATIBLE_VERSION;
     }
 
     // STUB
@@ -18205,14 +18216,18 @@ public:
         }
         auto& vk = state_.context->vk;
         if (state_.context->xdxr_acceleration_structures()) {
-            // XDXR records: the layout depends only on the triangle or instance count and on whether the nodes are
-            // BOX16 (MINIMIZE_MEMORY, bottom level; xdxr_build.h). Its size has room for the most nodes a tree of
-            // that many elements can have; a build's own size, in its header, is what COMPACTED_SIZE reports. An
-            // update refits (no sort); the build's scratch size covers it.
+            // XDXR records: the layout depends only on the triangle or instance count, on whether the nodes are
+            // BOX16 (MINIMIZE_MEMORY, bottom level; xdxr_build.h) and, for its scratch, on whether the triangles may
+            // pair (a bottom level without ALLOW_UPDATE). Its size has room for the most nodes a tree of that many
+            // elements can have and a leaf per triangle; a build's own size, in its header, is what COMPACTED_SIZE
+            // reports. An update refits (no sort); the build's scratch size covers it.
             leonida::BuildAccelerationStructure build{};
             build.is_tlas = is_tlas;
             if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY)
                 build.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR;
+            // a bottom-level build without ALLOW_UPDATE pairs its triangles, which takes more scratch
+            if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE)
+                build.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
             if (build.is_tlas) {
                 build.instance_count = desc->NumDescs;
             } else {
@@ -18231,7 +18246,7 @@ public:
             }
             leonida::XdxrLayout layout;
             if (!layout.compute(leonida::VulkanContext::xdxr_elements(build), build.is_tlas,
-                                leonida::VulkanContext::xdxr_box16(build)))
+                                leonida::VulkanContext::xdxr_box16(build), leonida::VulkanContext::xdxr_pair(build)))
                 return;
             out->ResultDataMaxSizeInBytes = layout.size;
             out->ScratchDataSizeInBytes = layout.scratch;
