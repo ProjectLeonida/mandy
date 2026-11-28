@@ -20,10 +20,14 @@
 //  14. LEONIDA_GEOMETRY_HOST picks a system-memory type (write-back for 1, write-combined for 2), never the BAR;
 //  15. a retired view is copied once more from its pages when they are readable, not when they are not;
 //  16. a full release queue joins touching ranges before it collapses to one covering range;
-//  17. a range inside a live view is answered from that view (its address plus the offset), not copied again; it is
-//      refreshed with that view and leaves with it, and a view it was inside before keeps answering after the outer
-//      one goes; a retired view with a range inside it the release did not touch also waits for the command lists
-//      recorded before (LEONIDA_GEOMETRY_CONTAINED=0, a copy of its own as before, fails 17).
+//  17. a range inside a live view is answered from that view (its address plus the offset), not copied again, unless
+//      the caller asks for a copy of its own; it is refreshed with that view and leaves with it, and a view it was
+//      inside before keeps answering after the outer one goes; a retired view with a range inside it the release did
+//      not touch also waits for the command lists whose recording began before that range stopped being answered,
+//      on_retire included (LEONIDA_GEOMETRY_CONTAINED=0, a copy of its own as before, fails 17);
+//  18. a filled view over a tile that cannot be guarded yet (a file read into it in flight) still takes the writes to
+//      its other tiles, and so does a range inside it (with whole views such a view waits for the read to end and is
+//      then copied whole, so its first check fails).
 #include <windows.h>
 
 #include <algorithm>
@@ -143,6 +147,10 @@ void title_write(std::uintptr_t at, std::uint8_t value) {
     watch::notify(at, at + 1, watch::Event::fault);
     *reinterpret_cast<std::uint8_t*>(at) = value;
 }
+
+// kernel_writes::begin_write pins a range only once the layer has an opener; the test's pages are opened by
+// title_write already.
+void open_nothing(std::uintptr_t, std::uintptr_t) {}
 
 }  // namespace
 
@@ -710,8 +718,76 @@ int main() {
         nest.execute_end(next, [] { return std::uint64_t(4); });
         check(nest.reap(device, 3) == 0 && nest.reap(device, 4) == 1 && nest.retired_count() == 0,
               "once that list is gone, the outer view waits only for the next replay's submissions");
+
+        // The range inside answers until on_retire has dropped what still names it (aliases, heap slots), after the
+        // views' lock is let go: a list whose recording begins in on_retire can still take its address, so the view
+        // waits for that list too.
+        const auto d = a + 2 * kTile;
+        const std::uint64_t outer_d = nest.resolve(device, d, 2 * kTile, copy);
+        check(outer_d != 0 && nest.resolve(device, d + 4096, kTile, copy) == outer_d + 4096,
+              "a fourth outer view with a range inside it");
+        std::unique_ptr<leonida::command_list_epochs::Stamp> late;
+        nest.retire_range(d + 100 * 1024, d + 104 * 1024, rt::d3d12::GeometryViews::kAfterExecutes,
+                          [&](std::uintptr_t, std::size_t, VkDeviceSize) {
+                              if (!late) late = std::make_unique<leonida::command_list_epochs::Stamp>();
+                          });
+        const std::uint64_t after = nest.execute_begin();
+        nest.execute_end(after, [] { return std::uint64_t(5); });
+        check(late && nest.reap(device, 5) == 0 && nest.retired_count() == 1,
+              "a list whose recording began in on_retire, while the range inside still answered, holds the view");
+        late.reset();
+        const std::uint64_t last_replay = nest.execute_begin();
+        nest.execute_end(last_replay, [] { return std::uint64_t(6); });
+        check(nest.reap(device, 6) == 1 && nest.retired_count() == 0, "once that list is gone, the view is freed");
+
+        // A caller that asks for a copy of its own (a structure the GPU writes, copy_title_range) gets one, even
+        // inside a live view: a release elsewhere in that view must not take the structure with it.
+        const std::uint64_t holder = nest.resolve(device, d, 2 * kTile, copy);
+        const std::uint64_t own = nest.resolve(device, d + 4096, kTile, copy, false);
+        check(holder != 0 && own != 0 && own != holder + 4096 && nest.find(d + 4096, kTile) == own &&
+                  nest.retire_range(d + 100 * 1024, d + 104 * 1024, 7) == 1 && nest.find(d + 4096, kTile) == own,
+              "asked for a copy of its own, a range inside a live view gets one, which outlives that view");
         nest.release(device);
         VirtualFree(nest_title, 0, MEM_RELEASE);
+    }
+
+    // 18. V = (P, 128 KiB) over tiles 0 and 1, and K = (P + 4 KiB, 4 KiB) inside tile 0. The title writes K and tile
+    // 1, and a file read into tile 1 is in flight at the next refresh, so tile 1 cannot be guarded yet. The refresh
+    // takes tile 0's version all the same, so a write to it that is not copied then is never copied: tile 0 goes to
+    // V (and K) now, and tile 1 once the read has ended.
+    {
+        auto* pin_title =
+            static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 2 * kTile, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!pin_title) return 1;
+        for (std::size_t i = 0; i < 2 * kTile; ++i) pin_title[i] = std::uint8_t((i * 5) ^ 0x0f);
+        const auto p = reinterpret_cast<std::uintptr_t>(pin_title);
+        rt::d3d12::GeometryViews pinned;
+        const auto host_of = [&](std::uint64_t at) -> const std::uint8_t* {
+            std::uint64_t host = 0, room = 0;
+            return at && pinned.lookup(device.arena.address + at, host, room)
+                       ? reinterpret_cast<const std::uint8_t*>(host)
+                       : nullptr;
+        };
+        const std::uint64_t whole = pinned.resolve(device, p, 2 * kTile, copy);
+        const std::uint64_t part = pinned.resolve(device, p + 4096, 4096, copy);
+        pinned.refresh(copy);
+        const std::uint8_t before = pin_title[kTile + 10];
+        leonida::kernel_writes::set_opener(open_nothing);
+        title_write(p + kTile + 10, 0x11);
+        title_write(p + 4096 + 5, 0x5a);
+        const std::uint64_t pin = leonida::kernel_writes::begin_write(pin_title + kTile + 100, 16, nullptr);
+        pinned.refresh(copy);
+        check(pin != 0 && host_of(whole) && host_of(part) && host_of(whole)[4096 + 5] == 0x5a &&
+                  host_of(part)[5] == 0x5a && host_of(whole)[kTile + 10] == before,
+              "while a file read into tile 1 is in flight, the write to tile 0 reaches V and K; tile 1 waits");
+        leonida::kernel_writes::end_write(pin, false);
+        pinned.refresh(copy);
+        check(host_of(whole) && host_of(part) && host_of(whole)[kTile + 10] == 0x11 &&
+                  host_of(whole)[4096 + 5] == 0x5a && host_of(part)[5] == 0x5a,
+              "once the read has ended, tile 1 reaches V too, and tile 0 keeps the write");
+        leonida::kernel_writes::set_opener(nullptr);
+        pinned.release(device);
+        VirtualFree(pin_title, 0, MEM_RELEASE);
     }
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

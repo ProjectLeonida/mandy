@@ -1782,10 +1782,14 @@ The copies:
   A positive cap enables persistent copies of placed buffer SRVs and buffer descriptors in title memory.
   A GPU-only reservation uses its paired CPU mapping. Matching source ranges share one copy, and a range inside a
   live, filled copy is answered from that copy at its offset instead of being copied again
-  (`LEONIDA_GEOMETRY_CONTAINED=0`: a copy of its own, as before).
+  (`LEONIDA_GEOMETRY_CONTAINED=0`: a copy of its own, as before). The copy of an acceleration structure's whole
+  range (`copy_title_range`: a destination, scratch or input no other range holds whole) is never answered that way,
+  so a release elsewhere in a larger copy cannot take a structure the GPU wrote with it.
   The resource descriptor heap keeps its console indices and original CPU bytes. Its shader-visible copy
   encodes each resolved buffer's offset from the arena base. CPU writes through either physical mapping,
-  file reads and XMem remaps invalidate the affected copies before their next submission.
+  file reads and XMem remaps invalidate the affected copies before their next submission. A filled copy over a
+  64 KiB tile that a file read is still writing (it cannot be guarded yet) takes its other written tiles at once,
+  and that tile once the read has ended (`geometry_views_test` case 18).
   During an untyped heap scan, an extent above 16 MiB with no format or an unrecognized descriptor
   encoding reuses only an independently established geometry view. An explicit table or placed SRV can
   establish that view. The Vulkan memory probe reports populated views, payload and reserved bytes,
@@ -1802,9 +1806,11 @@ The copies:
     retirement has recorded its submissions and those have completed (`kAfterExecutes`). Before it leaves the
     refresh it is copied once more from its pages if they are still readable (a heap block freed in memory that
     stays committed). The ranges answered from inside it go with it, each invalidated by its own address; when the
-    release did not touch one of them, the view's memory also waits until no command list recorded before the
-    retirement is left, as a retired title window's does. The next view of the range makes a new copy.
-    `geometry_views_test` cases 14-17 cover this without a GPU.
+    release did not touch one of them, the view's memory also waits until no command list is left whose recording
+    began before those invalidations had run. Unlike a retired title window, the view is not refreshed meanwhile: a
+    list recorded before the retirement and executed after it reads such a range as the last copy left it. The
+    `geometry buffers` line counts the retired views waiting for command lists. The next view of the range makes a
+    new copy. `geometry_views_test` cases 14-17 cover this without a GPU.
 - **Which pages changed** since the last refresh: where xmem reserved the title's memory with `MEM_WRITE_WATCH`
   (`XMemVirtualAlloc`'s ordinary regions and the title's `VirtualAlloc` reservations, not placeholders or
   physical-page windows), the kernel says (`GetWriteWatch` with reset, its answers kept for every copy over the page:
