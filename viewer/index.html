@@ -31,7 +31,7 @@
   and serve with <code>python -I viewer/serve.py --world &lt;work&gt;\world</code>.
 </div>
 <div id="help">
-  <kbd>W A S D</kbd> move · <kbd>Q</kbd>/<kbd>E</kbd> down/up · <kbd>Shift</kbd> fast · <kbd>Ctrl</kbd> slow · wheel: speed<br>
+  <kbd>W A S D</kbd> move · <kbd>Q</kbd>/<kbd>E</kbd> down/up · <kbd>Shift</kbd> fast · <kbd>C</kbd> slow · wheel: speed<br>
   <kbd>F</kbd> wireframe · <kbd>T</kbd> textures/clay · <kbd>G</kbd> chunk bounds · <kbd>R</kbd> back to spawn · <kbd>P</kbd> copy link to this view · <kbd>Esc</kbd> release mouse
 </div>
 <div id="start">Click to fly</div>
@@ -242,7 +242,7 @@ addEventListener("blur", () => { keys.clear(); dragging = false; });
 const world = await loadWorld();
 addEventListener("keydown", e => {
   keys.add(e.code);
-  // Track Ctrl for slow movement, but leave modified shortcuts to the browser.
+  // Leave modified shortcuts to the browser.
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.code === "KeyF" && !e.repeat) wire = !wire, applyWire();
   if (e.code === "KeyT" && !e.repeat) clay = !clay, applyClay();
@@ -439,7 +439,9 @@ renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
   camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, "YXZ"));
   camera.getWorldDirection(fwd); right.crossVectors(fwd, up).normalize();
-  const v = new THREE.Vector3(), s = speed * (keys.has("ShiftLeft") || keys.has("ShiftRight") ? 5 : 1) * (keys.has("ControlLeft") || keys.has("ControlRight") ? 0.2 : 1);
+  // Slow is C, not Ctrl: with a movement key held, Ctrl makes browser shortcuts that a page cannot all cancel
+  // (Ctrl+W closes the tab; S, D and E open the save and bookmark dialogs and the address bar).
+  const v = new THREE.Vector3(), s = speed * (keys.has("ShiftLeft") || keys.has("ShiftRight") ? 5 : 1) * (keys.has("KeyC") ? 0.2 : 1);
   if (keys.has("KeyW")) v.add(fwd); if (keys.has("KeyS")) v.sub(fwd);
   if (keys.has("KeyD")) v.add(right); if (keys.has("KeyA")) v.sub(right);
   if (keys.has("KeyE")) v.y += 1; if (keys.has("KeyQ")) v.y -= 1;
