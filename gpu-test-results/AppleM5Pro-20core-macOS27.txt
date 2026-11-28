@@ -1,0 +1,31 @@
+GPU:        Apple M5 Pro (Apple GPU, 20 cores, Metal 4), subgroup 4..32
+Driver:     MoltenVK 1.4.2 (Homebrew bottle), Vulkan 1.4.357
+Subgroup:   4..32 (default 32; no native 64-wide, no VK_EXT_mesh_shader)
+OS:         macOS 27.2.1 (26B131), arm64
+Commit:     24d8af66a (main, 2026-11-25)
+Tools:      llvm-mc 23.1.6 (Homebrew, AMDGPU target), SPIRV-Tools v2026.4, Apple clang 21.0.0,
+            CMake 4.4.3, Ninja 1.13.2, Python 3.14.2
+build.py:   stops at cs_dpp_cmp.asm ("dpp variant of this instruction is not supported") and writes no
+            SPIR-V, as on main elsewhere; #1444 (TEST-BUILD-TEXT-ONLY) is the open fix. Not applied here.
+check.py:   not counted: with no SPIR-V from build.py it reports 0 of 232 pass, 3 skipped.
+run_gpu_tests.py: 196/267 passed, 69 skipped, 2 failed
+            229/267 passed, 36 skipped, 2 failed (LEONIDA_W64_EMULATE=1)
+ctest:      98/98 passed, 2 skipped (shader_library_corpus, vk_sync_validation)
+Failed:     cs_fma_fused: word 7 (f16) reads 0x00000000, want 0x00007351. 20 of 20 single runs. The known
+            MoltenVK 1.4.2 row of docs/testing.md, and in the macOS job's EXPECTED_FAILURES.
+            cs_imgatomic_ext: 6 of 64 sint words differ; first word 32 reads 0x0badf00d, want 0x00000101.
+            20 of 20 single runs. The same words as on the M3 and on the 16-core M5 Pro; #1518 is the
+            open fix. Not applied here.
+Differs from the other Mac records:
+            ps_ssharp passes: "8 S#/T# cases, 4096 pixels each exact", in both full runs and in 20 of 20
+            single runs with --filter. It is in the macOS job's EXPECTED_FAILURES and fails on the M3
+            (macOS 26.5.1) and M4 records. Same MoltenVK version here; the OS is newer (macOS 27.2.1).
+            vk_overlapping_occlusion passes in ctest. It is in the macOS job's EXPECTED_FAILURES for the
+            hosted runner's paravirtual device.
+            cs_imgload_tfe and cs_imgload_d16_tfe pass ("0 bad, texel(5,3) = 71"); they failed at
+            d42773d07 in AppleM5Pro.txt.
+Flaky:      ps_imgatomic passed in both full runs, then failed 2 of 20 single runs with --filter. The same
+            flake AppleM5Pro.txt records (11 of 20 there); #543.
+Skipped:    33 "no 64-wide compute subgroup on this device" (native run only), the mesh fixtures (no
+            VK_EXT_mesh_shader), the Float64 fixtures (no shaderFloat64), gs_tri (no geometryShader), and
+            the fixtures the d3d12_* tests run.
