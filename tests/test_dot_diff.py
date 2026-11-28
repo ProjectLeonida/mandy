@@ -8,6 +8,7 @@ the accumulating v_dot4c_i32_i8, v_dot2c_i32_i16, v_dot2c_u32_u16, v_dot4c_u32_u
 import os
 import random
 import re
+import subprocess
 import sys
 import unittest
 
@@ -178,6 +179,43 @@ class Translated(unittest.TestCase):
             self.assertIn("expected 0x7fffffff, actual 0x80000000", d.check(lines))
         finally:
             d.translate_listing = real
+
+
+class ArgumentValidation(unittest.TestCase):
+    """--max-ops and --programs must be at least 1.
+
+    Before this, `--max-ops 0` (and a negative value) died with `ValueError: empty range in
+    randint(1, 0)`, and `--programs 0` printed the sweep statistics alone and exited 0, which
+    reads as a pass when no random program ran at all.
+    """
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "dot_diff.py"), *args],
+                              capture_output=True, text=True)
+
+    def check_rejected(self, argv, option):
+        res = self.run_cli(*argv)
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn(f"{option} must be at least 1", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_max_ops_zero_is_rejected(self):
+        self.check_rejected(["--max-ops", "0"], "--max-ops")
+
+    def test_max_ops_negative_is_rejected(self):
+        self.check_rejected(["--max-ops", "-3"], "--max-ops")
+
+    def test_programs_zero_is_rejected(self):
+        self.check_rejected(["--programs", "0"], "--programs")
+
+    def test_programs_negative_is_rejected(self):
+        self.check_rejected(["--programs", "-3"], "--programs")
+
+    def test_one_of_each_is_accepted(self):
+        res = self.run_cli("--programs", "1", "--max-ops", "1", "--no-sweep")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("random: 1/1 programs match, 0 mismatch", res.stdout)
 
 
 if __name__ == "__main__":
