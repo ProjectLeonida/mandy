@@ -22,8 +22,11 @@ inline std::atomic<std::int64_t>& last_submission() {
 }
 inline void note_submission() { last_submission().store(now_ns(), std::memory_order_relaxed); }
 inline bool title_submitting(std::int64_t within_ns = 1000000000) {
+    if (within_ns <= 0) return false;
     const std::int64_t last = last_submission().load(std::memory_order_relaxed);
-    return last && now_ns() - last < within_ns;
+    if (last <= 0) return false;
+    const std::int64_t now = now_ns();
+    return now < last || now - last < within_ns;
 }
 
 // Big warm-ups left to their first use while the title submits.
