@@ -4611,7 +4611,7 @@ struct DeviceState {
         std::lock_guard lock(backing_mutex);
         backing_generation.fetch_add(1, std::memory_order_relaxed);
         note_slot_change(leonida::SlotChange::target_gone, address, bytes);
-        if (heap_gpu) released_ranges.emplace_back(address - arena.address, bytes);
+        if (heap_pass_enabled()) released_ranges.emplace_back(address - arena.address, bytes);
     }
     void backing(VkDeviceAddress address, uint64_t bytes, uint64_t id, bool add) {
         std::lock_guard lock(backing_mutex);
@@ -4626,7 +4626,7 @@ struct DeviceState {
             // The heap slots whose copy names it are fixed again at the next refresh.
             note_slot_change(leonida::SlotChange::target_gone, address, bytes);
             // LEONIDA_CONSOLE_HEAP_GPU: the key entries answering into it go at the next refresh.
-            if (heap_gpu) released_ranges.emplace_back(address - arena.address, bytes);
+            if (heap_pass_enabled()) released_ranges.emplace_back(address - arena.address, bytes);
         }
     }
 
@@ -5025,11 +5025,10 @@ struct DeviceState {
         // had must not change them, and a double free must not count the bytes twice.
         const auto fault = arena.blocks.release(offset, bytes);
         if (fault != leonida::ArenaBlocks::Fault::outside_arena) {
+            // A heap copy re-fixes the slots that named a backing that has gone (slot_changes): the range is no view's.
             backing(arena.address + offset, bytes, offset, false);
             arena.in_use -= bytes;
             arena.use_in_use[use] -= bytes;
-            // A heap copy re-fixes the slots that named a backing that has gone (slot_changes): the range is no view's.
-            backing(arena.address + offset, bytes, offset, false);
         }
         if (fault != leonida::ArenaBlocks::Fault::none && arena_report_due()) {
             std::fprintf(stderr,
@@ -5844,6 +5843,9 @@ struct DeviceState {
     std::unique_ptr<leonida::ConsoleHeapGpu> heap_gpu;
     std::array<ConsoleHeap*, leonida::ConsoleHeapGpu::kMaxHeaps> gpu_heaps{};  // console_heap_mutex
     std::vector<std::pair<std::uint64_t, std::uint64_t>> released_ranges;     // (shader VA, bytes); backing_mutex
+    // Whether the pass runs: only it takes released_ranges and the alias table's removals (console_heap_gpu_begin).
+    // LEONIDA_SHADOW_GPU=1 alone makes heap_gpu for the shadows' page copies, and a range kept for it is never taken.
+    bool heap_pass_enabled() const { return heap_gpu && console_heap_gpu_enabled(); }
     struct GpuKeyHash {
         std::size_t operator()(const leonida::ConsoleHeapKeys::Key& k) const {
             return leonida::ConsoleHeapKeys::hash(k);
@@ -6136,7 +6138,8 @@ struct DeviceState {
         }
         heap_gpu = std::move(gpu);
         heap_gpu->set_signed_offsets(signed_vsharp_offsets());
-        leonida::title_va_aliases().record_removals(true);
+        // Only the pass takes what the alias table records (heap_pass_enabled).
+        if (console_heap_gpu_enabled()) leonida::title_va_aliases().record_removals(true);
         context->set_prelude([this](VkCommandBuffer cb) { return heap_gpu->record(cb); },
                              [this](bool submitted, std::uint64_t ticket) { heap_gpu->commit(submitted, ticket); });
         gpu_resolver = std::make_unique<GpuResolver>();
@@ -16095,6 +16098,10 @@ public:
         if (state_.context) {
             if (state_.gpu_resolver) state_.gpu_resolver->halt();  // it calls into the geometry copies
             ShadowPages::gpu_copy = nullptr;
+            // The console heap pass's pipeline and buffers (LEONIDA_CONSOLE_HEAP_GPU, LEONIDA_SHADOW_GPU) are the
+            // VkDevice's, and a device that owns its VkDevice destroys it below, before ~DeviceState: they go now.
+            state_.context->set_prelude(nullptr, nullptr);
+            state_.heap_gpu.reset();
             state_.geometry.release(state_);
             state_.external_windows.release(state_);
             std::lock_guard upload(state_.title_upload_mutex);
@@ -22054,6 +22061,21 @@ TitleShadowWatch title_shadow_watch(ID3D12Device* device) {
         watch.hot_bytes += shadow->hot_bytes();
     }
     return watch;
+}
+ConsoleHeapGpuPending console_heap_gpu_pending(ID3D12Device* device) {
+    ConsoleHeapGpuPending pending;
+    if (!device) return pending;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    if (!d) return pending;
+    auto& state = d->state();
+    pending.made = state.heap_gpu != nullptr;
+    {
+        std::lock_guard lock(state.backing_mutex);
+        pending.released = state.released_ranges.size();
+    }
+    pending.removed = leonida::title_va_aliases().removals_pending();
+    return pending;
 }
 
 HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
