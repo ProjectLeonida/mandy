@@ -171,6 +171,35 @@ class LaneMasksEndToEndTests(unittest.TestCase):
         ])
         self.assertEqual(got_ds, [3, 3, 3, 3])
 
+    def test_wave32_writelane_lane_32_aliases_lane_0_for_parked_masks(self):
+        """In wave32, lane index S1[4:0] wraps mod 32: lane 32 and lane 0 are the same parked-mask slot."""
+        # Case 1: plain-data v_writelane to lane 32 overwrites the mask parked in lane 0.
+        _, got_overwrite = run_cs("cs_w32_lane32_overwrite", [
+            "v_cmp_lt_u32_e64 s6, v0, 2",
+            "v_writelane_b32 v5, s6, 0",
+            "s_mov_b32 s7, 0x55aa",
+            "v_writelane_b32 v5, s7, 32",
+            "v_readlane_b32 s8, v5, 0",
+            "v_mov_b32_e32 v2, s8",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "global_store_dword v3, v2, s[0:1]",
+            "s_endpgm",
+        ])
+        self.assertEqual(got_overwrite, [0x55aa] * 4)
+
+        # Case 2: mask parked in lane 32 is restored per-lane when read from lane 0.
+        _, got_restore = run_cs("cs_w32_lane32_restore", [
+            "v_cmp_lt_u32_e64 s6, v0, 2",
+            "v_writelane_b32 v5, s6, 32",
+            "s_mov_b32 s6, 0",
+            "v_readlane_b32 s7, v5, 0",
+            "v_cndmask_b32_e64 v2, 10, 20, s7",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "global_store_dword v3, v2, s[0:1]",
+            "s_endpgm",
+        ])
+        self.assertEqual(got_restore, [20, 20, 10, 10])
+
 
 if __name__ == "__main__":
     unittest.main()
