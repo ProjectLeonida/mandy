@@ -64,9 +64,9 @@ def run(*argv):
     return code, out.getvalue()
 
 
-def cli(*argv):
+def cli(*argv, timeout=15):
     return subprocess.run([sys.executable, "-I", os.path.join(ROOT, "scripts", "run_semantic_tests.py"), *argv],
-                          capture_output=True, text=True, timeout=15)
+                          capture_output=True, text=True, timeout=timeout)
 
 
 class RunnerTest(unittest.TestCase):
@@ -74,11 +74,13 @@ class RunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"helper.py": "X = 1\n", "test_hang.py": HANG,
                         "test_pass_one.py": PASS, "test_pass_two.py": PASS})
-            result = cli(tmp, "-j", "2", "--timeout", "1")
+            # The limit applies to every module, so it must be one the two healthy modules cannot reach on a
+            # loaded CPU (at 1 s they timed out too); the hanging one sleeps for 60 s, so it still times out.
+            result = cli(tmp, "-j", "2", "--timeout", "10", timeout=60)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("before-sleep-marker", result.stdout)
             self.assertIn("==== FAILED: test_hang", result.stdout)
-            self.assertIn("TIMED OUT after 1 s: test_hang", result.stdout)
+            self.assertIn("TIMED OUT after 10 s: test_hang", result.stdout)
             self.assertIn("3 files, 4 tests, 1 files failed", result.stdout)
             self.assertNotIn("Traceback", result.stdout + result.stderr)
 
