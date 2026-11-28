@@ -100,6 +100,11 @@ class ShaderStageResumeTest(unittest.TestCase):
             elif p.endswith(".s"):
                 f.write("synthetic listing\n")
 
+    def record_current_carve(self):
+        self.touch(self.dxbc, "index.json")
+        with open(os.path.join(self.dxbc, "carve_sources.sha256"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(make_game.carve_sources_digest() + "\n")
+
     def fake_py(self, tool, *args):
         self.ran.append(tool)
         if tool == "shader_carve.py":
@@ -128,6 +133,21 @@ class ShaderStageResumeTest(unittest.TestCase):
     def test_fresh_folder_runs_every_step_then_nothing(self):
         self.assertEqual(self.run_stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"])
         self.assertEqual(self.run_stage(), [])
+
+    def test_legacy_or_stale_carve_rebuilds_all_shader_steps(self):
+        self.run_stage()
+        stamp = os.path.join(self.dxbc, "carve_sources.sha256")
+        for old_stamp in (None, "stale"):
+            with self.subTest(old_stamp=old_stamp):
+                if old_stamp is None:
+                    os.remove(stamp)
+                else:
+                    with open(stamp, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(old_stamp + "\n")
+                self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+                self.assertEqual(self.run_stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"])
+                self.assertTrue(make_game.shader_outputs_reusable(self.work, False, False))
+                self.assertEqual(self.run_stage(), [])
 
     def test_llvm_version_change_at_the_same_path_refreshes_only_the_dependent_steps(self):
         wrapper = os.path.join(self.work, "fake llvm-mc.py")
@@ -174,19 +194,19 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.assertIn("Check LLVM_MC: distribution not found", stderr.getvalue())
 
     def test_unpack_stopped_after_creating_fssm_folder_runs_again(self):
-        self.touch(self.dxbc, "index.json")
+        self.record_current_carve()
         os.makedirs(os.path.join(self.dxbc, "fssm"))       # what a stopped fssm_unpack.py leaves
         self.assertEqual(self.run_stage(), ["fssm_unpack.py", "shader_disasm.py", "translate"])
 
     def test_disasm_stopped_after_many_files_runs_again(self):
-        self.touch(self.dxbc, "index.json")
+        self.record_current_carve()
         self.touch(self.dxbc, "fssm_index.json")
         for i in range(1200):                               # past the old 1000-file threshold
             self.touch(self.dxbc, "disasm", f"s{i}.s")
         self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
 
     def test_disassembly_resume_keeps_completed_listings_for_the_same_llvm(self):
-        self.touch(self.dxbc, "index.json")
+        self.record_current_carve()
         self.touch(self.dxbc, "fssm_index.json")
         listing = os.path.join(self.dxbc, "disasm", "s0.s")
 
@@ -218,7 +238,7 @@ class ShaderStageResumeTest(unittest.TestCase):
                 self.assertFalse(os.path.exists(os.path.join(self.dxbc, "disasm.started")))
 
     def test_finished_disassembly_repairs_missing_recorded_listing_before_translation(self):
-        self.touch(self.dxbc, "index.json")
+        self.record_current_carve()
         self.touch(self.dxbc, "fssm_index.json")
         with open(os.path.join(self.dxbc, "index.json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump([{"file": name + ".dxbc"} for name in ("s0", "s1", "unsupported")], f)
@@ -288,7 +308,7 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.assertEqual(self.run_stage(), ["translate"])
 
     def test_failed_disasm_leaves_no_marker(self):
-        self.touch(self.dxbc, "index.json")
+        self.record_current_carve()
         self.touch(self.dxbc, "fssm_index.json")
 
         def failing_py(tool, *args):
@@ -322,7 +342,7 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.assertEqual(self.run_stage(), [])
 
     def test_legacy_folder_without_llvm_version_refreshes_disassembly_once(self):
-        self.touch(self.dxbc, "index.json")
+        self.record_current_carve()
         self.touch(self.dxbc, "fssm_index.json")
         self.touch(self.dxbc, "disasm", "s0.s")
         self.touch(self.spirv, "index.json")                # translated by a build from before disasm.done
@@ -333,7 +353,7 @@ class ShaderStageResumeTest(unittest.TestCase):
     def test_legacy_completion_marker_with_a_missing_listing_disassembles_everything_again(self):
         # A disasm.done from before the listings were recorded holds only the llvm-mc signature: with a listing
         # missing it can't tell which ones are current, so the whole disassembly runs again, not a resume.
-        self.touch(self.dxbc, "index.json")
+        self.record_current_carve()
         self.touch(self.dxbc, "fssm_index.json")
         self.touch(self.spirv, "index.json")
         with open(os.path.join(self.dxbc, "disasm.done"), "w", encoding="utf-8", newline="\n") as f:
@@ -353,7 +373,7 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.assertEqual(self.run_stage(), [])
 
     def test_old_disassembly_layout_is_rebuilt_in_the_current_location(self):
-        self.touch(self.dxbc, "index.json")
+        self.record_current_carve()
         self.touch(self.dxbc, "fssm_index.json")
         self.touch(self.work, "shaders", "disasm", "old.s")  # disasm next to the carve folder, the old layout
         self.touch(self.spirv, "index.json")
@@ -470,13 +490,16 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.assertEqual(self.run_stage(), ["translate"])
         self.assertEqual(self.run_stage(), [])
 
-    def test_editing_any_translation_source_translates_again_once(self):
+    def test_editing_shader_sources_rebuilds_the_dependent_steps_once(self):
         tools = self.copy_tools()
         self.run_stage()
         for name in make_game.TRANSLATION_SOURCES:
             with open(os.path.join(tools, name), "ab") as f:
                 f.write(b"\n")
-            self.assertEqual(self.run_stage(), ["translate"], name)
+            expected = ["translate"]
+            if name in ("shader_carve.py", "shader_carve_accel.py"):
+                expected = ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"]
+            self.assertEqual(self.run_stage(), expected, name)
             self.assertEqual(self.run_stage(), [], name)
 
     def test_editing_another_tool_or_changing_jobs_keeps_the_translation(self):

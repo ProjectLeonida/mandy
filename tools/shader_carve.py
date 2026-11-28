@@ -2,7 +2,8 @@
 
 Each shader in shaders.rpf is stored as:
 
-    <name> 00  <u8 kind>  <u32 stored>  <u32 id>  <u32 stored>  <u32 size>  <raw deflate, `stored` bytes>
+    <u8 name length including NUL>  <name> 00  <u8 kind>  <u32 stored>  <u32 id>
+    <u32 stored>  <u32 size>  <raw deflate, `stored` bytes>
 
 and inflates to a DXBC container (`size` bytes) holding DXIL plus an Xbox PRIV part.
 
@@ -26,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from replace_retry import replace as replace_retry  # noqa: E402
 from shader_carve_accel import entry_search  # noqa: E402
 
+# Scan for candidate headers with the same pattern as the optional native scanner.
 ENTRY = re.compile(rb"([\x21-\x7e]{3,200})\x00(.)(....)(....)\3(....)", re.DOTALL)
 STAGES = {0: "ps", 1: "vs", 2: "gs", 3: "hs", 4: "ds", 5: "cs", 6: "lib", 13: "ms", 14: "as"}
 RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
@@ -103,7 +105,14 @@ def main(argv=None) -> int:
             # A rejected header is rescanned past its name (a real entry can start inside it); a carved
             # shader resumes after its stored bytes, so deflate output never becomes a name or a match.
             pos = mt.end(1) + 1
-            name = mt.group(1).decode("latin-1")
+            name_bytes = mt.group(1)
+            name_start = mt.start(1)
+            # A printable length byte can be inside the match. A length byte just outside
+            # it takes precedence, even if the real first character also looks like a length.
+            if (name_bytes[0] == len(name_bytes)
+                    and (name_start == 0 or m[name_start - 1] != len(name_bytes) + 1)):
+                name_bytes = name_bytes[1:]
+            name = name_bytes.decode("latin-1")
             stored = struct.unpack("<I", mt.group(3))[0]
             size = struct.unpack("<I", mt.group(5))[0]
             if not (16 < stored < 64 << 20 and 32 < size < 256 << 20):
