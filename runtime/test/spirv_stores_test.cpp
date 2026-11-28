@@ -197,6 +197,55 @@ int main() {
     inst(mixed, OpVariable, {struct_t, length_c, UniformConstant});
     check(spirv_declares_writable_storage(mixed), "a storage image after a malformed array is still found");
 
+    // Function bodies with local Function-storage OpVariables are skipped once OpFunction begins, while global
+    // declarations before OpFunction are still honoured.
+    {
+        constexpr std::uint16_t OpFunction = 54, OpLabel = 248, OpReturn = 253, OpFunctionEnd = 56;
+        constexpr std::uint32_t FunctionStorage = 7;
+        Words with_fn = image_module(1, false, false, false);  // sampled image only -> read-only
+        inst(with_fn, OpFunction, {1, 50, 0, 51});
+        inst(with_fn, OpLabel, {52});
+        inst(with_fn, OpVariable, {pointer_t, 53, FunctionStorage});
+        inst(with_fn, OpReturn, {});
+        inst(with_fn, OpFunctionEnd, {});
+        check(!spirv_declares_writable_storage(with_fn), "sampled image plus function body needs no feature");
+
+        Words writable_with_fn = image_module(2, false, false, false);
+        inst(writable_with_fn, OpFunction, {1, 50, 0, 51});
+        inst(writable_with_fn, OpLabel, {52});
+        inst(writable_with_fn, OpVariable, {pointer_t, 53, FunctionStorage});
+        inst(writable_with_fn, OpReturn, {});
+        inst(writable_with_fn, OpFunctionEnd, {});
+        check(spirv_declares_writable_storage(writable_with_fn), "writable image before OpFunction is still found");
+    }
+
+    // BufferBlock applied via OpGroupDecorate on a Uniform block must still trigger the check.
+    {
+        constexpr std::uint32_t group = 21;
+        Words w = header();
+        inst(w, OpDecorate, {group, BufferBlock});
+        inst(w, OpDecorationGroup, {group});
+        inst(w, OpGroupDecorate, {group, struct_t});
+        inst(w, OpTypeInt, {uint_t, 32, 0});
+        inst(w, OpTypeStruct, {struct_t, uint_t, uint_t});
+        inst(w, OpTypePointer, {pointer_t, Uniform, struct_t});
+        inst(w, OpVariable, {pointer_t, var, Uniform});
+        check(spirv_declares_writable_storage(w), "Uniform struct made BufferBlock via group needs the feature");
+    }
+
+    // Duplicate NonWritable member decorations on member 0 cannot mask writable member 1.
+    {
+        Words w = header();
+        inst(w, OpDecorate, {struct_t, Block});
+        inst(w, OpMemberDecorate, {struct_t, 0, NonWritable});
+        inst(w, OpMemberDecorate, {struct_t, 0, NonWritable});
+        inst(w, OpTypeInt, {uint_t, 32, 0});
+        inst(w, OpTypeStruct, {struct_t, uint_t, uint_t});
+        inst(w, OpTypePointer, {pointer_t, StorageBuffer, struct_t});
+        inst(w, OpVariable, {pointer_t, var, StorageBuffer});
+        check(spirv_declares_writable_storage(w), "duplicate NonWritable on member 0 cannot mask writable member 1");
+    }
+
     if (failures) return 1;
     std::printf("spirv_stores_test: OK (storage images, arrays of them, storage buffers in both forms, framing, a "
                 "self-referential array, input attachments, decoration groups)\n");
