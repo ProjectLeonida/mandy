@@ -528,7 +528,7 @@ Target write_target(const std::wstring& path, bool copy_up) {
 
     const Roots r = roots();
     if (r.overlay.empty()) return fail(ERROR_PATH_NOT_FOUND);
-    if (parts.empty()) return fail(ERROR_INVALID_NAME);  // "GAME:" is a folder, not a file
+    if (drive_root(path, parts)) return fail(ERROR_INVALID_NAME);  // "GAME:" and "T:" are folders, not files
 
     // The folder has to exist in the title's view, as CreateDirectory, MoveFile and CopyFile require: without the
     // check a failed open left the missing folders behind, and a create succeeded in a folder that was never made,
@@ -1133,7 +1133,7 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
     }
 
     const Roots r = roots();
-    if (r.overlay.empty() || parts.empty()) {
+    if (r.overlay.empty() || drive_root(name, parts)) {
         SetLastError(ERROR_INVALID_NAME);
         return FALSE;
     }
@@ -1212,7 +1212,7 @@ BOOL create_directory(LPCWSTR template_name, LPCWSTR name, LPSECURITY_ATTRIBUTES
                                        : ::CreateDirectoryW(target.c_str(), security);
     if (created) {
         // Keep markers for deleted children, which must remain hidden after the folder is recreated.
-        std::filesystem::remove(marker(r.overlay, parts) / kRemovedDirMarker, ec);
+        std::filesystem::remove(win32_io_path(marker(r.overlay, parts) / kRemovedDirMarker), ec);
         if (ec) {
             const DWORD error = static_cast<DWORD>(ec.value());
             ::RemoveDirectoryW(target.c_str());
@@ -1316,6 +1316,9 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
         return TRUE;
     }
 
+    // From the destination folder's check to the host move: a RemoveDirectory of that folder comes wholly before or
+    // after (g_folder_locks), as for a write-open or CreateDirectory.
+    std::lock_guard folder(folder_lock(parent_of(dst)));
     const View to_view = view(r, dst);
     if (to_view.kind == Kind::Directory) return fail_bool(ERROR_ACCESS_DENIED);
     if (to_view.kind == Kind::File && (flags & MOVEFILE_REPLACE_EXISTING) == 0) return fail_bool(ERROR_ALREADY_EXISTS);
@@ -1371,8 +1374,12 @@ BOOL WINAPI move_file_a(LPCSTR from, LPCSTR to) {
 namespace {
 
 // Where a copy writes: a host path as given; a GAME: path is checked against the title's view (an existing name
-// counts even when only the package has it) and then means its overlay copy.
-bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& out, DWORD& error) {
+// counts even when only the package has it) and then means its overlay copy. `folder`, when given, receives the lock
+// of the destination's folder, taken before the checks, for the caller to hold through its host copy so a
+// RemoveDirectory of that folder comes wholly before or after (g_folder_locks). A copy with a progress routine passes
+// null: the routine is the title's code, and nothing holding a folder lock calls back into the title.
+bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& out, DWORD& error,
+                      std::unique_lock<std::mutex>* folder) {
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(to, parts);
     if (parsed == Parsed::Host) {
@@ -1380,10 +1387,12 @@ bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& ou
         return true;
     }
     error = ERROR_INVALID_NAME;
-    if (parsed == Parsed::Refused || parts.empty()) return false;
+    if (parsed == Parsed::Refused || drive_root(to, parts)) return false;
     const Roots r = roots();
     error = ERROR_PATH_NOT_FOUND;
     if (r.game.empty() || r.overlay.empty()) return false;
+    std::unique_lock lock(folder_lock(parent_of(parts)), std::defer_lock);
+    if (folder) lock.lock();
     const View v = view(r, parts);
     error = ERROR_ACCESS_DENIED;
     if (v.kind == Kind::Directory) return false;
@@ -1399,12 +1408,13 @@ bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& ou
         return false;
     }
     error = 0;
+    if (folder) *folder = std::move(lock);
     return true;
 }
 
-// The source and destination a copy opens, or the error it fails with.
+// The source and destination a copy opens, or the error it fails with. `folder`: as for copy_destination.
 bool copy_paths(LPCWSTR from, LPCWSTR to, bool fail_if_exists, std::filesystem::path& source,
-                std::filesystem::path& destination, DWORD& error) {
+                std::filesystem::path& destination, DWORD& error, std::unique_lock<std::mutex>* folder) {
     if (!from || !to) {
         error = ERROR_INVALID_PARAMETER;
         return false;
@@ -1415,7 +1425,7 @@ bool copy_paths(LPCWSTR from, LPCWSTR to, bool fail_if_exists, std::filesystem::
         return false;
     }
     source = t.path;
-    return copy_destination(to, fail_if_exists, destination, error);
+    return copy_destination(to, fail_if_exists, destination, error, folder);
 }
 
 }  // namespace
@@ -1423,7 +1433,8 @@ bool copy_paths(LPCWSTR from, LPCWSTR to, bool fail_if_exists, std::filesystem::
 BOOL WINAPI copy_file_w(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists) {
     std::filesystem::path source, destination;
     DWORD error = 0;
-    if (!copy_paths(from, to, fail_if_exists != FALSE, source, destination, error)) return fail_bool(error);
+    std::unique_lock<std::mutex> folder;
+    if (!copy_paths(from, to, fail_if_exists != FALSE, source, destination, error, &folder)) return fail_bool(error);
     return ::CopyFileW(source.c_str(), destination.c_str(), fail_if_exists);
 }
 
@@ -1437,7 +1448,9 @@ BOOL WINAPI copy_file_ex_w(LPCWSTR from, LPCWSTR to, LPPROGRESS_ROUTINE progress
                            DWORD flags) {
     std::filesystem::path source, destination;
     DWORD error = 0;
-    if (!copy_paths(from, to, (flags & COPY_FILE_FAIL_IF_EXISTS) != 0, source, destination, error))
+    std::unique_lock<std::mutex> folder;
+    if (!copy_paths(from, to, (flags & COPY_FILE_FAIL_IF_EXISTS) != 0, source, destination, error,
+                    progress ? nullptr : &folder))
         return fail_bool(error);
     return ::CopyFileExW(source.c_str(), destination.c_str(), progress, data, cancel, flags);
 }
@@ -1530,7 +1543,10 @@ HRESULT WINAPI copy_file2(PCWSTR from, PCWSTR to, COPYFILE2_EXTENDED_PARAMETERS*
     const bool fail_if_exists = parameters && (parameters->dwCopyFlags & COPY_FILE_FAIL_IF_EXISTS) != 0;
     std::filesystem::path source, destination;
     DWORD error = 0;
-    if (!copy_paths(from, to, fail_if_exists, source, destination, error)) return HRESULT_FROM_WIN32(error);
+    std::unique_lock<std::mutex> folder;
+    const bool calls_back = parameters && parameters->pProgressRoutine;
+    if (!copy_paths(from, to, fail_if_exists, source, destination, error, calls_back ? nullptr : &folder))
+        return HRESULT_FROM_WIN32(error);
     if (host) return host(source.c_str(), destination.c_str(), parameters);
     return copy_file2_fallback(source.c_str(), destination.c_str(), parameters);
 }
@@ -1544,7 +1560,7 @@ BOOL WINAPI set_file_attributes_w(LPCWSTR name, DWORD attributes) {
 
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
-    if (parts.empty()) return fail_bool(ERROR_ACCESS_DENIED);
+    if (drive_root(name, parts)) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" and "T:" themselves stay
     const View v = view(r, parts);
     if (v.kind == Kind::None) return fail_bool(missing_error(r, parts));
 
