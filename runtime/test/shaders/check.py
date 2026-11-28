@@ -110,7 +110,7 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
                 "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
                 "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_wrxchg2_ext", "cs_w32_wrxchg2st64", "cs_w32_andn2_exec",
                 "cs_mask_vgpr_exec", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi",
-                "cs_w32_exec_computed")
+                "cs_w32_exec_computed", "cs_pk_int16_u", "cs_pk_int16_i")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
@@ -154,6 +154,10 @@ CS_DUMPS = [*CS_DPP, ("cs_smem_vcc_base", CS_SMEM_VCC), ("cs_store", CS_STORE), 
             ("cs_w32_new_ops", [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234]),
             ("cs_w32_misc_ext", [0x0FFF0FFF, 0xE2C4A688, 0x0007FFFF, 0x7FFF8000, 0xFFFE0002, 0xFFFF0005, 0x509, 0xCAFEF00D]),
             ("cs_w32_salu64", [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE]),
+            # packed 16-bit integer ops (derivations in each .asm header): the six u16 forms with op_sel and
+            # clamp, then the five i16 forms with op_sel and clamp
+            ("cs_pk_int16_u", [0xFFFF0007, 0x0005FFFD, 0xFFFA0004, 0x0000000D, 0xFFFE0004, 0x00030001, 0xFFFF0005, 0x00000000]),
+            ("cs_pk_int16_i", [0x00018000, 0x00038002, 0x80010001, 0x0002FFFF, 0xFFFF8001, 0x80008000, 0x7FFF8000, 0x7FFF7FFF]),
             # SHADER-85: 8-bit LDS reads into one half of a VGPR, the other half kept
             ("cs_w32_lds_u8_d16", [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234]),
             # 8/16-bit LDS writes (incl. _d16_hi) and sign/zero-extending reads
