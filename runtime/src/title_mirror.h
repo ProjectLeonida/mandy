@@ -80,8 +80,11 @@ class TitleMirror {
 public:
     static constexpr std::uint64_t kPage = 0x10000;
     static constexpr std::uint64_t kChunk = std::uint64_t(2) << 30;
+    static constexpr std::size_t kChunkPages = std::size_t(kChunk / kPage);
     static constexpr std::uint64_t kUnitBytes = std::uint64_t(32) << 20;
     static constexpr std::uint32_t kUnitPages = std::uint32_t(kUnitBytes / kPage);
+    static constexpr std::size_t kStripBytes = 4096;
+    static constexpr std::size_t kStripPieces = kStripBytes / shadow_keep::kPiece;
     static constexpr std::size_t kParallelThreshold = 16;
     static constexpr std::size_t kMaxWorkers = 6;
     // Sentinel ticket for freed homes waiting for flush() + note_mirror_bind() to publish the sparse unbind before
@@ -268,17 +271,19 @@ public:
             if (!hooks_.make_chunk || !hooks_.make_chunk(c * kChunk, kChunk, buffer)) {
                 ++counters_.chunk_failures;
                 ok = false;
-                chunks_[c] = VK_NULL_HANDLE;  // tried once
+                chunks_[c].buffer = VK_NULL_HANDLE;  // tried once
                 continue;
             }
-            chunks_[c] = buffer;
+            Chunk& ch = chunks_[c];
+            ch.buffer = buffer;
+            ch.pages = std::make_unique<PageSlot[]>(kChunkPages);
+            insert_chunk_dir(c, ch);
             ++counters_.chunks;
         }
         return ok;
     }
     bool covers(std::uint64_t va) const {
-        const auto it = chunks_.find(va / kChunk);
-        return it != chunks_.end() && it->second != VK_NULL_HANDLE;
+        return find_chunk_dir(va / kChunk) != nullptr;
     }
 
     // The feed: the 64 KiB page at `va` shows the physical page whose 64 KiB are at `frame` (its section's scratch view,
@@ -289,33 +294,43 @@ public:
     void map(std::uint64_t va, std::uint8_t* frame, std::shared_ptr<void> keep,
              std::uint64_t ticket = kUnstamped, bool defer_fill = false) {
         va &= ~(kPage - 1);
-        if (!covers(va)) {
+        const std::uint64_t chunk_idx = va / kChunk;
+        const ChunkDirEntry* const dir = find_chunk_dir(chunk_idx);
+        if (!dir) {
             ++counters_.unmirrored_changes;
             return;
         }
-        const auto page = pages_.find(va);
-        if (page != pages_.end()) {
-            std::uint8_t* const old_frame = page->second;
+        Chunk* const chunk = dir->chunk;
+        PageSlot* const slot = &dir->pages[std::size_t((va - chunk_idx * kChunk) / kPage)];
+        if (slot->frame) {
+            std::uint8_t* const old_frame = slot->frame;
+            Home* const old_home = slot->home;
             if (old_frame == frame) return;
             // A filtered copy made for this page: another aliased page showing the same home takes it over (filled
-            // whole for that page), else it goes with this page. Bind `h` by reference and save `old_frame` by value
-            // before sync_and_fill_copy(), which may re-entrantly insert into `pages_` / `homes_` and rehash them.
-            if (const auto shown = homes_.find(old_frame);
-                shown != homes_.end() && shown->second.copy && shown->second.filter_va == va) {
+            // whole for that page), else it goes with this page. Only scan aliases when refs > 1; save `old_frame`
+            // and `old_home` by value before sync_and_fill_copy(), which may re-entrantly insert into `homes_`.
+            if (old_home && old_home->copy && old_home->filter_va == va) {
                 std::uint64_t other_va = 0;
-                for (const auto& [other, other_frame] : pages_)
-                    if (other != va && other_frame == old_frame && aliased(other)) other_va = other;
-                Home& h = shown->second;
+                if (old_home->refs > 1) {
+                    for (const auto& [alo, alias] : aliases_) {
+                        for_each_mapped_in(alo, alias.hi, [&](std::uint64_t other, const PageSlot& s) {
+                            if (other != va && s.frame == old_frame) other_va = other;
+                        });
+                    }
+                }
                 if (other_va) {
-                    h.filter_va = other_va;
-                    h.fresh = true;
-                    sync_and_fill_copy(h, old_frame, true);
+                    old_home->filter_va = other_va;
+                    old_home->fresh = true;
+                    sync_and_fill_copy(*old_home, old_frame, true);
                 } else {
-                    drop_copy(h, ticket);
+                    drop_copy(*old_home, ticket);
                 }
             }
+            slot->frame = nullptr;
+            slot->home = nullptr;
+            --chunk->mapped_count;
+            --pages_count_;
             release_home(old_frame, ticket);
-            pages_.erase(va);
         }
         if (!frame) {
             note_bind(va, VK_NULL_HANDLE, 0);
@@ -331,7 +346,10 @@ public:
             return;
         }
         ++home->refs;
-        pages_[va] = frame;
+        slot->frame = frame;
+        slot->home = home;
+        ++chunk->mapped_count;
+        ++pages_count_;
         note_bind(va, units_[home->unit].memory, VkDeviceSize(home->slot) * kPage);
         const bool is_aliased = aliased(va);
         if (created) {
@@ -370,15 +388,20 @@ public:
     // (32-bit descriptor-table pointers). Pages not mapped are left unbound there (they read zero).
     void alias(std::uint64_t lo, std::uint64_t hi, VkBuffer buffer, VkDeviceSize offset) {
         aliases_[lo] = {hi, buffer, offset};
-        std::vector<std::pair<std::uint64_t, std::uint8_t*>> matched;
-        for (const auto& [va, frame] : pages_)
-            if (va >= lo && va < hi) matched.emplace_back(va, frame);
-        for (const auto& [va, frame] : matched) {
-            const auto home = homes_.find(frame);
-            if (home == homes_.end()) continue;
-            Home& h = home->second;  // reference survives re-entrant homes_ rehash inside make_copy()
-            if (!h.copy) make_copy(h, frame, va);
-            if (h.copy) note_alias_bind(va, units_[h.copy_unit].memory, VkDeviceSize(h.copy_slot) * kPage);
+        struct Matched {
+            std::uint64_t va;
+            std::uint8_t* frame;
+            Home* home;
+        };
+        std::vector<Matched> matched;
+        for_each_mapped_in(lo, hi, [&](std::uint64_t va, const PageSlot& s) {
+            matched.push_back({va, s.frame, s.home});
+        });
+        for (const auto& m : matched) {
+            if (!m.home) continue;
+            Home& h = *m.home;  // node reference survives re-entrant homes_ rehash inside make_copy()
+            if (!h.copy) make_copy(h, m.frame, m.va);
+            if (h.copy) note_alias_bind(m.va, units_[h.copy_unit].memory, VkDeviceSize(h.copy_slot) * kPage);
         }
     }
     // The alias at `lo` goes: its pages are unbound there, and their filtered copies are freed after `ticket`
@@ -387,37 +410,30 @@ public:
         const auto it = aliases_.find(lo);
         if (it == aliases_.end()) return;
         const Alias alias = it->second;
-        for (const auto& [va, frame] : pages_)
-            if (va >= lo && va < alias.hi) {
-                alias_pending_[alias.buffer][alias.offset + (va - lo)] =
-                    {alias.offset + (va - lo), kPage, VK_NULL_HANDLE, 0, 0};
-                has_pending_binds_.store(true, std::memory_order_release);
-                const auto home = homes_.find(frame);
-                if (home != homes_.end() && home->second.copy && home->second.filter_va == va)
-                    drop_copy(home->second, ticket);
-            }
+        for_each_mapped_in(lo, alias.hi, [&](std::uint64_t va, const PageSlot& s) {
+            alias_pending_[alias.buffer][alias.offset + (va - lo)] =
+                {alias.offset + (va - lo), kPage, VK_NULL_HANDLE, 0, 0};
+            has_pending_binds_.store(true, std::memory_order_release);
+            if (s.home && s.home->copy && s.home->filter_va == va) drop_copy(*s.home, ticket);
+        });
         aliases_.erase(it);
     }
     // The filtered copy of the aliased page at `va`, mapped (its host bytes): what a filter's caller writes one
     // changed slot into between fills. Null when the page is not mapped or has no copy.
     std::uint8_t* copy_bytes(std::uint64_t va) {
-        const auto page = pages_.find(va & ~(kPage - 1));
-        if (page == pages_.end()) return nullptr;
-        const auto home = homes_.find(page->second);
-        if (home == homes_.end() || !home->second.copy) return nullptr;
-        return units_[home->second.copy_unit].host + std::size_t(home->second.copy_slot) * kPage;
+        const PageSlot* const slot = find_slot(va);
+        if (!slot || !slot->home || !slot->home->copy) return nullptr;
+        return units_[slot->home->copy_unit].host + std::size_t(slot->home->copy_slot) * kPage;
     }
 
     // The page at `va` was written (its physical page's bytes changed): its home is filled again, once however many
     // pages show it. True when `va` is a mirrored page.
     bool dirty(std::uint64_t va) {
-        const auto page = pages_.find(va & ~(kPage - 1));
-        if (page == pages_.end()) return false;
-        const auto home = homes_.find(page->second);
-        if (home == homes_.end()) return false;
-        if (!home->second.dirty) {
-            home->second.dirty = true;
-            dirty_.push_back(page->second);
+        const PageSlot* const slot = find_slot(va);
+        if (!slot || !slot->home) return false;
+        if (!slot->home->dirty) {
+            slot->home->dirty = true;
+            dirty_.push_back(slot->frame);
             dirty_count_.store(dirty_.size(), std::memory_order_release);
         }
         return true;
@@ -466,6 +482,7 @@ public:
     // True when the 64 KiB page at `va` has an unflushed bind/unbind in pending_: the sparse chunk on the GPU does not
     // yet reflect pages_[va], so reading back from chunk_at(va) would read the previous binding (or zeros).
     bool has_pending(std::uint64_t va) const {
+        if (!has_pending_binds() || pending_.empty()) return false;
         const std::uint64_t page = va & ~(kPage - 1);
         const std::uint64_t chunk = page / kChunk;
         const auto it = pending_.find(chunk);
@@ -476,12 +493,23 @@ public:
     // an unflushed bind in pending_ are skipped so the caller never copies a stale chunk binding.
     void homes_in(std::uint64_t begin, std::uint64_t end, std::vector<std::uint64_t>& out) const {
         if (begin >= end) return;
-        for (std::uint64_t page = begin & ~(kPage - 1); page < end; page += kPage) {
-            if (!has_pending(page)) {
-                const auto mapped = pages_.find(page);
-                if (mapped != pages_.end() && homes_.count(mapped->second)) out.push_back(page);
+        const bool any_pending = has_pending_binds() && !pending_.empty();
+        for (std::uint64_t page = begin & ~(kPage - 1); page < end;) {
+            const std::uint64_t c = page / kChunk;
+            const ChunkDirEntry* const dir = find_chunk_dir(c);
+            const std::uint64_t chunk_end = (c < UINT64_MAX / kChunk) ? ((c + 1) * kChunk) : UINT64_MAX;
+            if (!dir || dir->chunk->mapped_count == 0) {
+                if (chunk_end >= end || chunk_end <= page) break;
+                page = chunk_end;
+                continue;
             }
-            if (page > UINT64_MAX - kPage) break;
+            const std::uint64_t limit = (std::min)(end, chunk_end);
+            const PageSlot* const slots = dir->pages;
+            for (; page < limit; page += kPage) {
+                const PageSlot& s = slots[std::size_t((page - c * kChunk) / kPage)];
+                if (s.home && (!any_pending || !has_pending(page))) out.push_back(page);
+                if (page > UINT64_MAX - kPage) return;
+            }
         }
     }
 
@@ -491,16 +519,29 @@ public:
         if (ranges.empty()) return out;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> owned;
         const auto& merged = is_sorted_disjoint_ranges(ranges) ? ranges : (owned = merge_ranges(ranges));
+        const bool any_pending = has_pending_binds() && !pending_.empty();
         for (const auto& [begin, end] : merged) {
-            for (std::uint64_t page = begin & ~(kPage - 1); page < end; page += kPage) {
-                if ((out.empty() || page > out.back().page) && !has_pending(page)) {
-                    const auto mapped = pages_.find(page);
-                    VkBuffer chunk = VK_NULL_HANDLE;
-                    VkDeviceSize offset = 0;
-                    if (mapped != pages_.end() && homes_.count(mapped->second) && chunk_at(page, chunk, offset))
-                        out.push_back({page, chunk, offset, mapped->second});
+            for (std::uint64_t page = begin & ~(kPage - 1); page < end;) {
+                const std::uint64_t c = page / kChunk;
+                const ChunkDirEntry* const dir = find_chunk_dir(c);
+                const std::uint64_t chunk_end = (c < UINT64_MAX / kChunk) ? ((c + 1) * kChunk) : UINT64_MAX;
+                if (!dir || dir->chunk->mapped_count == 0) {
+                    if (chunk_end >= end || chunk_end <= page) break;
+                    page = chunk_end;
+                    continue;
                 }
-                if (page > UINT64_MAX - kPage) break;
+                const std::uint64_t limit = (std::min)(end, chunk_end);
+                const PageSlot* const slots = dir->pages;
+                const VkBuffer buf = dir->buffer;
+                const std::uint64_t chunk_base = c * kChunk;
+                for (; page < limit; page += kPage) {
+                    if (out.empty() || page > out.back().page) {
+                        const PageSlot& s = slots[std::size_t((page - chunk_base) / kPage)];
+                        if (s.home && (!any_pending || !has_pending(page)))
+                            out.push_back({page, buf, page - chunk_base, s.frame});
+                    }
+                    if (page > UINT64_MAX - kPage) return out;
+                }
             }
         }
         return out;
@@ -571,16 +612,50 @@ public:
                 const std::uint8_t* const gpu = staged + i * kPage;
                 std::uint64_t* const dst = out.sums.data() + i * kPieces;
                 if (plan.full_page) {
-                    for (std::size_t k = 0; k < kPieces; ++k) dst[k] = shadow_keep::sum_of(gpu + k * kPiece, kPiece);
+                    shadow_keep::sum_of_batch_256(gpu, kPieces, dst);
                 } else {
+                    std::size_t run_start = kPieces;
                     for (std::size_t w = 0; w < 4; ++w) {
-                        std::uint64_t m = plan.scan_mask[w];
-                        while (m) {
-                            const unsigned bit = static_cast<unsigned>(std::countr_zero(m));
-                            m &= m - 1;
-                            const std::size_t k = w * 64 + bit;
-                            dst[k] = shadow_keep::sum_of(gpu + k * kPiece, kPiece);
+                        const std::uint64_t word = plan.scan_mask[w];
+                        if (!word) {
+                            if (run_start < kPieces) {
+                                shadow_keep::sum_of_batch_256(gpu + run_start * kPiece, w * 64 - run_start,
+                                                              dst + run_start);
+                                run_start = kPieces;
+                            }
+                            continue;
                         }
+                        if (word == ~std::uint64_t(0)) {
+                            if (run_start == kPieces) run_start = w * 64;
+                            continue;
+                        }
+                        std::size_t bit = 0;
+                        while (bit < 64) {
+                            const std::uint64_t rem = word >> bit;
+                            if (!rem) {
+                                if (run_start < kPieces) {
+                                    shadow_keep::sum_of_batch_256(gpu + run_start * kPiece, w * 64 + bit - run_start,
+                                                                  dst + run_start);
+                                    run_start = kPieces;
+                                }
+                                break;
+                            }
+                            const std::size_t zeros = std::size_t(std::countr_zero(rem));
+                            if (zeros > 0) {
+                                if (run_start < kPieces) {
+                                    shadow_keep::sum_of_batch_256(gpu + run_start * kPiece, w * 64 + bit - run_start,
+                                                                  dst + run_start);
+                                    run_start = kPieces;
+                                }
+                                bit += zeros;
+                            }
+                            const std::size_t ones = std::size_t(std::countr_one(word >> bit));
+                            if (run_start == kPieces) run_start = w * 64 + bit;
+                            bit += ones;
+                        }
+                    }
+                    if (run_start < kPieces) {
+                        shadow_keep::sum_of_batch_256(gpu + run_start * kPiece, kPieces - run_start, dst + run_start);
                     }
                 }
             }
@@ -613,13 +688,11 @@ public:
             if (!plan.any_piece) continue;
             const HomeRef& ref = slice[i];
             if (has_pending(ref.page)) continue;
-            const auto mapped = pages_.find(ref.page);
-            if (mapped == pages_.end() || mapped->second != ref.frame) continue;
-            const auto found = homes_.find(mapped->second);
-            if (found == homes_.end()) continue;
+            const PageSlot* const slot = find_slot(ref.page);
+            if (!slot || slot->frame != ref.frame || !slot->home) continue;
 
             const std::uint64_t* const gpu_sums = prehashed.sums.data() + i * kPieces;
-            const std::uint64_t* const agreed = found->second.sums.get();
+            const std::uint64_t* const agreed = slot->home->sums.get();
             const std::array<std::uint64_t, 4>* const sm = skip_masks ? &skip_masks[i] : nullptr;
 
             std::array<std::uint64_t, 4> diff_mask{};
@@ -646,7 +719,7 @@ public:
                 }
             }
             if (!diff_count) continue;
-            written += write_back_diff_coalesced(found->second, ref.page, mapped->second, staged + i * kPage, gpu_sums,
+            written += write_back_diff_coalesced(*slot->home, ref.page, slot->frame, staged + i * kPage, gpu_sums,
                                                  diff_mask, diff_count, write, refilter_frames);
         }
         finish_write_back(written, refilter_frames);
@@ -656,18 +729,16 @@ public:
     // The home of the page at `va`, mapped (its host bytes): the title's bytes as the GPU reads them at the title's
     // address. Null when the page is not mapped.
     std::uint8_t* home_bytes(std::uint64_t va) {
-        const auto page = pages_.find(va & ~(kPage - 1));
-        if (page == pages_.end()) return nullptr;
-        const auto home = homes_.find(page->second);
-        if (home == homes_.end()) return nullptr;
-        return units_[home->second.unit].host + std::size_t(home->second.slot) * kPage;
+        const PageSlot* const slot = find_slot(va);
+        if (!slot || !slot->home) return nullptr;
+        return units_[slot->home->unit].host + std::size_t(slot->home->slot) * kPage;
     }
 
     // What the GPU wrote into the homes of the mirrored pages of [begin, end) goes back to each page's physical frame,
     // merged at the 256-byte piece against the sums both sides last agreed on: a piece only the GPU changed is written
     // back with `write(frame_dst, bytes, n)` (and agreed on again); a piece only the title changed waits for the
     // upload; a piece both changed keeps the title's bytes and is counted. `write` receives the physical frame address
-    // (`mapped->second + k * kPiece`, identical to the title VA for ordinary memory and the writable scratch view for
+    // (`slot->frame + k * kPiece`, identical to the title VA for ordinary memory and the writable scratch view for
     // xmem physical pages), so a concurrent CPU remap of `va` never receives the previous mapping's bytes. Pages with
     // an unflushed bind in pending_ are skipped. `staged(page)` gives the page's home as the GPU left it, or nullptr to
     // skip the page. Returns the bytes written back.
@@ -684,16 +755,13 @@ public:
         std::vector<std::uint8_t*> refilter_frames;
         for (std::uint64_t page = begin & ~(kPage - 1); page < end; page += kPage) {
             if (!has_pending(page)) {
-                const auto mapped = pages_.find(page);
-                if (mapped != pages_.end()) {
-                    const auto found = homes_.find(mapped->second);
-                    if (found != homes_.end()) {
-                        if (const std::uint8_t* gpu = staged(page)) {
-                            const std::size_t k0 = std::size_t(((std::max)(begin, page) - page) / kPiece);
-                            const std::size_t k1 = std::size_t(((std::min)(end, page + kPage) - page + kPiece - 1) / kPiece);
-                            written += write_back_pieces(found->second, page, mapped->second, gpu, k0, k1, write,
-                                                         refilter_frames);
-                        }
+                const PageSlot* const slot = find_slot(page);
+                if (slot && slot->home) {
+                    if (const std::uint8_t* gpu = staged(page)) {
+                        const std::size_t k0 = std::size_t(((std::max)(begin, page) - page) / kPiece);
+                        const std::size_t k1 = std::size_t(((std::min)(end, page + kPage) - page + kPiece - 1) / kPiece);
+                        written += write_back_pieces(*slot->home, page, slot->frame, gpu, k0, k1, write,
+                                                     refilter_frames);
                     }
                 }
             }
@@ -728,10 +796,8 @@ public:
                 if (cursor >= merged.size()) break;
                 if (merged[cursor].first >= ref.page + kPage) continue;
                 if (has_pending(ref.page)) continue;
-                const auto mapped = pages_.find(ref.page);
-                if (mapped == pages_.end() || mapped->second != ref.frame) continue;
-                const auto found = homes_.find(mapped->second);
-                if (found == homes_.end()) continue;
+                const PageSlot* const slot = find_slot(ref.page);
+                if (!slot || slot->frame != ref.frame || !slot->home) continue;
                 const std::uint8_t* gpu = staged + i * kPage;
                 std::size_t next_k = 0;
                 for (std::size_t r = cursor; r < merged.size() && merged[r].first < ref.page + kPage; ++r) {
@@ -741,7 +807,7 @@ public:
                     const std::size_t k0 = (std::max)(next_k, std::size_t((lo - ref.page) / kPiece));
                     const std::size_t k1 = std::size_t((hi - ref.page + kPiece - 1) / kPiece);
                     if (k0 < k1) {
-                        written += write_back_pieces(found->second, ref.page, mapped->second, gpu, k0, k1, write,
+                        written += write_back_pieces(*slot->home, ref.page, slot->frame, gpu, k0, k1, write,
                                                      refilter_frames);
                         next_k = k1;
                     }
@@ -762,18 +828,16 @@ public:
             if (cursor >= merged.size()) break;
             if (merged[cursor].first >= ref.page + kPage) continue;
             if (has_pending(ref.page)) continue;
-            const auto mapped = pages_.find(ref.page);
-            if (mapped == pages_.end() || mapped->second != ref.frame) continue;
-            const auto found = homes_.find(mapped->second);
-            if (found == homes_.end()) continue;
+            const PageSlot* const slot = find_slot(ref.page);
+            if (!slot || slot->frame != ref.frame || !slot->home) continue;
 
             WriteBackJob job;
-            job.home = &found->second;
+            job.home = slot->home;
             job.page = ref.page;
-            job.frame = mapped->second;
+            job.frame = slot->frame;
             job.gpu = staged + i * kPage;
-            job.sums = found->second.sums.get();
-            if (found->second.refs > 1) any_shared_home = true;
+            job.sums = slot->home->sums.get();
+            if (slot->home->refs > 1) any_shared_home = true;
 
             std::size_t next_k = 0;
             std::size_t piece_count = 0;
@@ -810,12 +874,14 @@ public:
         const std::size_t workers = pool_->worker_count();
         const std::size_t chunk = (std::max)(std::size_t(1), (std::min)(std::size_t(4), n_jobs / (workers * 2)));
         pool_->run(n_jobs, chunk, [this](std::size_t b, std::size_t e, std::size_t) {
+            std::uint64_t tmp_sums[kPieces];
             for (std::size_t i = b; i < e; ++i) {
                 WriteBackJob& job = wb_jobs_[i];
                 std::uint16_t diffs = 0;
                 if (job.full_page) {
+                    shadow_keep::sum_of_batch_256(job.gpu, kPieces, tmp_sums);
                     for (std::size_t k = 0; k < kPieces; ++k) {
-                        if (shadow_keep::sum_of(job.gpu + k * kPiece, kPiece) != job.sums[k]) {
+                        if (tmp_sums[k] != job.sums[k]) {
                             job.diff_mask[k >> 6] |= std::uint64_t(1) << (k & 63);
                             ++diffs;
                         }
@@ -887,7 +953,7 @@ public:
             auto& list = lists.emplace_back();
             list.reserve(by_offset.size());
             for (const auto& [offset, bind] : by_offset) list.push_back(bind);
-            infos.push_back({chunks_[chunk], std::uint32_t(list.size()), list.data()});
+            infos.push_back({chunks_[chunk].buffer, std::uint32_t(list.size()), list.data()});
         }
         // The aliases' binds in the same batch, so the one wait orders a reader of either address.
         for (auto& [buffer, by_offset] : alias_pending_) {
@@ -942,16 +1008,17 @@ public:
 
     // The home's memory and offset of the mirrored page at `va` (tests and diagnostics).
     bool home_at(std::uint64_t va, VkDeviceMemory& memory, VkDeviceSize& offset, std::uint8_t** host = nullptr) const {
-        const auto page = pages_.find(va & ~(kPage - 1));
-        if (page == pages_.end()) return false;
-        const auto home = homes_.find(page->second);
-        if (home == homes_.end()) return false;
-        memory = units_[home->second.unit].memory;
-        offset = VkDeviceSize(home->second.slot) * kPage;
-        if (host) *host = units_[home->second.unit].host + offset;
+        const PageSlot* const slot = find_slot(va);
+        if (!slot || !slot->home) return false;
+        memory = units_[slot->home->unit].memory;
+        offset = VkDeviceSize(slot->home->slot) * kPage;
+        if (host) *host = units_[slot->home->unit].host + offset;
         return true;
     }
-    bool mirrored(std::uint64_t va) const { return pages_.count(va & ~(kPage - 1)) != 0; }
+    bool mirrored(std::uint64_t va) const {
+        const PageSlot* const slot = find_slot(va);
+        return slot && slot->frame != nullptr;
+    }
     // Mixes the cached 256-byte piece hashes (Home::sums[]) for every 256-byte piece overlapping [va, va + bytes).
     // Returns false when bytes == 0, the range overflows, or any 64 KiB page in [va, va + bytes) is not mirrored or
     // has no home. Zero reads of title or device memory: O(overlapping 256-byte pieces).
@@ -959,20 +1026,28 @@ public:
         if (!bytes || va + bytes < va) return false;
         const std::uint64_t end = va + bytes;
         std::uint64_t h = 14695981039346656037ull ^ bytes;
-        for (std::uint64_t page = va & ~(kPage - 1); page < end; page += kPage) {
-            const auto mapped = pages_.find(page);
-            if (mapped == pages_.end()) return false;
-            const auto found = homes_.find(mapped->second);
-            if (found == homes_.end() || found->second.whole_fill) return false;
-            const std::uint64_t page_end = (page <= UINT64_MAX - kPage) ? (page + kPage) : UINT64_MAX;
-            const std::uint64_t lo = (std::max)(va, page);
-            const std::uint64_t hi = (std::min)(end, page_end);
-            const std::size_t k0 = std::size_t((lo - page) / kPiece);
-            const std::size_t k1 = std::size_t((hi - page + kPiece - 1) / kPiece);
-            const std::uint64_t* const sums = found->second.sums.get();
-            for (std::size_t k = k0; k < k1; ++k) {
-                h = (h ^ sums[k]) * 1099511628211ull;
-                h ^= h >> 29;
+        for (std::uint64_t page = va & ~(kPage - 1); page < end;) {
+            const std::uint64_t c = page / kChunk;
+            const ChunkDirEntry* const dir = find_chunk_dir(c);
+            if (!dir) return false;
+            const std::uint64_t chunk_base = c * kChunk;
+            const std::uint64_t chunk_end = (c < UINT64_MAX / kChunk) ? ((c + 1) * kChunk) : UINT64_MAX;
+            const std::uint64_t limit = (std::min)(end, chunk_end);
+            const PageSlot* const slots = dir->pages;
+            for (; page < limit; page += kPage) {
+                const PageSlot& s = slots[std::size_t((page - chunk_base) / kPage)];
+                if (!s.home || s.home->whole_fill) return false;
+                const std::uint64_t page_end = (page <= UINT64_MAX - kPage) ? (page + kPage) : UINT64_MAX;
+                const std::uint64_t lo = (std::max)(va, page);
+                const std::uint64_t hi = (std::min)(end, page_end);
+                const std::size_t k0 = std::size_t((lo - page) / kPiece);
+                const std::size_t k1 = std::size_t((hi - page + kPiece - 1) / kPiece);
+                const std::uint64_t* const sums = s.home->sums.get();
+                for (std::size_t k = k0; k < k1; ++k) {
+                    h = (h ^ sums[k]) * 1099511628211ull;
+                    h ^= h >> 29;
+                }
+                if (page > UINT64_MAX - kPage) break;
             }
             if (page > UINT64_MAX - kPage) break;
         }
@@ -981,15 +1056,16 @@ public:
     }
     // The physical page's bytes the mirrored page at `va` shows (its frame; for ordinary memory the page itself).
     std::uint8_t* frame_at(std::uint64_t va) const {
-        const auto page = pages_.find(va & ~(kPage - 1));
-        return page == pages_.end() ? nullptr : page->second;
+        const PageSlot* const slot = find_slot(va);
+        return slot ? slot->frame : nullptr;
     }
     // The chunk over `va` and the offset of `va` in it (tests and diagnostics).
     bool chunk_at(std::uint64_t va, VkBuffer& buffer, VkDeviceSize& offset) const {
-        const auto it = chunks_.find(va / kChunk);
-        if (it == chunks_.end() || it->second == VK_NULL_HANDLE) return false;
-        buffer = it->second;
-        offset = va - it->first * kChunk;
+        const std::uint64_t c = va / kChunk;
+        const ChunkDirEntry* const dir = find_chunk_dir(c);
+        if (!dir) return false;
+        buffer = dir->buffer;
+        offset = va - c * kChunk;
         return true;
     }
 
@@ -997,7 +1073,7 @@ public:
         Counters c = counters_;
         c.homes = homes_.size();
         c.units = units_.size();
-        c.pages = pages_.size();
+        c.pages = pages_count_;
         return c;
     }
 
@@ -1225,10 +1301,9 @@ private:
         std::uint64_t gpu_sums[kPieces];
         std::size_t diff_count = 0;
         const std::uint64_t* const agreed = home.sums.get();
+        if (k0 < k1) shadow_keep::sum_of_batch_256(gpu + k0 * kPiece, k1 - k0, gpu_sums + k0);
         for (std::size_t k = k0; k < k1; ++k) {
-            const std::uint64_t now = shadow_keep::sum_of(gpu + k * kPiece, kPiece);
-            if (now != agreed[k]) {
-                gpu_sums[k] = now;
+            if (gpu_sums[k] != agreed[k]) {
                 diff_mask[k >> 6] |= std::uint64_t(1) << (k & 63);
                 ++diff_count;
             }
@@ -1274,112 +1349,88 @@ private:
         }
     }
 
-    // Coalesces contiguous changed pieces across the 4 x 64-bit mask words into single memcpy bursts (optimal for
-    // write-combined device-local homes). Never reads from `to`.
-    static void flush_changed_runs(std::uint8_t* to, const std::uint8_t* scratch,
-                                   const std::array<std::uint64_t, 4>& changed_pieces, std::size_t changed) noexcept {
-        if (changed == kPieces) {
-            std::memcpy(to, scratch, kPage);
-            return;
-        }
-        std::size_t run_start = kPieces;
-        for (std::size_t w = 0; w < 4; ++w) {
-            const std::uint64_t word = changed_pieces[w];
-            if (!word) {
-                if (run_start < kPieces) {
-                    const std::size_t run_end = w * 64;
-                    std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece,
-                                (run_end - run_start) * kPiece);
-                    run_start = kPieces;
-                }
-                continue;
-            }
-            if (word == ~std::uint64_t(0)) {
-                if (run_start == kPieces) run_start = w * 64;
-                continue;
-            }
-            std::size_t bit = 0;
-            while (bit < 64) {
-                const std::uint64_t rem = word >> bit;
-                if (!rem) {
-                    if (run_start < kPieces) {
-                        const std::size_t run_end = w * 64 + bit;
-                        std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece,
-                                    (run_end - run_start) * kPiece);
-                        run_start = kPieces;
-                    }
-                    break;
-                }
-                const std::size_t zeros = std::size_t(std::countr_zero(rem));
-                if (zeros > 0) {
-                    if (run_start < kPieces) {
-                        const std::size_t run_end = w * 64 + bit;
-                        std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece,
-                                    (run_end - run_start) * kPiece);
-                        run_start = kPieces;
-                    }
-                    bit += zeros;
-                }
-                const std::size_t ones = std::size_t(std::countr_one(word >> bit));
-                if (run_start == kPieces) run_start = w * 64 + bit;
-                bit += ones;
-            }
-        }
-        if (run_start < kPieces) {
-            std::memcpy(to + run_start * kPiece, scratch + run_start * kPiece, (kPieces - run_start) * kPiece);
-        }
-    }
-
     // Stateless per-page copy + 256-byte piece hash + coalesced WC home flush (safe to run across worker threads on
-    // disjoint homes and scratch buffers).
+    // disjoint homes and scratch buffers). Processes each 64 KiB page in 4 KiB (16 x 256 B) L1-hot strips through
+    // `hooks_.copy` + hoisted `shadow_keep::sum_of_batch_256()` + immediate L1-to-WC flush so non-aliased pages
+    // (`scratch == nullptr`) never evict L1d through a 64 KiB bounce buffer, while aliased pages (`scratch != nullptr`)
+    // populate the full 64 KiB snapshot in `scratch` at the same time.
     bool sync_page_into_scratch(std::uint8_t* to, std::uint8_t* scratch, std::uint64_t* sums,
                                 const std::uint8_t* frame, bool whole,
                                 std::array<std::uint64_t, 4>& changed_pieces, std::size_t& changed) const {
+        static_assert(kPage % kStripBytes == 0 && kStripPieces == 16);
+        constexpr std::size_t kStrips = kPage / kStripBytes;
+        alignas(64) std::uint8_t local_strip[kStripBytes];
+        std::uint64_t strip_sums[kStripPieces];
+
         bool failed = false;
-        const bool whole_ok = hooks_.copy ? hooks_.copy(scratch, frame, kPage)
-                                          : (std::memcpy(scratch, frame, kPage), true);
-        if (!whole_ok) {
-            for (std::size_t k = 0; k < kPieces; ++k) {
-                std::uint8_t* piece = scratch + k * kPiece;
-                if (!hooks_.copy(piece, frame + k * kPiece, kPiece)) {
-                    std::memset(piece, 0, kPiece);
-                    failed = true;
+        changed_pieces = {};
+        changed = 0;
+
+        for (std::size_t strip = 0; strip < kStrips; ++strip) {
+            const std::size_t strip_off = strip * kStripBytes;
+            const std::size_t base_k = strip * kStripPieces;
+            std::uint8_t* const strip_buf = scratch ? (scratch + strip_off) : local_strip;
+
+            const bool strip_ok = hooks_.copy ? hooks_.copy(strip_buf, frame + strip_off, kStripBytes)
+                                              : (std::memcpy(strip_buf, frame + strip_off, kStripBytes), true);
+            if (!strip_ok) {
+                for (std::size_t p = 0; p < kStripPieces; ++p) {
+                    std::uint8_t* const piece = strip_buf + p * kPiece;
+                    if (!hooks_.copy(piece, frame + strip_off + p * kPiece, kPiece)) {
+                        std::memset(piece, 0, kPiece);
+                        failed = true;
+                    }
+                }
+            }
+
+            if (whole) {
+                shadow_keep::sum_of_batch_256(strip_buf, kStripPieces, sums + base_k);
+                std::memcpy(to + strip_off, strip_buf, kStripBytes);
+            } else {
+                shadow_keep::sum_of_batch_256(strip_buf, kStripPieces, strip_sums);
+                std::uint32_t strip_mask = 0;
+                for (std::size_t p = 0; p < kStripPieces; ++p) {
+                    if (strip_sums[p] != sums[base_k + p]) {
+                        sums[base_k + p] = strip_sums[p];
+                        strip_mask |= std::uint32_t(1u) << p;
+                        ++changed;
+                    }
+                }
+                if (strip_mask) {
+                    changed_pieces[base_k >> 6] |= std::uint64_t(strip_mask) << (base_k & 63);
+                    if (strip_mask == 0xffffu) {
+                        std::memcpy(to + strip_off, strip_buf, kStripBytes);
+                    } else {
+                        std::uint32_t m = strip_mask;
+                        while (m) {
+                            const unsigned r0 = static_cast<unsigned>(std::countr_zero(m));
+                            const unsigned ones = static_cast<unsigned>(std::countr_one(m >> r0));
+                            std::memcpy(to + strip_off + std::size_t(r0) * kPiece,
+                                        strip_buf + std::size_t(r0) * kPiece, std::size_t(ones) * kPiece);
+                            m &= ~(((std::uint32_t(1u) << ones) - 1u) << r0);
+                        }
+                    }
                 }
             }
         }
-
-        changed_pieces = {};
-        changed = 0;
         if (whole) {
-            for (std::size_t k = 0; k < kPieces; ++k) sums[k] = shadow_keep::sum_of(scratch + k * kPiece, kPiece);
-            std::memcpy(to, scratch, kPage);
             changed = kPieces;
             changed_pieces = kAllPieces;
-        } else {
-            for (std::size_t k = 0; k < kPieces; ++k) {
-                const std::uint64_t sum = shadow_keep::sum_of(scratch + k * kPiece, kPiece);
-                if (sum == sums[k]) continue;
-                sums[k] = sum;
-                changed_pieces[k >> 6] |= std::uint64_t(1) << (k & 63);
-                ++changed;
-            }
-            if (changed) flush_changed_runs(to, scratch, changed_pieces, changed);
         }
         return failed;
     }
 
-    // Brings the home up to date with the title's page, piece by piece, into `fill_scratch_`: `whole` (a new home)
-    // copies every piece, and otherwise only a piece the title changed since both sides last agreed, so a piece only
-    // the GPU wrote keeps the GPU's bytes (and goes back with write_back). A piece both changed takes the title's
-    // bytes. Copies the whole 64 KiB page in one hooks_.copy call, falling back to per-piece copies only when the
-    // whole-page copy fails, then updates home.sums in a tight pass and flushes changed pieces to `to` in coalesced
-    // contiguous runs (optimal for write-combined device-local homes). Never reads from `to`. Returns whether any
-    // piece copy failed.
+    // Brings the home up to date with the title's page, piece by piece: `whole` (a new home) copies every piece, and
+    // otherwise only a piece the title changed since both sides last agreed, so a piece only the GPU wrote keeps the
+    // GPU's bytes (and goes back with write_back). A piece both changed takes the title's bytes. Uses 4 KiB L1-hot
+    // strips (populating `fill_scratch_` only when the home has a filtered copy). Never reads from `to`. Returns
+    // whether any piece copy failed.
     bool sync_home_from_frame(Home& home, const std::uint8_t* frame, bool whole,
                               std::array<std::uint64_t, 4>& changed_pieces, std::size_t& changed) {
         std::uint8_t* const to = units_[home.unit].host + std::size_t(home.slot) * kPage;
+        std::uint8_t* const scratch = home.copy ? fill_scratch_.data() : nullptr;
         const bool failed =
-            sync_page_into_scratch(to, fill_scratch_.data(), home.sums.get(), frame, whole, changed_pieces, changed);
+            sync_page_into_scratch(to, scratch, home.sums.get(), frame, whole, changed_pieces, changed);
         counters_.uploaded_bytes += std::uint64_t(changed) * kPiece;
         return failed;
     }
@@ -1609,14 +1660,13 @@ private:
             if (run_parallel_sync) {
                 const std::size_t workers = pool_->worker_count();
                 const std::size_t chunk = (std::max)(std::size_t(1), (std::min)(std::size_t(4), n / (workers * 2)));
-                pool_->run(n, chunk, [this](std::size_t b, std::size_t e, std::size_t tid) {
-                    std::uint8_t* const worker_scratch = pool_->scratch(tid);
+                pool_->run(n, chunk, [this](std::size_t b, std::size_t e, std::size_t) {
                     for (std::size_t i = b; i < e; ++i) {
                         UploadJob& job = upload_jobs_[i];
                         std::uint8_t* const scratch =
                             (job.aliased_slot != kNoAliasedSlot)
                                 ? (aliased_scratch_.data() + job.aliased_slot * kPage)
-                                : worker_scratch;
+                                : nullptr;
                         job.failed = sync_page_into_scratch(job.to, scratch, job.sums, job.frame, job.whole,
                                                             job.changed_pieces, job.changed);
                     }
@@ -1625,7 +1675,7 @@ private:
                 for (UploadJob& job : upload_jobs_) {
                     std::uint8_t* const scratch = (job.aliased_slot != kNoAliasedSlot)
                                                       ? (aliased_scratch_.data() + job.aliased_slot * kPage)
-                                                      : fill_scratch_.data();
+                                                      : nullptr;
                     job.failed = sync_page_into_scratch(job.to, scratch, job.sums, job.frame, job.whole,
                                                         job.changed_pieces, job.changed);
                 }
@@ -1709,6 +1759,77 @@ private:
         bool full_page = false;
     };
 
+    struct PageSlot {
+        std::uint8_t* frame = nullptr;
+        Home* home = nullptr;
+    };
+    struct Chunk {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        std::unique_ptr<PageSlot[]> pages;  // kChunkPages (32768) direct slots per 2 GiB chunk
+        std::size_t mapped_count = 0;
+    };
+    struct ChunkDirEntry {
+        std::uint64_t index = 0;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        PageSlot* pages = nullptr;
+        Chunk* chunk = nullptr;
+    };
+
+    void insert_chunk_dir(std::uint64_t index, Chunk& ch) {
+        const ChunkDirEntry entry{index, ch.buffer, ch.pages.get(), &ch};
+        const auto pos = std::lower_bound(
+            chunk_dir_.begin(), chunk_dir_.end(), index,
+            [](const ChunkDirEntry& e, std::uint64_t key) { return e.index < key; });
+        chunk_dir_.insert(pos, entry);
+    }
+    const ChunkDirEntry* find_chunk_dir(std::uint64_t chunk_idx) const noexcept {
+        const std::size_t n = chunk_dir_.size();
+        if (n <= 16) {
+            for (std::size_t i = 0; i < n; ++i)
+                if (chunk_dir_[i].index == chunk_idx) return &chunk_dir_[i];
+            return nullptr;
+        }
+        const auto it = std::lower_bound(
+            chunk_dir_.begin(), chunk_dir_.end(), chunk_idx,
+            [](const ChunkDirEntry& e, std::uint64_t key) { return e.index < key; });
+        return (it != chunk_dir_.end() && it->index == chunk_idx) ? &(*it) : nullptr;
+    }
+    PageSlot* find_slot(std::uint64_t va) noexcept {
+        const std::uint64_t c = va / kChunk;
+        const ChunkDirEntry* const dir = find_chunk_dir(c);
+        if (!dir) return nullptr;
+        return &dir->pages[std::size_t((va - c * kChunk) / kPage)];
+    }
+    const PageSlot* find_slot(std::uint64_t va) const noexcept {
+        const std::uint64_t c = va / kChunk;
+        const ChunkDirEntry* const dir = find_chunk_dir(c);
+        if (!dir) return nullptr;
+        return &dir->pages[std::size_t((va - c * kChunk) / kPage)];
+    }
+    template <class Fn>
+    void for_each_mapped_in(std::uint64_t lo, std::uint64_t hi, Fn&& fn) const {
+        if (lo >= hi || chunk_dir_.empty()) return;
+        const std::uint64_t start_c = lo / kChunk;
+        auto it = std::lower_bound(
+            chunk_dir_.begin(), chunk_dir_.end(), start_c,
+            [](const ChunkDirEntry& e, std::uint64_t key) { return e.index < key; });
+        for (; it != chunk_dir_.end(); ++it) {
+            const std::uint64_t chunk_base = it->index * kChunk;
+            if (chunk_base >= hi) break;
+            if (it->chunk->mapped_count == 0) continue;
+            const std::uint64_t chunk_end =
+                (it->index < UINT64_MAX / kChunk) ? ((it->index + 1) * kChunk) : UINT64_MAX;
+            const std::uint64_t from = (std::max)(lo, chunk_base) & ~(kPage - 1);
+            const std::uint64_t until = (std::min)(hi, chunk_end);
+            const PageSlot* const slots = it->pages;
+            for (std::uint64_t va = from; va < until; va += kPage) {
+                const PageSlot& s = slots[std::size_t((va - chunk_base) / kPage)];
+                if (s.frame) fn(va, s);
+                if (va > UINT64_MAX - kPage) return;
+            }
+        }
+    }
+
     bool ensure_pool() {
         if (pool_) return true;
         pool_ = make_worker_pool();
@@ -1716,8 +1837,9 @@ private:
     }
 
     TitleMirrorHooks hooks_;
-    std::map<std::uint64_t, VkBuffer> chunks_;                 // chunk index -> buffer (null: could not be placed)
-    std::unordered_map<std::uint64_t, std::uint8_t*> pages_;   // mirrored page -> its physical page's bytes
+    std::map<std::uint64_t, Chunk> chunks_;                    // chunk index -> buffer + 32768 direct page slots
+    std::vector<ChunkDirEntry> chunk_dir_;                     // sorted flat directory of valid chunks for O(1) lookup
+    std::size_t pages_count_ = 0;                              // live mapped pages across all chunks
     std::unordered_map<std::uint8_t*, Home> homes_;            // physical page (its scratch bytes) -> home
     std::vector<Unit> units_;
     std::vector<std::uint8_t*> dirty_;

@@ -200,6 +200,54 @@ int main() {
         std::printf("unwatch single-lock & fault reopen fast path: ok\n");
     }
 
+    // Verify watch_batch / unwatch_batch, gap-bridging with pinned-tile guardrail, mid-batch unrelated map change,
+    // and reopen() fast path + unexpected-protection fallback.
+    {
+        std::vector<std::uint64_t> out;
+        leonida::HotColdTracking tracking;
+        std::vector<std::uint64_t> pages(kPages);
+        for (std::size_t p = 0; p < kPages; ++p) pages[p] = base + p * kPage;
+        tracking.watch_batch(pages.data(), pages.size());
+        tracking.collect(out);  // arms all 16 tiles and populates known_protect + armed_map_gen
+        EXPECT(out.size() == kPages);
+        for (std::size_t p = 0; p < kPages; ++p) EXPECT(tracking.unwritten(pages[p]));
+
+        // Fault tiles 0, 2, 5 (gaps at 1 and 3..4 are already-armed cold tiles -> eligible for gap-bridging!).
+        memory[0 * kPage + 1] = 0x11;
+        memory[2 * kPage + 1] = 0x22;
+        memory[5 * kPage + 1] = 0x55;
+        // Bump title_memory_map on an UNRELATED VA range to exercise range-scoped changes_since().
+        leonida::title_memory_map::changed(base + 0x10000000, base + 0x10010000);
+        tracking.collect(out);
+        EXPECT(out.size() == 3 && out[0] == pages[0] && out[1] == pages[2] && out[2] == pages[5]);
+        for (std::size_t p = 0; p < 6; ++p) EXPECT(tracking.unwritten(pages[p]));
+
+        // Pinned-tile guardrail: pin tile 1 via kernel_writes::hold() (opener opens tile 1 writable), fault tiles 0
+        // and 2, then collect() MUST NOT bridge over pinned tile 1 and must leave tile 1 writable!
+        leonida::kernel_writes::set_opener([](std::uintptr_t b, std::uintptr_t e) {
+            leonida::geometry_writes::notify(b, e, leonida::geometry_writes::Event::open);
+        });
+        const std::uint64_t pin = leonida::kernel_writes::hold(memory + 1 * kPage, kPage);
+        EXPECT(pin != 0);
+        memory[0 * kPage + 2] = 0x33;
+        memory[2 * kPage + 2] = 0x44;
+        tracking.collect(out);
+        // Tile 0 and tile 2 re-armed; pinned tile 1 stayed writable (writing it must NOT fault!).
+        EXPECT(tracking.unwritten(pages[0]) && tracking.unwritten(pages[2]));
+        const std::uint64_t f1_before = g_faults[1].load();
+        memory[1 * kPage + 2] = 0x77;
+        EXPECT(g_faults[1].load() == f1_before);
+        leonida::kernel_writes::release(pin);
+        leonida::kernel_writes::set_opener(nullptr);
+
+        // Unwatch all pages in one batch and verify zero faults on subsequent writes.
+        tracking.unwatch_batch(pages.data(), pages.size());
+        const std::uint64_t f0_before = g_faults[0].load();
+        memory[0 * kPage + 3] = 0x99;
+        EXPECT(g_faults[0].load() == f0_before);
+        std::printf("watch_batch/unwatch_batch, gap-bridging pin guardrail, reopen fast path: ok\n");
+    }
+
     VirtualFree(memory, 0, MEM_RELEASE);
     return failures ? 1 : 0;
 }
