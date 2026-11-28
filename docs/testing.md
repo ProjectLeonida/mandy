@@ -324,6 +324,18 @@ WINEPREFIX="$HOME/.local/share/leonida-wine" ctest --test-dir runtime/build/wind
 Use a recent xwin: 0.10.0 lays out SDK 10.0.26100 with the command above, while 0.6.5 stops with "unable to find
 x86_64 headers for Win11SDK_10.0.26100".
 
+On a Mac (Apple Silicon) the same steps work with Homebrew's LLVM and lld (`brew install llvm lld xwin`; the cross
+tools are `clang-cl`, `lld-link`, `llvm-lib`, `llvm-rc` and `llvm-mt` under `$(brew --prefix)/opt/llvm/bin` and
+`$(brew --prefix)/opt/lld/bin`) and the WineHQ macOS build, an x86-64 Wine that runs under Rosetta. Homebrew's
+`wine-stable` cask is disabled (it does not pass Gatekeeper), so take the archive the cask names from its
+`url` and check it against the cask's `sha256`. Configure with `-DCMAKE_CROSSCOMPILING_EMULATOR=<path to its wine>`
+when `wine` is not on `PATH`; a path with spaces (`Wine Stable.app`) is easiest behind a small wrapper script. Run
+`ctest` with `ROSETTA_ADVERTISE_AVX=1`: without it Rosetta hides AVX from Wine, and the `run_tiny_*` loader tests stop
+with "the game's code needs AVX, and this CPU or OS lacks AVX, OSXSAVE". Measured on an Apple M3 (macOS 26.5.1,
+Wine 11.0, its bundled MoltenVK 1.4.1) at `main` `fbf100b1b`: 1084 targets build, and `ctest -j 6 --timeout 120`
+gives 461 of 482 passed (440 without `ROSETTA_ADVERTISE_AVX`). The display is the Mac's own, so no virtual X server
+is needed.
+
 On a machine without a display (a server, a container, WSL without WSLg), Wine has no graphics driver to create a
 Vulkan instance with, so every Vulkan test fails with `vkCreateInstance failed (VkResult -3)` and, with
 `WINEDEBUG=+vulkan`, "Failed to load Wine graphics driver supporting Vulkan". Run the tests under a virtual X server,
