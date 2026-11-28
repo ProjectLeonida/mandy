@@ -844,6 +844,9 @@ if(BUILD_TESTING)
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
 
+  add_executable(rgba4_fragment_test test/rgba4_fragment_test.cpp)
+  add_test(NAME rgba4_fragment COMMAND rgba4_fragment_test)
+
   # The title's own window, where PresentX shows its frames (shims/title_window.h): user32 only, no device.
   if(WIN32)
     add_executable(title_window_test test/title_window_test.cpp)
