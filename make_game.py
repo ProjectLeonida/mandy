@@ -3147,9 +3147,23 @@ def crashes_alone(exe: str, spirv: str, cache: str, name: str, inflight: str | N
 
 def path_is_within(path: str, directory: str) -> bool:
     try:
-        return os.path.commonpath([path, directory]) == directory
+        if os.path.commonpath([path, directory]) == directory:
+            return True
     except ValueError:  # Different Windows drives or UNC shares have no common path.
         return False
+    # On case-insensitive volumes where normcase does not fold case (e.g. APFS),
+    # compare existing ancestors by identity. The destination itself may not exist yet.
+    ancestor = path
+    while True:
+        try:
+            if os.path.samefile(ancestor, directory):
+                return True
+        except OSError:
+            pass  # A not-yet-created destination has no identity to compare.
+        parent = os.path.dirname(ancestor)
+        if parent == ancestor:
+            return False
+        ancestor = parent
 
 
 def _invoke_stage(name: str, fn) -> None:

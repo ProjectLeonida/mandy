@@ -95,6 +95,26 @@ class BuildDestinationTest(unittest.TestCase):
         self.run_build(self.game, os.path.join(alias, "new"),
                        os.path.join(self.root, "work"), rejected=False)
 
+    def test_case_alias_of_game_rejects_existing_and_future_destinations(self):
+        # Simulate a case-insensitive volume even when this test runs on Linux.
+        alias = os.path.join(self.root, "GAME")
+        original_samefile = os.path.samefile
+
+        def samefile(a, b):
+            if a == alias and b == self.game:
+                return True
+            return original_samefile(a, b)
+
+        with patch("os.path.samefile", side_effect=samefile):
+            for option in ("out", "work"):
+                for suffix in ("", "new", os.path.join("new", "nested")):
+                    with self.subTest(option=option, suffix=suffix):
+                        destinations = {name: os.path.join(self.root, name) for name in ("out", "work")}
+                        destinations[option] = os.path.join(alias, suffix)
+                        self.run_build(self.game, **destinations, rejected=True)
+            self.run_build(self.game, os.path.join(self.root, "GAME-other", "new"),
+                           os.path.join(self.root, "work"), rejected=False)
+
     def test_drive_root_game_folder_rules(self):
         if os.name != "nt":
             self.skipTest("Windows drive root check")
