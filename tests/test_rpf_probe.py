@@ -389,6 +389,41 @@ runpy.run_path(sys.argv.pop(1), run_name="__main__")
         with self.assertRaises(ValueError):
             probe._write_json_report(self.out, [{"head_entropy": float("nan")}])
 
+    def test_publish_cleans_up_staged_file_when_replace_fails_even_if_readonly(self):
+        report = os.path.join(self.tmp, "report.json")
+        with open(report, "w", encoding="utf-8") as f:
+            f.write('{"initial": 1}\n')
+        os.chmod(report, 0o444)
+
+        real_unlink = os.unlink
+
+        def windows_strict_unlink(p):
+            mode = os.stat(p).st_mode
+            if not (mode & 0o200):
+                raise PermissionError(13, f"Access is denied: {p}")
+            return real_unlink(p)
+
+        with mock.patch.object(probe, "replace_retry", side_effect=OSError(13, "Permission denied")), \
+             mock.patch("os.unlink", side_effect=windows_strict_unlink):
+            with self.assertRaises(OSError):
+                probe._write_json_report(report, [{"key": "val"}])
+
+        leftover = [f for f in os.listdir(self.tmp) if f.startswith(".rpf_probe-")]
+        self.assertEqual(leftover, [])
+
+    def test_publish_applies_published_mode_on_windows(self):
+        report = os.path.join(self.tmp, "report_win.json")
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(p, mode):
+            chmod_calls.append((p, mode))
+            real_chmod(p, mode)
+
+        with mock.patch("os.name", "nt"), mock.patch("os.chmod", side_effect=track_chmod):
+            probe._write_json_report(report, [])
+        self.assertTrue(len(chmod_calls) > 0)
+
 
 if __name__ == "__main__":
     unittest.main()
