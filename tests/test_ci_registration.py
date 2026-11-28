@@ -120,11 +120,22 @@ def git_bash():
 
 
 def tracked_under_tests(root):
+    # git looks upward for a repository. A root that is not one, but sits under a directory that is (a temporary
+    # tree: on Windows %TEMP% can be inside the user's own repository), would otherwise be answered by that outer
+    # repository: `git ls-files -- tests` succeeds and lists nothing, and the walk below never runs. So the tracked
+    # list is used only when the root itself is the repository's top level, whatever the ceiling settings say.
     try:
-        result = subprocess.run(["git", "ls-files", "-z", "--", "tests"], cwd=root, capture_output=True, text=True)
-        if result.returncode == 0:
-            return [n for n in result.stdout.split("\0") if n]
-    except OSError:
+        top = subprocess.run(
+            ["git", "-c", "core.quotepath=false", "rev-parse", "--show-toplevel"],
+            cwd=root,
+            capture_output=True,
+        )
+        here = os.path.normcase(os.path.realpath(root))
+        if top.returncode == 0 and os.path.normcase(os.path.realpath(os.fsdecode(top.stdout.rstrip(b"\r\n")))) == here:
+            result = subprocess.run(["git", "ls-files", "-z", "--", "tests"], cwd=root, capture_output=True)
+            if result.returncode == 0:
+                return [os.fsdecode(n) for n in result.stdout.split(b"\0") if n]
+    except (OSError, UnicodeDecodeError):
         pass
     names = []                                     # no git: walk, as tests/test_docs_links.py does
     for base, dirs, files in os.walk(os.path.join(root, "tests")):
@@ -712,6 +723,50 @@ class RepositoryRegistrationTest(unittest.TestCase):
                                             require_test_case=True))
             self.assertFalse(has_main_guard(read(tmp, "tests/test_inequality_guard.py")))
             self.assertEqual(selected["tests/test_nested_dir/test_nested.cjs"], None)
+
+    def test_a_tree_that_is_not_a_repository_is_walked_even_inside_one(self) -> None:
+        # %TEMP% can sit inside a repository (Windows: the user's home). git then answers `ls-files` for the outer
+        # repository, which has no record of the temporary tree: the scan must walk it instead of reporting nothing.
+        if shutil.which("git") is None:
+            self.skipTest("no git to place an outer repository")
+        with tempfile.TemporaryDirectory() as outer:
+            added = subprocess.run(
+                ["git", "init", "-q"], cwd=outer, capture_output=True, encoding="utf-8", errors="replace"
+            )
+            if added.returncode != 0:
+                self.skipTest(f"git init refused: {added.stderr.strip()}")
+            inside = os.path.join(outer, "scratch")
+            os.makedirs(os.path.join(inside, "tests"))
+            with open(os.path.join(inside, "tests", "test_inside.py"), "w", encoding="utf-8") as f:
+                f.write("import unittest\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n")
+            self.assertEqual(tracked_under_tests(inside), ["tests/test_inside.py"])
+            self.assertIn("tests/test_inside.py", claimed_test_files(inside))
+
+    def test_non_ascii_repository_root_uses_tracked_list_not_walk(self) -> None:
+        # Under `python -I` on Windows, locale decoding defaults to cp1252 while Git outputs UTF-8 bytes.
+        # Include both a Latin character valid in cp1252 ('é') and one undefined in cp1252 ('č') so neither
+        # silently mismatches `root` nor fails decoding.
+        if shutil.which("git") is None:
+            self.skipTest("no git to initialize a non-ASCII repository")
+        with tempfile.TemporaryDirectory() as base:
+            repo = os.path.join(base, "caf\u00e9_\u010d_repo")
+            os.makedirs(os.path.join(repo, "tests"))
+            init = subprocess.run(
+                ["git", "init", "-q"], cwd=repo, capture_output=True, encoding="utf-8", errors="replace"
+            )
+            if init.returncode != 0:
+                self.skipTest(f"git init refused: {init.stderr.strip()}")
+            tracked_rel = "tests/test_caf\u00e9_\u010d.py"
+            for rel in (tracked_rel, "tests/test_untracked.py"):
+                with open(os.path.join(repo, rel), "w", encoding="utf-8") as f:
+                    f.write("import unittest\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n")
+            added = subprocess.run(
+                ["git", "add", "--", tracked_rel], cwd=repo, capture_output=True, encoding="utf-8", errors="replace"
+            )
+            if added.returncode != 0:
+                self.skipTest(f"git add refused: {added.stderr.strip()}")
+            self.assertEqual(tracked_under_tests(repo), [tracked_rel])
+            self.assertEqual(claimed_test_files(repo), [tracked_rel])
 
     def test_semantic_selection_matches_discovery_through_packages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
