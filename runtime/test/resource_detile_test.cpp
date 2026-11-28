@@ -100,6 +100,51 @@ bool test_intra_tile_bijective() {
     return offsets.size() == (tile_w * tile_h);
 }
 
+// Verify bit-exact equality against the scalar per-element LUT oracle AND that padding bytes outside
+// the active (blocks_w, blocks_h) region stay untouched (exact-length tail copies never overshoot).
+template <std::uint32_t Bpe>
+bool test_oracle_exact(std::uint32_t width, std::uint32_t height, std::uint32_t block_dim = 1) {
+    constexpr SwizzleLut64K<Bpe> lut{};
+    const std::size_t linear_size = linear_surface_size(width, height, Bpe, block_dim);
+    const std::size_t tiled_size = tiled_surface_size_64k(width, height, Bpe, block_dim);
+    if (!linear_size || !tiled_size) return false;
+    const std::uint32_t blocks_w = 1u + (width - 1u) / block_dim;
+    const std::uint32_t blocks_h = 1u + (height - 1u) / block_dim;
+    const std::uint32_t tiles_x = 1u + (blocks_w - 1u) / lut.tile_w;
+
+    std::vector<std::byte> linear(linear_size);
+    fill_synthetic_linear(linear, width * 17u + height * 31u + Bpe);
+
+    std::vector<std::byte> tiled_ref(tiled_size, std::byte{0xA5});
+    for (std::uint32_t y = 0; y < blocks_h; ++y) {
+        const std::uint32_t ty = y / lut.tile_h;
+        const std::uint16_t intra_y = lut.lut_y[y % lut.tile_h];
+        const std::size_t macro_y = static_cast<std::size_t>(ty) * tiles_x * tile_size_in_bytes;
+        const std::size_t lin_row = static_cast<std::size_t>(y) * blocks_w * Bpe;
+        for (std::uint32_t x = 0; x < blocks_w; ++x) {
+            const std::uint32_t tx = x / lut.tile_w;
+            const std::size_t t_off = macro_y + static_cast<std::size_t>(tx) * tile_size_in_bytes +
+                                      (lut.lut_x[x % lut.tile_w] | intra_y);
+            std::memcpy(&tiled_ref[t_off], &linear[lin_row + static_cast<std::size_t>(x) * Bpe], Bpe);
+        }
+    }
+
+    std::vector<std::byte> tiled_fast(tiled_size, std::byte{0xA5});
+    if (!tile_surface_64k(linear, tiled_fast, width, height, Bpe, block_dim)) return false;
+    if (std::memcmp(tiled_ref.data(), tiled_fast.data(), tiled_size) != 0) {
+        std::fprintf(stderr, "tile oracle mismatch for %ux%u bpe=%u blk=%u\n", width, height, Bpe, block_dim);
+        return false;
+    }
+
+    std::vector<std::byte> linear_fast(linear_size, std::byte{0x5A});
+    if (!detile_surface_64k(tiled_ref, linear_fast, width, height, Bpe, block_dim)) return false;
+    if (std::memcmp(linear.data(), linear_fast.data(), linear_size) != 0) {
+        std::fprintf(stderr, "detile oracle mismatch for %ux%u bpe=%u blk=%u\n", width, height, Bpe, block_dim);
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -202,6 +247,22 @@ int main() {
     // Non-multiple of 4 texel dimensions:
     CHECK(test_roundtrip(1001, 603, 8, 4));
     CHECK(test_roundtrip(1920, 1080, 16, 4));
+
+    // 6. Scalar-oracle bit-exactness + untouched-padding verification across every tail remainder
+    //    (0..run_elems-1) and tile boundary (tile_w-1, tile_w, tile_w+1, multi-tile) for all Bpe:
+    for (std::uint32_t w : {1u, 2u, 3u, 5u, 7u, 8u, 9u, 15u, 17u, 255u, 256u, 257u, 263u, 513u}) {
+        CHECK(test_oracle_exact<1>(w, 19u));
+        CHECK(test_oracle_exact<2>(w, 19u));
+    }
+    for (std::uint32_t w : {1u, 2u, 3u, 4u, 5u, 7u, 127u, 128u, 129u, 131u, 259u}) {
+        CHECK(test_oracle_exact<4>(w, 131u));
+        CHECK(test_oracle_exact<8>(w, 67u));
+    }
+    for (std::uint32_t w : {1u, 2u, 3u, 5u, 63u, 64u, 65u, 129u, 193u}) {
+        CHECK(test_oracle_exact<16>(w, 67u));
+    }
+    CHECK(test_oracle_exact<8>(1001u, 603u, 4u));
+    CHECK(test_oracle_exact<16>(1920u, 1080u, 4u));
 
     std::printf("resource detile: all 64 KiB GFX10 swizzle round-trip and validation checks passed\n");
     return 0;

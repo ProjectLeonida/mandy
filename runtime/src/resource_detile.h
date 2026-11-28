@@ -42,8 +42,20 @@ struct SwizzleLut64K {
     static constexpr std::uint32_t tile_w = shape.width;
     static constexpr std::uint32_t tile_h = shape.height;
 
+    static constexpr std::uint32_t run_elems = []() constexpr -> std::uint32_t {
+        if constexpr (bpe == 1) return 8u;
+        else if constexpr (bpe == 2) return 8u;
+        else if constexpr (bpe == 4) return 4u;
+        else if constexpr (bpe == 8) return 2u;
+        else if constexpr (bpe == 16) return 2u;
+        else return 1u;
+    }();
+    static constexpr std::uint32_t run_bytes = run_elems * bpe;
+    static constexpr std::uint32_t runs_per_tile = tile_w / run_elems;
+
     std::array<std::uint16_t, tile_w> lut_x{};
     std::array<std::uint16_t, tile_h> lut_y{};
+    std::array<std::uint16_t, runs_per_tile> lut_run_x{};
 
     constexpr SwizzleLut64K() {
         constexpr std::array<int8_t, 16> pat = []() {
@@ -84,6 +96,27 @@ struct SwizzleLut64K {
             }
             lut_y[y] = val;
         }
+
+        for (std::uint32_t r = 0; r < runs_per_tile; ++r) {
+            lut_run_x[r] = lut_x[r * run_elems];
+        }
+    }
+
+    constexpr bool runs_valid() const {
+        if (tile_w % run_elems != 0) return false;
+        for (std::uint32_t r = 0; r < runs_per_tile; ++r) {
+            if ((lut_run_x[r] & (run_bytes - 1u)) != 0u) return false;
+            for (std::uint32_t k = 0; k < run_elems; ++k) {
+                if (lut_x[r * run_elems + k] != static_cast<std::uint16_t>(lut_run_x[r] + k * bpe)) return false;
+            }
+        }
+        for (std::uint32_t y = 0; y < tile_h; ++y) {
+            if ((lut_y[y] & (run_bytes - 1u)) != 0u) return false;
+            for (std::uint32_t r = 0; r < runs_per_tile; ++r) {
+                if ((lut_run_x[r] & lut_y[y]) != 0u) return false;
+            }
+        }
+        return true;
     }
 };
 
@@ -92,6 +125,12 @@ inline constexpr SwizzleLut64K<2> swizzle_lut_64k_2bpe{};
 inline constexpr SwizzleLut64K<4> swizzle_lut_64k_4bpe{};
 inline constexpr SwizzleLut64K<8> swizzle_lut_64k_8bpe{};
 inline constexpr SwizzleLut64K<16> swizzle_lut_64k_16bpe{};
+
+static_assert(swizzle_lut_64k_1bpe.runs_valid());
+static_assert(swizzle_lut_64k_2bpe.runs_valid());
+static_assert(swizzle_lut_64k_4bpe.runs_valid());
+static_assert(swizzle_lut_64k_8bpe.runs_valid());
+static_assert(swizzle_lut_64k_16bpe.runs_valid());
 
 namespace detail {
 
@@ -167,9 +206,9 @@ constexpr std::size_t linear_surface_size(std::uint32_t width, std::uint32_t hei
 
 namespace detail {
 
-template <std::uint32_t Bpe>
-void detile_typed(std::span<const std::byte> tiled, std::span<std::byte> linear,
-                  std::uint32_t blocks_w, std::uint32_t blocks_h, std::uint32_t tiles_x) {
+template <std::uint32_t Bpe, bool ToTiled>
+void transfer_typed(const std::byte* src, std::byte* dst,
+                    std::uint32_t blocks_w, std::uint32_t blocks_h, std::uint32_t tiles_x) {
     constexpr const auto& lut = []() constexpr -> const auto& {
         if constexpr (Bpe == 1) return swizzle_lut_64k_1bpe;
         else if constexpr (Bpe == 2) return swizzle_lut_64k_2bpe;
@@ -180,53 +219,82 @@ void detile_typed(std::span<const std::byte> tiled, std::span<std::byte> linear,
 
     constexpr std::uint32_t tile_w = lut.tile_w;
     constexpr std::uint32_t tile_h = lut.tile_h;
+    constexpr std::uint32_t run_elems = lut.run_elems;
+    constexpr std::size_t run_bytes = lut.run_bytes;
+    constexpr std::uint32_t runs_per_tile = lut.runs_per_tile;
+    constexpr std::size_t tile_row_bytes = static_cast<std::size_t>(tile_w) * Bpe;
 
-    for (std::uint32_t y = 0; y < blocks_h; ++y) {
-        const std::uint32_t ty = y / tile_h;
-        const std::uint16_t intra_y = lut.lut_y[y % tile_h];
+    const std::size_t linear_stride = static_cast<std::size_t>(blocks_w) * Bpe;
+    const std::uint32_t full_tiles_x = blocks_w / tile_w;
+    const std::uint32_t rem_x = blocks_w % tile_w;
+    const std::uint32_t rem_full_runs = rem_x / run_elems;
+    const std::size_t rem_tail_bytes = static_cast<std::size_t>(rem_x % run_elems) * Bpe;
+
+    // Walk one 64 KiB macro-tile at a time so the swizzled side stays within a single 64 KiB cache footprint
+    // while copying compile-time contiguous micro-runs (8/16/32 bytes) with zero inner-loop division/modulo.
+    const std::uint32_t tiles_y = 1u + (blocks_h - 1u) / tile_h;
+    for (std::uint32_t ty = 0; ty < tiles_y; ++ty) {
+        const std::uint32_t y_base = ty * tile_h;
+        const std::uint32_t y_end = std::min(tile_h, blocks_h - y_base);
         const std::size_t macro_y_base = static_cast<std::size_t>(ty) * tiles_x * tile_size_in_bytes;
-        const std::size_t linear_row = static_cast<std::size_t>(y) * blocks_w * Bpe;
+        const std::size_t linear_y_base = static_cast<std::size_t>(y_base) * linear_stride;
 
-        for (std::uint32_t x = 0; x < blocks_w; ++x) {
-            const std::uint32_t tx = x / tile_w;
-            const std::uint16_t intra_x = lut.lut_x[x % tile_w];
-            const std::size_t tiled_off = macro_y_base + static_cast<std::size_t>(tx) * tile_size_in_bytes + (intra_x | intra_y);
-            const std::size_t linear_off = linear_row + static_cast<std::size_t>(x) * Bpe;
+        for (std::uint32_t tx = 0; tx < full_tiles_x; ++tx) {
+            const std::size_t tile_base = macro_y_base + static_cast<std::size_t>(tx) * tile_size_in_bytes;
+            std::size_t lin_row = linear_y_base + static_cast<std::size_t>(tx) * tile_row_bytes;
+            for (std::uint32_t ly = 0; ly < y_end; ++ly, lin_row += linear_stride) {
+                const std::size_t tile_row = tile_base + lut.lut_y[ly];
+                for (std::uint32_t r = 0; r < runs_per_tile; ++r) {
+                    const std::size_t t_off = tile_row + lut.lut_run_x[r];
+                    const std::size_t l_off = lin_row + static_cast<std::size_t>(r) * run_bytes;
+                    if constexpr (ToTiled) {
+                        std::memcpy(dst + t_off, src + l_off, run_bytes);
+                    } else {
+                        std::memcpy(dst + l_off, src + t_off, run_bytes);
+                    }
+                }
+            }
+        }
 
-            std::memcpy(&linear[linear_off], &tiled[tiled_off], Bpe);
+        if (rem_x != 0u) {
+            const std::size_t tile_base = macro_y_base + static_cast<std::size_t>(full_tiles_x) * tile_size_in_bytes;
+            std::size_t lin_row = linear_y_base + static_cast<std::size_t>(full_tiles_x) * tile_row_bytes;
+            const std::size_t tail_lin_rel = static_cast<std::size_t>(rem_full_runs) * run_bytes;
+            for (std::uint32_t ly = 0; ly < y_end; ++ly, lin_row += linear_stride) {
+                const std::size_t tile_row = tile_base + lut.lut_y[ly];
+                for (std::uint32_t r = 0; r < rem_full_runs; ++r) {
+                    const std::size_t t_off = tile_row + lut.lut_run_x[r];
+                    const std::size_t l_off = lin_row + static_cast<std::size_t>(r) * run_bytes;
+                    if constexpr (ToTiled) {
+                        std::memcpy(dst + t_off, src + l_off, run_bytes);
+                    } else {
+                        std::memcpy(dst + l_off, src + t_off, run_bytes);
+                    }
+                }
+                if (rem_tail_bytes != 0u) {
+                    const std::size_t t_off = tile_row + lut.lut_run_x[rem_full_runs];
+                    const std::size_t l_off = lin_row + tail_lin_rel;
+                    if constexpr (ToTiled) {
+                        std::memcpy(dst + t_off, src + l_off, rem_tail_bytes);
+                    } else {
+                        std::memcpy(dst + l_off, src + t_off, rem_tail_bytes);
+                    }
+                }
+            }
         }
     }
 }
 
 template <std::uint32_t Bpe>
+void detile_typed(std::span<const std::byte> tiled, std::span<std::byte> linear,
+                  std::uint32_t blocks_w, std::uint32_t blocks_h, std::uint32_t tiles_x) {
+    transfer_typed<Bpe, false>(tiled.data(), linear.data(), blocks_w, blocks_h, tiles_x);
+}
+
+template <std::uint32_t Bpe>
 void tile_typed(std::span<const std::byte> linear, std::span<std::byte> tiled,
                 std::uint32_t blocks_w, std::uint32_t blocks_h, std::uint32_t tiles_x) {
-    constexpr const auto& lut = []() constexpr -> const auto& {
-        if constexpr (Bpe == 1) return swizzle_lut_64k_1bpe;
-        else if constexpr (Bpe == 2) return swizzle_lut_64k_2bpe;
-        else if constexpr (Bpe == 4) return swizzle_lut_64k_4bpe;
-        else if constexpr (Bpe == 8) return swizzle_lut_64k_8bpe;
-        else if constexpr (Bpe == 16) return swizzle_lut_64k_16bpe;
-    }();
-
-    constexpr std::uint32_t tile_w = lut.tile_w;
-    constexpr std::uint32_t tile_h = lut.tile_h;
-
-    for (std::uint32_t y = 0; y < blocks_h; ++y) {
-        const std::uint32_t ty = y / tile_h;
-        const std::uint16_t intra_y = lut.lut_y[y % tile_h];
-        const std::size_t macro_y_base = static_cast<std::size_t>(ty) * tiles_x * tile_size_in_bytes;
-        const std::size_t linear_row = static_cast<std::size_t>(y) * blocks_w * Bpe;
-
-        for (std::uint32_t x = 0; x < blocks_w; ++x) {
-            const std::uint32_t tx = x / tile_w;
-            const std::uint16_t intra_x = lut.lut_x[x % tile_w];
-            const std::size_t tiled_off = macro_y_base + static_cast<std::size_t>(tx) * tile_size_in_bytes + (intra_x | intra_y);
-            const std::size_t linear_off = linear_row + static_cast<std::size_t>(x) * Bpe;
-
-            std::memcpy(&tiled[tiled_off], &linear[linear_off], Bpe);
-        }
-    }
+    transfer_typed<Bpe, true>(linear.data(), tiled.data(), blocks_w, blocks_h, tiles_x);
 }
 
 }  // namespace detail
