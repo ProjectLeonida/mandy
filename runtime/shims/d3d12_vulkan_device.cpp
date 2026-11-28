@@ -23421,6 +23421,8 @@ private:
     std::uint32_t max_shared_ = 0;
 };
 
+std::uint64_t journal_name_context(DeviceState& state);
+
 // gta6rt --precompile-pipelines (d3d12_precompile.h).
 int precompile_compute_pipelines(const PrecompileOptions& options) {
     using Clock = std::chrono::steady_clock;
@@ -23507,13 +23509,18 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
         return 3;
     }
     // A crash is held against what was built: this module file (its size and last write, so a new translation of it
-    // is a new key, with no read of the module) on this device and driver. --all tries every one again.
+    // is a new key, with no read of the module) on this device and driver, compiled the way this run compiles it
+    // (journal_name_context: subgroup sizes, the bindless layout, and NVIDIA's diagnostics config, which
+    // LEONIDA_DEVICE_FAULT=1 and Aftermath turn on and which compiles with shader debug info). A module that killed a
+    // run with diagnostics on is tried again without them, and the other way round. --all tries every one again.
     const std::uint32_t driver = host.state().pso_identity.driver, device_id = host.state().pso_identity.device;
+    const std::uint64_t compile_context = journal_name_context(host.state());
     const auto crash_key = [&](const leonida::ShaderEntry& entry) {
         leonida::pipeline_journal::Hasher hash;
         hash.text("precompile-crash");
         hash.value(driver);
         hash.value(device_id);
+        hash.value(compile_context);
         std::error_code ec;
         const std::filesystem::path file = library->spirv_path(entry);
         const std::uint64_t size = std::filesystem::file_size(file, ec);
