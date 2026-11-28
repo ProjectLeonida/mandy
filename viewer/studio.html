@@ -781,6 +781,7 @@ function loadModel(url, name, category, size) {
     camera.position.set(maxDim * 1.5, maxDim * 1.2, maxDim * 1.8);
     controls.target.set(0, 0, 0);
     controls.update();
+    controls.saveState();
   }, undefined, (err) => {
     if (loadId !== modelLoadId) return;
     bar.style.transform = 'scaleX(0)';
