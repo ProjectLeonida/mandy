@@ -91,8 +91,11 @@ public:
         virtual bool release_ready() = 0;
         // Drops the held operations that wait on `semaphore` (its fence is gone), reporting each.
         virtual void discard_waiting_on(Semaphore semaphore) = 0;
-        // Sequence number (next_seq()) of the oldest held operation, 0 when nothing is held.
+        // Sequence number (next_seq()) of the oldest held operation, 0 when nothing is held. Read-only query.
         virtual std::uint64_t oldest_held_seq() = 0;
+        // Notifies the holder that a real after_held() barrier was registered at `seq` so batches at or before `seq`
+        // will not coalesce with batches enqueued after `seq`. Called with no queue lock held.
+        virtual void note_barrier(std::uint64_t /*seq*/) {}
         // True when this queue has submitted GPU work that has not retired yet. Must not take any QueueHolds or
         // queue lock (called under holders_use_mutex_ shared lock from any_progress()).
         virtual bool has_pending_gpu_work() const { return false; }
@@ -245,10 +248,15 @@ public:
     // last of them, or right here if none is held. Callbacks of one owner run in registration order. Used by the
     // presenter: a Present queued behind held work shows what that work draws.
     void after_held(const void* owner, std::function<void()> fn) {
+        const std::uint64_t seq = current_seq();
         {
             std::lock_guard lock(mutex_);
-            barriers_.push_back({owner, current_seq(), std::move(fn)});
+            barriers_.push_back({owner, seq, std::move(fn)});
             barrier_count_.fetch_add(1, std::memory_order_acq_rel);
+        }
+        if (seq) {
+            std::shared_lock use(holders_use_mutex_);
+            for (Holder* holder : snapshot()) holder->note_barrier(seq);
         }
         pump_ready();
     }

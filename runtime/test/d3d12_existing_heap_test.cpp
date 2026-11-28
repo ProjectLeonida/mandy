@@ -2415,6 +2415,8 @@ int check_mapped_plane_byte(ID3D12Device* device, DWORD modifier) {
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&texture.p)), S_OK);
     void* mapped = nullptr;
     EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    Ref<ID3D12DescriptorHeap> named;  // filled from memory once a descriptor names it
+    EXPECT(!name_texture(device, texture.p, named));
     EXPECT(mapped == pages);
     std::memset(pages, 0x40, size);
     ID3D12CommandList* lists[]{gpu.list.p};

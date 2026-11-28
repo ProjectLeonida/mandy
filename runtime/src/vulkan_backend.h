@@ -4895,21 +4895,39 @@ private:
         }
     }
 
-    // Holder: the sequence number of the oldest active or held operation.
-    std::uint64_t oldest_held_seq() override {
-        // Take state_mutex_ briefly (never held across execution) so reading active_seq_/held_ linearizes with
-        // next_seq() called under state_mutex_ before after_held() reads current_seq(). Also records monotonic
-        // barrier_seq_ and marks the tail of held_ / inbox_ so a Present / after_held() barrier never merges with
-        // batches enqueued after it (including batches in transit between inbox_ and held_).
-        std::uint64_t oldest = 0;
-        std::uint64_t newest = 0;
+    // Holder: records a real after_held() barrier at `seq` so batches at or before `seq` never coalesce with batches
+    // enqueued after `seq` (including batches in transit between inbox_ and held_). Never called by run_barriers().
+    void note_barrier(std::uint64_t seq) override {
+        if (!seq) return;
+        std::uint64_t prev = barrier_seq_.load(std::memory_order_relaxed);
+        while (seq > prev && !barrier_seq_.compare_exchange_weak(prev, seq, std::memory_order_acq_rel)) {}
         {
             std::lock_guard state(state_mutex_);
-            if (!held_.empty()) {
-                held_.back().barrier_after = true;
-                newest = std::max(newest, held_.back().seq);
+            for (auto it = held_.rbegin(); it != held_.rend(); ++it) {
+                if (it->seq <= seq) {
+                    it->barrier_after = true;
+                    break;
+                }
             }
-            newest = std::max(newest, active_end_seq_);
+        }
+        if (async_started_.load(std::memory_order_acquire)) {
+            std::lock_guard lock(inbox_mutex_);
+            for (auto it = inbox_.rbegin(); it != inbox_.rend(); ++it) {
+                if (it->seq <= seq) {
+                    it->barrier_after = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Holder: the sequence number of the oldest active or held operation (read-only query).
+    std::uint64_t oldest_held_seq() override {
+        // Take state_mutex_ briefly (never held across execution) so reading active_seq_/held_ linearizes with
+        // next_seq() called under state_mutex_ before after_held() reads current_seq().
+        std::uint64_t oldest = 0;
+        {
+            std::lock_guard state(state_mutex_);
             const std::uint64_t queued = held_.empty() ? 0 : held_.front().seq;
             oldest = (active_seq_ && queued) ? std::min(active_seq_, queued)
                    : active_seq_             ? active_seq_
@@ -4917,17 +4935,8 @@ private:
         }
         if (async_started_.load(std::memory_order_acquire)) {
             std::lock_guard lock(inbox_mutex_);
-            if (!inbox_.empty()) {
-                inbox_.back().barrier_after = true;
-                newest = std::max(newest, inbox_.back().seq);
-            }
-            newest = std::max(newest, running_end_seq_);
             const std::uint64_t queued = running_seq_ ? running_seq_ : inbox_.empty() ? 0 : inbox_.front().seq;
             if (queued && (!oldest || queued < oldest)) oldest = queued;
-        }
-        if (newest) {
-            std::uint64_t prev = barrier_seq_.load(std::memory_order_relaxed);
-            while (newest > prev && !barrier_seq_.compare_exchange_weak(prev, newest, std::memory_order_acq_rel)) {}
         }
         return oldest;
     }
