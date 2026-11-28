@@ -73,7 +73,7 @@ def verify(job, process, mib, worker):
 
 @contextlib.contextmanager
 def job(mib, worker):
-    if not 0 < mib <= ((1 << (c.sizeof(Z)*8))-1) >> 20:
+    if type(mib) is not int or not 0 < mib <= ((1 << (c.sizeof(Z)*8))-1) >> 20:
         raise ValueError("invalid --memory-mib for Windows job")
     h = check(create_job(None, None))  # unnamed, never inherited; no breakaway
     try:
@@ -98,7 +98,7 @@ def output_lock(path):
     # One nonblocking, no-share open; duplicated into workers so an interrupted parent cannot
     # release exclusivity before the last worker has actually left. Never delete/recreate the lock.
     h = create_file(str(path), 0xc0000000, 0, None, 4, 0x80, None)
-    if h == H(-1).value:
+    if not h or h == H(-1).value:
         raise c.WinError(c.get_last_error())
     try:
         yield h
@@ -121,6 +121,14 @@ def drain(h):
 
 @contextlib.contextmanager
 def start(request, mib, lock):
+    if type(lock) is not int or lock <= 0:
+        raise ValueError("invalid Windows lock handle")
+    if type(mib) is not int or not 0 < mib <= ((1 << (c.sizeof(Z)*8))-1) >> 20:
+        raise ValueError("invalid --memory-mib for Windows job")
+    # A single framed gate validated before creating a job object or spawning a child.
+    gate = (json.dumps([str(request), mib, lock]) + "\n").encode("ascii")
+    if len(gate) > 65536:
+        raise ValueError("compute worker gate too large")
     with job(mib, True) as h:
         si = subprocess.STARTUPINFO(lpAttributeList={"handle_list": [lock]})
         os.set_handle_inheritable(lock, True)
@@ -134,10 +142,7 @@ def start(request, mib, lock):
             check(assign(h, int(p._handle)))
             attached = True
             verify(h, int(p._handle), mib, True)
-            # A single framed gate. EOF, even after a short write, is not permission to start.
-            gate = (json.dumps([str(request), mib, lock])+"\n").encode("ascii")
-            if len(gate)>65536:
-                raise ValueError("compute worker gate too large")
+            # EOF, even after a short write, is not permission to start.
             p.stdin.write(gate)
             p.stdin.close()
             yield p
@@ -169,14 +174,29 @@ def run(requests, mib, lock):
 
 def child():
     line = sys.stdin.buffer.readline(65537)
-    if not line.endswith(b"\n") or len(line)>65536:
+    if not line.endswith(b"\n") or len(line) > 65536:
         raise ValueError("no complete Windows compute gate")
-    request, mib, lock = json.loads(line)
-    # NULL queries this worker's immediate job. No job handle in a worker can keep it alive after
-    # coordinator death. No library/source inputs touched before membership and effective limits.
-    verify(None, current(), mib, True)
-    os.set_handle_inheritable(lock, False)
     try:
+        payload = json.loads(line.decode("ascii"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise ValueError("invalid Windows compute gate") from None
+    if not isinstance(payload, list) or len(payload) != 3:
+        raise ValueError("invalid Windows compute gate")
+    request, mib, lock = payload
+    if (
+        not isinstance(request, str)
+        or not request
+        or type(mib) is not int
+        or mib <= 0
+        or type(lock) is not int
+        or lock <= 0
+    ):
+        raise ValueError("invalid Windows compute gate")
+    try:
+        # NULL queries this worker's immediate job. No job handle in a worker can keep it alive after
+        # coordinator death. No library/source inputs touched before membership and effective limits.
+        verify(None, current(), mib, True)
+        os.set_handle_inheritable(lock, False)
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from translate_pipeline_compute import run_request
         run_request(Path(request))
