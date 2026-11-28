@@ -87,3 +87,22 @@ foreach(bytes -1 1.5 4294967296)
     message(FATAL_ERROR "pc_tail.bytes=${bytes}: expected a malformed index, got ${code}\n${log}")
   endif()
 endforeach()
+
+# mesh_compute must be a JSON object (or null) on an "ms" entry, rejected before Vulkan loads.
+foreach(bad_mc 123 true "\"obj\"" "[]")
+  file(WRITE "${TEST_DIR}/index.json" "{\"example\":{\"stage\":\"ms\",\"mesh_compute\":${bad_mc}}}\n")
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  if(NOT code STREQUAL "2" OR NOT log MATCHES "expected object for mesh_compute at byte [0-9]+")
+    message(FATAL_ERROR "mesh_compute=${bad_mc}: expected a malformed index, got ${code}\n${log}")
+  endif()
+endforeach()
+
+foreach(wrong_stage cs ps vs gs)
+  file(WRITE "${TEST_DIR}/index.json" "{\"example\":{\"mesh_compute\":{},\"stage\":\"${wrong_stage}\"}}\n")
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  if(NOT code STREQUAL "2" OR NOT log MATCHES "mesh_compute requires stage ms at byte [0-9]+")
+    message(FATAL_ERROR "mesh_compute on stage=${wrong_stage}: expected a malformed index, got ${code}\n${log}")
+  endif()
+endforeach()
