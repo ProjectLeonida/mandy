@@ -48,11 +48,33 @@ of the x86-64 → arm64 groundwork.
 - Control flow: direct branches/calls become arm `b`; `ret`, `jmp/call reg` and unknown targets
   load the guest pc into `x16` and go through `rt_dispatch`; guest pc 0 is the exit sentinel.
 
+### Apple Silicon userland runner (Mach-O + `mmap`, JIT-free)
+
+`tools/x64_recomp.py` also builds and executes native arm64 Mach-O binaries on Apple Silicon macOS
+(`build_test_macho`, `run_macho`, `run_macho_result`, and `pack_macho_arm64`), replacing the QEMU kernel
+harness on arm64 Darwin with no JIT entitlement, no external compiler, and no `codesign` dependency:
+
+- **Signed `__TEXT` without JIT:** `pack_macho_arm64` wraps the PIE arm64 image in a 64-bit `MH_EXECUTE`
+  (`MH_PIE`, 4 GiB `__PAGEZERO`, 16 KiB-aligned `__TEXT`/`__LINKEDIT`, `/usr/lib/dyld`,
+  `/usr/lib/libSystem.B.dylib`, `LC_BUILD_VERSION`, `LC_MAIN`) with a pure-Python ad-hoc SHA-256
+  `LC_CODE_SIGNATURE` (`CodeDirectory` v`0x20400`, `CS_ADHOC | CS_LINKER_SIGNED`, 4 KiB code-signing pages).
+- **PIE-safe dispatch:** under `emit_rt(..., darwin=True)`, `rt_lookup` locates `pc_table` with `adr` and
+  adds each entry's signed 64-bit relative offset, so `call`/`ret` and indirect jumps work under any ASLR slide.
+- **Guest memory via `mmap`:** the startup stub maps `DARWIN_RW` (`0x10047000000`, 2 MiB; above macOS arm64's
+  `__TEXT`/stack/dyld-cache/guard/malloc regions) with `MAP_PRIVATE | MAP_ANON` (no `MAP_FIXED`, failing with
+  exit code 77 if the address is unavailable), zeroes guest GPRs and `NZCV`, and optionally maps the input
+  bytes read-only at `guest_va` (`map_code=True` / `--map-code`) so RIP-relative reads execute natively.
+- **CLI:** `python -I tools/x64_recomp.py --emit-macho IN OUT [--base VA] [--rw-base VA] [--map-code]`
+  writes a runnable Mach-O on any OS; `--run FILE [--base VA] [--rw-base VA] [--map-code]` translates and
+  executes it natively on Apple Silicon (or via QEMU when `QEMU_AARCH64` is set or on other hosts).
+
 ## Status and honest limits
 
-- Hand-written fixtures run end-to-end under qemu: arithmetic, loops, taken/not-taken signed and
-  unsigned branches, `setcc`/`cmov`, `adc`/`sbb` carry chains, shifts with CF, `movsx`, high-byte
-  regs, `call`/`ret`/`leave`/`pushf`/`popf`, `rep movsb`, `repne scasb`, moffs/LEA memory
+- Hand-written fixtures run end-to-end under qemu and natively on Apple Silicon macOS (measured on Apple M5,
+  macOS 27.2.1: 46/46 tests in `tests/test_x64_recomp.py` pass without QEMU or JIT, including RIP-relative
+  constant reads, multi-page signed images, and PIE indirect dispatch across ASLR runs): arithmetic, loops,
+  taken/not-taken signed and unsigned branches, `setcc`/`cmov`, `adc`/`sbb` carry chains, shifts with CF,
+  `movsx`, high-byte regs, `call`/`ret`/`leave`/`pushf`/`popf`, `rep movsb`, `repne scasb`, moffs/LEA memory
   addressing, and indirect jumps through the pc table — all hand-assembled, no game bytes.
 - Not covered yet (each is an `unhandled` entry at translate time, not silent wrongness): SIMD/SSE
   beyond decode, x87, `rcl`/`rcr`, `std` (DF=1), system/privileged insns, `int`/`syscall`, far
@@ -60,8 +82,8 @@ of the x86-64 → arm64 groundwork.
   the fixture suite until those lands — `recomp_census.py` is the tool that will measure it.
 - The engine image itself is still not in the repository (the exe obtained so far is a packaging
   probe — `docs/boot.md`), so nothing here has run against real code. First real milestone is the
-  census over a genuine PE, then a same-behaviour run of a real function under qemu against a
-  native x86-64 run.
+  census over a genuine PE, then a same-behaviour run of a real function under qemu or the native Mach-O
+  runner against a native x86-64 run.
 
 ## Next steps
 
@@ -69,5 +91,6 @@ of the x86-64 → arm64 groundwork.
 2. SIMD/SSE emitters (the largest hazard class on any modern binary), then `std`/RCL-RCR.
 3. SEH story: translate `.xdata` prologue ops or run translated code inside a frame the host
    unwinder can walk — needed before C++ `throw` works.
-4. arm64 userland runner (Mach-O + `mmap` JIT-free) to replace the qemu harness on Apple silicon.
+4. Extend the JIT-free Mach-O + `mmap` userland runner from single functions (`build_test_macho`/`run_macho`)
+   to multi-function PE images with import-shim thunks on Apple silicon.
 5. Vulkan backend under MoltenVK on macOS as the first graphics target; Metal backend later.

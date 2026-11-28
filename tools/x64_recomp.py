@@ -27,6 +27,8 @@ Standard library only; runs under `python -I` like the other tools.
 
 CLI:
     python -I tools/x64_recomp.py --disasm <file.bin> [--base VA]
+    python -I tools/x64_recomp.py --emit-macho <out.macho> <file.bin> [--base VA] [--map-code]
+    python -I tools/x64_recomp.py --run <file.bin> [--base VA] [--map-code]
 """
 from __future__ import annotations
 
@@ -36,6 +38,10 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import hashlib  # noqa: E402
+import platform  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # x86-64 decoder
@@ -838,6 +844,10 @@ class Asm:
         self.fixups.append((len(self.words), "tb14", label))
         self.emit(0x37000000 | ((bit & 0x20) << 26) | ((bit & 0x1F) << 19) | rt)
 
+    def adr(self, rd, label):
+        self.fixups.append((len(self.words), "adr21", label))
+        self.emit(0x10000000 | rd)
+
     def br(self, rn):
         self.emit(0xD61F0000 | rn << 5)
 
@@ -863,6 +873,10 @@ class Asm:
                 imm = (tgt - here) >> 2
                 assert -(1 << 13) <= imm < (1 << 13)
                 self.words[idx] |= (imm & 0x3FFF) << 5
+            elif kind == "adr21":
+                imm = tgt - here
+                assert -(1 << 20) <= imm < (1 << 20), f"adr out of range to {lbl}"
+                self.words[idx] |= ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5)
         return b"".join(struct.pack("<I", w) for w in self.words)
 
     # moves
@@ -2342,12 +2356,13 @@ class FunctionTranslator:
 # runtime + ELF
 # ---------------------------------------------------------------------------
 
-def emit_rt(a: Asm, table_va, bare_metal=False, ctx_va=None):
-    """rt_dispatch + rt_mkflags. table_va is the host VA of the pc table.
+def emit_rt(a: Asm, table_va, bare_metal=False, ctx_va=None, darwin=False):
+    """rt_dispatch + rt_mkflags. table_va is the host VA of the pc table (unused when darwin=True).
 
     Exit protocol: guest pc 0 means "leave the translated world".
-      bare_metal=False -> linux svc exit(edi)
-      bare_metal=True  -> semihosting: print "R=xxxxxxxx" (guest edi) then SYS_EXIT
+      bare_metal=False, darwin=False -> linux svc exit(edi)
+      bare_metal=True                -> semihosting: print "R=xxxxxxxx" (guest edi) then SYS_EXIT
+      darwin=True                    -> Darwin PIE: print "R=xxxxxxxx" via SYS_write then SYS_exit(0)
     """
     a.label("rt_dispatch")
     a.cbnz(ADDR_T, "rt_lookup")
@@ -2357,18 +2372,36 @@ def emit_rt(a: Asm, table_va, bare_metal=False, ctx_va=None):
         a.movz(0, 0x18, 0, sf=0)     # SYS_EXIT
         a.li(1, ctx_va + 0x38, pad4=True)  # -> {0x20026, status} block
         a.emit(0xD45E0000)           # hlt #0xF000
+    elif darwin:
+        a.bl("rt_print")
+        a.movz(0, 0, 0, sf=0)        # status = 0
+        a.movz(16, 1, 0)             # SYS_exit
+        a.svc(0x80)
     else:
         a.movz(8, 93, 0)
         a.svc(0)
     a.label("rt_lookup")
-    a.li(LINK, table_va, pad4=True)
-    a.label("rt_scan")
-    a.ldr_post(0, LINK, 16)
-    a.cbz(0, "rt_miss")
-    a.cmp_r(0, ADDR_T)
-    a.bcond("ne", "rt_scan")
-    a.ldur(0, LINK, -8, size=8)
-    a.br(0)
+    if darwin:
+        # PIE-safe lookup: pc_table holds (guest_va, host_offset_from_pc_table).
+        a.adr(LINK, "pc_table")
+        a.mov(1, LINK)
+        a.label("rt_scan")
+        a.ldr_post(0, 1, 16)
+        a.cbz(0, "rt_miss")
+        a.cmp_r(0, ADDR_T)
+        a.bcond("ne", "rt_scan")
+        a.ldur(0, 1, -8, size=8)
+        a.add_r(0, LINK, 0)
+        a.br(0)
+    else:
+        a.li(LINK, table_va, pad4=True)
+        a.label("rt_scan")
+        a.ldr_post(0, LINK, 16)
+        a.cbz(0, "rt_miss")
+        a.cmp_r(0, ADDR_T)
+        a.bcond("ne", "rt_scan")
+        a.ldur(0, LINK, -8, size=8)
+        a.br(0)
     a.label("rt_miss")
     a.brk(1)
     # rt_mkflags: x0=kind (0 add,1 sub,2 logic); NZCV + ctx -> ctx.eflags.
@@ -2409,8 +2442,8 @@ def emit_rt(a: Asm, table_va, bare_metal=False, ctx_va=None):
     a.str(2, CTX_REG, CTX_EFLAGS, size=4)
     a.msr_nzcv(5)
     a.ret(LINK)
-    if bare_metal:
-        # rt_print: w0 -> "R=xxxxxxxx\n\0" at ctx+0x40, SYS_WRITE0 it. clobbers x0-x5.
+    if bare_metal or darwin:
+        # rt_print: w0 -> "R=xxxxxxxx\n\0" at ctx+0x40, then output it. clobbers x0-x5 (and x16 on Darwin).
         a.label("rt_print")
         a.movz(1, 0x3D52, 0, sf=0)            # "R="
         a.str(1, CTX_REG, 0x40, size=2)
@@ -2434,9 +2467,16 @@ def emit_rt(a: Asm, table_va, bare_metal=False, ctx_va=None):
         a.movz(1, 0x0A, 0, sf=0)
         a.add_r(2, 5, CTX_REG, sf=1)
         a.str(1, 2, 0x42, size=1)
-        a.movz(0, 4, 0, sf=0)                 # SYS_WRITE0
-        a.add(1, CTX_REG, 0x40)
-        a.emit(0xD45E0000)                    # hlt #0xF000
+        if darwin:
+            a.movz(0, 1, 0, sf=0)             # fd = 1 (stdout)
+            a.add(1, CTX_REG, 0x40)           # buf = ctx + 0x40
+            a.movz(2, 11, 0, sf=0)            # len = 11 ("R=xxxxxxxx\n")
+            a.movz(16, 4, 0)                  # SYS_write
+            a.svc(0x80)
+        else:
+            a.movz(0, 4, 0, sf=0)             # SYS_WRITE0
+            a.add(1, CTX_REG, 0x40)
+            a.emit(0xD45E0000)                # hlt #0xF000
         a.ret(LINK)
 
 
@@ -2456,16 +2496,26 @@ def _finalize_full(a, rx_base, off):
     """Resolve fixups. Labels are raw word positions; the host VA of a label is
     `rx_base + off + pos` (off = stub/lead-in bytes prepended by the caller)."""
     for idx, kind, lbl in a.fixups:
-        if kind in ("tbl_guest", "tbl_host"):
+        if kind in ("tbl_guest", "tbl_host", "tbl_rel"):
             continue
         tgt = a.labels[lbl]
         here = idx * 4
         if kind == "b26":
-            a.words[idx] |= ((tgt - here) >> 2) & 0x03FFFFFF
+            imm = (tgt - here) >> 2
+            assert -(1 << 25) <= imm < (1 << 25), f"b out of range to {lbl}"
+            a.words[idx] |= imm & 0x03FFFFFF
         elif kind in ("cond19", "cb19"):
-            a.words[idx] |= (((tgt - here) >> 2) & 0x7FFFF) << 5
+            imm = (tgt - here) >> 2
+            assert -(1 << 18) <= imm < (1 << 18), f"cond branch out of range to {lbl}"
+            a.words[idx] |= (imm & 0x7FFFF) << 5
         elif kind == "tb14":
-            a.words[idx] |= (((tgt - here) >> 2) & 0x3FFF) << 5
+            imm = (tgt - here) >> 2
+            assert -(1 << 13) <= imm < (1 << 13), f"tbz/tbnz out of range to {lbl}"
+            a.words[idx] |= (imm & 0x3FFF) << 5
+        elif kind == "adr21":
+            imm = tgt - here
+            assert -(1 << 20) <= imm < (1 << 20), f"adr out of range to {lbl}"
+            a.words[idx] |= ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5)
     for idx, kind, lbl in a.fixups:
         if kind == "tbl_guest":
             a.words[idx] = lbl & 0xFFFFFFFF
@@ -2474,6 +2524,10 @@ def _finalize_full(a, rx_base, off):
             va = rx_base + off + a.labels[lbl]
             a.words[idx] = va & 0xFFFFFFFF
             a.words[idx + 1] = (va >> 32) & 0xFFFFFFFF
+        elif kind == "tbl_rel":
+            rel = (a.labels[lbl] - a.labels["pc_table"]) & 0xFFFFFFFFFFFFFFFF
+            a.words[idx] = rel & 0xFFFFFFFF
+            a.words[idx + 1] = (rel >> 32) & 0xFFFFFFFF
     return b"".join(struct.pack("<I", w) for w in a.words)
 
 
@@ -2624,8 +2678,347 @@ def run_kernel(code, guest_va=0x46000000, timeout=15):
         os.unlink(path)
 
 
-def run_result(code, guest_va=0x46000000):
-    """Run and parse 'R=xxxxxxxx' -> int (the guest edi at exit)."""
+DARWIN_PAGE_SIZE = 0x4000          # Apple Silicon 16 KiB VM page size
+DARWIN_PAGEZERO_SIZE = 0x100000000 # 4 GiB __PAGEZERO enforced by XNU on arm64
+DARWIN_TEXT_BASE = 0x100000000     # unslid __TEXT vmaddr (PIE slides at exec)
+# Above macOS arm64's __TEXT/stack/dyld-cache (< 16 GiB), guard (63..448 GiB) and malloc zones (< 512 GiB):
+DARWIN_GUEST_VA = 0x10046000000    # default high guest VA (1 TiB + 0x46000000)
+DARWIN_RW = 0x10047000000          # guest ctx @ +0, stack @ +0x8000, scratch @ +0x100000
+DARWIN_RW_SIZE = 0x200000          # 2 MiB anonymous RW mapping
+DARWIN_MMAP_FAIL_EXIT = 77
+
+CAN_RUN_MACHO = sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+def _align_up(val, align):
+    return (val + align - 1) & ~(align - 1)
+
+
+def _pad8(data):
+    return data + bytes((-len(data)) & 7)
+
+
+def pack_macho_arm64(code_bytes, ident="leonida_x64"):
+    """Wrap raw PIE arm64 machine code in an ad-hoc signed, JIT-free MH_EXECUTE Mach-O.
+
+    The entry point is offset 0 of `code_bytes`. XNU executes __TEXT directly from the signed
+    binary without MAP_JIT or any external compiler/codesign tool; the ad-hoc SHA-256
+    CodeDirectory (version 0x20400, CS_ADHOC | CS_LINKER_SIGNED) is generated in pure Python.
+    """
+    if not code_bytes or len(code_bytes) % 4 != 0:
+        raise ValueError("code_bytes must be non-empty and 4-byte aligned")
+    if not isinstance(ident, str) or not ident:
+        raise ValueError("ident must be a non-empty string")
+
+    dylinker_name = _pad8(b"/usr/lib/dyld\0")
+    lc_dylinker = struct.pack("<III", 0x0E, 12 + len(dylinker_name), 12) + dylinker_name
+
+    dylib_name = _pad8(b"/usr/lib/libSystem.B.dylib\0")
+    lc_dylib = struct.pack(
+        "<IIIIII", 0x0C, 24 + len(dylib_name), 24, 2, 0x00010000, 0x00010000
+    ) + dylib_name
+
+    # LC_BUILD_VERSION: PLATFORM_MACOS=1, minos=11.0.0, sdk=11.0.0, ntools=0
+    lc_build_ver = struct.pack("<IIIIII", 0x32, 24, 1, 0x000B0000, 0x000B0000, 0)
+    lc_symtab = struct.pack("<IIIIII", 0x02, 24, 0, 0, 0, 0)
+    lc_dysymtab = struct.pack("<II", 0x0B, 80) + bytes(72)
+
+    # mach_header_64 (32) + __PAGEZERO (72) + __TEXT+__text (152) + __LINKEDIT (72)
+    # + dylinker + dylib + build_version + LC_MAIN (24) + symtab + dysymtab + LC_CODE_SIGNATURE (16)
+    hdr_and_cmds_len = (
+        32 + 72 + 152 + 72 + len(lc_dylinker) + len(lc_dylib)
+        + len(lc_build_ver) + 24 + len(lc_symtab) + len(lc_dysymtab) + 16
+    )
+    code_off = _align_up(hdr_and_cmds_len, 16)
+    text_sz = _align_up(code_off + len(code_bytes), DARWIN_PAGE_SIZE)
+    if text_sz >= 0x100000000:
+        raise ValueError("Mach-O __TEXT exceeds 32-bit CodeDirectory codeLimit")
+
+    cs_page_shift = 12  # 4 KiB code-signing page size
+    cs_page_sz = 1 << cs_page_shift
+    n_code_slots = text_sz // cs_page_sz
+
+    ident_bytes = ident.encode("utf-8") + b"\0"
+    cd_hdr_sz = 88      # CodeDirectory v0x20400 (includes execSegBase/Limit/Flags)
+    ident_off = cd_hdr_sz
+    hash_off = ident_off + len(ident_bytes)
+    cd_sz = hash_off + n_code_slots * 32
+    sb_sz = 20 + cd_sz  # SuperBlob header (12) + 1 BlobIndex (8) + CodeDirectory
+    sig_sz = _align_up(sb_sz, 16)
+    linkedit_vmsz = _align_up(sig_sz, DARWIN_PAGE_SIZE)
+
+    def seg64(name, vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects, flags=0):
+        return struct.pack(
+            "<II16sQQQQIIII", 0x19, 72 + nsects * 80,
+            name.encode("ascii").ljust(16, b"\0"),
+            vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects, flags,
+        )
+
+    lc_pagezero = seg64("__PAGEZERO", 0, DARWIN_PAGEZERO_SIZE, 0, 0, 0, 0, 0)
+    sect_text = struct.pack(
+        "<16s16sQQIIIIIIII",
+        b"__text".ljust(16, b"\0"), b"__TEXT".ljust(16, b"\0"),
+        DARWIN_TEXT_BASE + code_off, len(code_bytes), code_off, 2, 0, 0,
+        0x80000400, 0, 0, 0,
+    )
+    lc_text = seg64("__TEXT", DARWIN_TEXT_BASE, text_sz, 0, text_sz, 5, 5, 1) + sect_text
+    lc_linkedit = seg64(
+        "__LINKEDIT", DARWIN_TEXT_BASE + text_sz, linkedit_vmsz, text_sz, sig_sz, 1, 1, 0
+    )
+    lc_main = struct.pack("<IIQQ", 0x80000028, 24, code_off, 0)
+    lc_codesig = struct.pack("<IIII", 0x1D, 16, text_sz, sig_sz)
+
+    cmds = (
+        lc_pagezero + lc_text + lc_linkedit + lc_dylinker + lc_dylib
+        + lc_build_ver + lc_main + lc_symtab + lc_dysymtab + lc_codesig
+    )
+    # MH_MAGIC_64, CPU_TYPE_ARM64, subtype=0, MH_EXECUTE=2, ncmds=10,
+    # flags = MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE (0x200085)
+    mh = struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, 10, len(cmds), 0x00200085, 0)
+
+    prefix = bytearray(mh + cmds)
+    prefix += bytes(code_off - len(prefix))
+    prefix += code_bytes
+    prefix += bytes(text_sz - len(prefix))
+    assert len(prefix) == text_sz
+
+    hashes = b"".join(
+        hashlib.sha256(prefix[i:i + cs_page_sz]).digest()
+        for i in range(0, text_sz, cs_page_sz)
+    )
+    cd = struct.pack(
+        ">IIIIIIIIIBBBBIIIIQQQQ",
+        0xFADE0C02, cd_sz, 0x00020400, 0x00020002,
+        hash_off, ident_off, 0, n_code_slots, text_sz,
+        32, 2, 0, cs_page_shift, 0,
+        0, 0, 0, 0,
+        0, text_sz, 1,
+    ) + ident_bytes + hashes
+    assert len(cd) == cd_sz
+    superblob = struct.pack(">IIIII", 0xFADE0CC0, sb_sz, 1, 0, 20) + cd
+    superblob += bytes(sig_sz - len(superblob))
+    return bytes(prefix) + superblob
+
+
+def build_test_macho(code, guest_va=DARWIN_GUEST_VA, rw_base=DARWIN_RW,
+                     rw_size=DARWIN_RW_SIZE, map_code=False, ident="leonida_x64"):
+    """x86-64 function bytes -> runnable JIT-free arm64 Mach-O executable + translator.
+
+    Layout inside __TEXT (PIE, no hardcoded host VAs):
+      [darwin stub][optional raw guest code][translated code][darwin rt][pc_table]
+    At startup the stub mmaps `rw_base..rw_base+rw_size` (ctx @ +0, guest stack @ +0x8000,
+    scratch @ +0x100000) without MAP_FIXED so it never clobbers dyld or host stack, optionally
+    maps and copies `code` at `guest_va` for RIP-relative reads (`map_code=True`), zeroes all
+    guest GPRs and NZCV, and branches to the translated entry. Guest `ret` off the sentinel
+    stack hits pc 0 -> prints "R=xxxxxxxx\\n" to stdout via SYS_write and exits 0.
+    """
+    if not code:
+        raise ValueError("empty guest code")
+    if rw_base < DARWIN_PAGEZERO_SIZE or rw_base % DARWIN_PAGE_SIZE != 0:
+        raise ValueError(f"rw_base {rw_base:#x} must be >= 4 GiB and 16 KiB aligned")
+    if rw_size < 0x10000 or rw_size % DARWIN_PAGE_SIZE != 0:
+        raise ValueError(f"rw_size {rw_size:#x} must be >= 64 KiB and 16 KiB aligned")
+
+    code_map_base = code_map_size = 0
+    code_in_rw = False
+    if map_code:
+        if guest_va < DARWIN_PAGEZERO_SIZE:
+            raise ValueError(f"map_code requires guest_va >= 4 GiB (got {guest_va:#x})")
+        code_end = guest_va + len(code)
+        rw_end = rw_base + rw_size
+        if guest_va < rw_base + 0x10000 and code_end > rw_base:
+            raise ValueError("guest_va overlaps runtime ctx/stack window")
+        code_map_base = guest_va & ~(DARWIN_PAGE_SIZE - 1)
+        code_map_end = _align_up(code_end, DARWIN_PAGE_SIZE)
+        code_map_size = code_map_end - code_map_base
+        if guest_va >= rw_base + 0x10000 and code_end <= rw_end:
+            code_in_rw = True
+        elif code_map_base < rw_end and code_map_end > rw_base:
+            raise ValueError("guest code pages partially overlap rw_base..rw_base+rw_size")
+
+    good = []
+    for i in disasm(code, guest_va):
+        if i.unknown or i.error:
+            break
+        good.append(i)
+    if not good:
+        raise ValueError("no translatable instructions in guest code")
+    tr = FunctionTranslator(good)
+    tr.translate()
+
+    a = Asm()
+    # 1. mmap anonymous guest RW window at exact rw_base (without MAP_FIXED).
+    a.li(0, rw_base)
+    a.li(1, rw_size)
+    a.movz(2, 3, 0)                      # PROT_READ | PROT_WRITE
+    a.movz(3, 0x1002, 0)                 # MAP_PRIVATE | MAP_ANON
+    a.movn(4, 0)                         # fd = -1
+    a.movz(5, 0, 0)                      # offset = 0
+    a.movz(16, 197, 0)                   # SYS_mmap
+    a.svc(0x80)
+    a.bcond("cs", "darwin_mmap_fail")
+    a.li(1, rw_base)
+    a.cmp_r(0, 1)
+    a.bcond("ne", "darwin_mmap_fail")
+
+    # 2. Optionally map and populate guest code bytes at guest_va (for RIP-relative reads).
+    if map_code:
+        if not code_in_rw:
+            a.li(0, code_map_base)
+            a.li(1, code_map_size)
+            a.movz(2, 3, 0)              # PROT_READ | PROT_WRITE while populating
+            a.movz(3, 0x1002, 0)         # MAP_PRIVATE | MAP_ANON
+            a.movn(4, 0)
+            a.movz(5, 0, 0)
+            a.movz(16, 197, 0)           # SYS_mmap
+            a.svc(0x80)
+            a.bcond("cs", "darwin_mmap_fail")
+            a.li(1, code_map_base)
+            a.cmp_r(0, 1)
+            a.bcond("ne", "darwin_mmap_fail")
+        a.li(0, guest_va)
+        a.adr(1, "guest_code_blob")
+        a.li(2, len(code))
+        a.label("darwin_copy_loop")
+        a.cbz(2, "darwin_copy_done")
+        a.ldr_post(3, 1, 1, size=1)
+        a.str(3, 0, 0, size=1)
+        a.add(0, 0, 1)
+        a.subs(2, 2, 1)
+        a.bcond("ne", "darwin_copy_loop")
+        a.label("darwin_copy_done")
+        if not code_in_rw:
+            a.li(0, code_map_base)
+            a.li(1, code_map_size)
+            a.movz(2, 1, 0)              # PROT_READ (keep guest code non-writable, non-exec)
+            a.movz(16, 74, 0)            # SYS_mprotect
+            a.svc(0x80)
+            a.bcond("cs", "darwin_mmap_fail")
+
+    # 3. Deterministic guest machine state (dyld leaves arbitrary values in callee/caller regs).
+    for g in range(16):
+        if g != 4:
+            a.movz(GMAP[g], 0, 0)
+    a.li(CTX_REG, rw_base)
+    a.li(GMAP[4], rw_base + 0x8000)
+    a.str(31, GMAP[4], 0)                # guest stack top: sentinel ret -> pc 0
+    a.msr_nzcv(31)                       # clear NZCV
+    a.b(f"G{tr.insns[0].addr:x}")
+
+    a.label("darwin_mmap_fail")
+    a.movz(0, DARWIN_MMAP_FAIL_EXIT, 0, sf=0)
+    a.movz(16, 1, 0)                     # SYS_exit
+    a.svc(0x80)
+
+    if map_code:
+        a.label("guest_code_blob")
+        padded = code + bytes((-len(code)) & 3)
+        for off in range(0, len(padded), 4):
+            a.emit(struct.unpack_from("<I", padded, off)[0])
+
+    # 4. Append translated function, shifting its label offsets and fixup word indices.
+    code_word_off = len(a.words)
+    code_byte_off = a.tell()
+    a.words += tr.asm.words
+    for name, pos in tr.asm.labels.items():
+        a.labels[name] = code_byte_off + pos
+    for idx, kind, lbl in tr.asm.fixups:
+        a.fixups.append((code_word_off + idx, kind, lbl))
+
+    # 5. Append Darwin PIE runtime + PC-relative dispatch table.
+    emit_rt(a, 0, darwin=True)
+    a.label("pc_table")
+    for gva in sorted(tr.leaders):
+        a.words += [0, 0, 0, 0]
+        a.fixups += [(len(a.words) - 4, "tbl_guest", gva),
+                     (len(a.words) - 2, "tbl_rel", f"G{gva:x}")]
+    a.words += [0, 0, 0, 0]
+
+    img = _finalize_full(a, 0, 0)
+    return pack_macho_arm64(img, ident=ident), tr
+
+
+def _run_macho_proc(code, guest_va=DARWIN_GUEST_VA, rw_base=DARWIN_RW,
+                    rw_size=DARWIN_RW_SIZE, map_code=False, timeout=15):
+    import subprocess
+    import tempfile
+    if not CAN_RUN_MACHO:
+        raise RuntimeError("native Mach-O execution requires macOS on arm64")
+    macho, tr = build_test_macho(
+        code, guest_va=guest_va, rw_base=rw_base, rw_size=rw_size, map_code=map_code
+    )
+    with tempfile.NamedTemporaryFile(suffix=".macho", delete=False) as f:
+        f.write(macho)
+        path = f.name
+    try:
+        os.chmod(path, 0o755)
+        p = subprocess.run([path], capture_output=True, timeout=timeout)
+        return p.returncode, p.stdout + p.stderr, tr
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def run_macho(code, guest_va=DARWIN_GUEST_VA, rw_base=DARWIN_RW,
+              rw_size=DARWIN_RW_SIZE, map_code=False, timeout=15):
+    """Build + run natively on Apple Silicon macOS via a signed, JIT-free Mach-O binary."""
+    _, out, tr = _run_macho_proc(
+        code, guest_va=guest_va, rw_base=rw_base, rw_size=rw_size,
+        map_code=map_code, timeout=timeout,
+    )
+    return out, tr
+
+
+def run_macho_result(code, guest_va=DARWIN_GUEST_VA, rw_base=DARWIN_RW,
+                     rw_size=DARWIN_RW_SIZE, map_code=False, timeout=15):
+    """Run natively via Mach-O on Apple Silicon and parse 'R=xxxxxxxx' -> (int, translator)."""
+    rc, out, tr = _run_macho_proc(
+        code, guest_va=guest_va, rw_base=rw_base, rw_size=rw_size,
+        map_code=map_code, timeout=timeout,
+    )
+    if rc == DARWIN_MMAP_FAIL_EXIT:
+        raise RuntimeError(
+            f"Mach-O guest mmap failed at rw_base={rw_base:#x} (exit {rc})"
+        )
+    if rc != 0:
+        raise RuntimeError(
+            f"Mach-O runner exited with {rc}: {out!r} (unhandled: {tr.stats['unhandled']})"
+        )
+    for line in out.split():
+        if line.startswith(b"R="):
+            return int(line[2:], 16), tr
+    raise RuntimeError(f"no result in output: {out!r} (unhandled: {tr.stats['unhandled']})")
+
+
+def run_result(code, guest_va=0x46000000, *, backend="auto", rw_base=None, map_code=False):
+    """Run and parse 'R=xxxxxxxx' -> int (the guest edi at exit).
+
+    `backend`:
+      - "auto": native JIT-free Mach-O on Apple Silicon macOS (unless QEMU_AARCH64 is set),
+        otherwise qemu-system-aarch64.
+      - "macho": force native Apple Silicon Mach-O runner.
+      - "qemu": force qemu-system-aarch64 runner.
+    """
+    if backend == "auto":
+        use_macho = CAN_RUN_MACHO and not os.environ.get("QEMU_AARCH64")
+    elif backend == "macho":
+        use_macho = True
+    elif backend == "qemu":
+        use_macho = False
+    else:
+        raise ValueError(f"unknown backend: {backend!r}")
+    if use_macho:
+        return run_macho_result(
+            code, guest_va=guest_va,
+            rw_base=DARWIN_RW if rw_base is None else rw_base,
+            map_code=map_code,
+        )
+    if map_code:
+        raise ValueError("map_code=True is only supported by the Mach-O backend")
+    if rw_base is not None and rw_base != KERNEL_RW:
+        raise ValueError("custom rw_base is only supported by the Mach-O backend")
     out, tr = run_kernel(code, guest_va)
     for line in out.split():
         if line.startswith(b"R="):
@@ -2638,7 +3031,8 @@ def run_result(code, guest_va=0x46000000):
 # ---------------------------------------------------------------------------
 
 def _cmd_disasm(args):
-    data = open(args.file, "rb").read()
+    with open(args.file, "rb") as f:
+        data = f.read()
     for ins in disasm(data, args.base):
         raw = data[ins.addr - args.base:ins.addr - args.base + max(ins.size, 1)]
         print(f"{ins.addr:10x}  {raw.hex():24} {ins}")
@@ -2646,14 +3040,68 @@ def _cmd_disasm(args):
             break
 
 
+def _cmd_emit_macho(args):
+    in_path, out_path = args.emit_macho
+    if same_report_path(in_path, out_path):
+        print("ERROR: --emit-macho output path matches the input file", file=sys.stderr)
+        return 2
+    try:
+        with open(in_path, "rb") as f:
+            code = f.read()
+        base = DARWIN_GUEST_VA if args.base is None else args.base
+        macho, tr = build_test_macho(
+            code, guest_va=base, rw_base=args.rw_base, map_code=args.map_code
+        )
+        with open(out_path, "wb") as f:
+            f.write(macho)
+        if os.name != "nt":
+            os.chmod(out_path, 0o755)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    print(f"wrote {len(macho)} bytes to {out_path} ({tr.stats['insns']} insns, "
+          f"{len(tr.stats['unhandled'])} unhandled)")
+    return 0
+
+
+def _cmd_run(args):
+    try:
+        with open(args.run, "rb") as f:
+            code = f.read()
+        base = DARWIN_GUEST_VA if args.base is None else args.base
+        val, tr = run_result(
+            code, guest_va=base, rw_base=args.rw_base, map_code=args.map_code
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    print(f"R={val:08x} ({tr.stats['insns']} insns, {len(tr.stats['unhandled'])} unhandled)")
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="x86-64 -> arm64 recompiler groundwork")
-    p.add_argument("--disasm", dest="file")
-    p.add_argument("--base", type=lambda s: int(s, 0), default=0)
+    p.add_argument("--disasm", dest="file", help="disassemble raw x86-64 bytes")
+    p.add_argument("--emit-macho", nargs=2, metavar=("IN", "OUT"),
+                   help="build a signed JIT-free arm64 Mach-O executable from raw x86-64 bytes")
+    p.add_argument("--run", metavar="FILE",
+                   help="translate and run raw x86-64 bytes natively on Apple Silicon (or via QEMU)")
+    p.add_argument("--base", type=lambda s: int(s, 0), default=None,
+                   help=f"guest virtual base address (default: 0 for --disasm, {DARWIN_GUEST_VA:#x} for Mach-O/--run)")
+    p.add_argument("--rw-base", type=lambda s: int(s, 0), default=DARWIN_RW,
+                   help=f"guest RW base address for Mach-O output (default: {DARWIN_RW:#x})")
+    p.add_argument("--map-code", action="store_true",
+                   help="map the input bytes at --base for RIP-relative reads in Mach-O/--run")
     args = p.parse_args(argv)
     if args.file:
+        if args.base is None:
+            args.base = 0
         _cmd_disasm(args)
         return 0
+    if args.emit_macho:
+        return _cmd_emit_macho(args)
+    if args.run:
+        return _cmd_run(args)
     p.print_help()
     return 2
 

@@ -42,6 +42,16 @@ def asm(*hexes):
     return bytes.fromhex("".join(h.replace(" ", "") for h in hexes))
 
 
+import hashlib  # noqa: E402
+import struct  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+
+USE_MACHO = x.CAN_RUN_MACHO and not os.environ.get("QEMU_AARCH64")
+CAN_RUN = USE_MACHO or HAS_QEMU
+EXEC_SCRATCH = (x.DARWIN_RW + 0x100000) if USE_MACHO else SCRATCH
+
+
 class DecodeTests(unittest.TestCase):
     def one(self, code, base=0x1000):
         return x.decode_one(code, 0, len(code), base)
@@ -215,7 +225,7 @@ def run(code):
     return x.run_result(code, GUEST_VA)
 
 
-@unittest.skipUnless(HAS_QEMU, "qemu-system-aarch64 not installed")
+@unittest.skipUnless(CAN_RUN, "neither Apple Silicon Mach-O runner nor qemu-system-aarch64 available")
 class ExecTests(unittest.TestCase):
     def test_mov_add_ret(self):
         # mov eax,40; add eax,2; mov edi,eax; ret -> 42
@@ -352,7 +362,7 @@ class ExecTests(unittest.TestCase):
 
     def test_memory(self):
         # mov [scratch],eax; mov edi,[scratch]
-        s = SCRATCH
+        s = EXEC_SCRATCH
         r, _ = run(asm(
             "b8 2a 00 00 00",                    # mov eax,42
             "a3 " + s.to_bytes(8, "little").hex(),  # mov [scratch],eax (moffs)
@@ -362,14 +372,14 @@ class ExecTests(unittest.TestCase):
         self.assertEqual(r, 42)
 
     def test_lea_and_indexed_mem(self):
-        s = SCRATCH
+        s = EXEC_SCRATCH
         r, _ = run(asm(
-            "bf " + s.to_bytes(4, "little").hex(),   # mov edi,scratch
-            "c7 07 63 00 00 00",                      # mov dword [rdi],99
-            "be " + (s + 4).to_bytes(4, "little").hex(),  # mov esi,scratch+4
-            "c7 06 58 02 00 00",                      # mov dword [rsi],600
-            "8b 07",                                   # mov eax,[rdi]   =99
-            "03 06",                                   # add eax,[rsi]   +600
+            "48 bf " + s.to_bytes(8, "little").hex(),          # mov rdi,scratch
+            "c7 07 63 00 00 00",                               # mov dword [rdi],99
+            "48 be " + (s + 4).to_bytes(8, "little").hex(),    # mov rsi,scratch+4
+            "c7 06 58 02 00 00",                               # mov dword [rsi],600
+            "8b 07",                                           # mov eax,[rdi]   =99
+            "03 06",                                           # add eax,[rsi]   +600
             "89 c7",
             "c3"))
         self.assertEqual(r, 699)
@@ -403,29 +413,29 @@ class ExecTests(unittest.TestCase):
         self.assertEqual(r, 99)
 
     def test_rep_movsb(self):
-        s = SCRATCH
-        dst = SCRATCH + 0x100
+        s = EXEC_SCRATCH
+        dst = EXEC_SCRATCH + 0x100
         r, _ = run(asm(
-            "be " + s.to_bytes(4, "little").hex(),          # mov esi,src
-            "c7 06 41 42 43 44",                            # src = 'ABCD'
-            "bf " + dst.to_bytes(4, "little").hex(),        # mov edi,dst
-            "b9 04 00 00 00",                               # mov ecx,4
-            "f3 a4",                                        # rep movsb -> rdi=dst+4
-            "8b 7f fc",                                     # mov edi,[rdi-4] = the 4 copied bytes
+            "48 be " + s.to_bytes(8, "little").hex(),          # mov rsi,src
+            "c7 06 41 42 43 44",                               # src = 'ABCD'
+            "48 bf " + dst.to_bytes(8, "little").hex(),        # mov rdi,dst
+            "b9 04 00 00 00",                                  # mov ecx,4
+            "f3 a4",                                           # rep movsb -> rdi=dst+4
+            "8b 7f fc",                                        # mov edi,[rdi-4] = the 4 copied bytes
             "c3"))
         self.assertEqual(r, 0x44434241)
 
     def test_repne_scasb(self):
-        s = SCRATCH
+        s = EXEC_SCRATCH
         r, _ = run(asm(
-            "bf " + s.to_bytes(4, "little").hex(),          # mov edi,buf
-            "c7 07 58 58 51 00",                            # buf = 'XXQ\0'
-            "b0 51",                                        # mov al,'Q'
-            "b9 05 00 00 00",                               # mov ecx,5
-            "f2 ae",                                        # repne scasb
+            "48 bf " + s.to_bytes(8, "little").hex(),          # mov rdi,buf
+            "c7 07 58 58 51 00",                               # buf = 'XXQ\0'
+            "b0 51",                                           # mov al,'Q'
+            "b9 05 00 00 00",                                  # mov ecx,5
+            "f2 ae",                                           # repne scasb
             # found -> rdi = buf+3, ZF=1 -> sete
-            "0f 94 c0",                                     # sete al
-            "0f b6 f8",                                     # movzx edi,al
+            "0f 94 c0",                                        # sete al
+            "0f b6 f8",                                        # movzx edi,al
             "c3"))
         self.assertEqual(r, 1)
 
@@ -538,6 +548,280 @@ class ExecTests(unittest.TestCase):
         # stc; test eax, eax (CF=0); mov cl, 0; shl eax, cl; setc dl; movzx edi, dl; ret -> 0
         r, _ = run(asm("f9", "85 c0", "b1 00", "d3 e0", "0f 92 c2", "0f b6 fa", "c3"))
         self.assertEqual(r, 0)
+
+
+def _parse_macho_commands(blob):
+    magic, cputype, subtype, filetype, ncmds, sizeofcmds, flags, _ = struct.unpack_from("<8I", blob, 0)
+    cmds = []
+    off = 32
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", blob, off)
+        cmds.append((cmd, blob[off:off + cmdsize]))
+        off += cmdsize
+    return {
+        "magic": magic, "cputype": cputype, "subtype": subtype,
+        "filetype": filetype, "ncmds": ncmds, "sizeofcmds": sizeofcmds,
+        "flags": flags, "cmds": cmds, "cmds_end": off,
+    }
+
+
+class MachOBuilderTests(unittest.TestCase):
+    def test_adr_encoding(self):
+        a = x.Asm()
+        a.label("back")
+        a.nop()
+        a.adr(30, "fwd")     # offset +4: immlo=0, immhi=1
+        a.label("fwd")
+        a.adr(1, "back")     # offset -8: immlo=0, immhi=-2 (0x7fffe)
+        raw = a.finalize()
+        _, w_fwd, w_back = struct.unpack("<3I", raw)
+        self.assertEqual(w_fwd, 0x1000003E)
+        self.assertEqual(w_back, 0x10FFFFC1)
+
+    def _assert_valid_macho(self, blob, expected_min_text_sz=x.DARWIN_PAGE_SIZE):
+        hdr = _parse_macho_commands(blob)
+        self.assertEqual(hdr["magic"], 0xFEEDFACF)
+        self.assertEqual(hdr["cputype"], 0x0100000C)
+        self.assertEqual(hdr["filetype"], 2)
+        self.assertEqual(hdr["flags"] & 0x00200000, 0x00200000)  # MH_PIE
+        self.assertEqual(hdr["cmds_end"], 32 + hdr["sizeofcmds"])
+
+        segs = {}
+        entry_off = None
+        codesig = None
+        dylinker = None
+        dylib = None
+        for cmd, data in hdr["cmds"]:
+            if cmd == 0x19:  # LC_SEGMENT_64
+                name = data[8:24].split(b"\0", 1)[0].decode("ascii")
+                vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects, _ = struct.unpack_from(
+                    "<QQQQIIII", data, 24
+                )
+                segs[name] = (vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects, data)
+            elif cmd == 0x80000028:  # LC_MAIN
+                entry_off = struct.unpack_from("<Q", data, 8)[0]
+            elif cmd == 0x1D:  # LC_CODE_SIGNATURE
+                codesig = struct.unpack_from("<II", data, 8)
+            elif cmd == 0x0E:  # LC_LOAD_DYLINKER
+                str_off = struct.unpack_from("<I", data, 8)[0]
+                dylinker = data[str_off:].split(b"\0", 1)[0]
+            elif cmd == 0x0C:  # LC_LOAD_DYLIB
+                str_off = struct.unpack_from("<I", data, 8)[0]
+                dylib = data[str_off:].split(b"\0", 1)[0]
+
+        self.assertEqual(segs["__PAGEZERO"][:2], (0, x.DARWIN_PAGEZERO_SIZE))
+        text_vm, text_vmsz, text_off, text_fsz, text_maxp, text_initp, text_nsects, text_cmd = segs["__TEXT"]
+        self.assertEqual((text_vm, text_off, text_maxp, text_initp, text_nsects), (x.DARWIN_TEXT_BASE, 0, 5, 5, 1))
+        self.assertEqual(text_vmsz, text_fsz)
+        self.assertGreaterEqual(text_fsz, expected_min_text_sz)
+        self.assertEqual(text_fsz % x.DARWIN_PAGE_SIZE, 0)
+
+        sect_addr, sect_sz, sect_off = struct.unpack_from("<QQI", text_cmd, 72 + 32)
+        self.assertEqual(entry_off, sect_off)
+        self.assertEqual(sect_addr, x.DARWIN_TEXT_BASE + sect_off)
+        self.assertGreater(sect_sz, 0)
+        self.assertEqual(dylinker, b"/usr/lib/dyld")
+        self.assertEqual(dylib, b"/usr/lib/libSystem.B.dylib")
+
+        self.assertIsNotNone(codesig)
+        sig_off, sig_sz = codesig
+        self.assertEqual(sig_off, text_fsz)
+        self.assertEqual(sig_off + sig_sz, len(blob))
+        self.assertEqual(segs["__LINKEDIT"][2:6], (sig_off, sig_sz, 1, 1))
+
+        # Verify SuperBlob + CodeDirectory SHA-256 hashes over every 4 KiB page.
+        sb_magic, _, sb_count, slot_type, slot_off = struct.unpack_from(">IIIII", blob, sig_off)
+        self.assertEqual((sb_magic, sb_count, slot_type), (0xFADE0CC0, 1, 0))
+        cd_at = sig_off + slot_off
+        (cd_magic, _, cd_ver, cd_flags, hash_off, _, n_special, n_slots, code_limit,
+         hash_sz, hash_type, _, page_shift) = struct.unpack_from(">IIIIIIIIIBBBB", blob, cd_at)
+        self.assertEqual((cd_magic, cd_ver, cd_flags, n_special), (0xFADE0C02, 0x00020400, 0x00020002, 0))
+        self.assertEqual((hash_sz, hash_type, page_shift), (32, 2, 12))
+        self.assertEqual(code_limit, text_fsz)
+        self.assertEqual(n_slots, text_fsz // 4096)
+        for slot in range(n_slots):
+            expected = hashlib.sha256(blob[slot * 4096:(slot + 1) * 4096]).digest()
+            actual = blob[cd_at + hash_off + slot * 32:cd_at + hash_off + (slot + 1) * 32]
+            self.assertEqual(actual, expected, f"page {slot} SHA-256 mismatch")
+
+    def test_macho_structure_and_code_signature(self):
+        macho, tr = x.build_test_macho(asm("bf 2a 00 00 00", "c3"))
+        self.assertEqual(tr.stats["unhandled"], [])
+        self._assert_valid_macho(macho, expected_min_text_sz=x.DARWIN_PAGE_SIZE)
+
+    def test_macho_multipage_signature(self):
+        # 2,200 x (add eax, 1) -> > 16 KiB of arm64 instructions -> 32 KiB __TEXT (8 CS pages).
+        code = (asm("83 c0 01") * 2200) + asm("89 c7", "c3")
+        macho, tr = x.build_test_macho(code)
+        self.assertEqual(tr.stats["unhandled"], [])
+        self._assert_valid_macho(macho, expected_min_text_sz=2 * x.DARWIN_PAGE_SIZE)
+
+    def test_macho_pie_relative_pc_table(self):
+        code = asm("e8 01 00 00 00", "c3", "bf 09 00 00 00", "c3")
+        macho, tr = x.build_test_macho(code, guest_va=x.DARWIN_GUEST_VA)
+        hdr = _parse_macho_commands(macho)
+        text_cmd = [d for c, d in hdr["cmds"] if c == 0x19 and d[8:14] == b"__TEXT"][0]
+        _, sect_sz, sect_off = struct.unpack_from("<QQI", text_cmd, 72 + 32)
+        img = macho[sect_off:sect_off + sect_sz]
+        # pc_table ends with a 16-byte zero sentinel; one entry per sorted leader precedes it.
+        n = len(tr.leaders)
+        tbl_off = len(img) - (n + 1) * 16
+        sentinel = struct.unpack_from("<QQ", img, len(img) - 16)
+        self.assertEqual(sentinel, (0, 0))
+        seen = []
+        for i in range(n):
+            gva, rel = struct.unpack_from("<Qq", img, tbl_off + i * 16)
+            seen.append(gva)
+            self.assertLess(rel, 0)
+            self.assertGreaterEqual(tbl_off + rel, 0)
+            self.assertEqual((tbl_off + rel) % 4, 0)
+        self.assertEqual(seen, sorted(tr.leaders))
+
+    def test_macho_validation_errors(self):
+        with self.assertRaises(ValueError):
+            x.build_test_macho(b"")
+        with self.assertRaises(ValueError):
+            x.build_test_macho(asm("06"))  # unknown opcode in 64-bit mode
+        with self.assertRaises(ValueError):
+            x.build_test_macho(asm("66"))  # truncated prefix (DecodeError)
+        with self.assertRaises(ValueError):
+            x.build_test_macho(asm("c3"), rw_base=0x47000000)
+        with self.assertRaises(ValueError):
+            x.build_test_macho(asm("c3"), rw_base=x.DARWIN_RW + 0x1000)
+        with self.assertRaises(ValueError):
+            x.build_test_macho(asm("c3"), rw_size=0x4000)
+        with self.assertRaises(ValueError):
+            x.build_test_macho(asm("c3"), guest_va=0x46000000, map_code=True)
+        with self.assertRaises(ValueError):
+            x.build_test_macho(asm("c3"), guest_va=x.DARWIN_RW + 0x4000, map_code=True)
+        with self.assertRaises(ValueError):
+            x.build_test_macho(
+                asm("bf 2a 00 00 00", "c3"),
+                guest_va=x.DARWIN_RW + x.DARWIN_RW_SIZE - 2,
+                map_code=True,
+            )
+        with self.assertRaises(ValueError):
+            x.pack_macho_arm64(b"\x00\x00\x00")
+        with self.assertRaises(ValueError):
+            x.run_result(asm("c3"), backend="bogus")
+
+    def test_cli_emit_macho_and_same_path_guard(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as td:
+            in_path = os.path.join(td, "fn.bin")
+            out_path = os.path.join(td, "fn.macho")
+            payload = asm("bf 2a 00 00 00", "c3")
+            with open(in_path, "wb") as f:
+                f.write(payload)
+            # Refuses to overwrite its own input file.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(x.main(["--emit-macho", in_path, in_path]), 2)
+            self.assertIn("ERROR:", err.getvalue())
+            with open(in_path, "rb") as f:
+                self.assertEqual(f.read(), payload)
+            # Writes a valid Mach-O to a distinct path.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(x.main(["--emit-macho", in_path, out_path]), 0)
+            self.assertIn("wrote", out.getvalue())
+            with open(out_path, "rb") as f:
+                self._assert_valid_macho(f.read())
+
+
+@unittest.skipUnless(x.CAN_RUN_MACHO, "requires Apple Silicon macOS")
+class MachONativeTests(unittest.TestCase):
+    def test_codesign_validates_emitted_binary(self):
+        import shutil as _shutil
+        codesign = _shutil.which("codesign")
+        if not codesign:
+            self.skipTest("codesign tool not present")
+        macho, _ = x.build_test_macho(asm("bf 2a 00 00 00", "c3"))
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "signed.macho")
+            with open(p, "wb") as f:
+                f.write(macho)
+            os.chmod(p, 0o755)
+            res = subprocess.run([codesign, "-vvv", p], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_rip_relative_constant_read(self):
+        # 00: mov edi, [rip+1] -> reads 0x12345678 placed right after ret
+        code = asm("8b 3d 01 00 00 00", "c3", "78 56 34 12")
+        r, _ = x.run_macho_result(code, guest_va=x.DARWIN_GUEST_VA, map_code=True)
+        self.assertEqual(r, 0x12345678)
+
+    def test_rip_relative_code_inside_rw_window(self):
+        # Guest code placed inside rw_base+0x20000 shares the RW mapping without a second mmap.
+        code = asm("8b 3d 01 00 00 00", "c3", "ef be ad de")
+        r, _ = x.run_macho_result(code, guest_va=x.DARWIN_RW + 0x20000, map_code=True)
+        self.assertEqual(r, 0xDEADBEEF)
+
+    def test_multipage_native_execution(self):
+        # Runs across > 16 KiB of translated arm64 code (multiple 4 KiB code-signing pages).
+        code = (asm("83 c0 01") * 2200) + asm("89 c7", "c3")
+        r, _ = x.run_macho_result(code)
+        self.assertEqual(r, 2200)
+
+    def test_pie_indirect_dispatch_across_aslr_runs(self):
+        # Exercises call/ret and indirect jmp through the PIE-relative pc_table across fresh slides.
+        gva = x.DARWIN_GUEST_VA
+        # 00: call +12 -> 0x11 ; 05: mov rax, gva+0x17 ; 0f: jmp rax ;
+        # 11: mov ebx, 30 ; 16: ret ; 17: lea edi, [rbx+12] ; 1a: ret
+        code = asm(
+            "e8 0c 00 00 00",
+            "48 b8 " + (gva + 0x17).to_bytes(8, "little").hex(),
+            "ff e0",
+            "bb 1e 00 00 00",
+            "c3",
+            "8d 7b 0c",
+            "c3",
+        )
+        for _ in range(3):
+            r, _ = x.run_macho_result(code, guest_va=gva)
+            self.assertEqual(r, 42)
+
+    def test_clean_initial_guest_registers(self):
+        # OR all non-RSP guest GPRs into edi; dyld passes non-zero argc/argv/envp at LC_MAIN,
+        # so any unzeroed guest register would produce a non-zero result.
+        code = asm(
+            "48 09 c7",  # or rdi, rax
+            "48 09 cf",  # or rdi, rcx
+            "48 09 d7",  # or rdi, rdx
+            "48 09 df",  # or rdi, rbx
+            "48 09 ef",  # or rdi, rbp
+            "48 09 f7",  # or rdi, rsi
+            "4c 09 c7",  # or rdi, r8
+            "4c 09 cf",  # or rdi, r9
+            "4c 09 d7",  # or rdi, r10
+            "4c 09 df",  # or rdi, r11
+            "4c 09 e7",  # or rdi, r12
+            "4c 09 ef",  # or rdi, r13
+            "4c 09 f7",  # or rdi, r14
+            "4c 09 ff",  # or rdi, r15
+            "c3",
+        )
+        r, _ = x.run_macho_result(code)
+        self.assertEqual(r, 0)
+
+    def test_unhandled_instruction_traps_cleanly(self):
+        # fldz (d9 e8) emits brk in the translated image; child traps without crashing Python.
+        with self.assertRaises(RuntimeError) as cm:
+            x.run_macho_result(asm("d9 e8", "c3"))
+        self.assertIn("exited with", str(cm.exception))
+
+    def test_cli_run_native(self):
+        with tempfile.TemporaryDirectory() as td:
+            in_path = os.path.join(td, "fn.bin")
+            with open(in_path, "wb") as f:
+                f.write(asm("bf 2a 00 00 00", "c3"))
+            p = subprocess.run(
+                [sys.executable, "-I", os.path.join(TOOLS_DIR, "x64_recomp.py"), "--run", in_path],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("R=0000002a", p.stdout)
 
 
 if __name__ == "__main__":
