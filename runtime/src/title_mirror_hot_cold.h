@@ -702,9 +702,9 @@ private:
                     }
 
                     // Short-lived VirtualQuery cache within this lock hold: if a uniform MEM_COMMIT (writable or
-                    // read-only) or MEM_RESERVE region extends past the current sub-run into subsequent pages in the
-                    // same batch and no title map change overlapped it, reuse its state/protection instead of issuing
-                    // a redundant VirtualQuery syscall.
+                    // PAGE_NOACCESS — never PAGE_READONLY/PAGE_EXECUTE_READ), MEM_RESERVE, or MEM_FREE region extends
+                    // past the current sub-run into subsequent pages in the same batch and no title map change
+                    // overlapped it, reuse its state/protection instead of issuing a redundant VirtualQuery syscall.
                     std::uintptr_t cached_lo = 0;
                     std::uintptr_t cached_hi = 0;
                     DWORD cached_state = 0;
@@ -823,12 +823,22 @@ private:
                                             sub_start = bridge_end_eff;
                                             continue;
                                         }
-                                        // Unexpected prior protection: restore `old` and fall back to eligible-only.
-                                        DWORD dummy{};
-                                        ++arm_stats.vp_calls;
-                                        VirtualProtect(reinterpret_cast<void*>(span_lo), span_hi - span_lo, old,
-                                                       &dummy);
+                                        // Unexpected prior protection: `old` describes tile 0 (`span_lo`) only.
+                                        // Restore eligible tiles individually (tile 0 to `old`, other eligible tiles
+                                        // to their verified `kp`), leaving already-armed gap tiles at `kg`.
+                                        for (std::size_t k = sub_start; k < bridge_end_eff; ++k) {
+                                            if (!run_eligible_[k]) continue;
+                                            DWORD dummy{};
+                                            ++arm_stats.vp_calls;
+                                            VirtualProtect(reinterpret_cast<void*>(batch_pages[k]), kTile,
+                                                           k == sub_start ? old : kp, &dummy);
+                                        }
                                     }
+                                    for (auto cit = s.cells.lower_bound(span_lo);
+                                         cit != s.cells.end() && cit->first < span_hi; ++cit) {
+                                        clear_cell_known(cit->second);
+                                    }
+                                    cached_hi = 0;
                                 }
                             }
                         }
@@ -889,10 +899,14 @@ private:
                                                 continue;
                                             }
                                             // Unexpected prior protection (caller bypassed title_memory_map::changed):
-                                            // restore `old` before falling through to VirtualQuery + VirtualProtect.
-                                            DWORD dummy{};
-                                            ++arm_stats.vp_calls;
-                                            VirtualProtect(reinterpret_cast<void*>(p), end - p, old, &dummy);
+                                            // `old` describes tile 0 (`p`) only; restore tile 0 to `old` and remaining
+                                            // tiles to their verified `fkp` before falling through to VirtualQuery.
+                                            for (std::uintptr_t q = p; q < end; q += kTile) {
+                                                DWORD dummy{};
+                                                ++arm_stats.vp_calls;
+                                                VirtualProtect(reinterpret_cast<void*>(q), kTile, q == p ? old : fkp,
+                                                               &dummy);
+                                            }
                                         }
                                         // Unexpected protection or VirtualProtect failure: invalidate cached protection
                                         // for these tiles and fall through to VirtualQuery + VirtualProtect.
@@ -977,8 +991,15 @@ private:
                                 state = m.State;
                                 protect = m.Protect;
                                 guarded = geometry_writes::read_only(m.Protect);
-                                if (region_end > sub_hi &&
-                                    (state == MEM_RESERVE || (state == MEM_COMMIT && !(protect & PAGE_GUARD)))) {
+                                const DWORD base_prot = protect & 255u;
+                                // Intra-pass region cache: MEM_RESERVE, MEM_FREE, PAGE_NOACCESS, and writable
+                                // MEM_COMMIT. NEVER cache PAGE_READONLY / PAGE_EXECUTE_READ (ShadowPages::reopen()
+                                // bypasses map_gen, so a concurrent RO -> RW reopen could mark a writable tile armed).
+                                const bool cacheable_region =
+                                    state == MEM_RESERVE || state == MEM_FREE ||
+                                    (state == MEM_COMMIT && !(protect & PAGE_GUARD) &&
+                                     (guarded != 0 || base_prot == PAGE_NOACCESS));
+                                if (cacheable_region && region_end > sub_hi) {
                                     cached_lo = p;
                                     cached_hi = region_end;
                                     cached_state = state;

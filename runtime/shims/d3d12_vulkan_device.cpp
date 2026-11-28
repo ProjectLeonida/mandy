@@ -2038,10 +2038,21 @@ struct TitleTextureCells {
                                         sub_start = bridge_end_eff;
                                         continue;
                                     }
-                                    // Unexpected prior protection: restore `old` and fall back to eligible-only.
-                                    DWORD dummy{};
-                                    VirtualProtect(reinterpret_cast<void*>(span_lo), span_hi - span_lo, old, &dummy);
+                                    // Unexpected prior protection: `old` describes tile 0 (`span_lo`) only.
+                                    // Restore eligible tiles individually (tile 0 to `old`, other eligible tiles
+                                    // to their verified `kp`), leaving already-armed gap tiles at `kg`.
+                                    for (std::size_t k = sub_start; k < bridge_end_eff; ++k) {
+                                        if (!run_eligible_[k]) continue;
+                                        DWORD dummy{};
+                                        VirtualProtect(reinterpret_cast<void*>(batch_tiles[k]), kTile,
+                                                       k == sub_start ? old : kp, &dummy);
+                                    }
                                 }
+                                for (auto cit = s.cells.lower_bound(span_lo);
+                                     cit != s.cells.end() && cit->first < span_hi; ++cit) {
+                                    clear_cell_known(cit->second);
+                                }
+                                cached_hi = 0;
                             }
                         }
                     }
@@ -2096,9 +2107,13 @@ struct TitleTextureCells {
                                             continue;
                                         }
                                         // Unexpected prior protection (caller bypassed title_memory_map::changed):
-                                        // restore `old` before falling through to VirtualQuery + VirtualProtect.
-                                        DWORD dummy{};
-                                        VirtualProtect(reinterpret_cast<void*>(p), end - p, old, &dummy);
+                                        // `old` describes tile 0 (`p`) only; restore tile 0 to `old` and remaining
+                                        // tiles to their verified `fkp` before falling through to VirtualQuery.
+                                        for (std::uintptr_t q = p; q < end; q += kTile) {
+                                            DWORD dummy{};
+                                            VirtualProtect(reinterpret_cast<void*>(q), kTile, q == p ? old : fkp,
+                                                           &dummy);
+                                        }
                                     }
                                     for (std::size_t t = tile_k; t < fast_end; ++t) clear_cell_known(*batch_cells[t]);
                                     cached_hi = 0;
@@ -5910,6 +5925,7 @@ struct DeviceState {
         SRWLOCK feed_lock = SRWLOCK_INIT;
         leonida::host_heap::vector<Change> feed;
         std::atomic<bool> feed_pending{false};
+        std::atomic<std::uint64_t> feed_seq{0};
         std::atomic<std::uint64_t> space_gen_atomic{0};
         std::atomic<bool> in_place_pending{false};
         std::atomic<std::uint32_t> refresh_in_flight{0};
@@ -6033,6 +6049,7 @@ struct DeviceState {
         AcquireSRWLockExclusive(&m.feed_lock);
         m.feed.push_back({page, frame, keep});
         m.feed_pending.store(true, std::memory_order_release);
+        m.feed_seq.fetch_add(1, std::memory_order_release);
         ReleaseSRWLockExclusive(&m.feed_lock);
     }
 
@@ -12567,13 +12584,24 @@ struct DeviceState {
                     return true;
                 return false;
             };
+            const auto sv_is_live = [&](const SharedViewEntry& sv) -> bool {
+                if (gc_live_addrs_scratch.empty()) return false;
+                if (addr_is_live(sv.entry.address)) return true;
+                for (const auto& k : sv.keys) {
+                    if (const auto e_it = image_entries.find(k); e_it != image_entries.end()) {
+                        if (e_it->second.address != sv.entry.address && addr_is_live(e_it->second.address))
+                            return true;
+                    }
+                }
+                return false;
+            };
             for (const auto& [vk_key, sv] : shared_views) {
                 if (sv.entry.dimension != dimension) continue;
                 if (!is_evictable_sv(sv)) continue;
                 if (sv.last_touch_ticket > completed) continue;
                 if (skip_view_key && vk_key == *skip_view_key) continue;
                 if (need_storage && sv.entry.index >= storage_cap) continue;
-                if (addr_is_live(sv.entry.address)) continue;
+                if (sv_is_live(sv)) continue;
                 gc_candidates_scratch.emplace_back(&vk_key, sv.last_seen_gen);
             }
         }
@@ -20915,6 +20943,7 @@ public:
             std::condition_variable cv;
             bool in_flight = false;
             std::uint64_t completed_seq = 0;
+            std::uint64_t completed_feed_seq = 0;
             std::uint64_t ran = 0;
             std::uint64_t coalesced = 0;
             std::uint64_t wait_count = 0;
@@ -20957,6 +20986,7 @@ public:
             struct LeaderGuard {
                 BeforeExecuteCoalescer* c = nullptr;
                 std::uint64_t pass_seq = 0;
+                std::uint64_t pass_feed_seq = 0;
                 std::uint64_t wb_ns = 0;
                 std::uint64_t mirror_ns = 0;
                 std::uint64_t shadows_ns = 0;
@@ -20972,6 +21002,7 @@ public:
                     {
                         std::lock_guard lock(c->mutex);
                         if (completed && pass_seq > c->completed_seq) c->completed_seq = pass_seq;
+                        if (completed && pass_feed_seq > c->completed_feed_seq) c->completed_feed_seq = pass_feed_seq;
                         ++c->ran;
                         c->wb_ns += wb_ns;
                         c->mirror_ns += mirror_ns;
@@ -21016,18 +21047,35 @@ public:
                 }
             } leader_guard{};
             if (use_coalesce) {
+                // Do not fast-skip while a page-mirror remap feed is pending, being drained
+                // (`refresh_in_flight > 0`; mirrors refresh_page_mirror's own settle check since feed_pending
+                // clears at drain start before chunk creation), or drained by an in-flight leader whose sparse
+                // binds, texture refresh, and shadow/heap refilter have not yet completed (`completed_feed_seq`).
+                const auto feed_settled = [&] {
+                    return !state_.page_mirror.feed_pending.load(std::memory_order_acquire) &&
+                           state_.page_mirror.refresh_in_flight.load(std::memory_order_seq_cst) == 0;
+                };
+                const std::uint64_t req_feed_seq = state_.page_mirror.feed_seq.load(std::memory_order_acquire);
                 std::unique_lock lock(coalescer->mutex);
-                while (coalescer->in_flight && coalescer->completed_seq < req_seq) {
+                for (;;) {
+                    if (coalescer->completed_seq >= req_seq &&
+                        coalescer->completed_feed_seq >= req_feed_seq &&
+                        feed_settled()) {
+                        ++coalescer->coalesced;
+                        return;
+                    }
+                    if (!coalescer->in_flight) break;
                     const std::int64_t wait_start = phases::now_ns();
-                    coalescer->cv.wait(lock, [&] { return !coalescer->in_flight || coalescer->completed_seq >= req_seq; });
+                    coalescer->cv.wait(lock, [&] {
+                        return !coalescer->in_flight ||
+                               (coalescer->completed_seq >= req_seq &&
+                                coalescer->completed_feed_seq >= req_feed_seq &&
+                                feed_settled());
+                    });
                     const std::uint64_t waited = std::uint64_t(phases::now_ns() - wait_start);
                     phases::add_part(phases::part_lock_wait, waited);
                     ++coalescer->wait_count;
                     coalescer->wait_ns += waited;
-                }
-                if (coalescer->completed_seq >= req_seq) {
-                    ++coalescer->coalesced;
-                    return;
                 }
                 coalescer->in_flight = true;
                 leader_guard.c = coalescer.get();
@@ -21043,10 +21091,12 @@ public:
                 state_.write_back_titles();
                 t1 = phases::now_ns();
                 if (use_coalesce) {
-                    // Acquire current visibility epoch AFTER write_back_titles() and immediately BEFORE scanning any
-                    // CPU memory so batches enqueued during write_back_titles() coalesce into this single pass.
+                    // Acquire current visibility epoch and feed_seq AFTER write_back_titles() and immediately BEFORE
+                    // refresh_page_mirror() so batches enqueued during write_back_titles() coalesce into this single
+                    // pass and completed_feed_seq covers every remap drained by refresh_page_mirror().
                     pass_seq = (std::max)(req_seq, state_.context->current_visibility_seq());
                     leader_guard.pass_seq = pass_seq;
+                    leader_guard.pass_feed_seq = state_.page_mirror.feed_seq.load(std::memory_order_acquire);
                 }
                 mirror_serial = leonida::geometry_writes::state().serial.load(std::memory_order_acquire);
                 state_.refresh_page_mirror();  // what this submission's title-written addresses read
@@ -21687,12 +21737,23 @@ public:
                     std::lock_guard lock(st->descriptor_mutex);
                     if (st->bindless) {
                         const auto dimension = static_cast<leonida::ImageDimension>(dim);
+                        const bool check_2d_mirror = dimension != leonida::ImageDimension::dim_2d;
                         const bool was_sampled_full = st->bindless->free_images(dimension) == 0;
                         const bool was_storage_full = st->bindless->storage_capacity(dimension) > 0 &&
                                                       st->bindless->free_storage_images(dimension) == 0;
+                        const bool was_2d_sampled_full =
+                            check_2d_mirror && st->bindless->free_images(leonida::ImageDimension::dim_2d) == 0;
+                        const bool was_2d_storage_full =
+                            check_2d_mirror &&
+                            st->bindless->storage_capacity(leonida::ImageDimension::dim_2d) > 0 &&
+                            st->bindless->free_storage_images(leonida::ImageDimension::dim_2d) == 0;
                         st->bindless->remove_image(dimension, idx);
-                        notify_room = (was_sampled_full && st->bindless->free_images(dimension) > 0) ||
-                                      (was_storage_full && st->bindless->free_storage_images(dimension) > 0);
+                        notify_room =
+                            (was_sampled_full && st->bindless->free_images(dimension) > 0) ||
+                            (was_storage_full && st->bindless->free_storage_images(dimension) > 0) ||
+                            (was_2d_sampled_full && st->bindless->free_images(leonida::ImageDimension::dim_2d) > 0) ||
+                            (was_2d_storage_full &&
+                             st->bindless->free_storage_images(leonida::ImageDimension::dim_2d) > 0);
                     }
                 }
                 if (notify_room) st->note_slot_change(leonida::SlotChange::texture_room, 0, 1);
