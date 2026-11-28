@@ -96,12 +96,20 @@ class SampledDynamicIndex(unittest.TestCase):
 
     def test_sample_with_literal_sampler_still_indexes_both_arrays_dynamically(self):
         fixture = Path(__file__).with_name("fixtures") / "sampled_dynamic_index.asm"
-        asm = support.translate_lines("ps_dynamic_index", fixture.read_text(encoding="utf-8").splitlines())
+        lines = fixture.read_text(encoding="utf-8").splitlines()
+        asm = support.translate_lines("ps_dynamic_index", lines)
         self.check_accesses(asm, (0, 1))
         self.assertIn("OpSampledImage", asm)
         self.assertIn("OpImageSampleExplicitLod", asm)
+        # Bilinear literal S# (word2 = 0x14500000) is float-only (Item 3B.6), so dead uint/sint aliases are elided.
+        for signedness in (1, 2):
+            self.assertNotIn(f"%itx{signedness}_0", asm)
+        # Point-filtered literal S# (word2 = 0) retains UINT/SINT aliases of binding 0, still dynamically indexed.
+        point_lines = [ln.replace("0x14500000", "0x0") for ln in lines]
+        asm_point = support.translate_lines("ps_dynamic_index_pt", point_lines)
+        self.check_accesses(asm_point, (0, 1))
         for signedness in (1, 2):  # UINT/SINT alias the same sampled binding as the float view.
-            self.assertRegex(asm, rf"OpAccessChain %_ptr_UC_itx{signedness}_0 %itx{signedness}_0 ")
+            self.assertRegex(asm_point, rf"OpAccessChain %_ptr_UC_itx{signedness}_0 %itx{signedness}_0 ")
 
     def test_fetch_and_query_paths(self):
         for op, dim, coords, sampler, expected_op, bindings in (
