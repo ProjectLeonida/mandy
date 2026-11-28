@@ -245,6 +245,12 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
     vkGetPhysicalDeviceFeatures2(pd, &have);
+    // The translated vs_ids reads BaseVertex / BaseInstance (DrawParameters) for the zero-based v0 / v3, as in
+    // vk_harness and vk_sampler_test. Queried on its own vkGetPhysicalDeviceFeatures2 call: without the feature,
+    // creating the VS module breaks VUID-VkShaderModuleCreateInfo-pCode-08740 under validation.
+    VkPhysicalDeviceVulkan11Features have11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceFeatures2 have11q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have11};
+    vkGetPhysicalDeviceFeatures2(pd, &have11q);
     // Name the missing feature(s): one message per run is not enough to tell which one stopped it.
     std::string missing;
     const auto need = [&missing](bool present, const char* name) {
@@ -267,7 +273,10 @@ int main(int argc, char** argv) {
         have12.descriptorBindingSampledImageUpdateAfterBind && have12.descriptorBindingStorageImageUpdateAfterBind &&
             have12.descriptorBindingStorageBufferUpdateAfterBind,
         have12.descriptorBindingPartiallyBound == VK_TRUE};
+    VkPhysicalDeviceVulkan11Features enable11{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+                                              .shaderDrawParameters = have11.shaderDrawParameters};
     VkPhysicalDeviceVulkan12Features enable12{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                              .pNext = &enable11,
                                               .descriptorIndexing = have12.descriptorIndexing,
                                               .descriptorBindingSampledImageUpdateAfterBind = device_flags.update_after_bind,
                                               .descriptorBindingStorageImageUpdateAfterBind = device_flags.update_after_bind,
