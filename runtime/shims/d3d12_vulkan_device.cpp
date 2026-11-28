@@ -3744,27 +3744,31 @@ struct DeviceState {
         if (!leonida::title_va_aliases().title_memory(va, lo, hi) || va >= hi) return;
         const std::uint64_t end = va + std::min(bytes, hi - va);
         std::lock_guard lock(title_write_back_mutex);
-        auto it = title_write_back.lower_bound(va);
-        if (it != title_write_back.begin()) {
-            auto previous = std::prev(it);
-            if (previous->second >= va) {
-                if (previous->second < end) previous->second = end;
-                return;
-            }
+        auto first = title_write_back.lower_bound(va);
+        if (first != title_write_back.begin() && std::prev(first)->second >= va) --first;
+        if (first != title_write_back.end() && first->first <= va && first->second >= end) return;
+
+        // Charge only newly covered bytes, even if this write joins several queued ranges.
+        std::uint64_t begin = va, merged_end = end, replaced_bytes = 0;
+        auto last = first;
+        while (last != title_write_back.end() && last->first <= merged_end) {
+            begin = std::min(begin, last->first);
+            merged_end = std::max(merged_end, last->second);
+            replaced_bytes += last->second - last->first;
+            ++last;
         }
-        if (it != title_write_back.end() && it->first <= end) {
-            it->second = std::max(it->second, end);
-            return;
-        }
-        if (title_write_back.size() >= kTitleWriteBackRanges || title_write_back_bytes >= kTitleWriteBackBytes) {
+        const std::uint64_t added_bytes = (merged_end - begin) - replaced_bytes;
+        if ((first == last && title_write_back.size() >= kTitleWriteBackRanges) ||
+            added_bytes > kTitleWriteBackBytes - title_write_back_bytes) {
             if (!title_write_back_refused++)
                 log_once("past LEONIDA_TITLE_WRITEBACK's caps: reached ranges are not copied back this submission; "
                          "ranges refused:",
                          1);
             return;
         }
-        title_write_back_bytes += end - va;
-        title_write_back.emplace(va, end);
+        auto kept = title_write_back.insert_or_assign(first, begin, merged_end);
+        title_write_back.erase(std::next(kept), last);
+        title_write_back_bytes += added_bytes;
     }
 
     // What the GPU wrote into those copies goes back to the title's pages, so a later read by the title or the next

@@ -142,6 +142,7 @@ D3D12_SHADER_RESOURCE_VIEW_DESC raw_srv(UINT first_word, UINT words) {
     return desc;
 }
 
+constexpr UINT kCodeWord = 6000;  // word 1 of the synthetic shader container
 constexpr UINT kElements = 64, kBytes = kElements * 4;
 constexpr UINT64 kPages = 64 * 1024;
 constexpr UINT kSrvWord = 256;   // the V# reads title words 256..319
@@ -564,13 +565,14 @@ int submit_write(WriteBack& s, std::uint64_t va, std::uint64_t va2 = 0, bool wai
 // reads back): the pages are not imported here, so the buffer is a shadow, and the write of a root UAV over the
 // title's VA must reach the pages at the next submission - and the title's own newer words must still win.
 int check_placed_write_back(Context& c, bool geometry) {
-    void* pages = VirtualAlloc(nullptr, kPages, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    constexpr UINT64 allocation_bytes = 2 * kPages;
+    void* pages = VirtualAlloc(nullptr, allocation_bytes, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     EXPECT(pages);
     const auto title_va = reinterpret_cast<std::uint64_t>(pages);
     auto* words = static_cast<std::uint32_t*>(pages);
-    for (UINT i = 0; i < kPages / 4; ++i) words[i] = 0xA0000000u + i * 3u;  // never zero, unlike the shader's rows
+    for (UINT i = 0; i < allocation_bytes / 4; ++i) words[i] = 0xA0000000u + i * 3u;  // never zero, unlike the shader's rows
     auto& aliases = leonida::title_va_aliases();
-    aliases.add_title_memory(title_va, kPages);  // what the xmem shims do for the title's allocations
+    aliases.add_title_memory(title_va, allocation_bytes);  // what the xmem shims do for the title's allocations
     const D3D12_RESOURCE_DESC desc = buffer_desc(kPages);
     Ref<ID3D12Resource> placed;
     EXPECT(SUCCEEDED(
@@ -634,6 +636,38 @@ int check_placed_write_back(Context& c, bool geometry) {
     std::printf("placed buffer write back: the title's own words survived %u/%u\n", kept, kElements);
     EXPECT(kept == kElements);
 
+    // Two distinct placed buffers share one title allocation. Record both before either range retires.
+    auto* upper_pages = static_cast<std::uint8_t*>(pages) + kPages;
+    const UINT64 upper_va = title_va + kPages;
+    Ref<ID3D12Resource> upper;
+    EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(c.inner, upper_pages, desc, 0xFFFFFFFFu,
+                                                               IID_PPV_ARGS(&upper.p))));
+    EXPECT(upper->GetGPUVirtualAddress() == upper_va);
+    const UINT64 cpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p);
+    EXPECT(cpu);
+    constexpr UINT page_words = UINT(kPages / sizeof(*words));
+    for (bool upper_first : {true, false}) {
+        const UINT64 first = upper_first ? upper_va : title_va;
+        const UINT64 second = upper_first ? title_va : upper_va;
+        // cs_user_data adds the table's four words, its code word and the lane index.
+        // Point it past the output in the first buffer so each ordering has a different result.
+        const UINT64 table_data = aliases.shader_va(first) + kBytes;
+        std::memcpy(reinterpret_cast<void*>(cpu), &table_data, sizeof(table_data));
+        EXPECT(submit_write(s, first, second) == 0);
+        EXPECT(submit_write(s, first, second) == 0);  // retire the first submission's writes
+        const UINT source_word = (upper_first ? page_words : 0u) + kElements;
+        for (UINT i = 0; i < allocation_bytes / sizeof(*words); ++i) {
+            const UINT lane = i % page_words;
+            const UINT expected = lane < kElements ? 0xA0000000u + (source_word + lane % 4) * 3u + kCodeWord + lane
+                                                   : 0xA0000000u + i * 3u;
+            if (words[i] != expected) {
+                std::fprintf(stderr, "adjacent buffers (%s first): word %u got %08x, expected %08x\n",
+                             upper_first ? "upper" : "lower", i, words[i], expected);
+                return 1;
+            }
+        }
+    }
+    upper.reset();
     placed.reset();  // the shadow goes, the pages stay writable
     aliases.remove_title_memory(title_va);
     VirtualFree(pages, 0, MEM_RELEASE);
@@ -1763,7 +1797,7 @@ int main(int argc, char** argv) {
     EXPECT(device_status == vktest::DeviceStatus::ready);
 
     std::vector<std::uint8_t> fssm = {'F', 'S', 'S', 'M'};
-    put32(fssm, 6000);
+    put32(fssm, kCodeWord);
     for (std::uint32_t i = 0; i < 14; ++i) put32(fssm, 0xbf810000u + i);
     const auto container = shader_container(fssm);
     const testfiles::ScratchDir scratch("leonida_title_va_test");
