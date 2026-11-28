@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import tempfile
+from contextlib import suppress
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
@@ -104,19 +105,28 @@ def main(argv=None) -> int:
               + " | ".join(parts))
     if a.json:
         out_dir = os.path.dirname(os.path.abspath(a.json))
+        staged = None
         try:
             os.makedirs(out_dir, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix=".mask-json-", dir=out_dir) as staging:
-                staged = os.path.join(staging, "masks.json")
-                with open(staged, "w", encoding="utf-8", newline="\n") as fh:
-                    json.dump({"width": width, "height": height, "channels": counts}, fh, indent=2)
-                os.chmod(staged, published_mode(a.json))    # tempfile creates 0600; the report gets the usual bits
-                os.replace(staged, a.json)
+            fd, staged = tempfile.mkstemp(prefix=".mask-json-", suffix=".tmp", dir=out_dir)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"width": width, "height": height, "channels": counts}, fh, indent=2)
+            os.chmod(staged, published_mode(a.json))    # mkstemp creates 0600; the report gets the usual bits
+            os.replace(staged, a.json)
+            staged = None
         except OSError as error:
             # A failed write must not leave a half-written report where the last good one was.
             reason = error.strerror or str(error)
             print(f"ERROR: {a.json}: {reason}", file=sys.stderr)
             return 2
+        finally:
+            if staged is not None:
+                with suppress(OSError):
+                    # The staging file has the destination's bits, which a read-only report makes read-only;
+                    # make it deletable before unlinking, or Windows strands it beside the report when the
+                    # replace fails and the cleanup error masks the real one.
+                    os.chmod(staged, 0o600)
+                    os.unlink(staged)
     return 0
 
 
