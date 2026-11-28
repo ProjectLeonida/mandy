@@ -5487,7 +5487,7 @@ struct DeviceState {
         std::unordered_set<std::uint8_t*> readback_invalidated;  // under `mutex`: physical frames invalidated during copy
         std::vector<std::uint8_t*> readback_slice_frames;        // under `mutex`: sorted unique frames in active slice
         std::vector<std::array<std::uint64_t, 4>> readback_slice_skip_masks;  // under `mutex`: upload()-modified pieces per slice frame
-        std::unique_ptr<leonida::TitleMirror::WorkerPool> readback_pool;      // under `readback_mutex`: lock-free Phase 1 hasher
+        std::unique_ptr<leonida::TitleMirror::WorkerPool> readback_hash_pool; // under `readback_mutex`: lock-free Phase 1 hasher
         leonida::TitleMirror::PrehashedReadback readback_prehashed;           // under `readback_mutex`: reusable Phase 1 sums
         std::vector<std::array<std::uint64_t, 4>> readback_exec_skip_masks;   // under `readback_mutex`: Phase 2 per-slice masks
         std::vector<std::uint8_t> readback_exec_skip_page;                    // under `readback_mutex`: Phase 2 skip flags
@@ -6213,12 +6213,12 @@ struct DeviceState {
             std::uint64_t slice_written = 0;
             const std::size_t slice_pages = m.readback_async.slice.size();
             // Phase 1 (lock-free with respect to page_mirror.mutex): compute 256-byte GPU piece hashes across the
-            // host-cached readback buffer in parallel using m.readback_pool (owned solely by readback_mutex).
-            if (slice_pages >= leonida::TitleMirror::kParallelThreshold && !m.readback_pool)
-                m.readback_pool = leonida::TitleMirror::make_worker_pool();
+            // host-cached readback buffer in parallel using m.readback_hash_pool (owned solely by readback_mutex).
+            if (slice_pages >= leonida::TitleMirror::kParallelThreshold && !m.readback_hash_pool)
+                m.readback_hash_pool = leonida::TitleMirror::make_worker_pool();
             leonida::TitleMirror::prehash_readback_slice(m.readback_async.slice.data(), slice_pages,
                                                          m.readback_async.ranges, m.readback_host, m.readback_prehashed,
-                                                         m.readback_pool.get());
+                                                         m.readback_hash_pool.get());
             // Phase 2 (short page_mirror.mutex hold): O(pieces) uint64 compare + coalesced write-back runs.
             {
                 std::unique_lock mirror_lock(m.mutex, std::defer_lock);
@@ -6410,7 +6410,7 @@ struct DeviceState {
         page_mirror.readback_async = {};
         page_mirror.readback_queued_ranges.clear();
         page_mirror.readback_async_pending.store(false, std::memory_order_release);
-        page_mirror.readback_pool.reset();
+        page_mirror.readback_hash_pool.reset();
         page_mirror.readback_prehashed = {};
         page_mirror.readback_exec_skip_masks.clear();
         page_mirror.readback_exec_skip_page.clear();
@@ -20973,7 +20973,7 @@ public:
                          static_cast<unsigned long long>(w.arm_busy - l.arm_busy),
                          static_cast<unsigned long long>(w.arm_failures - l.arm_failures),
                          static_cast<unsigned long long>(w.overflows - l.overflows), watch.textures(), watch.tiles(),
-                         watch.unarmed(), double(stats.refresh_ns) * 1e-6 / double((std::max)<std::uint64_t>(1, stats.passes)),
+                         watch.unarmed(), double(stats.refresh_ns) * 1e-6 / double((std::max)(std::uint64_t(1), stats.passes)),
                          double(stats.max_refresh_ns) * 1e-6);
             const auto& o = state_.over_gpu_target;
             std::fprintf(stderr,
@@ -21001,7 +21001,7 @@ public:
                          static_cast<unsigned long long>(stats.whole_by[4]));
             stats.read_whole = stats.unchanged_parts = stats.gpu_unchanged = stats.first_named = 0;
             stats.whole_by = {};
-            const double per_pass = 1e-6 / double((std::max)<std::uint64_t>(1, title_split_passes_));
+            const double per_pass = 1e-6 / double((std::max)(std::uint64_t(1), title_split_passes_));
             std::fprintf(stderr,
                          "[rt] d3d12: title texture pass split, ms a pass: %.3f finding what to look at (%.3f lock "
                          "wait), %.3f naming, arming and reserving, %.3f reading on %u threads (%.3f of it detiling, "
@@ -21010,7 +21010,7 @@ public:
                          double(stats.examine_ns) * per_pass,
                          double(stats.read_ns) * per_pass, title_read_pool_ ? title_read_pool_->threads() + 1 : 1,
                          double(stats.detile_ns) * per_pass,
-                         double(stats.read_bytes) / 1048576.0 / double((std::max)<std::uint64_t>(1, title_split_passes_)),
+                         double(stats.read_bytes) / 1048576.0 / double((std::max)(std::uint64_t(1), title_split_passes_)),
                          double(stats.staged_ns) * per_pass);
             stats.collect_ns = stats.lock_wait_ns = stats.examine_ns = stats.read_ns = stats.detile_ns =
                 stats.read_bytes = 0;
