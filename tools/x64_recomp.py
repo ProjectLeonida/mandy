@@ -1924,28 +1924,65 @@ class FunctionTranslator:
             if cval == 0:
                 return
             self._load(ins, dst, T0)
+            if m == "sar" and width < 32:
+                (a.sxtb if width == 8 else a.sxth)(T0, T0, sf=0)
             a.mov(T2, T0)  # original for CF
             if m in ("shl", "sal"):
-                a.lsl(T0, T0, cval, sf)
+                if cval >= width:
+                    a.movz(T0, 0, 0, sf=0)
+                else:
+                    a.lsl(T0, T0, cval, sf)
+                    if width == 8:
+                        a.uxtb(T0, T0)
+                    elif width == 16:
+                        a.uxth(T0, T0)
             elif m == "shr":
-                a.lsr(T0, T0, cval, sf)
+                if cval >= width:
+                    a.movz(T0, 0, 0, sf=0)
+                else:
+                    a.lsr(T0, T0, cval, sf)
             elif m == "sar":
                 a.asr(T0, T0, cval, sf)
-            elif m == "ror":
-                a.ror(T0, T0, cval % width or width, sf)
-            elif m == "rol":
-                a.ror(T0, T0, width - (cval % width or width), sf)
+                if width == 8:
+                    a.uxtb(T0, T0)
+                elif width == 16:
+                    a.uxth(T0, T0)
+            elif m in ("rol", "ror"):
+                r = cval % width
+                if r != 0:
+                    if width < 32:
+                        if width == 8:
+                            a.orr_r(T0, T0, T0, sf=0, shift=0, imm6=8)
+                        a.orr_r(T0, T0, T0, sf=0, shift=0, imm6=16)
+                        a.ror(T0, T0, r if m == "ror" else width - r, sf=0)
+                        (a.uxtb if width == 8 else a.uxth)(T0, T0)
+                    else:
+                        a.ror(T0, T0, r if m == "ror" else width - r, sf)
             self._store(ins, dst, T0)
             if flaggy:
-                res = GMAP[dst[1]] if dst[0] == "r" and self._op_size(dst) >= 4 else T0
-                a.tst_r(res, res, sf)
-                if need_c:
-                    self._shift_cf_imm(ins, m, cval, width)
-            self._stash_res(ins, T0)
-            self._maybe_mkflags(ins)
+                if m in ("rol", "ror"):
+                    if need_c:
+                        self._shift_cf_imm(ins, m, cval, width)
+                        if ins.addr in self.mat:
+                            a.ldur(T1, CTX_REG, CTX_EFLAGS, size=8)
+                            a.bfi(T1, T3, 0, 1)
+                            a.stur(T1, CTX_REG, CTX_EFLAGS, size=8)
+                else:
+                    if width < 32:
+                        (a.sxtb if width == 8 else a.sxth)(T3, T0, sf=0)
+                        a.tst_r(T3, T3, sf=0)
+                    else:
+                        res = GMAP[dst[1]] if dst[0] == "r" else T0
+                        a.tst_r(res, res, sf)
+                    if need_c:
+                        self._shift_cf_imm(ins, m, cval, width)
+                    self._stash_res(ins, T0)
+                    self._maybe_mkflags(ins)
             return
         # variable count in cl
         self._load(ins, dst, T0)
+        if m == "sar" and width < 32:
+            (a.sxtb if width == 8 else a.sxth)(T0, T0, sf=0)
         a.mov(T2, T0)
         a.mov(T1, GMAP[1], sf=0)
         a.and_i(T1, T1, 0x3F if width == 64 else 0x1F, sf=0)
@@ -1956,24 +1993,56 @@ class FunctionTranslator:
         a.cbz(T1, skip, sf=0)
         if m in ("shl", "sal"):
             a.lslv(T0, T0, T1, sf)
+            if width == 8:
+                a.uxtb(T0, T0)
+            elif width == 16:
+                a.uxth(T0, T0)
         elif m == "shr":
             a.lsrv(T0, T0, T1, sf)
         elif m == "sar":
             a.asrv(T0, T0, T1, sf)
-        elif m == "ror":
-            a.rorv(T0, T0, T1, sf)
-        elif m == "rol":
-            a.movz(T3, width, 0, sf=0)
-            a.sub_r(T3, T3, T1, sf=0)
-            a.rorv(T0, T0, T3, sf)
+            if width == 8:
+                a.uxtb(T0, T0)
+            elif width == 16:
+                a.uxth(T0, T0)
+        elif m in ("rol", "ror"):
+            if width < 32:
+                if width == 8:
+                    a.orr_r(T0, T0, T0, sf=0, shift=0, imm6=8)
+                a.orr_r(T0, T0, T0, sf=0, shift=0, imm6=16)
+                if m == "ror":
+                    a.rorv(T0, T0, T1, sf=0)
+                else:
+                    a.movz(T3, 32, 0, sf=0)
+                    a.sub_r(T3, T3, T1, sf=0)
+                    a.rorv(T0, T0, T3, sf=0)
+                (a.uxtb if width == 8 else a.uxth)(T0, T0)
+            elif m == "ror":
+                a.rorv(T0, T0, T1, sf)
+            else:
+                a.movz(T3, width, 0, sf=0)
+                a.sub_r(T3, T3, T1, sf=0)
+                a.rorv(T0, T0, T3, sf)
         self._store(ins, dst, T0)
         if flaggy:
-            res = GMAP[dst[1]] if dst[0] == "r" and self._op_size(dst) >= 4 else T0
-            a.tst_r(res, res, sf)
-            if need_c:
-                self._shift_cf_var(ins, m, width)
-        self._stash_res(ins, T0)
-        self._maybe_mkflags(ins)
+            if m in ("rol", "ror"):
+                if need_c:
+                    self._shift_cf_var(ins, m, width)
+                    if ins.addr in self.mat:
+                        a.ldur(T1, CTX_REG, CTX_EFLAGS, size=8)
+                        a.bfi(T1, T3, 0, 1)
+                        a.stur(T1, CTX_REG, CTX_EFLAGS, size=8)
+            else:
+                if width < 32:
+                    (a.sxtb if width == 8 else a.sxth)(T3, T0, sf=0)
+                    a.tst_r(T3, T3, sf=0)
+                else:
+                    res = GMAP[dst[1]] if dst[0] == "r" else T0
+                    a.tst_r(res, res, sf)
+                if need_c:
+                    self._shift_cf_var(ins, m, width)
+                self._stash_res(ins, T0)
+                self._maybe_mkflags(ins)
         a.label(skip)
 
     def _set_cf(self, bit_reg):
@@ -1985,32 +2054,39 @@ class FunctionTranslator:
 
     def _shift_cf_imm(self, ins, m, cval, width):
         a = self.asm
-        if cval >= width:
-            a.movz(T3, 0, 0, sf=0)
-        elif m in ("shl", "sal"):
-            a.ubfx(T3, T2, width - cval, 1, sf=0)
-        elif m in ("shr", "sar"):
-            a.ubfx(T3, T2, cval - 1, 1, sf=0)
-        elif m == "rol":
+        sf = 1 if width == 64 else 0
+        if m == "rol":
             a.and_i(T3, T0, 1, sf=0)
         elif m == "ror":
-            a.ubfx(T3, T0, width - 1, 1, sf=0)
+            a.ubfx(T3, T0, width - 1, 1, sf)
+        elif m == "sar":
+            a.ubfx(T3, T2, min(cval - 1, width - 1), 1, sf)
+        elif cval > width:
+            a.movz(T3, 0, 0, sf=0)
+        elif m in ("shl", "sal"):
+            a.ubfx(T3, T2, width - cval, 1, sf)
+        elif m == "shr":
+            a.ubfx(T3, T2, cval - 1, 1, sf)
         self._set_cf(T3)
 
     def _shift_cf_var(self, ins, m, width):
         a = self.asm
+        sf = 1 if width == 64 else 0
         # count in T1, original in T2, result in T0
         if m in ("shl", "sal"):
             a.movz(T3, width, 0, sf=0)
             a.sub_r(T3, T3, T1, sf=0)
-            a.lsrv(T3, T2, T3, sf=0)
-        elif m in ("shr", "sar"):
+            a.lsrv(T3, T2, T3, sf)
+        elif m == "shr":
             a.sub(T3, T1, 1, sf=0)
-            a.lsrv(T3, T2, T3, sf=0)
+            a.lsrv(T3, T2, T3, sf)
+        elif m == "sar":
+            a.sub(T3, T1, 1, sf=0)
+            a.asrv(T3, T2, T3, sf)
         elif m == "rol":
             a.mov(T3, T0, sf=0)
         elif m == "ror":
-            a.lsr(T3, T0, width - 1, sf=0)
+            a.lsr(T3, T0, width - 1, sf)
         a.and_i(T3, T3, 1, sf=0)
         self._set_cf(T3)
 
