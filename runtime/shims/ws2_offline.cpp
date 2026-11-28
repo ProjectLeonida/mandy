@@ -13,7 +13,8 @@
 //   - connect (#4), WSAConnect, WSAConnectByNameA/W, WSAConnectByList, ConnectEx (from WSAIoctl), sendto (#20),
 //     WSASendTo, and WSASendMsg (direct and via WSAIoctl) permit only IPv4 loopback (127.0.0.0/8), IPv6 loopback
 //     (::1), and IPv4-mapped IPv6 loopback (::ffff:127.0.0.0/104). Every other destination fails with WSAENETUNREACH.
-//     WSAConnectByNameA/W pass "localhost" to the host as the literal 127.0.0.1, so the hosts file is never read.
+//     WSAConnectByNameA/W pass "localhost" to the host as a loopback literal (::1 for an IPv6 socket with
+//     IPV6_V6ONLY set, 127.0.0.1 otherwise), so the hosts file is never read.
 //   - bind (#2) rewrites wildcard binds (0.0.0.0 or ::) to 127.0.0.1 or ::1 so no external peer can connect in,
 //     allows explicit loopback binds, and refuses any other address with WSAEADDRNOTAVAIL.
 //   - getaddrinfo, GetAddrInfoW, GetAddrInfoExA/W, gethostbyname (#52), gethostbyaddr (#51), and
@@ -252,6 +253,24 @@ bool is_localhost_name_a(const char* node) {
     return ascii_iequals(node, "localhost") || ascii_iequals(node, "localhost.");
 }
 
+// Windows resolves "localhost" for WSAConnectByName to ::1 and 127.0.0.1 and tries them in turn. An IPv6 socket with
+// IPV6_V6ONLY set (Windows' default) reaches only ::1: given 127.0.0.1 the host fails with WSAHOST_NOT_FOUND. Such a
+// socket gets the ::1 literal; an IPv4 or dual-mode IPv6 socket keeps 127.0.0.1.
+bool is_ipv6_only_socket(SOCKET s) {
+    using GetSockOptFn = int(WSAAPI*)(SOCKET, int, int, char*, int*);
+    static GetSockOptFn real_getsockopt = host_proc<GetSockOptFn>("getsockopt");
+    if (!real_getsockopt) return false;
+    WSAPROTOCOL_INFOW info{};
+    int len = sizeof(info);
+    if (real_getsockopt(s, SOL_SOCKET, SO_PROTOCOL_INFOW, reinterpret_cast<char*>(&info), &len) != 0 ||
+        info.iAddressFamily != AF_INET6) {
+        return false;
+    }
+    DWORD v6only = 0;
+    len = sizeof(v6only);
+    return real_getsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<char*>(&v6only), &len) == 0 && v6only != 0;
+}
+
 // ---- Socket connect / send / bind shims ----
 
 int WSAAPI connect_offline(SOCKET s, const sockaddr* name, int namelen) {
@@ -302,7 +321,7 @@ BOOL WSAAPI wsa_connect_by_name_a_offline(SOCKET s, LPCSTR nodename, LPCSTR serv
         return FALSE;
     }
     // The host would resolve "localhost" through its hosts file; hand it the literal instead.
-    LPCSTR node = is_localhost_name_a(nodename) ? "127.0.0.1" : nodename;
+    LPCSTR node = !is_localhost_name_a(nodename) ? nodename : is_ipv6_only_socket(s) ? "::1" : "127.0.0.1";
     return real_fn(s, node, servicename, local_addr_len, local_addr, remote_addr_len, remote_addr, timeout, reserved);
 }
 
@@ -323,8 +342,11 @@ BOOL WSAAPI wsa_connect_by_name_w_offline(SOCKET s, LPWSTR nodename, LPWSTR serv
         return FALSE;
     }
     // The host would resolve "localhost" through its hosts file; hand it the literal instead.
-    wchar_t loopback[] = L"127.0.0.1";
-    LPWSTR node = is_localhost_name_a(narrow_ascii(nodename).c_str()) ? loopback : nodename;
+    wchar_t loopback4[] = L"127.0.0.1";
+    wchar_t loopback6[] = L"::1";
+    LPWSTR node = !is_localhost_name_a(narrow_ascii(nodename).c_str()) ? nodename
+                  : is_ipv6_only_socket(s)                              ? loopback6
+                                                                        : loopback4;
     return real_fn(s, node, servicename, local_addr_len, local_addr, remote_addr_len, remote_addr, timeout, reserved);
 }
 
