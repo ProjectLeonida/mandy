@@ -5071,6 +5071,16 @@ if(TARGET Vulkan::Headers)
       endif()
     endif()
     add_test(NAME r3b_runtime_hooks COMMAND r3b_runtime_hooks_test)
+    # Stage 5b replay state caching: redundant bind/push/dynamic-state elision, helper invalidation, throughput & GPU validation.
+    add_executable(replay_state_cache_test test/replay_state_cache_test.cpp)
+    target_link_libraries(replay_state_cache_test PRIVATE Vulkan::Headers Threads::Threads ${CMAKE_DL_LIBS})
+    if(WIN32)
+      target_compile_definitions(replay_state_cache_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      if(MSVC)
+        target_compile_options(replay_state_cache_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+      endif()
+    endif()
+    add_test(NAME replay_state_cache COMMAND replay_state_cache_test)
 
     # Title-placed buffer VAs (device slot 133) and the console VA shaders reach them by (src/title_va_alias.h).
     add_executable(title_va_alias_test test/title_va_alias_test.cpp)

@@ -16,6 +16,8 @@
 #include <vector>
 
 #include "../src/title_mirror.h"
+#include "../src/title_write_policy.h"
+#include <set>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -881,6 +883,95 @@ int unstamped_freed_homes_wait_for_flush() {
     return 0;
 }
 
+// End-to-end TitleMirror + TitleWritePolicy across 30-submission frames: a page written once every 30 submissions
+// (1x/frame across 4 frames) promotes via present_frame() and stops taking per-frame write faults while keeping the
+// mirror byte-exact; a genuinely cold page stays guarded and a quiet frame-hot page demotes cleanly.
+int frame_hot_mirror_integration() {
+    struct FakeGuard {
+        std::set<std::uintptr_t> armed;
+        std::map<std::uintptr_t, std::uint64_t> faults;
+        leonida::TitleWritePolicy<FakeGuard>* policy = nullptr;
+        bool arm(std::uintptr_t page) {
+            armed.insert(page);
+            return true;
+        }
+        void disarm(std::uintptr_t page) { armed.erase(page); }
+        void write_byte(std::uint64_t va, std::uint8_t* backing, std::size_t off, std::uint8_t val) {
+            const std::uintptr_t page = std::uintptr_t(va) & ~(kPage - 1);
+            if (armed.erase(page)) {
+                ++faults[page];
+                policy->written(page);
+            }
+            backing[off] = val;
+        }
+    } guard;
+    leonida::TitleWritePolicy<FakeGuard> policy(guard);
+    guard.policy = &policy;
+
+    Fixture f;
+    TitleMirror mirror(f.hooks());
+    EXPECT(mirror.cover(kBase, kBase + 4 * kPage));
+    std::vector<std::uint8_t> dyn_frame(kPage, 0x10), cold_frame(kPage, 0x20);
+    const std::uint64_t dyn_va = kBase;
+    const std::uint64_t cold_va = kBase + kPage;
+    mirror.map(dyn_va, dyn_frame.data(), nullptr, 1);
+    mirror.map(cold_va, cold_frame.data(), nullptr, 1);
+    EXPECT(mirror.flush(1));
+
+    policy.add(std::uintptr_t(dyn_va), std::uintptr_t(cold_va + kPage));
+    bool initial_dirty_ok = true;
+    policy.collect([&](std::uintptr_t p) { initial_dirty_ok = initial_dirty_ok && mirror.dirty(p); });
+    EXPECT(initial_dirty_ok);
+    mirror.upload();
+
+    constexpr unsigned kSubsPerFrame = 30;
+    // 4 frames of 30 submissions/frame: dyn_va written once per frame before sub 0; cold_va written only on frame 1.
+    for (unsigned frame = 1; frame <= 4; ++frame) {
+        guard.write_byte(dyn_va, dyn_frame.data(), frame * 16, std::uint8_t(0x80 + frame));
+        if (frame == 1) guard.write_byte(cold_va, cold_frame.data(), 32, 0xCC);
+        for (unsigned sub = 0; sub < kSubsPerFrame; ++sub) {
+            policy.collect([&](std::uintptr_t p) { mirror.dirty(p); });
+            mirror.upload();
+            EXPECT(std::memcmp(mirror.home_bytes(dyn_va), dyn_frame.data(), kPage) == 0);
+            EXPECT(std::memcmp(mirror.home_bytes(cold_va), cold_frame.data(), kPage) == 0);
+            policy.frame();
+        }
+        policy.present_frame();
+    }
+    EXPECT(policy.hot(std::uintptr_t(dyn_va)) && policy.frame_hot(std::uintptr_t(dyn_va)));
+    EXPECT(!policy.hot(std::uintptr_t(cold_va)));
+
+    // Frames 5..12: dyn_va takes ZERO additional write faults while mirror stays byte-exact on every submission.
+    const std::uint64_t dyn_faults_before = guard.faults[std::uintptr_t(dyn_va)];
+    for (unsigned frame = 5; frame <= 12; ++frame) {
+        guard.write_byte(dyn_va, dyn_frame.data(), frame * 16, std::uint8_t(0x90 + frame));
+        for (unsigned sub = 0; sub < kSubsPerFrame; ++sub) {
+            policy.collect([&](std::uintptr_t p) { mirror.dirty(p); });
+            mirror.upload();
+            EXPECT(std::memcmp(mirror.home_bytes(dyn_va), dyn_frame.data(), kPage) == 0);
+            policy.frame();
+        }
+        policy.present_frame();
+    }
+    EXPECT(guard.faults[std::uintptr_t(dyn_va)] == dyn_faults_before);
+    EXPECT(!policy.hot(std::uintptr_t(cold_va)) && guard.faults[std::uintptr_t(cold_va)] == 1);
+
+    // Stop writing dyn_va: demotes cleanly to cold after a probe cycle.
+    for (unsigned frame = 0; frame < 2 * leonida::TitleWritePolicy<FakeGuard>::kFrameProbe; ++frame) {
+        for (unsigned sub = 0; sub < 4; ++sub) {
+            policy.collect([&](std::uintptr_t p) { mirror.dirty(p); });
+            mirror.upload();
+            policy.frame();
+        }
+        policy.present_frame();
+    }
+    EXPECT(!policy.hot(std::uintptr_t(dyn_va)) && !policy.frame_hot(std::uintptr_t(dyn_va)));
+    EXPECT(policy.stats().frame_demotions == 1);
+    std::printf("frame_hot_mirror_integration: 1x/frame across 30 subs promotes with zero post-promotion faults, cold "
+                "guarded, demotes cleanly\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -897,6 +988,7 @@ int main() {
     if (lock_free_pending_fast_paths()) return 1;
     if (range_sum_piece_hashing()) return 1;
     if (unstamped_freed_homes_wait_for_flush()) return 1;
+    if (frame_hot_mirror_integration()) return 1;
     std::printf("title_mirror_hooks_test: ok\n");
     return 0;
 }

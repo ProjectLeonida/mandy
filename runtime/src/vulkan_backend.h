@@ -4171,6 +4171,7 @@ private:
                                      kind_ == QueueKind::compute ? "compute" : "copy";
             diagnostics = fault.begin_submission(execute_call, queue_, queue_kind, lists.size());
         }
+        ReplayStateCache replay_state;
         for (std::size_t i = 0; i < lists.size(); ++i) {
             // Between merged ExecuteCommandLists batches: close any open list debug labels and emit D3D12's implicit
             // ExecuteCommandLists boundary barrier so writes from the previous batch are visible to the next.
@@ -4190,9 +4191,10 @@ private:
             const auto& list = prepared[i];
             if (execute_call && i < diagnostics.lists.size()) {
                 const CheckpointRecorder recorder{checkpoint, diagnostics, context_.device_fault()->pipeline_names, i};
-                emit_commands<true>(list, command_buffer, replay, &next_tracker, &open_labels, &recorder);
+                emit_commands<true>(list, command_buffer, replay, &next_tracker, &open_labels, &recorder,
+                                    &replay_state);
             } else {
-                emit(list, command_buffer, replay, &next_tracker, &open_labels);
+                emit(list, command_buffer, replay, &next_tracker, &open_labels, &replay_state);
             }
             wrote_readback |= list.wrote_readback;
             readback_stages |= list.readback_src_stages;

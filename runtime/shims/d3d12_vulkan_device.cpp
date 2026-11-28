@@ -5290,6 +5290,7 @@ struct DeviceState {
         std::atomic<std::int64_t> since_ns_atomic{
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
                 .count()};
+        std::atomic<std::uint64_t> last_present_serial{0};
         // Read-mostly snapshot of chunk coverage + plain/ensured intervals so title recording threads calling
         // page_mirror_resolve() take a shared lock and never contend on page_mirror.mutex against async workers.
         // Lock order: page_mirror.mutex -> resolve_cache.mutex (never reversed).
@@ -5520,6 +5521,9 @@ struct DeviceState {
         };
         page_mirror.mirror = std::make_unique<leonida::TitleMirror>(std::move(hooks));
         page_mirror.tracking = std::make_unique<leonida::HotColdTracking>();
+        page_mirror.last_present_serial.store(
+            leonida::submit_phases::totals().present_serial.load(std::memory_order_acquire),
+            std::memory_order_release);
         leonida::geometry_writes::subscribe(page_mirror.released);
         // A vertex, index, copy or indirect-argument address no buffer of ours holds is looked up in the mirror.
         context->set_mirror_buffer([this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
@@ -6226,11 +6230,14 @@ struct DeviceState {
         // due.
         {
             const bool log_due = (start_ns - m.since_ns_atomic.load(std::memory_order_acquire)) >= 10'000'000'000ll;
+            const std::uint64_t present_now =
+                leonida::submit_phases::totals().present_serial.load(std::memory_order_acquire);
+            const bool present_due = present_now != m.last_present_serial.load(std::memory_order_acquire);
             const bool in_place_dirty =
                 in_place_heaps.load(std::memory_order_acquire) != 0 &&
                 (slot_change_count.load(std::memory_order_acquire) != 0 ||
                  m.in_place_pending.load(std::memory_order_acquire));
-            if (!log_due && !in_place_dirty &&
+            if (!log_due && !present_due && !in_place_dirty &&
                 leonida::title_mirror_space::generation() == m.space_gen_atomic.load(std::memory_order_acquire) &&
                 !m.feed_pending.load(std::memory_order_acquire) &&
                 !leonida::geometry_writes::has_released(m.released) && !m.tracking->has_pending_work() &&
@@ -6296,6 +6303,18 @@ struct DeviceState {
         if (ensured_changed) {
             std::unique_lock rc_lock(m.resolve_cache.mutex);
             m.resolve_cache.ensured = m.ensured;
+        }
+        // Advance the frame-hot tier before collect() whenever Present has advanced so writes landed after Present
+        // start in the new frame's bit while the completed frame's history evaluates cleanly.
+        {
+            const std::uint64_t present_latest =
+                leonida::submit_phases::totals().present_serial.load(std::memory_order_acquire);
+            const std::uint64_t prev_present = m.last_present_serial.load(std::memory_order_relaxed);
+            if (present_latest > prev_present) {
+                const std::uint64_t delta = (std::min)(present_latest - prev_present, std::uint64_t(32));
+                for (std::uint64_t f = 0; f < delta; ++f) m.tracking->on_present();
+                m.last_present_serial.store(present_latest, std::memory_order_release);
+            }
         }
         m.tracking->collect(m.written);  // re-watched before the copies below
         for (const std::uint64_t page : m.written)
