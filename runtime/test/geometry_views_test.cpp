@@ -319,6 +319,26 @@ int main() {
           "draining the twin's range retires the view at its CPU address only");
     const std::uint64_t va_w2b = watched.resolve(device, pbase + kView, kView, copy);
     check(va_w2b != 0, "the retired view is made again on the next resolve");
+    // A GPU-only release that starts before the twin and runs into it: its part in the twin counts.
+    leonida::geometry_writes::note_released(gpu_twin - 4096, gpu_twin + 4096);
+    check(watched.has_released(), "a range starting before the GPU-only twin and overlapping it is queued");
+    watched.drain_released(device, 4, 4);
+    check(watched.find(pbase, kView) == 0 && watched.find(pbase + kView, kView) == va_w2b,
+          "draining it retires the view under the overlapped part only");
+    const std::uint64_t va_w1b = watched.resolve(device, pbase, kView, copy);
+    check(va_w1b != 0, "that view is made again");
+    // Two adjacent twins: a release from the first into the second retires the views under both CPU views.
+    leonida::title_gpu_views::note_reservation(pbase + 2 * kView, kView, false);
+    check(leonida::title_gpu_views::note_reservation(gpu_twin + 2 * kView, kView, true), "a second, adjacent twin pairs");
+    const std::uint64_t va_w3 = watched.resolve(device, pbase + 2 * kView, kView, copy);
+    check(va_w3 != 0 && watched.live_views() == 3, "a view under the second twin's CPU view");
+    leonida::geometry_writes::note_released(gpu_twin + kView, gpu_twin + 3 * kView);
+    watched.drain_released(device, 5, 5);
+    check(watched.find(pbase + kView, kView) == 0 && watched.find(pbase + 2 * kView, kView) == 0 &&
+              watched.find(pbase, kView) == va_w1b,
+          "a release spanning two twins retires the views under both, and not the one outside it");
+    const std::uint64_t va_w2c = watched.resolve(device, pbase + kView, kView, copy);
+    check(va_w2c != 0 && watched.live_views() == 2, "the first twin's view is made again; two live views as before");
 
     // 9. Queue overflow: 65537 disjoint ranges collapse into one covering range; drain retires every covered view.
     constexpr std::size_t kOverflowCount = 65537;

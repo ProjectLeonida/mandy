@@ -62,13 +62,13 @@ inline void note_released(std::uintptr_t begin, std::uintptr_t end) {
     const std::uintptr_t hi = s.watched_hi.load(std::memory_order_acquire);
     if (end <= lo || begin >= hi) {
         // Views are keyed by the CPU view's address, so a GPU-only range freed by its own address counts through its
-        // CPU view (GeometryViews::drain_released maps it there).
-        leonida::title_gpu_views::Range pair{};
-        if (!leonida::title_gpu_views::view_at(begin, 1, pair) || begin < pair.gpu || begin - pair.gpu >= pair.size)
-            return;
-        const std::uintptr_t cpu = pair.cpu + (begin - pair.gpu);
-        const std::uintptr_t span = (std::min)(end - begin, pair.size - (begin - pair.gpu));
-        if (cpu + span <= lo || cpu >= hi) return;
+        // CPU view (GeometryViews::drain_released maps it there): every pair the range overlaps, also one it starts
+        // before or one after the first.
+        bool watched = false;
+        leonida::title_gpu_views::for_each_gpu_overlap(begin, end, [&](std::uintptr_t cpu_lo, std::uintptr_t cpu_hi) {
+            if (cpu_hi > lo && cpu_lo < hi) watched = true;
+        });
+        if (!watched) return;
     }
     std::lock_guard subscribers_lock(s.subscribers_mutex);
     for (ReleaseQueue* q : s.subscribers) {
