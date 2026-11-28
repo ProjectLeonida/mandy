@@ -252,9 +252,25 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
         release_object(a);
     }
 
-    // Classes nobody serves are still refused, and logged, as before.
+    // XAppCaptureImpl: the retail executable's one reference to a class this file used to refuse. It queries the
+    // class id for IXAppCaptureImpl4 and calls slot 5, XAppCaptureTakeScreenshot. Offline there is no capture or
+    // record, so every method refuses instead of QueryApiImpl's kClassNotProvided.
+    const GUID appcapture_cls = {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
+    const GUID appcapture4 = {0x22e672d7, 0xb4e3, 0x406c, {0xbd, 0x50, 0x8f, 0x0d, 0x25, 0x23, 0x6f, 0x9e}};
+    void* cap = ask(query, appcapture_cls, appcapture4);
+    check(cap != nullptr, "QueryApiImpl hands out XAppCaptureImpl for its class id and the v4 interface id");
+    if (cap) {
+        using TakeScreenshot = HRESULT(STDMETHODCALLTYPE*)(void*);
+        check(method<TakeScreenshot>(cap, 5)(cap) == E_NOTIMPL, "slot 5 (XAppCaptureTakeScreenshot) refuses offline");
+        void* other = reinterpret_cast<void*>(1);
+        const GUID bogus = {0x0a0a0a0a, 0x0b0b, 0x0c0c, {0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14}};
+        check(query(&appcapture_cls, bogus, &other) == E_NOINTERFACE && other == nullptr,
+              "XAppCaptureImpl answers its class id and the interface ids, not another class's interface");
+        release_object(cap);
+    }
+
+    // A class nobody serves is still refused, and logged, as before.
     const GUID refused[] = {
-        {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}},  // XAppCaptureImpl
         {0x12345678, 0x9abc, 0xdef0, {0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0}},  // no such class
     };
     bool all_refused = true;
@@ -262,7 +278,7 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
         void* out = reinterpret_cast<void*>(1);
         all_refused = all_refused && query(&cls, cls, &out) == static_cast<HRESULT>(0x80070032) && out == nullptr;
     }
-    check(all_refused, "XAppCaptureImpl and an unknown class are still refused");
+    check(all_refused, "an unknown class is still refused");
 }
 
 // xgameruntime.lib's thunks don't import the runtime: they LoadLibraryW(L"xgameruntime.dll") and GetProcAddress five
