@@ -495,6 +495,16 @@ class DriveMapTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
+    def test_resource_lock_inventory_requires_strings(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(io.StringIO()):
+            inventory = Path(tmp) / "ctest.json"
+            for value, accepted in ((None, False), (4, False), (False, False), ([{}], False),
+                                    (["gpu", 2], False), ("gpu", True), (["gpu", "display"], True), ([], True)):
+                with self.subTest(value=value):
+                    row = ctest_entry("fixture", None, {"RESOURCE_LOCK": value})
+                    inventory.write_text(json.dumps({"tests": [row]}), encoding="utf-8", newline="\n")
+                    self.assertEqual(rwt.read_tests(str(inventory)), [row] if accepted else None)
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)

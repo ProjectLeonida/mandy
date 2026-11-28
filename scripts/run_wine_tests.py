@@ -435,7 +435,7 @@ def valid_test_property(entry) -> bool:
     name, value = entry["name"], entry["value"]
     if name == "WORKING_DIRECTORY":
         return isinstance(value, str) and "\0" not in value
-    if name in ("PASS_REGULAR_EXPRESSION", "FAIL_REGULAR_EXPRESSION", "SKIP_REGULAR_EXPRESSION"):
+    if name in ("PASS_REGULAR_EXPRESSION", "FAIL_REGULAR_EXPRESSION", "SKIP_REGULAR_EXPRESSION", "RESOURCE_LOCK"):
         return isinstance(value, str) or (isinstance(value, list) and all(isinstance(p, str) for p in value))
     return True
 
