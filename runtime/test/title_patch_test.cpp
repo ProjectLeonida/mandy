@@ -4,7 +4,10 @@
 //   2. malformed items (no colons, odd hex, unequal lengths, empty fields, not hex) are reported and skipped;
 //   3. a patch whose expected bytes are there is written, and the page keeps its protection;
 //   4. a patch whose expected bytes are not there leaves the bytes alone;
-//   5. a patch that reaches past the image, or starts past it, is refused without touching memory.
+//   5. a patch that reaches past the image, or starts past it, is refused without touching memory;
+//   6. a patch that runs from a committed page into a reserved one, or into a no-access page, is refused
+//      before anything is read; one across two committed pages with different protections is applied and
+//      each page keeps its own protection.
 #include <windows.h>
 
 #include <cstdint>
@@ -87,6 +90,40 @@ int main() {
         check(q.size() == 1 && rt::title_patch::apply(image, size, q[0]) == Result::outside, "5. starts past the end");
     }
     VirtualFree(image, 0, MEM_RELEASE);
+    {
+        // Two pages reserved, only the first committed: a patch over the boundary reads no reserved byte.
+        auto* two = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 2 * size, MEM_RESERVE, PAGE_NOACCESS));
+        check(two && VirtualAlloc(two, size, MEM_COMMIT, PAGE_READWRITE), "6. reserve two pages, commit one");
+        if (two) {
+            two[size - 2] = 0x11;
+            two[size - 1] = 0x22;
+            char spec[64];
+            std::snprintf(spec, sizeof(spec), "%zx:11220000:99999999", size - 2);
+            const auto p = rt::title_patch::parse(spec);
+            check(p.size() == 1 && rt::title_patch::apply(two, 2 * size, p[0]) == Result::unreadable,
+                  "6. into a reserved page: refused");
+            check(two[size - 2] == 0x11 && two[size - 1] == 0x22, "6. committed bytes unchanged");
+            // Both committed, the second no-access: refused as well.
+            VirtualAlloc(two + size, size, MEM_COMMIT, PAGE_NOACCESS);
+            check(rt::title_patch::apply(two, 2 * size, p[0]) == Result::unreadable, "6. into a no-access page: refused");
+            // Second page readable with another protection: applied, each page keeps its own.
+            DWORD old2 = 0;
+            VirtualProtect(two + size, size, PAGE_READONLY, &old2);
+            DWORD old1 = 0;
+            VirtualProtect(two, size, PAGE_EXECUTE_READ, &old1);
+            std::snprintf(spec, sizeof(spec), "%zx:11220000:aabbccdd", size - 2);
+            const auto q = rt::title_patch::parse(spec);
+            check(q.size() == 1 && rt::title_patch::apply(two, 2 * size, q[0]) == Result::applied,
+                  "6. across two committed pages: applied");
+            check(two[size - 2] == 0xaa && two[size - 1] == 0xbb && two[size] == 0xcc && two[size + 1] == 0xdd,
+                  "6. both pages written");
+            MEMORY_BASIC_INFORMATION a{}, b{};
+            VirtualQuery(two, &a, sizeof(a));
+            VirtualQuery(two + size, &b, sizeof(b));
+            check(a.Protect == PAGE_EXECUTE_READ && b.Protect == PAGE_READONLY, "6. each page keeps its protection");
+            VirtualFree(two, 0, MEM_RELEASE);
+        }
+    }
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

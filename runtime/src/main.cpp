@@ -125,6 +125,8 @@ void apply_title_patches(std::uint8_t* base, std::size_t image_size) {
         const char* what = r == rt::title_patch::Result::applied    ? "applied"
                            : r == rt::title_patch::Result::mismatch ? "left alone: the expected bytes are not there"
                            : r == rt::title_patch::Result::outside  ? "left alone: outside the image"
+                           : r == rt::title_patch::Result::unreadable
+                               ? "left alone: not all of it is committed, readable memory"
                                                                     : "left alone: VirtualProtect failed";
         std::fprintf(stderr, "[rt] loader: LEONIDA_TITLE_PATCH at +0x%llx (%zu bytes) %s\n",
                      static_cast<unsigned long long>(p.rva), p.replace.size(), what);

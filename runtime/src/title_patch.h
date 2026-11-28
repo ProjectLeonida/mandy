@@ -24,7 +24,7 @@ struct Patch {
     std::vector<std::uint8_t> expect, replace;
 };
 
-enum class Result { applied, mismatch, outside, protect_failed };
+enum class Result { applied, mismatch, outside, unreadable, protect_failed };
 
 inline bool parse_hex(const char* text, std::size_t len, std::vector<std::uint8_t>& out) {
     out.clear();
@@ -67,19 +67,43 @@ inline std::vector<Patch> parse(const char* spec, std::vector<std::string>* bad 
     return out;
 }
 
-// Writes one patch into the image at `base` (`size` bytes) when the expected bytes are there.
+// Writes one patch into the image at `base` (`size` bytes) when the expected bytes are there. Every page the patch
+// covers is checked first (committed, readable, not a guard page), region by region, so a patch that runs into an
+// uncommitted or no-access region is refused before anything is read; each region keeps its own protection.
 inline Result apply(std::uint8_t* base, std::size_t size, const Patch& p) {
     if (p.expect.empty() || p.rva > size || p.expect.size() > size - p.rva) return Result::outside;
     std::uint8_t* const where = base + p.rva;
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery(where, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
-        std::memcmp(where, p.expect.data(), p.expect.size()) != 0)
-        return Result::mismatch;
-    DWORD old = 0;
-    if (!VirtualProtect(where, p.replace.size(), PAGE_EXECUTE_READWRITE, &old)) return Result::protect_failed;
+    std::uint8_t* const end = where + p.expect.size();
+    struct Piece {
+        std::uint8_t* at;
+        std::size_t len;
+        DWORD old;
+    };
+    Piece pieces[8]{};  // a patch is at most 64 bytes: it spans at most two pages, so few regions
+    std::size_t count = 0;
+    for (std::uint8_t* at = where; at < end;) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (count == std::size(pieces) || !VirtualQuery(at, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+            !mbi.Protect || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            return Result::unreadable;
+        std::uint8_t* const region_end = static_cast<std::uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+        std::uint8_t* const stop = region_end < end ? region_end : end;
+        pieces[count++] = {at, static_cast<std::size_t>(stop - at), 0};
+        at = stop;
+    }
+    if (std::memcmp(where, p.expect.data(), p.expect.size()) != 0) return Result::mismatch;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!VirtualProtect(pieces[i].at, pieces[i].len, PAGE_EXECUTE_READWRITE, &pieces[i].old)) {
+            DWORD ignored = 0;
+            while (i-- > 0) VirtualProtect(pieces[i].at, pieces[i].len, pieces[i].old, &ignored);
+            return Result::protect_failed;
+        }
+    }
     std::memcpy(where, p.replace.data(), p.replace.size());
-    DWORD ignored = 0;
-    VirtualProtect(where, p.replace.size(), old, &ignored);
+    for (std::size_t i = 0; i < count; ++i) {
+        DWORD ignored = 0;
+        VirtualProtect(pieces[i].at, pieces[i].len, pieces[i].old, &ignored);
+    }
     FlushInstructionCache(GetCurrentProcess(), where, p.replace.size());
     return Result::applied;
 }
