@@ -127,8 +127,30 @@ int scripted() {
     EXPECT(load(f.phase_ns[sp::shadows]) >= 2 * ms);
     EXPECT(load(f.part_ns[sp::part_lock_wait]) >= 2 * ms);
     EXPECT(load(f.part_ns[sp::part_lists]) < load(f.phase_ns[sp::shadows]));
+    // Contended lock_timed inside a WorkerScope bills worker_lock_wait_ns without polluting title-thread lock waits.
+    {
+        const std::uint64_t title_waits_before = load(f.part_ns[sp::part_lock_wait]);
+        std::mutex worker_m;
+        std::atomic<bool> held_flag{false};
+        std::thread holder([&] {
+            const std::lock_guard held(worker_m);
+            held_flag.store(true, std::memory_order_release);
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        });
+        while (!held_flag.load(std::memory_order_acquire)) std::this_thread::yield();
+        std::thread worker([&] {
+            const sp::WorkerScope busy(sp::worker_submit);
+            std::unique_lock lock(worker_m, std::defer_lock);
+            sp::lock_timed(lock);
+        });
+        worker.join();
+        holder.join();
+        EXPECT(load(f.worker_lock_wait_ns) >= 2 * ms);
+        EXPECT(load(f.part_ns[sp::part_lock_wait]) == title_waits_before);
+    }
     sp::frame_lines(1.0);
-    std::printf("scripted: frame sums, title and own threads, worst frame and floor as scripted\n");
+    EXPECT(load(f.worker_lock_wait_ns) == 0);
+    std::printf("scripted: frame sums, title and own threads, worker lock waits, worst frame and floor as scripted\n");
     return 0;
 }
 
@@ -1820,6 +1842,178 @@ int queue_sync_and_async() {
         EXPECT(copy_q.take_held_failure() == ReplayResult::unsupported);
         EXPECT(db[16] == 0x40 && db[32] == 0x41 && db[48] == 0x42 && db[0] == 0x42);
         std::printf("queue execute+signal coalescing: unwaited merge, 17-batch burst, cross-queue Wait split, Present split & error fallback ok\n");
+    }
+
+    // 12. Round 6 queue contention fixes:
+    //     (a) 24 Wait-separated batches within one frame on depth=4 enqueue with zero room_cv_ stalls;
+    //     (b) Distinct Present-separated frames still throttle cleanly at depth=4 (bounded backpressure);
+    //     (c) Held-only Compute queue executions via release_held() are counted in async_run_ns (worker busy %);
+    //     (d) Visibility epochs (current_before_execute_seq / signaled_visibility_seq) allow safe single-flight
+    //         before_execute_() coalescing across concurrent/back-to-back queues while NEVER skipping a refresh
+    //         when a Wait-before-Signal CPU Fence::Signal lands after the previous refresh started.
+    {
+        VulkanContext context(d.device_proc, d.device, true);
+        EXPECT(context.loaded());
+        VulkanQueue direct(context, d.queue, d.family, VulkanQueue::QueueKind::direct);
+        VulkanQueue compute(context, d.queue, d.family, VulkanQueue::QueueKind::compute);
+        EXPECT(direct.ok() && compute.ok());
+        direct.set_async_depth(4);
+        compute.set_async_depth(4);
+
+        auto empty = std::make_shared<CommandList>();
+        EXPECT(empty->close());
+        std::shared_ptr<const CommandList> snap = empty;
+
+        // (a) 24 Wait-separated batches within a single present_epoch on depth=4: zero room_cv_ stalls!
+        std::atomic<bool> block_first{true}, in_first{false};
+        context.set_before_execute([&] {
+            if (block_first.exchange(false, std::memory_order_acq_rel)) {
+                in_first.store(true, std::memory_order_release);
+                while (in_first.load(std::memory_order_acquire)) std::this_thread::yield();
+            }
+        });
+        VulkanFence intra_f(context, 0), done_a(context, 0);
+        EXPECT(intra_f.semaphore() && done_a.semaphore());
+        EXPECT(direct.execute({&snap, 1}) == ReplayResult::success);
+        while (!in_first.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        std::atomic<bool> burst24_done{false};
+        std::thread producer24([&] {
+            bool ok = true;
+            for (int i = 1; i <= 24 && ok; ++i) {
+                direct.wait(intra_f.semaphore(), std::uint64_t(i - 1));
+                ok = (direct.execute({&snap, 1}) == ReplayResult::success) &&
+                     direct.signal(intra_f.semaphore(), std::uint64_t(i));
+            }
+            ok = ok && direct.signal(done_a.semaphore(), 1);
+            if (ok) burst24_done.store(true, std::memory_order_release);
+        });
+        const auto d24 = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (!burst24_done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < d24)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const bool non_stalling_24 = burst24_done.load(std::memory_order_acquire);
+        in_first.store(false, std::memory_order_release);
+        producer24.join();
+        EXPECT(non_stalling_24);
+        EXPECT(done_a.wait(1, 5'000'000'000ull));
+        EXPECT(direct.idle());
+        EXPECT(direct.async_room_waits_for_test() == 0);
+
+        // (b) Distinct Present frames on depth=4 still throttle when 4 frames are already queued/running.
+        block_first.store(true, std::memory_order_release);
+        in_first.store(false, std::memory_order_release);
+        VulkanFence done_b(context, 0);
+        EXPECT(done_b.semaphore());
+        EXPECT(direct.execute({&snap, 1}) == ReplayResult::success);
+        while (!in_first.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        std::atomic<unsigned> frames_queued{0};
+        std::thread frame_producer([&] {
+            for (unsigned f = 1; f <= 5; ++f) {
+                {
+                    const sp::TitleCall pres(sp::part_present);
+                }
+                (void)direct.execute({&snap, 1});
+                frames_queued.store(f, std::memory_order_release);
+            }
+            (void)direct.signal(done_b.semaphore(), 1);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        // Worker busy (1) + 3 distinct present_epoch frames in inbox_ = 4 == depth: 4th queued frame must wait!
+        EXPECT(frames_queued.load(std::memory_order_acquire) == 3);
+        in_first.store(false, std::memory_order_release);
+        frame_producer.join();
+        EXPECT(done_b.wait(1, 5'000'000'000ull));
+        EXPECT(direct.idle());
+        EXPECT(direct.async_room_waits_for_test() >= 1);
+
+        // (c) Held-only Compute queue execution via release_held() is measured in async_run_ns (worker busy %).
+        context.set_before_execute([] { std::this_thread::sleep_for(std::chrono::milliseconds(10)); });
+        VulkanFence gate_c(context, 0), done_c(context, 0);
+        EXPECT(gate_c.semaphore() && done_c.semaphore());
+        compute.wait(gate_c.semaphore(), 1);
+        EXPECT(compute.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(compute.signal(done_c.semaphore(), 1));
+        EXPECT(compute.idle());  // flushed into held_ while gate_c is unmet
+        const std::uint64_t run_before = compute.async_run_ns_for_test();
+        EXPECT(gate_c.signal(1));
+        EXPECT(done_c.wait(1, 5'000'000'000ull));
+        EXPECT(compute.idle());
+        const std::uint64_t run_after = compute.async_run_ns_for_test();
+        EXPECT(run_after - run_before >= 5 * ms);
+
+        // (d) Visibility epoch contract for single-flight before_execute_() coalescing + Wait-before-Signal safety.
+        std::mutex coal_m;
+        std::uint64_t coal_completed = 0;
+        std::atomic<unsigned> coal_ran{0}, coal_skipped{0};
+        std::atomic<bool> hold_lead{false}, in_lead{false}, coal_bad_req{false};
+        std::atomic<int> cpu_data{0}, observed_data{0};
+        context.set_before_execute([&] {
+            const std::uint64_t req = VulkanContext::current_before_execute_seq();
+            if (req == 0) {
+                coal_bad_req.store(true, std::memory_order_relaxed);
+                return;
+            }
+            std::unique_lock lock(coal_m);
+            if (coal_completed >= req) {
+                coal_skipped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            const std::uint64_t pass = (std::max)(req, context.current_visibility_seq());
+            lock.unlock();
+            if (hold_lead.exchange(false, std::memory_order_acq_rel)) {
+                in_lead.store(true, std::memory_order_release);
+                while (in_lead.load(std::memory_order_acquire)) std::this_thread::yield();
+            }
+            observed_data.store(cpu_data.load(std::memory_order_acquire), std::memory_order_release);
+            coal_ran.fetch_add(1, std::memory_order_relaxed);
+            lock.lock();
+            if (pass > coal_completed) coal_completed = pass;
+        });
+
+        // Case d1: Back-to-back direct + compute enqueued before direct's pass starts -> compute coalesces cleanly!
+        VulkanFence cross_d(context, 0), comp_done_d(context, 0);
+        EXPECT(cross_d.semaphore() && comp_done_d.semaphore());
+        hold_lead.store(true, std::memory_order_release);
+        EXPECT(direct.execute({&snap, 1}) == ReplayResult::success);  // batch 0 holds lead
+        while (!in_lead.load(std::memory_order_acquire)) std::this_thread::yield();
+
+        cpu_data.store(42, std::memory_order_release);
+        EXPECT(direct.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(direct.signal(cross_d.semaphore(), 1));
+        compute.wait(cross_d.semaphore(), 1);
+        EXPECT(compute.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(compute.signal(comp_done_d.semaphore(), 1));
+        EXPECT(compute.idle());  // compute batch now held waiting for cross_d
+
+        in_lead.store(false, std::memory_order_release);
+        EXPECT(comp_done_d.wait(1, 5'000'000'000ull));
+        EXPECT(direct.idle() && compute.idle());
+        EXPECT(observed_data.load(std::memory_order_acquire) == 42);
+        EXPECT(coal_skipped.load(std::memory_order_acquire) >= 1);
+
+        // Case d2: Wait-before-Signal with CPU write + CPU Fence::Signal AFTER prior pass completed MUST NOT skip!
+        VulkanFence cpu_gate(context, 0), comp_done_d2(context, 0);
+        EXPECT(cpu_gate.semaphore() && comp_done_d2.semaphore());
+        compute.wait(cpu_gate.semaphore(), 1);
+        EXPECT(compute.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(compute.signal(comp_done_d2.semaphore(), 1));
+        EXPECT(compute.idle());  // held in compute.held_
+
+        // Run a direct pass now: coal_completed advances past compute's enqueue visibility_seq!
+        EXPECT(direct.execute({&snap, 1}) == ReplayResult::success);
+        EXPECT(direct.idle());
+        const unsigned ran_before_cpu_sig = coal_ran.load(std::memory_order_acquire);
+
+        // Title writes new CPU data and signals cpu_gate from CPU: compute MUST run a fresh refresh and see 99!
+        cpu_data.store(99, std::memory_order_release);
+        EXPECT(cpu_gate.signal(1));
+        EXPECT(comp_done_d2.wait(1, 5'000'000'000ull));
+        EXPECT(compute.idle());
+        EXPECT(!coal_bad_req.load(std::memory_order_acquire));
+        EXPECT(coal_ran.load(std::memory_order_acquire) == ran_before_cpu_sig + 1);
+        EXPECT(observed_data.load(std::memory_order_acquire) == 99);
+        std::printf("queue r6 contention: 24-wait frame 0 room stalls, frame-group bound, held run_ns & visibility coalescing ok\n");
     }
 
     return 0;

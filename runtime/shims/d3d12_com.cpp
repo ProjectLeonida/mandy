@@ -1652,7 +1652,16 @@ private:
         } else {
             const std::uint64_t raw = va;
             if (descriptor_ring_diagnostics()) note_table_slots(va, p->table_descriptors);
-            va = console_descriptor_table_va(va);
+            if (cbv_srv_uav_shader_va_ != cbv_srv_uav_base_ && cbv_srv_uav_num_descriptors_ &&
+                va >= cbv_srv_uav_base_ &&
+                va - cbv_srv_uav_base_ < std::uint64_t(cbv_srv_uav_num_descriptors_) * descriptor_size) {
+                va = cbv_srv_uav_shader_va_ + (va - cbv_srv_uav_base_);
+            } else if (sampler_shader_va_ != sampler_base_ && sampler_num_descriptors_ && va >= sampler_base_ &&
+                       va - sampler_base_ < std::uint64_t(sampler_num_descriptors_) * descriptor_size) {
+                va = sampler_shader_va_ + (va - sampler_base_);
+            } else {
+                va = console_descriptor_table_va(va);
+            }
             console_heap_table = (va != raw);
         }
         if (type != rt::rootsig::ParamType::Descriptor && va && p->table_descriptors) {
@@ -1690,6 +1699,7 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_shader_va_ = 0;
     D3D12_GPU_VIRTUAL_ADDRESS sampler_shader_va_ = 0;
     UINT cbv_srv_uav_num_descriptors_ = 0;
+    UINT sampler_num_descriptors_ = 0;
     bool direct_cbv_table_recorded_ = false;
     UINT heap_slots_[2]{};  // NumDescriptors of the bound view and sampler heaps
     std::uint64_t table_high_[3]{};  // this list's descriptor-ring marks: view, sampler, console heap (note_table_slots)
@@ -1806,6 +1816,7 @@ private:
         direct_cbv_table_recorded_ = false;
         sampler_heap_ = smp;
         sampler_base_ = smp_base;
+        sampler_num_descriptors_ = smp_slots;
         sampler_shader_va_ = smp_base ? console_descriptor_table_va(smp_base) : 0;
         if (!descriptor_ring_diagnostics()) return;
         heap_slots_[0] = cbv_slots;
@@ -1935,6 +1946,7 @@ private:
         cbv_srv_uav_shader_va_ = 0;
         sampler_shader_va_ = 0;
         cbv_srv_uav_num_descriptors_ = 0;
+        sampler_num_descriptors_ = 0;
         direct_cbv_table_recorded_ = false;
         topology_ = 0;
         vertex_buffers_ = {};
@@ -2431,6 +2443,7 @@ public:
             }
             held->fetch_sub(1);
             if (signaled) {
+                context->note_signaled_visibility_seq(context->next_visibility_seq());
                 context->holds().signaled(semaphore, value);
                 context->holds().pump_ready();
             }
@@ -2507,6 +2520,7 @@ public:
     static std::shared_ptr<void> pin_lists(const std::vector<const GraphicsCommandList*>& lists) {
         std::size_t total = 0;
         for (const GraphicsCommandList* list : lists) total += list->pinned().size();
+        if (!total) return {};
         auto pinned = std::make_shared<PinnedObjects>();
         pinned->objects.reserve(total);
         for (const GraphicsCommandList* list : lists)
