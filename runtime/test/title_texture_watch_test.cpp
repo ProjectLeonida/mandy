@@ -701,12 +701,13 @@ int main() {
             std::uint64_t batch_calls = 0;
             std::uint64_t batch_tiles_total = 0;
             std::vector<std::uintptr_t> last_batch_vas;
-            void arm_batch(const std::uintptr_t* tiles, Cell* const* cells, std::int8_t* results, std::size_t count) {
+            void arm_batch(const std::uintptr_t* tiles, Cell* const* cell_ptrs, std::int8_t* results,
+                           std::size_t count) {
                 ++batch_calls;
                 batch_tiles_total += count;
                 last_batch_vas.assign(tiles, tiles + count);
                 for (std::size_t i = 0; i < count; ++i) {
-                    const int r = arm(tiles[i], *cells[i]);
+                    const int r = arm(tiles[i], *cell_ptrs[i]);
                     results[i] = static_cast<std::int8_t>(r > 0 ? 1 : (r == 0 ? 0 : -1));
                 }
             }

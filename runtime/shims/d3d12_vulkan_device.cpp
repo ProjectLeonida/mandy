@@ -7533,7 +7533,7 @@ struct DeviceState {
                     last_page = page_va;
                     last_copy = page_mirror.mirror->copy_bytes(page_va);
                     last_frame = (last_copy && readback) ? page_mirror.mirror->frame_at(page_va) : nullptr;
-                    if (last_frame) page_mirror.readback_invalidated.insert(last_frame);
+                    if (last_frame) note_readback_frame_invalidated_locked(last_frame);
                 }
                 if (last_copy) filter_slot_locked(heap, slot, last_copy + (va & kOffMask), &cache, false);
                 // A page not mapped is filtered whole when it is.
@@ -7958,7 +7958,7 @@ struct DeviceState {
                 last_home = has_mirror ? page_mirror.mirror->copy_bytes(page_va) : nullptr;
                 if (last_home && readback) {
                     if (std::uint8_t* frame = page_mirror.mirror->frame_at(page_va))
-                        page_mirror.readback_invalidated.insert(frame);
+                        note_readback_frame_invalidated_locked(frame);
                 }
             }
             if (!last_home) continue;
@@ -17736,12 +17736,7 @@ void DeviceState::page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& ite
     auto* const tracking = page_mirror.tracking.get();
 
     const auto mark_dirty_page = [&](std::uint64_t p) {
-        if (mirror.dirty(p)) {
-            need_upload = true;
-            if (page_mirror.readback_in_flight) {
-                if (std::uint8_t* const f = mirror.frame_at(p)) page_mirror.readback_invalidated.insert(f);
-            }
-        }
+        if (mirror.dirty(p)) need_upload = true;
     };
 
     const auto try_full_view = [&](TitleMirrorCheckItem& item, std::uint64_t va, bool is_cpu_view) -> bool {
@@ -17813,7 +17808,14 @@ void DeviceState::page_mirror_check_batch(std::vector<TitleMirrorCheckItem>& ite
     // Pass 2: ONE batched parallel upload across all dirty mirror pages of the pass.
     if (need_upload) {
         const std::uint64_t failures_before = mirror.counters().upload_failures;
-        page_mirror.uploads += mirror.upload();
+        if (page_mirror.readback_in_flight) {
+            page_mirror.uploads += mirror.upload([this](std::uint8_t* frame,
+                                                        const std::array<std::uint64_t, 4>& changed) {
+                note_readback_pieces_uploaded_locked(frame, changed);
+            });
+        } else {
+            page_mirror.uploads += mirror.upload();
+        }
         // Do not upload zeroed fallback pieces or poison mirror_hash when hooks_.copy failed mid-sync.
         if (mirror.counters().upload_failures != failures_before) return;
     }
