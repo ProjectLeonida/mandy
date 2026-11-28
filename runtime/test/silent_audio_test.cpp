@@ -367,6 +367,39 @@ void test_render_stream() {
     void* other = reinterpret_cast<void*>(1);
     check(d->Activate(__uuidof(IMMDeviceEnumerator), CLSCTX_ALL, nullptr, &other) == E_NOINTERFACE && !other,
           "Activate(another interface) is E_NOINTERFACE");
+    // A description that is not a format is E_INVALIDARG in IsFormatSupported and Initialize, as Windows answers it: no
+    // channels, no rate, no sample size, a block or byte rate that does not follow, an extensible header too short. A
+    // fresh client each time, so one that took such a format does not carry it into the tests below.
+    {
+        bool refused = true;
+        for (int field = 0; field < 6; ++field) {
+            WAVEFORMATEX bad{WAVE_FORMAT_PCM, 2, 48000, 48000 * 4, 4, 16, 0};
+            switch (field) {
+            case 0: bad.nChannels = 0; break;
+            case 1: bad.nSamplesPerSec = 0; break;
+            case 2: bad.wBitsPerSample = 0; break;
+            case 3: bad.nBlockAlign = 3; break;
+            case 4: bad.nAvgBytesPerSec = 1; break;
+            case 5: bad.wFormatTag = WAVE_FORMAT_EXTENSIBLE; break;
+            }
+            IAudioClient* fresh = activate(d, __uuidof(IAudioClient));
+            if (!fresh) {
+                refused = false;
+                continue;
+            }
+            WAVEFORMATEX* closest = nullptr;
+            const HRESULT supported = fresh->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, &bad, &closest);
+            const HRESULT init = fresh->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, &bad, nullptr);
+            fresh->Release();
+            if (supported != E_INVALIDARG || init != E_INVALIDARG || closest) {
+                std::printf("  malformed case %d: IsFormatSupported 0x%08lx, Initialize 0x%08lx\n", field,
+                            static_cast<unsigned long>(supported), static_cast<unsigned long>(init));
+                refused = false;
+            }
+            CoTaskMemFree(closest);
+        }
+        check(refused, "IsFormatSupported and Initialize refuse a malformed format with E_INVALIDARG");
+    }
 
     IAudioClient3* c = nullptr;
     d->Activate(__uuidof(IAudioClient3), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&c));
@@ -400,6 +433,11 @@ void test_render_stream() {
           "Initialize(shared, event callback, mix format)");
     check(c->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, mix, nullptr) == AUDCLNT_E_ALREADY_INITIALIZED,
           "a second Initialize is refused");
+    {
+        WAVEFORMATEX bad{WAVE_FORMAT_PCM, 0, 48000, 0, 0, 16, 0};
+        check(c->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, &bad, nullptr) == AUDCLNT_E_ALREADY_INITIALIZED,
+              "an initialized client says so before it looks at the format, as on the host");
+    }
     CoTaskMemFree(mix);
     check(c->GetBufferSize(&frames) == S_OK && frames >= 960, "GetBufferSize: at least two periods");
     REFERENCE_TIME latency = 0;
@@ -422,6 +460,10 @@ void test_render_stream() {
     check(c->GetService(__uuidof(IAudioStreamVolume), reinterpret_cast<void**>(&stream)) == S_OK && stream,
           "GetService(IAudioStreamVolume)");
     if (!render || !clock || !simple || !stream) return;
+    void* capture = reinterpret_cast<void*>(1);
+    check(c->GetService(__uuidof(IAudioCaptureClient), &capture) == AUDCLNT_E_WRONG_ENDPOINT_TYPE && !capture,
+          "GetService(IAudioCaptureClient) on the render endpoint is AUDCLNT_E_WRONG_ENDPOINT_TYPE, as on the host");
+    check(c->Reset() == S_OK && c->Reset() == S_OK, "Reset of a stream with nothing to reset is S_OK, as on the host");
     UINT32 channels = 0;
     float level = 0.0f;
     check(stream->GetChannelCount(&channels) == S_OK && channels == 8 && stream->SetChannelVolume(7, 0.5f) == S_OK &&
@@ -440,6 +482,11 @@ void test_render_stream() {
     if (data) std::memset(data, 0x7f, static_cast<size_t>(frames) * 32);
     check(render->GetBuffer(1, &data) == AUDCLNT_E_OUT_OF_ORDER, "a second GetBuffer before ReleaseBuffer");
     check(render->ReleaseBuffer(frames + 1, 0) == AUDCLNT_E_INVALID_SIZE, "ReleaseBuffer of more than was got");
+    // A render packet takes only AUDCLNT_BUFFERFLAGS_SILENT (and bit 31): any other flag is E_INVALIDARG, before the
+    // size is checked, and the packet stays pending (measured on the host).
+    check(render->ReleaseBuffer(frames, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) == E_INVALIDARG &&
+              render->ReleaseBuffer(frames, 0x10) == E_INVALIDARG && render->ReleaseBuffer(frames + 1, 0x4) == E_INVALIDARG,
+          "ReleaseBuffer refuses flags a render packet does not take");
     check(render->ReleaseBuffer(frames, 0) == S_OK, "ReleaseBuffer(whole buffer)");
     UINT32 padding = 0;
     check(c->GetCurrentPadding(&padding) == S_OK && padding == frames, "padding is the whole buffer before Start");
